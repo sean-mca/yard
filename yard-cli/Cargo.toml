@@ -1,0 +1,13 @@
+[package]
+name = "yard"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.0", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.50.0", features = ["full"] }
+yard-structs = { path = "../yard-structs" }
+yard-core = { path = "../yard-core" }
+yaml-rust2 = "0.11.0"
