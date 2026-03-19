@@ -1,4 +1,0 @@
-project: my-data-app
-state:
-  type: local
-  path: .yard/state.json
