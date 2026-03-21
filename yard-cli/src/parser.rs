@@ -20,13 +20,4 @@ pub enum Commands {
         #[arg(index = 1)]
         directory: Option<String>,
     },
-    // /// Preview changes before applying
-    // Plan,
-    // /// Apply the architecture defined in YAML
-    // Apply {
-    //     #[arg(long)]
-    //     dry_run: bool,
-    // },
-    // /// Destroy managed infrastructure/data assets
-    // Destroy,
 }

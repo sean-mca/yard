@@ -5,6 +5,11 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
+aws-config = { version = "1.8.15", features = ["behavior-version-latest"] }
+aws-sdk-s3 = { version = "1.127.0", features = ["behavior-version-latest"] }
+chrono = "0.4.44"
+serde_json = "1.0.149"
+tokio = { version = "1.50.0", features = ["full"] }
 yaml-rust2 = "0.11.0"
 
 yard-structs = { path = "../yard-structs" }

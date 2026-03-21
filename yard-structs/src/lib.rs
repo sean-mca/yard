@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -32,4 +33,27 @@ pub enum StateBackend {
 pub struct ProjectManifest {
     pub project: String,
     pub state: StateBackend,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct Resource {
+    pub r#type: String,
+    pub id: String,       // Unique identifier (ARN/Name)
+    pub provider: String, // "aws", "azure", "local" - helps the Core know which driver to use
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct Deployment {
+    pub env: String,
+    pub config_hash: String,
+    pub status: String, // "success", "failed", "running"
+    pub applied_at: String,
+    pub resources: Vec<Resource>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ProjectState {
+    pub project: String,
+    pub last_updated: String,
+    pub deployments: HashMap<String, Deployment>, // Key = "job_name"
 }

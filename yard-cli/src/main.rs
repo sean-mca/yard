@@ -1,6 +1,7 @@
 // src/main.rs
-fn main() {
-    if let Err(e) = yard::run() {
+#[tokio::main]
+async fn main() {
+    if let Err(e) = yard::run().await {
         eprintln!("YARD Error: {:?}", e);
         std::process::exit(1);
     }
