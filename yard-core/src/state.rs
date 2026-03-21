@@ -1,6 +1,6 @@
 // yard-core/src/state.rs
+use crate::storage::S3Storage;
 use anyhow::{Context, Result, anyhow};
-use aws_sdk_s3::Client;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::fs;
@@ -41,44 +41,23 @@ pub async fn initialize_backend(project_name: &str, backend: &StateBackend) -> R
             println!("✅ Initialized local state at {:?}", path);
         }
         StateBackend::S3 { bucket, key, .. } => {
-            let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-            let client = Client::new(&config);
+            // 1. Initialize the worker using your existing S3Storage::new
+            let storage = S3Storage::new(bucket.clone(), key.clone()).await?;
 
+            // 2. Build the initial state struct
             let new_state = ProjectState {
                 project: project_name.to_string(),
                 last_updated: Utc::now().to_rfc3339(),
                 deployments: HashMap::new(),
             };
-            let json = serde_json::to_string_pretty(&new_state)?;
 
-            println!("☁️  Initializing S3 state: s3://{}/{}", bucket, key);
-
-            let result = client
-                .put_object()
-                .bucket(bucket)
-                .key(key)
-                .body(json.into_bytes().into())
-                .content_type("application/json")
-                // CRITICAL: This header ensures we DON'T overwrite an existing state.
-                // S3 interprets If-None-Match: "*" as "Fail if any object already exists at this key"
-                .if_none_match("*")
-                .send()
-                .await;
-
-            match result {
-                Ok(_) => println!("✅ Successfully initialized S3 backend."),
-                Err(e) => {
-                    // Check if the error is specifically a "Precondition Failed" (412)
-                    if let Some(service_error) = e.as_service_error() {
-                        if service_error.is_invalid_request() {
-                            println!(
-                                "⚠️  State file already exists in S3. Skipping initialization."
-                            );
-                            return Ok(());
-                        }
-                    }
-                    return Err(e).context("Failed to upload initial state to S3");
+            // 3. Call the specialized write method
+            match storage.write_if_not_exists(&new_state).await {
+                Ok(_) => println!("✅ Initialized S3 state at s3://{}/{}", bucket, key),
+                Err(e) if e.to_string().contains("already exists") => {
+                    println!("⚠️  State already exists in S3. Skipping.");
                 }
+                Err(e) => return Err(e),
             }
         }
     }
