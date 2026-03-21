@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use yard_structs::{StateBackend, YardAction};
 mod state;
 mod storage;
-mod utils;
+pub mod utils;
 
 pub async fn dispatch(action: YardAction) -> Result<()> {
     match action {

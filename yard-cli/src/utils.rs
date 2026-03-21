@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 // use yard_core::utils::get_current_context;
 
 // pub fn interpolate_value(raw: &str) -> String {
@@ -42,4 +43,20 @@ pub fn yaml_to_json(yaml: &yaml_rust2::Yaml) -> serde_json::Value {
         yaml_rust2::Yaml::Null => serde_json::Value::Null,
         _ => serde_json::Value::Null,
     }
+}
+
+pub fn find_in_parent_folders(start_path: &Path, filename: &str) -> Option<PathBuf> {
+    let mut current = start_path.to_path_buf();
+
+    loop {
+        let target = current.join(filename);
+        if target.exists() {
+            return Some(target);
+        }
+        // Move up one level. If pop() returns false, we hit the filesystem root.
+        if !current.pop() {
+            break;
+        }
+    }
+    None
 }

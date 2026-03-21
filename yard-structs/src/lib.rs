@@ -75,3 +75,10 @@ pub enum StateChange {
     Modify(String),
     NoChange(String),
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct YARDContext {
+    pub account: serde_json::Value,
+    pub region: serde_json::Value,
+    pub transforms: serde_json::Value,
+}

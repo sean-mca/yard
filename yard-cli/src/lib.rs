@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod context;
 pub mod parser;
 pub mod utils;
 
