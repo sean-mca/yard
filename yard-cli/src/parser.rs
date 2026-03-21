@@ -20,4 +20,9 @@ pub enum Commands {
         #[arg(index = 1)]
         directory: Option<String>,
     },
+
+    Plan {
+        #[arg(index = 1)]
+        directory: Option<String>,
+    },
 }

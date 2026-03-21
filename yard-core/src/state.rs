@@ -1,65 +1,76 @@
 // yard-core/src/state.rs
-use crate::storage::S3Storage;
+use crate::storage;
+use crate::utils;
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use std::collections::HashMap;
-use std::fs;
-use yard_structs::{ProjectState, StateBackend};
+use yard_structs::{Deployment, ProjectManifest, ProjectState, StateBackend, StateChange};
 
 pub async fn initialize_backend(project_name: &str, backend: &StateBackend) -> Result<()> {
-    match backend {
-        StateBackend::Local { path } => {
-            // 1. Prevent overwriting an existing state
-            if path.exists() {
-                println!(
-                    "⚠️  State file already exists at {:?}. Skipping initialization.",
-                    path
-                );
-                return Ok(());
-            }
+    // 1. Get our unified storage worker
+    let storage = storage::get_storage(backend).await?;
 
-            // 2. Ensure the parent directory exists (e.g., .yard/)
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("Failed to create directory {:?}", parent))?;
-            }
+    // 2. Build the "Blank" state
+    let new_state = ProjectState {
+        project: project_name.to_string(),
+        last_updated: Utc::now().to_rfc3339(),
+        deployments: HashMap::new(),
+    };
 
-            // 3. Construct the "Empty" ProjectState
-            let new_state = ProjectState {
-                project: project_name.to_string(),
-                last_updated: Utc::now().to_rfc3339(),
-                deployments: HashMap::new(), // Starts empty
-            };
+    // 3. Perform the write
+    // We'll update the Storage enum to handle the "if not exists" logic
+    storage.write_new(&new_state).await?;
 
-            // 4. Serialize to JSON and write to disk
-            let json = serde_json::to_string_pretty(&new_state)
-                .context("Failed to serialize initial state to JSON")?;
+    Ok(())
+}
 
-            fs::write(path, json)
-                .with_context(|| format!("Failed to write state file to {:?}", path))?;
+pub fn calculate_proposed_state(manifest: &ProjectManifest) -> ProjectState {
+    let mut deployments = HashMap::new();
 
-            println!("✅ Initialized local state at {:?}", path);
-        }
-        StateBackend::S3 { bucket, key, .. } => {
-            // 1. Initialize the worker using your existing S3Storage::new
-            let storage = S3Storage::new(bucket.clone(), key.clone()).await?;
+    for (name, job_def) in &manifest.jobs {
+        // Here is the structure that actually matches your struct
+        deployments.insert(
+            name.clone(),
+            Deployment {
+                env: "default".to_string(), // Or pull from manifest if we add an env field
+                config_hash: utils::calculate_hash(&job_def.config),
+                status: "pending".to_string(),
+                applied_at: "".to_string(),
+                resources: Vec::new(),
+            },
+        );
+    }
 
-            // 2. Build the initial state struct
-            let new_state = ProjectState {
-                project: project_name.to_string(),
-                last_updated: Utc::now().to_rfc3339(),
-                deployments: HashMap::new(),
-            };
+    ProjectState {
+        project: manifest.project.clone(),
+        last_updated: Utc::now().to_rfc3339(),
+        deployments,
+    }
+}
 
-            // 3. Call the specialized write method
-            match storage.write_if_not_exists(&new_state).await {
-                Ok(_) => println!("✅ Initialized S3 state at s3://{}/{}", bucket, key),
-                Err(e) if e.to_string().contains("already exists") => {
-                    println!("⚠️  State already exists in S3. Skipping.");
+pub fn calculate_diff(actual: &ProjectState, proposed: &ProjectState) -> Vec<StateChange> {
+    let mut changes = Vec::new();
+
+    // Check for Creates and Modifications
+    for (name, proposed_deploy) in &proposed.deployments {
+        match actual.deployments.get(name) {
+            Some(actual_deploy) => {
+                if actual_deploy.config_hash != proposed_deploy.config_hash {
+                    changes.push(StateChange::Modify(name.clone()));
+                } else {
+                    changes.push(StateChange::NoChange(name.clone()));
                 }
-                Err(e) => return Err(e),
             }
+            None => changes.push(StateChange::Create(name.clone())),
         }
     }
-    Ok(())
+
+    // Check for Deletions
+    for name in actual.deployments.keys() {
+        if !proposed.deployments.contains_key(name) {
+            changes.push(StateChange::Delete(name.clone()));
+        }
+    }
+
+    changes
 }

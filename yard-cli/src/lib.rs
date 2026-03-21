@@ -11,6 +11,7 @@ pub async fn run() -> Result<()> {
     let action = match cli.command {
         // Only 'directory' exists now, so this is clean
         parser::Commands::Init { directory } => commands::init::execute(directory)?,
+        parser::Commands::Plan { directory } => commands::plan::execute(directory)?,
     };
 
     if let Some(work) = action {

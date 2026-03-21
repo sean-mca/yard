@@ -1,6 +1,8 @@
-use crate::utils;
+use crate::utils::yaml_to_json;
 use anyhow::{Context, Result, anyhow};
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 use yaml_rust2::YamlLoader;
 use yard_structs::{JobDefinition, ProjectManifest, StateBackend, YardAction};
 
@@ -16,30 +18,23 @@ pub fn execute(directory: Option<String>) -> Result<Option<YardAction>> {
 
     let docs =
         YamlLoader::load_from_str(&content).map_err(|e| anyhow!("YAML Scan Error: {}", e))?;
-
     let doc = docs.get(0).ok_or_else(|| anyhow!("yard.yaml is empty"))?;
 
-    // 1. Extract Project Name
+    // 1. Project & State (Same as init)
     let project = doc["project"]
         .as_str()
-        .ok_or_else(|| anyhow!("Missing 'project' name in yard.yaml"))?
+        .ok_or_else(|| anyhow!("Missing project name"))?
         .to_string();
 
-    // 2. Extract State Info
     let state_node = &doc["state"];
     let state_type = state_node["type"]
         .as_str()
-        .ok_or_else(|| anyhow!("Missing state 'type' (local/s3) in yard.yaml"))?;
+        .ok_or_else(|| anyhow!("Missing state type"))?;
 
     let state = match state_type {
-        "local" => {
-            let path_str = state_node["path"]
-                .as_str()
-                .ok_or_else(|| anyhow!("Missing 'path' for local state"))?;
-            StateBackend::Local {
-                path: PathBuf::from(path_str),
-            }
-        }
+        "local" => StateBackend::Local {
+            path: PathBuf::from(state_node["path"].as_str().unwrap_or(".yard/state.json")),
+        },
         "s3" => StateBackend::S3 {
             bucket: state_node["bucket"].as_str().unwrap_or("").to_string(),
             region: state_node["region"]
@@ -51,42 +46,31 @@ pub fn execute(directory: Option<String>) -> Result<Option<YardAction>> {
                 .unwrap_or("state.json")
                 .to_string(),
         },
-        _ => return Err(anyhow!("Unsupported state type: {}", state_type)),
+        _ => return Err(anyhow!("Unsupported state type")),
     };
 
+    // 2. Jobs
     let mut jobs = HashMap::new();
     if let Some(jobs_hash) = doc["jobs"].as_hash() {
         for (key, val) in jobs_hash {
-            let name = key
-                .as_str()
-                .ok_or_else(|| anyhow!("Job name must be a string"))?
-                .to_string();
-
-            let job_type = val["type"]
-                .as_str()
-                .ok_or_else(|| anyhow!("Job '{}' is missing a 'type'", name))?
-                .to_string();
-
-            // We convert the remaining YAML config for this job into a JSON Value
-            // so yard-core can process it generically.
-            let config_json = utils::yaml_to_json(val);
-
+            let name = key.as_str().unwrap().to_string();
+            let job_type = val["type"].as_str().unwrap_or("unknown").to_string();
             jobs.insert(
                 name,
                 JobDefinition {
                     job_type,
-                    config: config_json,
+                    config: yaml_to_json(val),
                 },
             );
         }
     }
 
-    // 3. Construct Manifest (Variable names now match Struct fields)
     let manifest = ProjectManifest {
         project,
         state,
         jobs,
     };
 
-    Ok(Some(YardAction::Init { manifest }))
+    // Return the Plan action!
+    Ok(Some(YardAction::Plan { manifest }))
 }

@@ -7,6 +7,9 @@ pub enum YardAction {
     Init {
         manifest: ProjectManifest,
     },
+    Plan {
+        manifest: ProjectManifest,
+    },
     Apply {
         manifest_path: String,
         target_env: String,
@@ -33,6 +36,13 @@ pub enum StateBackend {
 pub struct ProjectManifest {
     pub project: String,
     pub state: StateBackend,
+    pub jobs: HashMap<String, JobDefinition>, // This was missing!
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct JobDefinition {
+    pub job_type: String,          // e.g., "glue"
+    pub config: serde_json::Value, // Catch-all for Glue/Lambda/etc. configs
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -56,4 +66,12 @@ pub struct ProjectState {
     pub project: String,
     pub last_updated: String,
     pub deployments: HashMap<String, Deployment>, // Key = "job_name"
+}
+
+#[derive(Debug)]
+pub enum StateChange {
+    Create(String),
+    Delete(String),
+    Modify(String),
+    NoChange(String),
 }
