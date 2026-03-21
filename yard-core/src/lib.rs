@@ -7,7 +7,7 @@ mod utils;
 pub async fn dispatch(action: YardAction) -> Result<()> {
     match action {
         YardAction::Init { manifest } => {
-            state::initialize_backend(&manifest.project, &manifest.state).await?;
+            state::initialize_backend(&manifest.project, &manifest.state, &manifest.jobs).await?;
         }
         YardAction::Plan { manifest } => {
             let storage = storage::get_storage(&manifest.state).await?;

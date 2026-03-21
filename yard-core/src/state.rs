@@ -4,23 +4,40 @@ use crate::utils;
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use std::collections::HashMap;
-use yard_structs::{Deployment, ProjectManifest, ProjectState, StateBackend, StateChange};
+use yard_structs::{
+    Deployment, JobDefinition, ProjectManifest, ProjectState, StateBackend, StateChange,
+};
 
-pub async fn initialize_backend(project_name: &str, backend: &StateBackend) -> Result<()> {
-    // 1. Get our unified storage worker
+pub async fn initialize_backend(
+    project_name: &str,
+    backend: &StateBackend,
+    jobs: &HashMap<String, JobDefinition>, // Add this!
+) -> Result<()> {
     let storage = storage::get_storage(backend).await?;
 
-    // 2. Build the "Blank" state
+    // 1. Calculate the initial deployments from the jobs provided
+    let mut deployments = HashMap::new();
+    for (name, job_def) in jobs {
+        deployments.insert(
+            name.clone(),
+            Deployment {
+                env: "default".to_string(),
+                config_hash: utils::calculate_hash(&job_def.config),
+                status: "initialized".to_string(),
+                applied_at: Utc::now().to_rfc3339(),
+                resources: Vec::new(),
+            },
+        );
+    }
+
+    // 2. Build the state with ACTUAL deployments
     let new_state = ProjectState {
         project: project_name.to_string(),
         last_updated: Utc::now().to_rfc3339(),
-        deployments: HashMap::new(),
+        deployments,
     };
 
-    // 3. Perform the write
-    // We'll update the Storage enum to handle the "if not exists" logic
     storage.write_new(&new_state).await?;
-
     Ok(())
 }
 
