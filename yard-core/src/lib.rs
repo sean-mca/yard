@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+pub mod codegen;
 mod state;
 mod storage;
 pub mod utils;
@@ -29,7 +30,7 @@ pub fn calculate_diff(manifest: &ProjectManifest, state: &State) -> Vec<JobDiff>
     // 1. Check for New or Modified Jobs
     for (name, job) in &manifest.jobs {
         // Calculate what the hash WOULD be if we applied this
-        let new_hash = crate::utils::calculate_hash(&job.config);
+        let new_hash = crate::utils::calculate_json_hash(&job.config);
 
         if let Some(existing) = state.deployments.get(name) {
             if existing.config_hash != new_hash {

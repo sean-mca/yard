@@ -3,9 +3,16 @@ use regex::Regex;
 use serde_json::Value;
 use yard_structs::YARDContext;
 
-pub fn calculate_hash(config: &serde_json::Value) -> String {
-    let serialized = serde_json::to_string(config).unwrap_or_default();
-    blake3::hash(serialized.as_bytes()).to_hex().to_string()
+pub fn calculate_hash<T: AsRef<[u8]>>(data: T) -> String {
+    let hash = blake3::hash(data.as_ref());
+    hash.to_hex().to_string()
+}
+
+pub fn calculate_json_hash(val: &Value) -> String {
+    // We use a stable serialization to ensure the same JSON
+    // always produces the same hash regardless of key order.
+    let s = serde_json::to_string(val).unwrap_or_default();
+    calculate_hash(s)
 }
 
 pub fn resolve_variables(raw_yaml: &str, ctx: &YARDContext) -> Result<String> {

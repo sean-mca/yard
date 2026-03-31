@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use yaml_rust2::YamlLoader;
+use yard_core::codegen;
 use yard_structs::{JobDefinition, JobState, ProjectManifest, State, StateBackend, YardAction};
 
 pub fn execute(directory: Option<String>) -> Result<Option<YardAction>> {
@@ -130,22 +131,49 @@ pub fn execute(directory: Option<String>) -> Result<Option<YardAction>> {
     for diff in diffs {
         match diff.diff_type {
             yard_structs::DiffType::Create | yard_structs::DiffType::Modify { .. } => {
-                let job_def = manifest.jobs.get(&diff.name).unwrap();
+                let job_def = manifest
+                    .jobs
+                    .get(&diff.name)
+                    .context("Job definition missing during apply")?;
 
-                // USE THE Deployment STRUCT, NOT JobState
+                // A. GENERATE THE PYTHON SCRIPT
+                let script_content = codegen::generate_python_script(&diff.name, job_def)
+                    .context("Failed to generate Python script")?;
+
+                // B. CALCULATE HASH BASED ON THE GENERATED SCRIPT
+                let script_hash = yard_core::utils::calculate_hash(&script_content);
+
+                // C. PERSIST GENERATED SCRIPT TO DISK (Local Preview)
+                let gen_dir = root_dir.join(".yard/generated");
+                fs::create_dir_all(&gen_dir)?;
+                let script_path = gen_dir.join(format!("{}.py", diff.name));
+                fs::write(&script_path, &script_content)?;
+
+                println!("  -> Generated script: .yard/generated/{}.py", diff.name);
+
+                // D. UPDATE STATE
                 current_state.deployments.insert(
                     diff.name.clone(),
                     yard_structs::JobState {
-                        config_hash: diff.new_hash.clone().unwrap(), // Matches struct field name
+                        config_hash: script_hash, // Use the script hash, not the YAML hash
                         config: job_def.config.clone(),
-                        status: "success".to_string(),
+                        status: "generated".to_string(),
                         applied_at: chrono::Utc::now().to_rfc3339(),
                         resources: Vec::new(),
                     },
                 );
             }
             yard_structs::DiffType::Delete => {
+                println!("  - Deleting job: {}", diff.name);
                 current_state.deployments.remove(&diff.name);
+
+                // Optional: Clean up the generated file
+                let script_path = root_dir
+                    .join(".yard/generated")
+                    .join(format!("{}.py", diff.name));
+                if script_path.exists() {
+                    let _ = fs::remove_file(script_path);
+                }
             }
             _ => {}
         }

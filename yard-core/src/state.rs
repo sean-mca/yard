@@ -22,7 +22,7 @@ pub async fn initialize_backend(
             name.clone(),
             Deployment {
                 env: Some("default".to_string()),
-                config_hash: utils::calculate_hash(&job_def.config),
+                config_hash: utils::calculate_json_hash(&job_def.config),
                 config: job_def.config.clone(),
                 status: "initialized".to_string(),
                 applied_at: Utc::now().to_rfc3339(),
@@ -51,7 +51,7 @@ pub fn calculate_proposed_state(manifest: &ProjectManifest) -> ProjectState {
             name.clone(),
             Deployment {
                 env: Some("default".to_string()), // Or pull from manifest if we add an env field
-                config_hash: utils::calculate_hash(&job_def.config),
+                config_hash: utils::calculate_json_hash(&job_def.config),
                 config: job_def.config.clone(),
                 status: "pending".to_string(),
                 applied_at: "".to_string(),
