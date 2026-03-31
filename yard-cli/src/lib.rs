@@ -13,6 +13,7 @@ pub async fn run() -> Result<()> {
         // Only 'directory' exists now, so this is clean
         parser::Commands::Init { directory } => commands::init::execute(directory)?,
         parser::Commands::Plan { directory } => commands::plan::execute(directory)?,
+        parser::Commands::Apply { directory } => commands::apply::execute(directory)?,
     };
 
     if let Some(work) = action {

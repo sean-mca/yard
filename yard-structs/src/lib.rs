@@ -54,8 +54,9 @@ pub struct Resource {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Deployment {
-    pub env: String,
+    pub env: Option<String>,
     pub config_hash: String,
+    pub config: serde_json::Value,
     pub status: String, // "success", "failed", "running"
     pub applied_at: String,
     pub resources: Vec<Resource>,
@@ -81,4 +82,39 @@ pub struct YARDContext {
     pub account: serde_json::Value,
     pub region: serde_json::Value,
     pub transforms: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum DiffType {
+    Create,
+    Modify {
+        // Key -> (Old Value, New Value)
+        changes: std::collections::HashMap<String, (String, String)>,
+    },
+    Delete,
+    None,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct JobDiff {
+    pub name: String,
+    pub diff_type: DiffType,
+    pub old_hash: Option<String>,
+    pub new_hash: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct JobState {
+    pub config_hash: String,
+    pub config: serde_json::Value,
+    pub status: String,
+    pub applied_at: String,
+    pub resources: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct State {
+    pub project: String,
+    pub last_updated: String,
+    pub deployments: std::collections::HashMap<String, JobState>,
 }

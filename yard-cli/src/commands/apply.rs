@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use yaml_rust2::YamlLoader;
-use yard_structs::{JobDefinition, ProjectManifest, StateBackend, YardAction};
+use yard_structs::{JobDefinition, JobState, ProjectManifest, State, StateBackend, YardAction};
 
 pub fn execute(directory: Option<String>) -> Result<Option<YardAction>> {
     let base_path = match directory {
@@ -30,9 +30,8 @@ pub fn execute(directory: Option<String>) -> Result<Option<YardAction>> {
         .to_string();
     let state_node = &root_doc["state"];
 
-    let state = match state_node["type"].as_str().context("Missing state type")? {
+    let state_backend = match state_node["type"].as_str().context("Missing state type")? {
         "local" => StateBackend::Local {
-            // Anchor state to the root yard.yaml location
             path: root_dir.join(state_node["path"].as_str().unwrap_or(".yard/state.json")),
         },
         "s3" => StateBackend::S3 {
@@ -51,16 +50,12 @@ pub fn execute(directory: Option<String>) -> Result<Option<YardAction>> {
 
     // 3. RECURSIVE JOB DISCOVERY
     let mut all_jobs = HashMap::new();
-
-    // We search from the root down. If you want to only plan a sub-folder,
-    // you'd pass that folder as an argument.
     let search_root = if base_path.join("jobs").exists() {
         base_path.join("jobs")
     } else {
         base_path
     };
 
-    // Note: You'll need `walkdir = "2"` in yard-cli/Cargo.toml
     for entry in walkdir::WalkDir::new(search_root)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -69,7 +64,6 @@ pub fn execute(directory: Option<String>) -> Result<Option<YardAction>> {
         let path = entry.path();
         let file_name = path.file_name().unwrap().to_str().unwrap();
 
-        // Skip config/context files
         if file_name == "yard.yaml"
             || file_name == "account.yaml"
             || file_name == "region.yaml"
@@ -78,11 +72,9 @@ pub fn execute(directory: Option<String>) -> Result<Option<YardAction>> {
             continue;
         }
 
-        // 4. LOAD CONTEXT (Crawl UP from the JOB'S specific location)
         let job_dir = path.parent().unwrap();
         let ctx = crate::context::load_context(job_dir)?;
 
-        // 5. RESOLVE & PARSE
         let raw_job_content = fs::read_to_string(path)?;
         let resolved_job_str = yard_core::utils::resolve_variables(&raw_job_content, &ctx)?;
 
@@ -104,58 +96,71 @@ pub fn execute(directory: Option<String>) -> Result<Option<YardAction>> {
     }
 
     let manifest = ProjectManifest {
-        project,
-        state,
+        project: project.clone(),
+        state: state_backend.clone(),
         jobs: all_jobs,
     };
 
-    let current_state = if let StateBackend::Local { path } = &manifest.state {
+    // 4. LOAD CURRENT STATE
+    let mut current_state: State = if let StateBackend::Local { path } = &state_backend {
         if path.exists() {
             let state_raw = fs::read_to_string(path)?;
             serde_json::from_str(&state_raw)?
         } else {
-            // Initial state if file doesn't exist
-            yard_structs::State {
-                project: manifest.project.clone(),
+            State {
+                project: project.clone(),
                 deployments: HashMap::new(),
                 last_updated: chrono::Utc::now().to_rfc3339(),
             }
         }
     } else {
-        return Err(anyhow!("S3 state loading not implemented yet"));
+        return Err(anyhow!("S3 state not yet supported for apply"));
     };
 
-    // 2. Calculate the Diff using the Core
+    // 5. CALCULATE DIFF & APPLY
     let diffs = yard_core::calculate_diff(&manifest, &current_state);
 
-    println!("--- Plan for {} ---", manifest.project);
-
     if diffs.is_empty() {
-        println!("No changes. Infrastructure is up to date.");
+        println!("No changes to apply.");
+        return Ok(None);
     }
+
+    println!("Applying changes for {}...", project);
 
     for diff in diffs {
         match diff.diff_type {
-            yard_structs::DiffType::Create => {
-                println!(
-                    "+ Create job [{}] ({})",
-                    diff.name,
-                    diff.new_hash.as_ref().unwrap_or(&"???".to_string())
+            yard_structs::DiffType::Create | yard_structs::DiffType::Modify { .. } => {
+                let job_def = manifest.jobs.get(&diff.name).unwrap();
+
+                // USE THE Deployment STRUCT, NOT JobState
+                current_state.deployments.insert(
+                    diff.name.clone(),
+                    yard_structs::JobState {
+                        config_hash: diff.new_hash.clone().unwrap(), // Matches struct field name
+                        config: job_def.config.clone(),
+                        status: "success".to_string(),
+                        applied_at: chrono::Utc::now().to_rfc3339(),
+                        resources: Vec::new(),
+                    },
                 );
             }
-            yard_structs::DiffType::Modify { ref changes } => {
-                println!("~ Modify job [{}]", diff.name);
-                for (key, (old, new)) in changes {
-                    println!("    {} : {} -> {}", key, old, new);
-                }
-            }
             yard_structs::DiffType::Delete => {
-                println!("- Delete job [{}]", diff.name);
+                current_state.deployments.remove(&diff.name);
             }
             _ => {}
         }
     }
 
-    // Return the action so the main.rs knows what to do next
-    Ok(Some(YardAction::Plan { manifest }))
+    // 6. PERSIST UPDATED STATE
+    if let StateBackend::Local { path } = &state_backend {
+        // Ensure the .yard directory exists
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let updated_json = serde_json::to_string_pretty(&current_state)?;
+        fs::write(path, updated_json)?;
+        println!("\n✅ State updated successfully at {}", path.display());
+    }
+
+    Ok(None)
 }
