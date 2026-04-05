@@ -25,6 +25,14 @@ fn err(field: &str, message: &str) -> ValidationError {
 pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
+    // body and job_file are mutually exclusive
+    if job.body.is_some() && job.job_file.is_some() {
+        errors.push(err(
+            "job_file",
+            "cannot specify both \"body\" and \"job_file\"",
+        ));
+    }
+
     // Job type
     if !SUPPORTED_JOB_TYPES.contains(&job.job_type.as_str()) {
         errors.push(err(
@@ -431,6 +439,7 @@ mod tests {
             job_type: "glue".to_string(),
             imports: vec![],
             body: None,
+            job_file: None,
             sources: vec![Source {
                 name: "events".to_string(),
                 source_type: "s3".to_string(),
@@ -477,6 +486,7 @@ mod tests {
             job_type: "glue".to_string(),
             imports: vec![],
             body: None,
+            job_file: None,
             sources: vec![],
             sink: None,
             transforms: vec![],
@@ -1175,5 +1185,20 @@ mod tests {
         let job = valid_glue_job();
         let errors = validate_job_full("good_job", &job);
         assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+    }
+
+    #[test]
+    fn body_and_job_file_mutually_exclusive() {
+        let mut job = minimal_job();
+        job.body = Some("print('hi')".to_string());
+        job.job_file = Some("./custom.py".to_string());
+        let errors = validate_job(&job);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "job_file" && e.message.contains("cannot specify both")),
+            "Expected mutual exclusion error, got: {:?}",
+            errors
+        );
     }
 }

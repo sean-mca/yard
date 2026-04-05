@@ -80,6 +80,8 @@ pub struct JobDefinition {
     pub job_type: String,
     pub imports: Vec<Import>,
     pub body: Option<String>,
+    /// Path to an external Python file that replaces YARD's generated script entirely.
+    pub job_file: Option<String>,
     pub sources: Vec<Source>,
     pub sink: Option<Sink>,
     pub transforms: Vec<Transform>,

@@ -143,12 +143,19 @@ fn discover_jobs(search_root: &PathBuf) -> Result<HashMap<String, JobDefinition>
         let sink = yard_core::parse_sink(&config);
         let transforms = yard_core::parse_transforms(&config);
 
+        // Resolve job_file path relative to the job YAML's directory
+        let job_file = yard_core::parse_job_file(&config).map(|p| {
+            let resolved = job_dir.join(&p);
+            resolved.to_string_lossy().to_string()
+        });
+
         all_jobs.insert(
             job_name,
             JobDefinition {
                 job_type,
                 imports,
                 body,
+                job_file,
                 sources,
                 sink,
                 transforms,

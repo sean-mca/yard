@@ -240,9 +240,20 @@ transforms:
       WHERE o.total > 0
 ```
 
-#### Body override
+#### External script file
 
-For jobs that don't fit the source/transform/sink model, you can provide a raw Python body:
+For jobs with complex logic, you can point to an external Python file instead of using YARD's codegen. The file replaces YARD's generated script entirely — no Glue boilerplate is added, no sources/transforms/sinks are processed.
+
+```yaml
+type: glue
+role: arn:aws:iam::123456789:role/GlueJobExecutionRole
+
+job_file: ./my_custom_job.py
+```
+
+The path is relative to the job YAML file. This is useful when a job is complex enough that writing it in Python directly is more practical than expressing it in YAML. YARD still handles deployment, state tracking, and locking — it just uses your script as-is.
+
+You can also use `body:` for short inline overrides that still get wrapped in the Glue template:
 
 ```yaml
 type: glue
@@ -250,9 +261,10 @@ role: arn:aws:iam::123456789:role/GlueJobExecutionRole
 
 body: |
   df = spark.read.format("parquet").load("s3://bucket/input/")
-  # Custom logic here
   df.write.format("parquet").save("s3://bucket/output/")
 ```
+
+`body` and `job_file` cannot both be specified on the same job.
 
 ### Generated output
 
