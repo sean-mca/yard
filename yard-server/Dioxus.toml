@@ -1,0 +1,14 @@
+[application]
+name = "yard-server"
+default_platform = "fullstack"
+
+[web.app]
+title = "yard-server"
+
+[web.resource]
+style = []
+script = []
+
+[web.resource.dev]
+style = []
+script = []
