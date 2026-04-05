@@ -1,8 +1,7 @@
 use super::resolve_project;
 use anyhow::Result;
-use yard_structs::YardAction;
 
-pub async fn execute(directory: Option<String>) -> Result<Option<YardAction>> {
+pub async fn execute(directory: Option<String>) -> Result<()> {
     let project = resolve_project(directory).await?;
 
     let diffs = yard_core::calculate_diff(&project.manifest, &project.current_state);
@@ -35,7 +34,5 @@ pub async fn execute(directory: Option<String>) -> Result<Option<YardAction>> {
         }
     }
 
-    Ok(Some(YardAction::Plan {
-        manifest: project.manifest,
-    }))
+    Ok(())
 }

@@ -2,9 +2,9 @@ use crate::utils;
 use anyhow::{Context, Result, anyhow};
 use std::{collections::HashMap, fs, path::PathBuf};
 use yaml_rust2::YamlLoader;
-use yard_structs::{JobDefinition, ProjectManifest, StateBackend, YardAction};
+use yard_structs::{JobDefinition, ProjectManifest, StateBackend};
 
-pub fn execute(directory: Option<String>) -> Result<Option<YardAction>> {
+pub async fn execute(directory: Option<String>) -> Result<()> {
     let base_path = match directory {
         Some(d) => PathBuf::from(d),
         None => std::env::current_dir().context("Failed to get current directory")?,
@@ -19,13 +19,11 @@ pub fn execute(directory: Option<String>) -> Result<Option<YardAction>> {
 
     let doc = docs.get(0).ok_or_else(|| anyhow!("yard.yaml is empty"))?;
 
-    // 1. Extract Project Name
     let project = doc["project"]
         .as_str()
         .ok_or_else(|| anyhow!("Missing 'project' name in yard.yaml"))?
         .to_string();
 
-    // 2. Extract State Info
     let state_node = &doc["state"];
     let state_type = state_node["type"]
         .as_str()
@@ -67,8 +65,6 @@ pub fn execute(directory: Option<String>) -> Result<Option<YardAction>> {
                 .ok_or_else(|| anyhow!("Job '{}' is missing a 'type'", name))?
                 .to_string();
 
-            // We convert the remaining YAML config for this job into a JSON Value
-            // so yard-core can process it generically.
             let config_json = utils::yaml_to_json(val);
 
             jobs.insert(
@@ -81,12 +77,13 @@ pub fn execute(directory: Option<String>) -> Result<Option<YardAction>> {
         }
     }
 
-    // 3. Construct Manifest (Variable names now match Struct fields)
     let manifest = ProjectManifest {
         project,
         state,
         jobs,
     };
 
-    Ok(Some(YardAction::Init { manifest }))
+    yard_core::init(&manifest).await?;
+
+    Ok(())
 }

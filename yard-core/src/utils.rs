@@ -1,4 +1,4 @@
-use anyhow::{Error, Result, anyhow};
+use anyhow::{Result, anyhow};
 use regex::Regex;
 use serde_json::Value;
 use yard_structs::YARDContext;

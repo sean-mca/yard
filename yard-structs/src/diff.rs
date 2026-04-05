@@ -1,14 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug)]
-pub enum StateChange {
-    Create(String),
-    Delete(String),
-    Modify(String),
-    NoChange(String),
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum DiffType {
     Create,
