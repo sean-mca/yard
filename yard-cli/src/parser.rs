@@ -35,6 +35,16 @@ pub enum Commands {
         auto_approve: bool,
     },
 
+    /// Show the generated script for a job
+    Show {
+        /// The job name to show
+        #[arg(index = 1)]
+        job_name: String,
+
+        #[arg(index = 2)]
+        directory: Option<String>,
+    },
+
     /// Validate all job configurations
     Validate {
         #[arg(index = 1)]

@@ -17,6 +17,10 @@ pub async fn run() -> Result<()> {
             dry_run,
             auto_approve,
         } => commands::apply::execute(directory, dry_run, auto_approve).await?,
+        parser::Commands::Show {
+            job_name,
+            directory,
+        } => commands::show::execute(job_name, directory).await?,
         parser::Commands::Validate { directory } => commands::validate::execute(directory).await?,
         parser::Commands::Destroy {
             job_name,

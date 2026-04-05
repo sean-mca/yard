@@ -420,6 +420,17 @@ pub async fn destroy_all(
     Ok(result)
 }
 
+/// Generate and return the script for a job without deploying or modifying state.
+pub fn show(manifest: &ProjectManifest, job_name: &str) -> Result<String> {
+    let job_def = manifest
+        .jobs
+        .get(job_name)
+        .ok_or_else(|| anyhow!("Job \"{job_name}\" not found in manifest"))?;
+
+    codegen::generate_python_script(job_name, job_def)
+        .with_context(|| format!("Failed to generate script for job \"{job_name}\""))
+}
+
 /// Extract optional body override from a job config.
 pub fn parse_body(config: &Value) -> Option<String> {
     config
