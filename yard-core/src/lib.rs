@@ -1,4 +1,5 @@
 pub mod codegen;
+pub mod providers;
 pub mod storage;
 pub mod utils;
 pub mod validation;
@@ -8,7 +9,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 use yard_structs::{
-    Deployment, DiffType, Import, JobDiff, ProjectManifest, ProjectState, Sink, Source, Transform,
+    Deployment, DiffType, Import, JobDiff, JobState, ProjectManifest, ProjectState, Sink, Source,
+    Transform,
 };
 
 /// Compute the diff between the manifest and the current state.
@@ -63,15 +65,17 @@ pub struct ApplyResult {
     pub deleted: Vec<String>,
 }
 
-/// Apply changes: generate scripts, update state, persist to backend.
+/// Apply changes: generate scripts, deploy via provider, update state.
 /// `root_dir` is where `.yard/generated/` lives.
+/// Each job is locked individually during its apply.
 pub async fn apply(
     manifest: &ProjectManifest,
     current_state: &ProjectState,
     root_dir: &Path,
+    dry_run: bool,
 ) -> Result<ApplyResult> {
     let diffs = calculate_diff(manifest, current_state);
-    let mut updated_state = current_state.clone();
+    let storage = storage::get_storage(&manifest.state).await?;
     let mut result = ApplyResult {
         created: Vec::new(),
         modified: Vec::new(),
@@ -79,75 +83,140 @@ pub async fn apply(
     };
 
     for diff in &diffs {
-        match &diff.diff_type {
-            DiffType::Create | DiffType::Modify { .. } => {
-                let job_def = manifest
-                    .jobs
-                    .get(&diff.name)
-                    .context("Job definition missing during apply")?;
+        // Lock the job before making changes
+        let lock = storage.lock(&diff.name).await?;
 
-                let script_content = codegen::generate_python_script(&diff.name, job_def)
-                    .context("Failed to generate Python script")?;
-                let script_hash = utils::calculate_hash(&script_content);
+        let apply_result: Result<()> = async {
+            match &diff.diff_type {
+                DiffType::Create | DiffType::Modify { .. } => {
+                    let job_def = manifest
+                        .jobs
+                        .get(&diff.name)
+                        .context("Job definition missing during apply")?;
 
-                let gen_dir = root_dir.join(".yard/generated");
-                std::fs::create_dir_all(&gen_dir)?;
-                let script_path = gen_dir.join(format!("{}.py", diff.name));
-                std::fs::write(&script_path, &script_content)?;
+                    let script_content = codegen::generate_python_script(&diff.name, job_def)
+                        .context("Failed to generate Python script")?;
+                    let script_hash = utils::calculate_hash(&script_content);
 
-                updated_state.deployments.insert(
-                    diff.name.clone(),
-                    Deployment {
+                    // Write generated script locally
+                    let gen_dir = root_dir.join(".yard/generated");
+                    std::fs::create_dir_all(&gen_dir)?;
+                    let script_path = gen_dir.join(format!("{}.py", diff.name));
+                    std::fs::write(&script_path, &script_content)?;
+
+                    // Deploy via provider if configured (skip in dry-run mode)
+                    let resources = if !dry_run {
+                        if let Some(provider_config) =
+                            manifest.providers.get(&job_def.job_type)
+                        {
+                            let provider = providers::get_provider(
+                                &job_def.job_type,
+                                provider_config,
+                            )
+                            .await?;
+                            provider.deploy(&diff.name, &script_content, &job_def.config).await?
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    };
+
+                    let status = if resources.is_empty() {
+                        "generated"
+                    } else {
+                        "deployed"
+                    };
+
+                    let deployment = Deployment {
                         config_hash: script_hash,
                         config: job_def.config.clone(),
-                        status: "generated".to_string(),
+                        status: status.to_string(),
                         applied_at: chrono::Utc::now().to_rfc3339(),
-                        resources: Vec::new(),
+                        resources,
                         env: None,
-                    },
-                );
+                    };
 
-                if matches!(&diff.diff_type, DiffType::Create) {
-                    result.created.push(diff.name.clone());
-                } else {
-                    result.modified.push(diff.name.clone());
+                    storage
+                        .write_job(
+                            &diff.name,
+                            &JobState {
+                                job_name: diff.name.clone(),
+                                project: manifest.project.clone(),
+                                deployment,
+                            },
+                        )
+                        .await?;
+
+                    if matches!(&diff.diff_type, DiffType::Create) {
+                        result.created.push(diff.name.clone());
+                    } else {
+                        result.modified.push(diff.name.clone());
+                    }
+                }
+                DiffType::Delete => {
+                    // Destroy via provider if configured and resources exist (skip in dry-run)
+                    if !dry_run {
+                        if let Some(existing) = current_state.deployments.get(&diff.name) {
+                            if !existing.resources.is_empty() {
+                                let job_type = existing
+                                    .config
+                                    .get("type")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+
+                                if let Some(provider_config) = manifest.providers.get(job_type) {
+                                    let provider =
+                                        providers::get_provider(job_type, provider_config).await?;
+                                    provider.destroy(&diff.name, &existing.resources).await?;
+                                }
+                            }
+                        }
+                    }
+
+                    storage.delete_job(&diff.name).await?;
+
+                    let script_path = root_dir
+                        .join(".yard/generated")
+                        .join(format!("{}.py", diff.name));
+                    if script_path.exists() {
+                        let _ = std::fs::remove_file(script_path);
+                    }
+
+                    result.deleted.push(diff.name.clone());
                 }
             }
-            DiffType::Delete => {
-                updated_state.deployments.remove(&diff.name);
-
-                let script_path = root_dir
-                    .join(".yard/generated")
-                    .join(format!("{}.py", diff.name));
-                if script_path.exists() {
-                    let _ = std::fs::remove_file(script_path);
-                }
-
-                result.deleted.push(diff.name.clone());
-            }
+            Ok(())
         }
-    }
+        .await;
 
-    // Persist state
-    let storage = storage::get_storage(&manifest.state).await?;
-    storage.write(&updated_state).await?;
+        // Always unlock, even on error
+        storage.unlock(&diff.name, &lock).await?;
+        apply_result?;
+    }
 
     Ok(result)
 }
 
-/// Initialize the state backend with the given manifest.
+/// Initialize per-job state files. Skips jobs that already have state.
 pub async fn init(manifest: &ProjectManifest) -> Result<()> {
     let storage = storage::get_storage(&manifest.state).await?;
 
-    let mut deployments = HashMap::new();
     for (name, job_def) in &manifest.jobs {
-        let script_content = codegen::generate_python_script(name, job_def)
-            .unwrap_or_else(|_| "".to_string());
+        // Skip if state already exists for this job
+        if storage.read_job(name).await?.is_some() {
+            println!("State for job \"{name}\" already exists. Skipping.");
+            continue;
+        }
+
+        let script_content =
+            codegen::generate_python_script(name, job_def).unwrap_or_else(|_| "".to_string());
         let script_hash = utils::calculate_hash(&script_content);
 
-        deployments.insert(
-            name.clone(),
-            Deployment {
+        let job_state = JobState {
+            job_name: name.clone(),
+            project: manifest.project.clone(),
+            deployment: Deployment {
                 env: Some("default".to_string()),
                 config_hash: script_hash,
                 config: job_def.config.clone(),
@@ -155,17 +224,26 @@ pub async fn init(manifest: &ProjectManifest) -> Result<()> {
                 applied_at: chrono::Utc::now().to_rfc3339(),
                 resources: Vec::new(),
             },
-        );
+        };
+
+        storage.write_job(name, &job_state).await?;
+        println!("Initialized state for job \"{name}\".");
     }
 
-    let new_state = ProjectState {
-        project: manifest.project.clone(),
-        last_updated: chrono::Utc::now().to_rfc3339(),
-        deployments,
-    };
-
-    storage.write_new(&new_state).await?;
     Ok(())
+}
+
+/// Force-unlock a job. Returns the LockInfo of the previous holder, or None if not locked.
+pub async fn force_unlock(
+    backend: &yard_structs::StateBackend,
+    job_name: &str,
+) -> Result<Option<yard_structs::LockInfo>> {
+    let storage = storage::get_storage(backend).await?;
+    let existing = storage.get_lock(job_name).await?;
+    if existing.is_some() {
+        storage.force_unlock(job_name).await?;
+    }
+    Ok(existing)
 }
 
 /// Extract optional body override from a job config.
@@ -362,6 +440,7 @@ mod tests {
             state: StateBackend::Local {
                 path: ".yard/state.json".into(),
             },
+            providers: HashMap::new(),
             jobs: HashMap::from([("new_job".to_string(), job)]),
         };
 
@@ -386,6 +465,7 @@ mod tests {
             state: StateBackend::Local {
                 path: ".yard/state.json".into(),
             },
+            providers: HashMap::new(),
             jobs: HashMap::new(),
         };
 
@@ -415,6 +495,7 @@ mod tests {
             state: StateBackend::Local {
                 path: ".yard/state.json".into(),
             },
+            providers: HashMap::new(),
             jobs: HashMap::from([("stable".to_string(), job)]),
         };
 
@@ -441,6 +522,7 @@ mod tests {
             state: StateBackend::Local {
                 path: ".yard/state.json".into(),
             },
+            providers: HashMap::new(),
             jobs: HashMap::from([("my_job".to_string(), new_job)]),
         };
 
@@ -479,6 +561,7 @@ mod tests {
             state: StateBackend::Local {
                 path: ".yard/state.json".into(),
             },
+            providers: HashMap::new(),
             jobs: HashMap::from([
                 ("keep".to_string(), keep_job),
                 (
@@ -504,16 +587,17 @@ mod tests {
     #[tokio::test]
     async fn apply_creates_scripts_and_updates_state() {
         let dir = std::env::temp_dir().join(format!("yard_apply_{}", std::process::id()));
-        let state_path = dir.join(".yard/state.json");
+        let state_dir = dir.join(".yard/state");
 
         let job = make_job("glue", json!({"type": "glue", "script_name": "new_job"}));
         let manifest = ProjectManifest {
             project: "test".to_string(),
-            state: StateBackend::Local { path: state_path },
+            state: StateBackend::Local { path: state_dir.clone() },
+            providers: HashMap::new(),
             jobs: HashMap::from([("new_job".to_string(), job)]),
         };
 
-        let result = apply(&manifest, &empty_state(), &dir).await.unwrap();
+        let result = apply(&manifest, &empty_state(), &dir, true).await.unwrap();
 
         assert_eq!(result.created, vec!["new_job"]);
         assert!(result.modified.is_empty());
@@ -523,12 +607,13 @@ mod tests {
         let script_path = dir.join(".yard/generated/new_job.py");
         assert!(script_path.exists());
 
-        // Verify state was persisted
-        let state_path = dir.join(".yard/state.json");
-        assert!(state_path.exists());
-        let state: ProjectState =
-            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
-        assert!(state.deployments.contains_key("new_job"));
+        // Verify per-job state was persisted
+        let job_state_path = state_dir.join("new_job.json");
+        assert!(job_state_path.exists());
+        let job_state: yard_structs::JobState =
+            serde_json::from_str(&std::fs::read_to_string(&job_state_path).unwrap()).unwrap();
+        assert_eq!(job_state.job_name, "new_job");
+        assert_eq!(job_state.deployment.status, "generated");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -46,7 +46,7 @@ pub async fn execute(directory: Option<String>) -> Result<()> {
                 .to_string(),
             key: state_node["key"]
                 .as_str()
-                .unwrap_or("state.json")
+                .unwrap_or("state/")
                 .to_string(),
         },
         _ => return Err(anyhow!("Unsupported state type: {}", state_type)),
@@ -87,9 +87,19 @@ pub async fn execute(directory: Option<String>) -> Result<()> {
         }
     }
 
+    let mut providers = HashMap::new();
+    if let Some(providers_hash) = doc["providers"].as_hash() {
+        for (key, val) in providers_hash {
+            if let Some(name) = key.as_str() {
+                providers.insert(name.to_string(), utils::yaml_to_json(val));
+            }
+        }
+    }
+
     let manifest = ProjectManifest {
         project,
         state,
+        providers,
         jobs,
     };
 

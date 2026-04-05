@@ -1,7 +1,7 @@
 use super::resolve_project;
 use anyhow::Result;
 
-pub async fn execute(directory: Option<String>) -> Result<()> {
+pub async fn execute(directory: Option<String>, dry_run: bool) -> Result<()> {
     let project = resolve_project(directory).await?;
 
     let diffs = yard_core::calculate_diff(&project.manifest, &project.current_state);
@@ -10,15 +10,19 @@ pub async fn execute(directory: Option<String>) -> Result<()> {
         return Ok(());
     }
 
-    println!("Applying changes for {}...", project.manifest.project);
+    if dry_run {
+        println!("Applying changes for {} (dry run — skipping provider deployment)...", project.manifest.project);
+    } else {
+        println!("Applying changes for {}...", project.manifest.project);
+    }
 
-    let result = yard_core::apply(&project.manifest, &project.current_state, &project.root_dir).await?;
+    let result = yard_core::apply(&project.manifest, &project.current_state, &project.root_dir, dry_run).await?;
 
     for name in &result.created {
-        println!("  + Created: .yard/generated/{}.py", name);
+        println!("  + Created: {}", name);
     }
     for name in &result.modified {
-        println!("  ~ Modified: .yard/generated/{}.py", name);
+        println!("  ~ Modified: {}", name);
     }
     for name in &result.deleted {
         println!("  - Deleted: {}", name);

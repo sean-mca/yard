@@ -25,11 +25,25 @@ pub enum Commands {
     Apply {
         #[arg(index = 1)]
         directory: Option<String>,
+
+        /// Skip provider deployment (codegen and state only)
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Validate all job configurations
     Validate {
         #[arg(index = 1)]
+        directory: Option<String>,
+    },
+
+    /// Force-unlock a locked job
+    ForceUnlock {
+        /// The job name to unlock
+        #[arg(index = 1)]
+        job_name: String,
+
+        #[arg(index = 2)]
         directory: Option<String>,
     },
 }

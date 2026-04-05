@@ -19,6 +19,9 @@ pub enum StateBackend {
 pub struct ProjectManifest {
     pub project: String,
     pub state: StateBackend,
+    /// Per-provider config, keyed by job type (e.g. "glue", "emr").
+    /// Each value is the raw provider config block from yard.yaml.
+    pub providers: HashMap<String, serde_json::Value>,
     pub jobs: HashMap<String, JobDefinition>,
 }
 

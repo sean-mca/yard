@@ -1,4 +1,5 @@
 pub mod apply;
+pub mod force_unlock;
 pub mod init;
 pub mod plan;
 pub mod validate;
@@ -43,7 +44,7 @@ pub async fn resolve_project(directory: Option<String>) -> Result<ResolvedProjec
 
     let state_backend = match state_node["type"].as_str().context("Missing state type")? {
         "local" => StateBackend::Local {
-            path: root_dir.join(state_node["path"].as_str().unwrap_or(".yard/state.json")),
+            path: root_dir.join(state_node["path"].as_str().unwrap_or(".yard/state/")),
         },
         "s3" => StateBackend::S3 {
             bucket: state_node["bucket"].as_str().unwrap_or("").to_string(),
@@ -53,7 +54,7 @@ pub async fn resolve_project(directory: Option<String>) -> Result<ResolvedProjec
                 .to_string(),
             key: state_node["key"]
                 .as_str()
-                .unwrap_or("state.json")
+                .unwrap_or("state/")
                 .to_string(),
         },
         _ => return Err(anyhow!("Unsupported state type in root")),
@@ -68,9 +69,20 @@ pub async fn resolve_project(directory: Option<String>) -> Result<ResolvedProjec
 
     let all_jobs = discover_jobs(&search_root)?;
 
+    // 3b. PARSE PROVIDERS CONFIG
+    let mut providers = HashMap::new();
+    if let Some(providers_hash) = root_doc["providers"].as_hash() {
+        for (key, val) in providers_hash {
+            if let Some(name) = key.as_str() {
+                providers.insert(name.to_string(), crate::utils::yaml_to_json(val));
+            }
+        }
+    }
+
     let manifest = ProjectManifest {
         project: project.clone(),
         state: state_backend.clone(),
+        providers,
         jobs: all_jobs,
     };
 
@@ -151,15 +163,18 @@ fn discover_jobs(search_root: &PathBuf) -> Result<HashMap<String, JobDefinition>
 
 async fn load_state(backend: &StateBackend, project: &str) -> Result<ProjectState> {
     let storage = yard_core::storage::get_storage(backend).await?;
-    match storage.read().await {
-        Ok(state) => Ok(state),
-        Err(_) => {
-            // No state yet — return empty state so plan/apply treat everything as new
-            Ok(ProjectState {
-                project: project.to_string(),
-                deployments: HashMap::new(),
-                last_updated: chrono::Utc::now().to_rfc3339(),
-            })
+    let job_names = storage.list_jobs().await?;
+    let mut deployments = HashMap::new();
+
+    for name in job_names {
+        if let Some(job_state) = storage.read_job(&name).await? {
+            deployments.insert(name, job_state.deployment);
         }
     }
+
+    Ok(ProjectState {
+        project: project.to_string(),
+        last_updated: chrono::Utc::now().to_rfc3339(),
+        deployments,
+    })
 }
