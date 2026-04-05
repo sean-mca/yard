@@ -78,11 +78,11 @@ impl Storage {
         match self {
             Storage::Local(s) => {
                 if s.path.exists() {
-                    println!("⚠️  Local state already exists at {:?}. Skipping.", s.path);
+                    println!("Local state already exists at {:?}. Skipping.", s.path);
                     return Ok(());
                 }
                 self.write(state).await?;
-                println!("✅ Initialized local state.");
+                println!("Initialized local state.");
             }
             Storage::S3(s) => {
                 let json = serde_json::to_string_pretty(state)?;
@@ -98,11 +98,11 @@ impl Storage {
                     .await;
 
                 match result {
-                    Ok(_) => println!("✅ Initialized S3 state."),
+                    Ok(_) => println!("Initialized S3 state."),
                     Err(e) => {
                         if let Some(service_error) = e.as_service_error() {
                             if service_error.is_invalid_request() {
-                                println!("⚠️  S3 state already exists. Skipping.");
+                                println!("S3 state already exists. Skipping.");
                                 return Ok(());
                             }
                         }
@@ -119,8 +119,11 @@ impl Storage {
 pub async fn get_storage(backend: &StateBackend) -> Result<Storage> {
     match backend {
         StateBackend::Local { path } => Ok(Storage::Local(LocalStorage { path: path.clone() })),
-        StateBackend::S3 { bucket, key, .. } => {
-            let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+        StateBackend::S3 { bucket, key, region } => {
+            let config = aws_config::defaults(BehaviorVersion::latest())
+                .region(aws_config::Region::new(region.clone()))
+                .load()
+                .await;
             let client = Client::new(&config);
 
             Ok(Storage::S3(S3Storage {

@@ -4,19 +4,10 @@ use std::path::PathBuf;
 
 #[derive(Debug)]
 pub enum YardAction {
-    Init {
-        manifest: ProjectManifest,
-    },
-    Plan {
-        manifest: ProjectManifest,
-    },
-    Apply {
-        manifest_path: String,
-        target_env: String,
-    },
-    Destroy {
-        resource_id: String,
-    },
+    Init { manifest: ProjectManifest },
+    Plan { manifest: ProjectManifest },
+    Apply { manifest: ProjectManifest },
+    Destroy { resource_id: String },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

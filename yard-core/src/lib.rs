@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 pub mod codegen;
 mod state;
-mod storage;
+pub mod storage;
 pub mod utils;
 use serde_json::Value;
 use std::collections::HashMap;
-use yard_structs::{DiffType, JobDiff, ProjectManifest, State, YardAction};
+use yard_structs::{DiffType, JobDiff, ProjectManifest, ProjectState, YardAction};
 
 pub async fn dispatch(action: YardAction) -> Result<()> {
     match action {
@@ -19,28 +19,47 @@ pub async fn dispatch(action: YardAction) -> Result<()> {
 
             let changes = state::calculate_diff(&actual_state, &proposed_state);
         }
+        YardAction::Apply { manifest } => {
+            let storage = storage::get_storage(&manifest.state).await?;
+            let mut state = storage.read().await.context("Run init first!")?;
+
+            // This is where the Python generation and Diffing logic
+            // should actually live to be "architecturally correct"
+            let diffs = calculate_diff(&manifest, &state);
+
+            for diff in diffs {
+                // 1. Generate Python
+                // 2. Upload to S3
+                // 3. Update 'state' object
+            }
+
+            storage.write(&state).await?;
+        }
         _ => {}
     }
     Ok(())
 }
 
-pub fn calculate_diff(manifest: &ProjectManifest, state: &State) -> Vec<JobDiff> {
+pub fn calculate_diff(manifest: &ProjectManifest, state: &ProjectState) -> Vec<JobDiff> {
     let mut diffs = Vec::new();
 
-    // 1. Check for New or Modified Jobs
-    for (name, job) in &manifest.jobs {
-        // Calculate what the hash WOULD be if we applied this
-        let new_hash = crate::utils::calculate_json_hash(&job.config);
+    for (name, job_def) in &manifest.jobs {
+        // --- THE FIX IS HERE ---
+        // Plan must generate the script to see if the hash actually changed
+        let script_content = crate::codegen::generate_python_script(name, job_def)
+            .unwrap_or_else(|_| "".to_string());
+
+        let current_proposed_hash = crate::utils::calculate_hash(&script_content);
 
         if let Some(existing) = state.deployments.get(name) {
-            if existing.config_hash != new_hash {
-                // MODIFIED
-                let changes = compare_json(&existing.config, &job.config);
+            // Compare the generated script hash vs the hash stored in state
+            if existing.config_hash != current_proposed_hash {
+                let changes = compare_json(&existing.config, &job_def.config);
                 diffs.push(JobDiff {
                     name: name.clone(),
                     diff_type: DiffType::Modify { changes },
                     old_hash: Some(existing.config_hash.clone()),
-                    new_hash: Some(new_hash),
+                    new_hash: Some(current_proposed_hash),
                 });
             }
         } else {
@@ -49,7 +68,7 @@ pub fn calculate_diff(manifest: &ProjectManifest, state: &State) -> Vec<JobDiff>
                 name: name.clone(),
                 diff_type: DiffType::Create,
                 old_hash: None,
-                new_hash: Some(new_hash),
+                new_hash: Some(current_proposed_hash),
             });
         }
     }
