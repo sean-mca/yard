@@ -134,27 +134,31 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
                 }
             }
             "join" => {
-                if transform.left.is_none() {
+                if let Some(left) = &transform.left {
+                    if !known_names.contains(left) {
+                        errors.push(err(
+                            &format!("{prefix}.left"),
+                            &format!(
+                                "\"{}\" does not reference a known source or transform output",
+                                left
+                            ),
+                        ));
+                    }
+                } else {
                     errors.push(err(&prefix.to_string(), "type \"join\" requires \"left\""));
-                } else if !known_names.contains(transform.left.as_ref().unwrap()) {
-                    errors.push(err(
-                        &format!("{prefix}.left"),
-                        &format!(
-                            "\"{}\" does not reference a known source or transform output",
-                            transform.left.as_ref().unwrap()
-                        ),
-                    ));
                 }
-                if transform.right.is_none() {
+                if let Some(right) = &transform.right {
+                    if !known_names.contains(right) {
+                        errors.push(err(
+                            &format!("{prefix}.right"),
+                            &format!(
+                                "\"{}\" does not reference a known source or transform output",
+                                right
+                            ),
+                        ));
+                    }
+                } else {
                     errors.push(err(&prefix.to_string(), "type \"join\" requires \"right\""));
-                } else if !known_names.contains(transform.right.as_ref().unwrap()) {
-                    errors.push(err(
-                        &format!("{prefix}.right"),
-                        &format!(
-                            "\"{}\" does not reference a known source or transform output",
-                            transform.right.as_ref().unwrap()
-                        ),
-                    ));
                 }
                 if transform.on.is_none() {
                     errors.push(err(&prefix.to_string(), "type \"join\" requires \"on\""));
