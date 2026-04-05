@@ -68,6 +68,9 @@ pub async fn execute(directory: Option<String>) -> Result<()> {
             let config_json = utils::yaml_to_json(val);
             let imports = yard_core::parse_imports(&config_json);
             let body = yard_core::parse_body(&config_json);
+            let source = yard_core::parse_source(&config_json);
+            let sink = yard_core::parse_sink(&config_json);
+            let transforms = yard_core::parse_transforms(&config_json);
 
             jobs.insert(
                 name,
@@ -75,6 +78,9 @@ pub async fn execute(directory: Option<String>) -> Result<()> {
                     job_type,
                     imports,
                     body,
+                    source,
+                    sink,
+                    transforms,
                     config: config_json,
                 },
             );

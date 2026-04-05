@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 use yard_structs::{
-    Deployment, DiffType, Import, JobDiff, ProjectManifest, ProjectState,
+    Deployment, DiffType, Import, JobDiff, ProjectManifest, ProjectState, Sink, Source, Transform,
 };
 
 /// Compute the diff between the manifest and the current state.
@@ -185,6 +185,92 @@ pub fn parse_imports(config: &Value) -> Vec<Import> {
     imports
 }
 
+/// Extract source configuration from a job config.
+pub fn parse_source(config: &Value) -> Option<Source> {
+    let src = config.get("source")?;
+    Some(Source {
+        source_type: src.get("type")?.as_str()?.to_string(),
+        format: src.get("format").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        path: src.get("path").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        connection_url: src.get("connection_url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        table: src.get("table").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        database: src.get("database").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        secret_id: src.get("secret_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+    })
+}
+
+/// Extract sink configuration from a job config.
+pub fn parse_sink(config: &Value) -> Option<Sink> {
+    let snk = config.get("sink")?;
+    let partition_by = snk
+        .get("partition_by")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Some(Sink {
+        sink_type: snk.get("type")?.as_str()?.to_string(),
+        format: snk.get("format").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        path: snk.get("path").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        connection_url: snk.get("connection_url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        table: snk.get("table").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        database: snk.get("database").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        secret_id: snk.get("secret_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        mode: snk.get("mode").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        partition_by,
+    })
+}
+
+/// Extract transforms from a job config.
+pub fn parse_transforms(config: &Value) -> Vec<Transform> {
+    let mut transforms = Vec::new();
+    let Some(arr) = config.get("transforms").and_then(|v| v.as_array()) else {
+        return transforms;
+    };
+
+    for item in arr {
+        let Some(transform_type) = item.get("type").and_then(|v| v.as_str()) else {
+            continue;
+        };
+
+        let columns = item
+            .get("columns")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mapping = item
+            .get("mapping")
+            .and_then(|v| v.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        transforms.push(Transform {
+            transform_type: transform_type.to_string(),
+            condition: item.get("condition").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            query: item.get("query").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            columns,
+            mapping,
+            name: item.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            expression: item.get("expression").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        });
+    }
+
+    transforms
+}
+
 fn compare_json(old: &Value, new: &Value) -> HashMap<String, (String, String)> {
     let mut changes = HashMap::new();
     if let (Value::Object(old_obj), Value::Object(new_obj)) = (old, new) {
@@ -207,10 +293,16 @@ mod tests {
     fn make_job(job_type: &str, config: serde_json::Value) -> JobDefinition {
         let imports = parse_imports(&config);
         let body = parse_body(&config);
+        let source = parse_source(&config);
+        let sink = parse_sink(&config);
+        let transforms = parse_transforms(&config);
         JobDefinition {
             job_type: job_type.to_string(),
             imports,
             body,
+            source,
+            sink,
+            transforms,
             config,
         }
     }
