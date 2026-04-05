@@ -1,34 +1,54 @@
 use super::resolve_project;
+use crate::utils::{bold, color_create, color_delete, color_modify};
 use anyhow::Result;
 
-pub async fn execute(directory: Option<String>) -> Result<()> {
+pub async fn execute(directory: Option<String>, target: Option<String>) -> Result<()> {
     let project = resolve_project(directory).await?;
 
-    let diffs = yard_core::calculate_diff(&project.manifest, &project.current_state);
+    let mut diffs = yard_core::calculate_diff(&project.manifest, &project.current_state);
 
-    println!("--- Plan for {} ---", project.manifest.project);
+    if let Some(ref name) = target {
+        diffs.retain(|d| &d.name == name);
+    }
+
+    println!(
+        "{}",
+        bold(&format!("--- Plan for {} ---", project.manifest.project))
+    );
+
+    if let Some(ref name) = target {
+        println!("(targeting: {})\n", name);
+    } else {
+        println!();
+    }
 
     if diffs.is_empty() {
         println!("No changes. Infrastructure is up to date.");
+        return Ok(());
     }
 
     for diff in diffs {
         match diff.diff_type {
             yard_structs::DiffType::Create => {
                 println!(
-                    "+ Create job [{}] ({})",
-                    diff.name,
-                    diff.new_hash.as_ref().unwrap_or(&"???".to_string())
+                    "{}",
+                    color_create(&format!("  + Create job [{}]", diff.name))
                 );
             }
             yard_structs::DiffType::Modify { ref changes } => {
-                println!("~ Modify job [{}]", diff.name);
+                println!(
+                    "{}",
+                    color_modify(&format!("  ~ Modify job [{}]", diff.name))
+                );
                 for (key, (old, new)) in changes {
-                    println!("    {} : {} -> {}", key, old, new);
+                    println!("      {} : {} -> {}", key, old, new);
                 }
             }
             yard_structs::DiffType::Delete => {
-                println!("- Delete job [{}]", diff.name);
+                println!(
+                    "{}",
+                    color_delete(&format!("  - Delete job [{}]", diff.name))
+                );
             }
         }
     }

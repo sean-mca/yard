@@ -1,31 +1,59 @@
 use super::resolve_project;
-use crate::utils::confirm;
+use crate::utils::{bold, color_create, color_delete, color_modify, confirm};
 use anyhow::Result;
 
-pub async fn execute(directory: Option<String>, dry_run: bool, auto_approve: bool) -> Result<()> {
+pub async fn execute(
+    directory: Option<String>,
+    dry_run: bool,
+    auto_approve: bool,
+    target: Option<String>,
+) -> Result<()> {
     let project = resolve_project(directory).await?;
 
-    let diffs = yard_core::calculate_diff(&project.manifest, &project.current_state);
+    let mut diffs = yard_core::calculate_diff(&project.manifest, &project.current_state);
+
+    if let Some(ref name) = target {
+        diffs.retain(|d| &d.name == name);
+    }
+
     if diffs.is_empty() {
         println!("No changes to apply.");
         return Ok(());
     }
 
     // Show the plan
-    println!("--- Plan for {} ---\n", project.manifest.project);
+    println!(
+        "{}",
+        bold(&format!("--- Plan for {} ---", project.manifest.project))
+    );
+    if let Some(ref name) = target {
+        println!("(targeting: {})\n", name);
+    } else {
+        println!();
+    }
+
     for diff in &diffs {
         match &diff.diff_type {
             yard_structs::DiffType::Create => {
-                println!("  + Create job [{}]", diff.name);
+                println!(
+                    "{}",
+                    color_create(&format!("  + Create job [{}]", diff.name))
+                );
             }
             yard_structs::DiffType::Modify { changes } => {
-                println!("  ~ Modify job [{}]", diff.name);
+                println!(
+                    "{}",
+                    color_modify(&format!("  ~ Modify job [{}]", diff.name))
+                );
                 for (key, (old, new)) in changes {
                     println!("      {} : {} -> {}", key, old, new);
                 }
             }
             yard_structs::DiffType::Delete => {
-                println!("  - Delete job [{}]", diff.name);
+                println!(
+                    "{}",
+                    color_delete(&format!("  - Delete job [{}]", diff.name))
+                );
             }
         }
     }
@@ -35,7 +63,6 @@ pub async fn execute(directory: Option<String>, dry_run: bool, auto_approve: boo
         return Ok(());
     }
 
-    // Confirm
     if !auto_approve {
         println!();
         if !confirm("Do you want to apply these changes? (y/n)") {
@@ -46,8 +73,17 @@ pub async fn execute(directory: Option<String>, dry_run: bool, auto_approve: boo
 
     println!("\nApplying...");
 
+    // When targeting a single job, filter the manifest
+    let manifest = if let Some(ref name) = target {
+        let mut filtered = project.manifest.clone();
+        filtered.jobs.retain(|k, _| k == name);
+        filtered
+    } else {
+        project.manifest.clone()
+    };
+
     let result = yard_core::apply(
-        &project.manifest,
+        &manifest,
         &project.current_state,
         &project.root_dir,
         dry_run,
@@ -55,13 +91,13 @@ pub async fn execute(directory: Option<String>, dry_run: bool, auto_approve: boo
     .await?;
 
     for name in &result.created {
-        println!("  + Created: {}", name);
+        println!("{}", color_create(&format!("  + Created: {}", name)));
     }
     for name in &result.modified {
-        println!("  ~ Modified: {}", name);
+        println!("{}", color_modify(&format!("  ~ Modified: {}", name)));
     }
     for name in &result.deleted {
-        println!("  - Deleted: {}", name);
+        println!("{}", color_delete(&format!("  - Deleted: {}", name)));
     }
 
     println!("\nState updated successfully.");
