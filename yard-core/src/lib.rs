@@ -4,7 +4,7 @@ pub mod storage;
 pub mod utils;
 pub mod validation;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
@@ -94,6 +94,7 @@ pub fn calculate_diff(manifest: &ProjectManifest, state: &ProjectState) -> Vec<J
 }
 
 /// Result of applying changes.
+#[derive(Debug)]
 pub struct ApplyResult {
     pub created: Vec<String>,
     pub modified: Vec<String>,
@@ -103,12 +104,31 @@ pub struct ApplyResult {
 /// Apply changes: generate scripts, deploy via provider, update state.
 /// `root_dir` is where `.yard/generated/` lives.
 /// Each job is locked individually during its apply.
+/// All jobs are validated before any changes are made.
 pub async fn apply(
     manifest: &ProjectManifest,
     current_state: &ProjectState,
     root_dir: &Path,
     dry_run: bool,
 ) -> Result<ApplyResult> {
+    // Validate all jobs up front — abort before making any changes
+    let mut all_errors: Vec<(String, Vec<yard_structs::ValidationError>)> = Vec::new();
+    for (name, job_def) in &manifest.jobs {
+        let errors = validation::validate_job(job_def);
+        if !errors.is_empty() {
+            all_errors.push((name.clone(), errors));
+        }
+    }
+    if !all_errors.is_empty() {
+        let mut msg = String::from("Validation failed:\n");
+        for (name, errors) in &all_errors {
+            for e in errors {
+                msg.push_str(&format!("  [{}] {}: {}\n", name, e.field, e.message));
+            }
+        }
+        return Err(anyhow!("{msg}"));
+    }
+
     let diffs = calculate_diff(manifest, current_state);
     let storage = storage::get_storage(&manifest.state).await?;
     let mut result = ApplyResult {
@@ -824,5 +844,30 @@ mod tests {
         assert!(!dir.join(".yard/generated/job_b.py").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn apply_rejects_invalid_jobs() {
+        let dir = std::env::temp_dir().join(format!("yard_invalid_{}", std::process::id()));
+        let state_dir = dir.join(".yard/state");
+
+        // Job with unsupported type — should fail validation
+        let bad_job = make_job("spark_streaming", json!({"type": "spark_streaming"}));
+        let manifest = ProjectManifest {
+            project: "test".to_string(),
+            state: StateBackend::Local {
+                path: state_dir.clone(),
+            },
+            providers: HashMap::new(),
+            jobs: HashMap::from([("bad_job".to_string(), bad_job)]),
+        };
+
+        let result = apply(&manifest, &empty_state(), &dir, true).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Validation failed"));
+
+        // No state or scripts should have been created
+        assert!(!state_dir.exists());
+        assert!(!dir.join(".yard/generated").exists());
     }
 }
