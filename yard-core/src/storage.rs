@@ -134,3 +134,114 @@ pub async fn get_storage(backend: &StateBackend) -> Result<Storage> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use yard_structs::ProjectState;
+
+    fn test_state() -> ProjectState {
+        ProjectState {
+            project: "test-project".to_string(),
+            last_updated: "2025-01-01T00:00:00Z".to_string(),
+            deployments: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn local_write_and_read() {
+        let dir = std::env::temp_dir().join(format!("yard_test_{}", std::process::id()));
+        let path = dir.join("state.json");
+
+        let storage = Storage::Local(LocalStorage { path: path.clone() });
+        let state = test_state();
+
+        storage.write(&state).await.unwrap();
+        let loaded = storage.read().await.unwrap();
+
+        assert_eq!(loaded.project, "test-project");
+        assert_eq!(loaded.last_updated, "2025-01-01T00:00:00Z");
+        assert!(loaded.deployments.is_empty());
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn local_read_missing_file_errors() {
+        let path = std::env::temp_dir().join("yard_nonexistent_state.json");
+        let storage = Storage::Local(LocalStorage { path });
+
+        let result = storage.read().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn local_write_creates_parent_dirs() {
+        let dir = std::env::temp_dir().join(format!("yard_nested_{}", std::process::id()));
+        let path = dir.join("deep").join("nested").join("state.json");
+
+        let storage = Storage::Local(LocalStorage { path: path.clone() });
+        storage.write(&test_state()).await.unwrap();
+
+        assert!(path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn local_write_new_skips_existing() {
+        let dir = std::env::temp_dir().join(format!("yard_wn_{}", std::process::id()));
+        let path = dir.join("state.json");
+
+        let storage = Storage::Local(LocalStorage { path: path.clone() });
+
+        // First write should succeed
+        storage.write_new(&test_state()).await.unwrap();
+
+        // Second write_new should skip (not overwrite)
+        let modified = ProjectState {
+            project: "overwritten".to_string(),
+            last_updated: "".to_string(),
+            deployments: HashMap::new(),
+        };
+        storage.write_new(&modified).await.unwrap();
+
+        // Should still be the original
+        let loaded = storage.read().await.unwrap();
+        assert_eq!(loaded.project, "test-project");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn local_write_overwrites_existing() {
+        let dir = std::env::temp_dir().join(format!("yard_ow_{}", std::process::id()));
+        let path = dir.join("state.json");
+
+        let storage = Storage::Local(LocalStorage { path: path.clone() });
+        storage.write(&test_state()).await.unwrap();
+
+        let updated = ProjectState {
+            project: "updated-project".to_string(),
+            last_updated: "2025-06-01T00:00:00Z".to_string(),
+            deployments: HashMap::new(),
+        };
+        storage.write(&updated).await.unwrap();
+
+        let loaded = storage.read().await.unwrap();
+        assert_eq!(loaded.project, "updated-project");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn get_storage_local() {
+        let backend = StateBackend::Local {
+            path: "/tmp/test.json".into(),
+        };
+        let storage = get_storage(&backend).await.unwrap();
+        assert!(matches!(storage, Storage::Local(_)));
+    }
+}

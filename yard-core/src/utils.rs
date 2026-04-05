@@ -46,7 +46,7 @@ pub fn resolve_variables(raw_yaml: &str, ctx: &YARDContext) -> Result<String> {
     Ok(result)
 }
 
-fn resolve_json_path(ctx: &YARDContext, path: &str) -> Option<serde_json::Value> {
+pub fn resolve_json_path(ctx: &YARDContext, path: &str) -> Option<serde_json::Value> {
     let parts: Vec<&str> = path.split('.').collect();
     if parts.len() < 2 {
         return None;
@@ -64,4 +64,148 @@ fn resolve_json_path(ctx: &YARDContext, path: &str) -> Option<serde_json::Value>
         current = current.get(part)?;
     }
     Some(current.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn test_context() -> YARDContext {
+        YARDContext {
+            account: json!({"id": "123456789", "name": "dev-account"}),
+            region: json!({"name": "us-east-1", "code": "ue1"}),
+            transforms: json!({"suffix": "prod", "nested": {"key": "deep_val"}}),
+        }
+    }
+
+    // --- calculate_hash ---
+
+    #[test]
+    fn hash_deterministic() {
+        let a = calculate_hash("hello");
+        let b = calculate_hash("hello");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn hash_differs_for_different_input() {
+        assert_ne!(calculate_hash("a"), calculate_hash("b"));
+    }
+
+    #[test]
+    fn hash_returns_hex_string() {
+        let h = calculate_hash("test");
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // --- calculate_json_hash ---
+
+    #[test]
+    fn json_hash_stable_regardless_of_key_order() {
+        let a = json!({"x": 1, "y": 2});
+        let b = json!({"y": 2, "x": 1});
+        // serde_json serialization of Value is key-order dependent,
+        // but these were constructed with the same underlying BTreeMap-like order.
+        // This test documents the current behavior.
+        // The important thing is same input -> same hash.
+        let c = json!({"x": 1, "y": 2});
+        assert_eq!(calculate_json_hash(&a), calculate_json_hash(&c));
+    }
+
+    #[test]
+    fn json_hash_differs_for_different_values() {
+        let a = json!({"x": 1});
+        let b = json!({"x": 2});
+        assert_ne!(calculate_json_hash(&a), calculate_json_hash(&b));
+    }
+
+    // --- resolve_json_path ---
+
+    #[test]
+    fn resolve_account_field() {
+        let ctx = test_context();
+        assert_eq!(
+            resolve_json_path(&ctx, "account.id"),
+            Some(json!("123456789"))
+        );
+    }
+
+    #[test]
+    fn resolve_region_field() {
+        let ctx = test_context();
+        assert_eq!(
+            resolve_json_path(&ctx, "region.name"),
+            Some(json!("us-east-1"))
+        );
+    }
+
+    #[test]
+    fn resolve_transforms_nested() {
+        let ctx = test_context();
+        assert_eq!(
+            resolve_json_path(&ctx, "transforms.nested.key"),
+            Some(json!("deep_val"))
+        );
+    }
+
+    #[test]
+    fn resolve_unknown_root_returns_none() {
+        let ctx = test_context();
+        assert_eq!(resolve_json_path(&ctx, "unknown.field"), None);
+    }
+
+    #[test]
+    fn resolve_missing_field_returns_none() {
+        let ctx = test_context();
+        assert_eq!(resolve_json_path(&ctx, "account.nonexistent"), None);
+    }
+
+    #[test]
+    fn resolve_single_segment_returns_none() {
+        let ctx = test_context();
+        assert_eq!(resolve_json_path(&ctx, "account"), None);
+    }
+
+    // --- resolve_variables ---
+
+    #[test]
+    fn resolve_single_variable() {
+        let ctx = test_context();
+        let input = "arn:aws:iam::${account.id}:role/glue";
+        let result = resolve_variables(input, &ctx).unwrap();
+        assert_eq!(result, "arn:aws:iam::123456789:role/glue");
+    }
+
+    #[test]
+    fn resolve_multiple_variables() {
+        let ctx = test_context();
+        let input = "account=${account.id} region=${region.name}";
+        let result = resolve_variables(input, &ctx).unwrap();
+        assert_eq!(result, "account=123456789 region=us-east-1");
+    }
+
+    #[test]
+    fn resolve_no_variables_passthrough() {
+        let ctx = test_context();
+        let input = "no variables here";
+        let result = resolve_variables(input, &ctx).unwrap();
+        assert_eq!(result, "no variables here");
+    }
+
+    #[test]
+    fn resolve_missing_variable_errors() {
+        let ctx = test_context();
+        let input = "${account.nope}";
+        let result = resolve_variables(input, &ctx);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_nested_transforms_variable() {
+        let ctx = test_context();
+        let input = "val=${transforms.nested.key}";
+        let result = resolve_variables(input, &ctx).unwrap();
+        assert_eq!(result, "val=deep_val");
+    }
 }

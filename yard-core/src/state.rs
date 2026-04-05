@@ -93,3 +93,203 @@ pub fn calculate_diff(actual: &ProjectState, proposed: &ProjectState) -> Vec<Sta
 
     changes
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn make_manifest(jobs: HashMap<String, JobDefinition>) -> ProjectManifest {
+        ProjectManifest {
+            project: "test-project".to_string(),
+            state: StateBackend::Local {
+                path: ".yard/state.json".into(),
+            },
+            jobs,
+        }
+    }
+
+    // --- calculate_proposed_state ---
+
+    #[test]
+    fn proposed_state_has_all_jobs() {
+        let jobs = HashMap::from([
+            (
+                "job_a".to_string(),
+                JobDefinition {
+                    job_type: "glue".to_string(),
+                    config: json!({"type": "glue"}),
+                },
+            ),
+            (
+                "job_b".to_string(),
+                JobDefinition {
+                    job_type: "glue".to_string(),
+                    config: json!({"type": "glue"}),
+                },
+            ),
+        ]);
+
+        let state = calculate_proposed_state(&make_manifest(jobs));
+        assert_eq!(state.deployments.len(), 2);
+        assert!(state.deployments.contains_key("job_a"));
+        assert!(state.deployments.contains_key("job_b"));
+    }
+
+    #[test]
+    fn proposed_state_sets_pending_status() {
+        let jobs = HashMap::from([(
+            "job_a".to_string(),
+            JobDefinition {
+                job_type: "glue".to_string(),
+                config: json!({"type": "glue"}),
+            },
+        )]);
+
+        let state = calculate_proposed_state(&make_manifest(jobs));
+        assert_eq!(state.deployments["job_a"].status, "pending");
+    }
+
+    #[test]
+    fn proposed_state_hashes_config() {
+        let config = json!({"type": "glue", "script_name": "etl"});
+        let jobs = HashMap::from([(
+            "job_a".to_string(),
+            JobDefinition {
+                job_type: "glue".to_string(),
+                config: config.clone(),
+            },
+        )]);
+
+        let state = calculate_proposed_state(&make_manifest(jobs));
+        let expected_hash = utils::calculate_json_hash(&config);
+        assert_eq!(state.deployments["job_a"].config_hash, expected_hash);
+    }
+
+    // --- calculate_diff ---
+
+    #[test]
+    fn state_diff_create() {
+        let actual = ProjectState {
+            project: "test".to_string(),
+            last_updated: "".to_string(),
+            deployments: HashMap::new(),
+        };
+
+        let proposed = ProjectState {
+            project: "test".to_string(),
+            last_updated: "".to_string(),
+            deployments: HashMap::from([(
+                "new_job".to_string(),
+                Deployment {
+                    env: None,
+                    config_hash: "abc".to_string(),
+                    config: json!({}),
+                    status: "pending".to_string(),
+                    applied_at: "".to_string(),
+                    resources: Vec::new(),
+                },
+            )]),
+        };
+
+        let changes = calculate_diff(&actual, &proposed);
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(changes[0], StateChange::Create(ref n) if n == "new_job"));
+    }
+
+    #[test]
+    fn state_diff_delete() {
+        let actual = ProjectState {
+            project: "test".to_string(),
+            last_updated: "".to_string(),
+            deployments: HashMap::from([(
+                "old_job".to_string(),
+                Deployment {
+                    env: None,
+                    config_hash: "abc".to_string(),
+                    config: json!({}),
+                    status: "generated".to_string(),
+                    applied_at: "".to_string(),
+                    resources: Vec::new(),
+                },
+            )]),
+        };
+
+        let proposed = ProjectState {
+            project: "test".to_string(),
+            last_updated: "".to_string(),
+            deployments: HashMap::new(),
+        };
+
+        let changes = calculate_diff(&actual, &proposed);
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(changes[0], StateChange::Delete(ref n) if n == "old_job"));
+    }
+
+    #[test]
+    fn state_diff_no_change() {
+        let deployment = Deployment {
+            env: None,
+            config_hash: "same_hash".to_string(),
+            config: json!({}),
+            status: "generated".to_string(),
+            applied_at: "".to_string(),
+            resources: Vec::new(),
+        };
+
+        let actual = ProjectState {
+            project: "test".to_string(),
+            last_updated: "".to_string(),
+            deployments: HashMap::from([("stable".to_string(), deployment.clone())]),
+        };
+
+        let proposed = ProjectState {
+            project: "test".to_string(),
+            last_updated: "".to_string(),
+            deployments: HashMap::from([("stable".to_string(), deployment)]),
+        };
+
+        let changes = calculate_diff(&actual, &proposed);
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(changes[0], StateChange::NoChange(ref n) if n == "stable"));
+    }
+
+    #[test]
+    fn state_diff_modify() {
+        let actual = ProjectState {
+            project: "test".to_string(),
+            last_updated: "".to_string(),
+            deployments: HashMap::from([(
+                "job".to_string(),
+                Deployment {
+                    env: None,
+                    config_hash: "old_hash".to_string(),
+                    config: json!({}),
+                    status: "generated".to_string(),
+                    applied_at: "".to_string(),
+                    resources: Vec::new(),
+                },
+            )]),
+        };
+
+        let proposed = ProjectState {
+            project: "test".to_string(),
+            last_updated: "".to_string(),
+            deployments: HashMap::from([(
+                "job".to_string(),
+                Deployment {
+                    env: None,
+                    config_hash: "new_hash".to_string(),
+                    config: json!({}),
+                    status: "pending".to_string(),
+                    applied_at: "".to_string(),
+                    resources: Vec::new(),
+                },
+            )]),
+        };
+
+        let changes = calculate_diff(&actual, &proposed);
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(changes[0], StateChange::Modify(ref n) if n == "job"));
+    }
+}

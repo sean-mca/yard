@@ -102,3 +102,186 @@ fn compare_json(old: &Value, new: &Value) -> HashMap<String, (String, String)> {
     }
     changes
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use yard_structs::{Deployment, JobDefinition};
+
+    fn make_job(job_type: &str, config: serde_json::Value) -> JobDefinition {
+        JobDefinition {
+            job_type: job_type.to_string(),
+            config,
+        }
+    }
+
+    fn make_deployment(config_hash: &str, config: serde_json::Value) -> Deployment {
+        Deployment {
+            env: None,
+            config_hash: config_hash.to_string(),
+            config,
+            status: "generated".to_string(),
+            applied_at: "2025-01-01T00:00:00Z".to_string(),
+            resources: Vec::new(),
+        }
+    }
+
+    fn empty_state() -> ProjectState {
+        ProjectState {
+            project: "test".to_string(),
+            last_updated: "".to_string(),
+            deployments: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn diff_detects_create() {
+        let job = make_job("glue", json!({"type": "glue", "script_name": "new_job"}));
+        let manifest = ProjectManifest {
+            project: "test".to_string(),
+            state: yard_structs::StateBackend::Local {
+                path: ".yard/state.json".into(),
+            },
+            jobs: HashMap::from([("new_job".to_string(), job)]),
+        };
+
+        let diffs = calculate_diff(&manifest, &empty_state());
+        assert_eq!(diffs.len(), 1);
+        assert!(matches!(diffs[0].diff_type, DiffType::Create));
+        assert_eq!(diffs[0].name, "new_job");
+    }
+
+    #[test]
+    fn diff_detects_delete() {
+        let config = json!({"type": "glue"});
+        let hash = crate::utils::calculate_hash("some old script");
+        let state = ProjectState {
+            project: "test".to_string(),
+            last_updated: "".to_string(),
+            deployments: HashMap::from([
+                ("old_job".to_string(), make_deployment(&hash, config)),
+            ]),
+        };
+
+        let manifest = ProjectManifest {
+            project: "test".to_string(),
+            state: yard_structs::StateBackend::Local {
+                path: ".yard/state.json".into(),
+            },
+            jobs: HashMap::new(),
+        };
+
+        let diffs = calculate_diff(&manifest, &state);
+        assert_eq!(diffs.len(), 1);
+        assert!(matches!(diffs[0].diff_type, DiffType::Delete));
+        assert_eq!(diffs[0].name, "old_job");
+    }
+
+    #[test]
+    fn diff_detects_no_change() {
+        let job = make_job("glue", json!({"type": "glue", "script_name": "stable"}));
+        // Generate the script hash the same way calculate_diff does internally
+        let script = crate::codegen::generate_python_script("stable", &job).unwrap();
+        let hash = crate::utils::calculate_hash(&script);
+
+        let state = ProjectState {
+            project: "test".to_string(),
+            last_updated: "".to_string(),
+            deployments: HashMap::from([(
+                "stable".to_string(),
+                make_deployment(&hash, job.config.clone()),
+            )]),
+        };
+
+        let manifest = ProjectManifest {
+            project: "test".to_string(),
+            state: yard_structs::StateBackend::Local {
+                path: ".yard/state.json".into(),
+            },
+            jobs: HashMap::from([("stable".to_string(), job)]),
+        };
+
+        let diffs = calculate_diff(&manifest, &state);
+        assert!(diffs.is_empty());
+    }
+
+    #[test]
+    fn diff_detects_modify() {
+        let old_config = json!({"type": "glue", "script_name": "v1"});
+        let new_job = make_job("glue", json!({"type": "glue", "script_name": "v2"}));
+
+        let state = ProjectState {
+            project: "test".to_string(),
+            last_updated: "".to_string(),
+            deployments: HashMap::from([(
+                "my_job".to_string(),
+                make_deployment("stale_hash", old_config),
+            )]),
+        };
+
+        let manifest = ProjectManifest {
+            project: "test".to_string(),
+            state: yard_structs::StateBackend::Local {
+                path: ".yard/state.json".into(),
+            },
+            jobs: HashMap::from([("my_job".to_string(), new_job)]),
+        };
+
+        let diffs = calculate_diff(&manifest, &state);
+        assert_eq!(diffs.len(), 1);
+        assert!(matches!(diffs[0].diff_type, DiffType::Modify { .. }));
+    }
+
+    #[test]
+    fn diff_mixed_create_modify_delete() {
+        let keep_job = make_job("glue", json!({"type": "glue", "script_name": "keep"}));
+        let keep_script = crate::codegen::generate_python_script("keep", &keep_job).unwrap();
+        let keep_hash = crate::utils::calculate_hash(&keep_script);
+
+        let state = ProjectState {
+            project: "test".to_string(),
+            last_updated: "".to_string(),
+            deployments: HashMap::from([
+                (
+                    "keep".to_string(),
+                    make_deployment(&keep_hash, keep_job.config.clone()),
+                ),
+                (
+                    "to_delete".to_string(),
+                    make_deployment("old", json!({"type": "glue"})),
+                ),
+                (
+                    "to_modify".to_string(),
+                    make_deployment("outdated", json!({"type": "glue", "v": "1"})),
+                ),
+            ]),
+        };
+
+        let manifest = ProjectManifest {
+            project: "test".to_string(),
+            state: yard_structs::StateBackend::Local {
+                path: ".yard/state.json".into(),
+            },
+            jobs: HashMap::from([
+                ("keep".to_string(), keep_job),
+                (
+                    "to_modify".to_string(),
+                    make_job("glue", json!({"type": "glue", "v": "2"})),
+                ),
+                (
+                    "new_job".to_string(),
+                    make_job("glue", json!({"type": "glue"})),
+                ),
+            ]),
+        };
+
+        let diffs = calculate_diff(&manifest, &state);
+        assert_eq!(diffs.len(), 3); // modify, create, delete (keep is no-change)
+
+        let names: Vec<&str> = diffs.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"to_delete"));
+        assert!(names.contains(&"to_modify"));
+        assert!(names.contains(&"new_job"));
+    }
+}
