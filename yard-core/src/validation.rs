@@ -1201,4 +1201,42 @@ mod tests {
             errors
         );
     }
+
+    #[test]
+    fn validate_job_full_catches_bad_job_file() {
+        let dir = std::env::temp_dir().join(format!("yard_vjf_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let bad_script = dir.join("bad.py");
+        std::fs::write(&bad_script, "def broken(\n").unwrap();
+
+        let mut job = minimal_job();
+        job.job_file = Some(bad_script.to_string_lossy().to_string());
+
+        let errors = validate_job_full("bad_file_job", &job);
+        assert!(
+            errors.iter().any(|e| e.field == "script"),
+            "Expected script syntax error, got: {:?}",
+            errors
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_job_full_passes_good_job_file() {
+        let dir = std::env::temp_dir().join(format!("yard_vjfg_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let good_script = dir.join("good.py");
+        std::fs::write(&good_script, "print('hello')\n").unwrap();
+
+        let mut job = minimal_job();
+        job.job_file = Some(good_script.to_string_lossy().to_string());
+
+        let errors = validate_job_full("good_file_job", &job);
+        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

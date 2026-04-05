@@ -74,7 +74,11 @@ pub fn calculate_diff(manifest: &ProjectManifest, state: &ProjectState) -> Vec<J
         let script_content = crate::codegen::generate_python_script(name, job_def)
             .unwrap_or_else(|_| "".to_string());
 
-        let current_proposed_hash = crate::utils::calculate_hash(&script_content);
+        // Hash both the script and the full job config so config-only changes
+        // (e.g. worker_type, timeout) are detected even if the script is unchanged
+        let config_str = serde_json::to_string(&job_def.config).unwrap_or_default();
+        let combined = format!("{script_content}\n{config_str}");
+        let current_proposed_hash = crate::utils::calculate_hash(&combined);
 
         if let Some(existing) = state.deployments.get(name) {
             if existing.config_hash != current_proposed_hash {
@@ -168,7 +172,9 @@ pub async fn apply(
 
                     let script_content = codegen::generate_python_script(&diff.name, job_def)
                         .context("Failed to generate Python script")?;
-                    let script_hash = utils::calculate_hash(&script_content);
+                    let config_str = serde_json::to_string(&job_def.config).unwrap_or_default();
+                    let combined = format!("{script_content}\n{config_str}");
+                    let script_hash = utils::calculate_hash(&combined);
 
                     // Write generated script locally
                     let gen_dir = root_dir.join(".yard/generated");
@@ -295,7 +301,9 @@ pub async fn init(manifest: &ProjectManifest) -> Result<()> {
 
         let script_content =
             codegen::generate_python_script(name, job_def).unwrap_or_else(|_| "".to_string());
-        let script_hash = utils::calculate_hash(&script_content);
+        let config_str = serde_json::to_string(&job_def.config).unwrap_or_default();
+        let combined = format!("{script_content}\n{config_str}");
+        let script_hash = utils::calculate_hash(&combined);
 
         let job_state = JobState {
             job_name: name.clone(),
@@ -614,6 +622,14 @@ mod tests {
         }
     }
 
+    /// Compute the combined hash the same way calculate_diff does
+    fn job_hash(name: &str, job: &JobDefinition) -> String {
+        let script = crate::codegen::generate_python_script(name, job).unwrap();
+        let config_str = serde_json::to_string(&job.config).unwrap_or_default();
+        let combined = format!("{script}\n{config_str}");
+        crate::utils::calculate_hash(&combined)
+    }
+
     fn make_deployment(config_hash: &str, config: serde_json::Value) -> Deployment {
         Deployment {
             env: None,
@@ -679,8 +695,7 @@ mod tests {
     #[test]
     fn diff_detects_no_change() {
         let job = make_job("glue", json!({"type": "glue", "script_name": "stable"}));
-        let script = crate::codegen::generate_python_script("stable", &job).unwrap();
-        let hash = crate::utils::calculate_hash(&script);
+        let hash = job_hash("stable", &job);
 
         let state = ProjectState {
             project: "test".to_string(),
@@ -702,6 +717,39 @@ mod tests {
 
         let diffs = calculate_diff(&manifest, &state);
         assert!(diffs.is_empty());
+    }
+
+    #[test]
+    fn diff_detects_config_only_change() {
+        // Same script, different config (e.g. worker_type changed)
+        let old_config = json!({"type": "glue", "glue": {"worker_type": "G.1X"}});
+        let new_config = json!({"type": "glue", "glue": {"worker_type": "G.2X"}});
+
+        let old_job = make_job("glue", old_config.clone());
+        let hash = job_hash("my_job", &old_job);
+
+        let state = ProjectState {
+            project: "test".to_string(),
+            last_updated: "".to_string(),
+            deployments: HashMap::from([(
+                "my_job".to_string(),
+                make_deployment(&hash, old_config),
+            )]),
+        };
+
+        let new_job = make_job("glue", new_config);
+        let manifest = ProjectManifest {
+            project: "test".to_string(),
+            state: StateBackend::Local {
+                path: ".yard/state".into(),
+            },
+            providers: HashMap::new(),
+            jobs: HashMap::from([("my_job".to_string(), new_job)]),
+        };
+
+        let diffs = calculate_diff(&manifest, &state);
+        assert_eq!(diffs.len(), 1);
+        assert!(matches!(diffs[0].diff_type, DiffType::Modify { .. }));
     }
 
     #[test]
@@ -735,8 +783,7 @@ mod tests {
     #[test]
     fn diff_mixed_create_modify_delete() {
         let keep_job = make_job("glue", json!({"type": "glue", "script_name": "keep"}));
-        let keep_script = crate::codegen::generate_python_script("keep", &keep_job).unwrap();
-        let keep_hash = crate::utils::calculate_hash(&keep_script);
+        let keep_hash = job_hash("keep", &keep_job);
 
         let state = ProjectState {
             project: "test".to_string(),
