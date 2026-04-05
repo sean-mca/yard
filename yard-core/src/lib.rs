@@ -13,6 +13,24 @@ use yard_structs::{
     Transform,
 };
 
+/// Merge provider-level defaults with job-level overrides.
+/// Provider config from yard.yaml is the base, job-level block wins on conflicts.
+pub fn merge_provider_config(provider_defaults: &Value, job_overrides: &Value) -> Value {
+    match (provider_defaults, job_overrides) {
+        (Value::Object(base), Value::Object(overrides)) => {
+            let mut merged = base.clone();
+            for (key, val) in overrides {
+                merged.insert(key.clone(), val.clone());
+            }
+            Value::Object(merged)
+        }
+        // If job overrides exist but aren't an object, just use defaults
+        (_, Value::Null) => provider_defaults.clone(),
+        // If defaults aren't an object, just use overrides
+        _ => job_overrides.clone(),
+    }
+}
+
 /// Load the current project state by reading all per-job state files.
 /// Errors (permissions, network, corrupt files) are propagated — only
 /// genuinely missing state is treated as "no deployments yet."
@@ -161,12 +179,21 @@ pub async fn apply(
 
                     // Deploy via provider if configured (skip in dry-run mode)
                     let resources = if !dry_run {
-                        if let Some(provider_config) =
+                        if let Some(provider_defaults) =
                             manifest.providers.get(&job_def.job_type)
                         {
+                            // Merge provider defaults with job-level overrides
+                            let job_overrides = job_def
+                                .config
+                                .get(&job_def.job_type)
+                                .unwrap_or(&Value::Null)
+                                .clone();
+                            let merged_config =
+                                merge_provider_config(provider_defaults, &job_overrides);
+
                             let provider = providers::get_provider(
                                 &job_def.job_type,
-                                provider_config,
+                                &merged_config,
                             )
                             .await?;
                             provider.deploy(&diff.name, &script_content, &job_def.config).await?
@@ -220,9 +247,16 @@ pub async fn apply(
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("unknown");
 
-                                if let Some(provider_config) = manifest.providers.get(job_type) {
+                                if let Some(provider_defaults) = manifest.providers.get(job_type) {
+                                    let job_overrides = existing
+                                        .config
+                                        .get(job_type)
+                                        .unwrap_or(&Value::Null)
+                                        .clone();
+                                    let merged_config =
+                                        merge_provider_config(provider_defaults, &job_overrides);
                                     let provider =
-                                        providers::get_provider(job_type, provider_config).await?;
+                                        providers::get_provider(job_type, &merged_config).await?;
                                     provider.destroy(&diff.name, &existing.resources).await?;
                                 }
                             }
@@ -333,8 +367,15 @@ pub async fn destroy_job(
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
 
-            if let Some(provider_config) = provider_configs.get(job_type) {
-                let provider = providers::get_provider(job_type, provider_config).await?;
+            if let Some(provider_defaults) = provider_configs.get(job_type) {
+                let job_overrides = job_state
+                    .deployment
+                    .config
+                    .get(job_type)
+                    .unwrap_or(&Value::Null)
+                    .clone();
+                let merged_config = merge_provider_config(provider_defaults, &job_overrides);
+                let provider = providers::get_provider(job_type, &merged_config).await?;
                 provider
                     .destroy(job_name, &job_state.deployment.resources)
                     .await?;
@@ -869,5 +910,37 @@ mod tests {
         // No state or scripts should have been created
         assert!(!state_dir.exists());
         assert!(!dir.join(".yard/generated").exists());
+    }
+
+    #[test]
+    fn merge_provider_config_job_overrides_defaults() {
+        let defaults = json!({
+            "script_bucket": "my-bucket",
+            "worker_type": "G.1X",
+            "number_of_workers": 2,
+            "glue_version": "4.0"
+        });
+        let overrides = json!({
+            "worker_type": "G.2X",
+            "number_of_workers": 10,
+            "timeout": 180
+        });
+
+        let merged = merge_provider_config(&defaults, &overrides);
+
+        // Overrides win
+        assert_eq!(merged["worker_type"], "G.2X");
+        assert_eq!(merged["number_of_workers"], 10);
+        assert_eq!(merged["timeout"], 180);
+        // Defaults preserved
+        assert_eq!(merged["script_bucket"], "my-bucket");
+        assert_eq!(merged["glue_version"], "4.0");
+    }
+
+    #[test]
+    fn merge_provider_config_no_overrides() {
+        let defaults = json!({"worker_type": "G.1X", "number_of_workers": 2});
+        let merged = merge_provider_config(&defaults, &Value::Null);
+        assert_eq!(merged, defaults);
     }
 }

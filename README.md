@@ -42,7 +42,7 @@ The directory hierarchy mirrors your cloud topology: cloud provider, account, re
 ### Root config (`yard.yaml`)
 
 ```yaml
-project: my-data-pipeline
+project: my-project
 
 state:
   type: local
@@ -54,6 +54,12 @@ providers:
     script_bucket: my-company-glue-scripts
     script_prefix: yard-scripts/
     role: arn:aws:iam::123456789:role/YardDeployRole
+    # Runtime defaults for all Glue jobs
+    worker_type: G.1X
+    number_of_workers: 2
+    glue_version: "4.0"
+    timeout: 60
+    bookmark: enabled
 ```
 
 The `state` block controls where per-job state files are stored. For teams, use S3:
@@ -67,6 +73,8 @@ state:
 ```
 
 The `providers` block configures deployment credentials and settings. The `role` here is the IAM role YARD uses to deploy -- it is separate from the execution role each job runs as.
+
+Runtime settings like `worker_type`, `number_of_workers`, and `timeout` defined here serve as defaults for all jobs of that type. Individual jobs can override them.
 
 ### Context files
 
@@ -87,7 +95,7 @@ Variables are referenced in job YAML with `${account.id}`, `${region.id}`, etc. 
 
 ### Job definitions
 
-A job YAML file describes what the ETL job does: where it reads from, what transformations to apply, and where to write.
+A job YAML file describes what the ETL job does: where it reads from, what transformations to apply, and where to write. Jobs inherit runtime settings from the `providers` block in `yard.yaml`, but can override any of them with a provider-specific block at the job level.
 
 ```yaml
 type: glue
@@ -116,6 +124,35 @@ sink:
 ```
 
 The `role` on the job is the Glue execution role -- the IAM role the job runs as when processing data. This is distinct from the provider deploy role in `yard.yaml`.
+
+#### Overriding provider defaults
+
+If a specific job needs different runtime settings from the defaults in `yard.yaml`, add a provider-specific block to the job file. Job-level values take precedence over provider defaults:
+
+```yaml
+type: glue
+role: arn:aws:iam::123456789:role/GlueJobExecutionRole
+
+# Override defaults from yard.yaml for this job only
+glue:
+  worker_type: G.2X
+  number_of_workers: 10
+  timeout: 180
+  bookmark: disabled
+
+source:
+  type: s3
+  format: parquet
+  path: s3://data-lake/raw/big-dataset/
+
+sink:
+  type: s3
+  format: parquet
+  path: s3://data-lake/curated/big-dataset/
+  mode: overwrite
+```
+
+In this example, `worker_type`, `number_of_workers`, `timeout`, and `bookmark` are overridden for this job, while `glue_version`, `script_bucket`, and other settings are still inherited from the provider defaults.
 
 #### Multiple sources and joins
 

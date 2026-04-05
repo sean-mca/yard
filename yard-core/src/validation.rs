@@ -265,7 +265,90 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
         }
     }
 
+    // Provider-specific config validation
+    if job.job_type == "glue" {
+        if let Some(glue_config) = job.config.get("glue") {
+            validate_glue_config(glue_config, &mut errors);
+        }
+    }
+
     errors
+}
+
+const VALID_WORKER_TYPES: &[&str] = &["G.025X", "G.1X", "G.2X", "G.4X", "G.8X", "Z.2X"];
+const VALID_BOOKMARK_VALUES: &[&str] = &["enabled", "disabled"];
+
+fn validate_glue_config(config: &serde_json::Value, errors: &mut Vec<ValidationError>) {
+    if let Some(wt) = config.get("worker_type").and_then(|v| v.as_str()) {
+        if !VALID_WORKER_TYPES.contains(&wt) {
+            errors.push(err(
+                "glue.worker_type",
+                &format!(
+                    "\"{}\" is not a valid worker type (expected: {})",
+                    wt,
+                    VALID_WORKER_TYPES.join(", ")
+                ),
+            ));
+        }
+    }
+
+    if let Some(n) = config.get("number_of_workers").and_then(|v| v.as_i64()) {
+        if n < 1 {
+            errors.push(err(
+                "glue.number_of_workers",
+                "must be at least 1",
+            ));
+        }
+    }
+
+    if let Some(v) = config.get("glue_version").and_then(|v| v.as_str()) {
+        if !["3.0", "4.0"].contains(&v) {
+            errors.push(err(
+                "glue.glue_version",
+                &format!("\"{}\" is not a supported Glue version (expected: 3.0, 4.0)", v),
+            ));
+        }
+    }
+
+    if let Some(t) = config.get("timeout").and_then(|v| v.as_i64()) {
+        if t < 1 {
+            errors.push(err("glue.timeout", "must be at least 1 (minutes)"));
+        }
+    }
+
+    if let Some(r) = config.get("max_retries").and_then(|v| v.as_i64()) {
+        if r < 0 {
+            errors.push(err("glue.max_retries", "cannot be negative"));
+        }
+    }
+
+    if let Some(b) = config.get("bookmark").and_then(|v| v.as_str()) {
+        if !VALID_BOOKMARK_VALUES.contains(&b) {
+            errors.push(err(
+                "glue.bookmark",
+                &format!(
+                    "\"{}\" is not valid (expected: {})",
+                    b,
+                    VALID_BOOKMARK_VALUES.join(", ")
+                ),
+            ));
+        }
+    }
+
+    if let Some(conns) = config.get("connections") {
+        if !conns.is_array() {
+            errors.push(err("glue.connections", "must be an array of strings"));
+        }
+    }
+
+    if let Some(args) = config.get("default_arguments") {
+        if !args.is_object() {
+            errors.push(err(
+                "glue.default_arguments",
+                "must be a map of string keys to string values",
+            ));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -862,5 +945,89 @@ mod tests {
         assert!(errors.iter().any(|e| e.field == "type"));
         assert!(errors.iter().any(|e| e.field == "sources[0].type"));
         assert!(errors.iter().any(|e| e.field == "sink.type"));
+    }
+
+    // --- Glue config validation ---
+
+    #[test]
+    fn valid_glue_config_passes() {
+        let mut job = minimal_job();
+        job.config = json!({
+            "type": "glue",
+            "glue": {
+                "worker_type": "G.2X",
+                "number_of_workers": 10,
+                "glue_version": "4.0",
+                "timeout": 120,
+                "max_retries": 1,
+                "bookmark": "enabled",
+                "connections": ["my-conn"],
+                "default_arguments": {"--key": "value"}
+            }
+        });
+        let errors = validate_job(&job);
+        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+    }
+
+    #[test]
+    fn invalid_worker_type() {
+        let mut job = minimal_job();
+        job.config = json!({
+            "type": "glue",
+            "glue": { "worker_type": "G.99X" }
+        });
+        let errors = validate_job(&job);
+        assert!(errors.iter().any(|e| e.field == "glue.worker_type"));
+    }
+
+    #[test]
+    fn invalid_number_of_workers() {
+        let mut job = minimal_job();
+        job.config = json!({
+            "type": "glue",
+            "glue": { "number_of_workers": 0 }
+        });
+        let errors = validate_job(&job);
+        assert!(errors.iter().any(|e| e.field == "glue.number_of_workers"));
+    }
+
+    #[test]
+    fn invalid_glue_version() {
+        let mut job = minimal_job();
+        job.config = json!({
+            "type": "glue",
+            "glue": { "glue_version": "2.0" }
+        });
+        let errors = validate_job(&job);
+        assert!(errors.iter().any(|e| e.field == "glue.glue_version"));
+    }
+
+    #[test]
+    fn invalid_bookmark_value() {
+        let mut job = minimal_job();
+        job.config = json!({
+            "type": "glue",
+            "glue": { "bookmark": "maybe" }
+        });
+        let errors = validate_job(&job);
+        assert!(errors.iter().any(|e| e.field == "glue.bookmark"));
+    }
+
+    #[test]
+    fn negative_timeout_rejected() {
+        let mut job = minimal_job();
+        job.config = json!({
+            "type": "glue",
+            "glue": { "timeout": 0 }
+        });
+        let errors = validate_job(&job);
+        assert!(errors.iter().any(|e| e.field == "glue.timeout"));
+    }
+
+    #[test]
+    fn no_glue_block_is_fine() {
+        let job = minimal_job();
+        let errors = validate_job(&job);
+        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
     }
 }
