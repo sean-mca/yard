@@ -23,8 +23,16 @@ pub struct ProjectManifest {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Import {
+    pub name: String,
+    pub from: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct JobDefinition {
     pub job_type: String,
+    pub imports: Vec<Import>,
+    pub body: Option<String>,
     pub config: serde_json::Value,
 }
 

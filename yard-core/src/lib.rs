@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 use yard_structs::{
-    Deployment, DiffType, JobDiff, ProjectManifest, ProjectState,
+    Deployment, DiffType, Import, JobDiff, ProjectManifest, ProjectState,
 };
 
 /// Compute the diff between the manifest and the current state.
@@ -164,6 +164,27 @@ pub async fn init(manifest: &ProjectManifest) -> Result<()> {
     Ok(())
 }
 
+/// Extract optional body override from a job config.
+pub fn parse_body(config: &Value) -> Option<String> {
+    config.get("body").and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+/// Extract imports from a job config's "imports" array.
+pub fn parse_imports(config: &Value) -> Vec<Import> {
+    let mut imports = Vec::new();
+    if let Some(arr) = config.get("imports").and_then(|v| v.as_array()) {
+        for item in arr {
+            let name = match item.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            let from = item.get("from").and_then(|v| v.as_str()).map(|s| s.to_string());
+            imports.push(Import { name, from });
+        }
+    }
+    imports
+}
+
 fn compare_json(old: &Value, new: &Value) -> HashMap<String, (String, String)> {
     let mut changes = HashMap::new();
     if let (Value::Object(old_obj), Value::Object(new_obj)) = (old, new) {
@@ -184,8 +205,12 @@ mod tests {
     use yard_structs::{JobDefinition, StateBackend};
 
     fn make_job(job_type: &str, config: serde_json::Value) -> JobDefinition {
+        let imports = parse_imports(&config);
+        let body = parse_body(&config);
         JobDefinition {
             job_type: job_type.to_string(),
+            imports,
+            body,
             config,
         }
     }

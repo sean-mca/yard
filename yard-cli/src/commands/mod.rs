@@ -124,12 +124,17 @@ fn discover_jobs(search_root: &PathBuf) -> Result<HashMap<String, JobDefinition>
 
         let job_name = file_name.replace(".yaml", "");
         let job_type = job_doc["type"].as_str().unwrap_or("unknown").to_string();
+        let config = yaml_to_json(job_doc);
+        let imports = yard_core::parse_imports(&config);
+        let body = yard_core::parse_body(&config);
 
         all_jobs.insert(
             job_name,
             JobDefinition {
                 job_type,
-                config: yaml_to_json(job_doc),
+                imports,
+                body,
+                config,
             },
         );
     }
