@@ -1,4 +1,5 @@
 pub mod apply;
+pub mod destroy;
 pub mod force_unlock;
 pub mod init;
 pub mod plan;
