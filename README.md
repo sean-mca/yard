@@ -270,7 +270,7 @@ if __name__ == "__main__":
 
 Initialize per-job state files for all jobs in the project. Skips jobs that already have state.
 
-```
+```bash
 $ yard init
 Initialized state for job "orders".
 Initialized state for job "customers".
@@ -281,7 +281,7 @@ Initialized state for job "enriched_orders".
 
 Show what would change without modifying anything. Compares the current YAML definitions against stored state.
 
-```
+```bash
 $ yard plan
 --- Plan for my-data-pipeline ---
 + Create job [orders] (a1b2c3...)
@@ -294,7 +294,7 @@ $ yard plan
 
 Validate all job definitions against the schema. Checks source types, required fields, transform references, and sink configuration.
 
-```
+```bash
 $ yard validate
 Validating job "orders"... OK
 Validating job "customers"... OK
@@ -304,7 +304,7 @@ Validating job "customers"... OK
 
 Apply changes: generate scripts, deploy to providers, and update state. Shows the plan and asks for confirmation before proceeding. Each job is locked during its apply to prevent concurrent modifications.
 
-```
+```bash
 $ yard apply
 --- Plan for my-project ---
 
@@ -323,7 +323,7 @@ State updated successfully.
 
 Use `--dry-run` to see the plan without applying anything:
 
-```
+```bash
 $ yard apply --dry-run
 --- Plan for my-project ---
 
@@ -334,7 +334,7 @@ Dry run -- no changes applied.
 
 Use `--auto-approve` to skip the confirmation prompt (useful in CI):
 
-```
+```bash
 $ yard apply --auto-approve
 ```
 
@@ -342,7 +342,7 @@ $ yard apply --auto-approve
 
 Tear down deployed jobs and remove their state. Shows what will be destroyed and asks for confirmation. Without a job name, destroys all jobs in the project. For each job, YARD calls the provider's destroy method to remove cloud resources, deletes the state file, and removes the generated script.
 
-```
+```bash
 $ yard destroy
 --- Destroy plan for my-project ---
 
@@ -362,7 +362,7 @@ All jobs destroyed.
 
 To destroy a single job:
 
-```
+```bash
 $ yard destroy orders
 --- Destroy plan ---
 
@@ -380,7 +380,7 @@ Use `--dry-run` to see what would be destroyed, or `--auto-approve` to skip the 
 
 Remove a stale lock on a job. This is an escape hatch for when a process dies mid-apply and leaves a lock behind.
 
-```
+```bash
 $ yard force-unlock orders
 Removing lock on job "orders" (held by sean since 2026-04-05T14:30:00Z)
 Lock removed.
