@@ -302,7 +302,7 @@ Validating job "customers"... OK
 
 ### `yard apply [directory] [--dry-run] [--auto-approve]`
 
-Apply changes: generate scripts, deploy to providers, and update state. Shows the plan and asks for confirmation before proceeding. Each job is locked during its apply to prevent concurrent modifications.
+Apply changes: generate scripts, deploy to providers, and update state. All jobs are validated before any changes are made -- if any job has an invalid configuration, the entire apply is aborted. Shows the plan and asks for confirmation before proceeding. Each job is locked during its apply to prevent concurrent modifications.
 
 ```bash
 $ yard apply
