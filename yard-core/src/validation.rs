@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::process::Command;
 use yard_structs::{JobDefinition, ValidationError};
 
 const SUPPORTED_JOB_TYPES: &[&str] = &["glue"];
@@ -344,6 +345,78 @@ fn validate_glue_config(config: &serde_json::Value, errors: &mut Vec<ValidationE
             "must be a map of string keys to string values",
         ));
     }
+}
+
+/// Validate that a generated Python script is syntactically valid.
+/// Shells out to `python3` using `ast.parse`. Returns None if valid,
+/// or Some(error message) if the script has a syntax error.
+pub fn validate_python_syntax(script: &str) -> Option<String> {
+    let result = Command::new("python3")
+        .args(["-c", "import ast, sys; ast.parse(sys.stdin.read())"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+
+    let mut child = match result {
+        Ok(child) => child,
+        Err(e) => {
+            return Some(format!("Failed to run python3: {e}. Is python3 installed?"));
+        }
+    };
+
+    // Write script to stdin
+    if let Some(ref mut stdin) = child.stdin {
+        use std::io::Write;
+        let _ = stdin.write_all(script.as_bytes());
+    }
+    // Drop stdin to close the pipe so python reads EOF
+    child.stdin.take();
+
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => return Some(format!("Failed to wait on python3: {e}")),
+    };
+
+    if output.status.success() {
+        None
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Extract just the meaningful part of the syntax error
+        let msg = stderr
+            .lines()
+            .rev()
+            .find(|l| l.contains("SyntaxError") || l.contains("Error"))
+            .map(|l| l.trim().to_string())
+            .unwrap_or_else(|| "Unknown syntax error".to_string());
+        Some(msg)
+    }
+}
+
+/// Validate a job definition and its generated script.
+/// Runs schema validation, then generates the script and checks Python syntax.
+pub fn validate_job_full(job_name: &str, job_def: &JobDefinition) -> Vec<ValidationError> {
+    let mut errors = validate_job(job_def);
+
+    // Only check syntax if schema validation passed — no point generating
+    // a script from an invalid config
+    if errors.is_empty() {
+        match crate::codegen::generate_python_script(job_name, job_def) {
+            Ok(script) => {
+                if let Some(syntax_err) = validate_python_syntax(&script) {
+                    errors.push(err(
+                        "script",
+                        &format!("generated script has a syntax error: {syntax_err}"),
+                    ));
+                }
+            }
+            Err(e) => {
+                errors.push(err("script", &format!("failed to generate script: {e}")));
+            }
+        }
+    }
+
+    errors
 }
 
 #[cfg(test)]
@@ -1062,6 +1135,45 @@ mod tests {
     fn no_glue_block_is_fine() {
         let job = minimal_job();
         let errors = validate_job(&job);
+        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+    }
+
+    // --- Python syntax validation ---
+
+    #[test]
+    fn valid_python_passes_syntax_check() {
+        let script = "x = 1\nprint(x)\n";
+        assert!(validate_python_syntax(script).is_none());
+    }
+
+    #[test]
+    fn invalid_python_fails_syntax_check() {
+        let script = "def foo(\n";
+        let result = validate_python_syntax(script);
+        assert!(result.is_some());
+        assert!(
+            result.as_ref().is_some_and(|m| m.contains("SyntaxError")),
+            "Expected SyntaxError, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn validate_job_full_catches_bad_body() {
+        let mut job = minimal_job();
+        job.body = Some("def broken(\n".to_string());
+        let errors = validate_job_full("bad_body", &job);
+        assert!(
+            errors.iter().any(|e| e.field == "script"),
+            "Expected script error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_job_full_passes_valid_job() {
+        let job = valid_glue_job();
+        let errors = validate_job_full("good_job", &job);
         assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
     }
 }
