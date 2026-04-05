@@ -185,43 +185,81 @@ pub fn parse_imports(config: &Value) -> Vec<Import> {
     imports
 }
 
-/// Extract source configuration from a job config.
-pub fn parse_source(config: &Value) -> Option<Source> {
-    let src = config.get("source")?;
-    Some(Source {
-        source_type: src.get("type")?.as_str()?.to_string(),
-        format: src.get("format").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        path: src.get("path").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        connection_url: src.get("connection_url").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        table: src.get("table").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        database: src.get("database").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        secret_id: src.get("secret_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
-    })
+/// Helper to extract an optional string field from JSON.
+fn str_field(obj: &Value, key: &str) -> Option<String> {
+    obj.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
-/// Extract sink configuration from a job config.
-pub fn parse_sink(config: &Value) -> Option<Sink> {
-    let snk = config.get("sink")?;
-    let partition_by = snk
-        .get("partition_by")
+/// Helper to extract a string array field from JSON.
+fn str_array_field(obj: &Value, key: &str) -> Vec<String> {
+    obj.get(key)
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
 
+/// Helper to extract a string->string map field from JSON.
+fn str_map_field(obj: &Value, key: &str) -> HashMap<String, String> {
+    obj.get(key)
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_single_source(src: &Value, default_name: &str) -> Option<Source> {
+    Some(Source {
+        name: str_field(src, "name").unwrap_or_else(|| default_name.to_string()),
+        source_type: src.get("type")?.as_str()?.to_string(),
+        format: str_field(src, "format"),
+        path: str_field(src, "path"),
+        connection_url: str_field(src, "connection_url"),
+        table: str_field(src, "table"),
+        database: str_field(src, "database"),
+        secret_id: str_field(src, "secret_id"),
+    })
+}
+
+/// Extract sources from a job config. Supports both `source:` (single) and `sources:` (list).
+pub fn parse_sources(config: &Value) -> Vec<Source> {
+    // Try `sources:` (list) first
+    if let Some(arr) = config.get("sources").and_then(|v| v.as_array()) {
+        return arr
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| parse_single_source(item, &format!("source_{i}")))
+            .collect();
+    }
+    // Fall back to `source:` (single)
+    if let Some(src) = config.get("source") {
+        if let Some(parsed) = parse_single_source(src, "source") {
+            return vec![parsed];
+        }
+    }
+    vec![]
+}
+
+/// Extract sink configuration from a job config.
+pub fn parse_sink(config: &Value) -> Option<Sink> {
+    let snk = config.get("sink")?;
     Some(Sink {
+        source: str_field(snk, "source"),
         sink_type: snk.get("type")?.as_str()?.to_string(),
-        format: snk.get("format").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        path: snk.get("path").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        connection_url: snk.get("connection_url").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        table: snk.get("table").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        database: snk.get("database").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        secret_id: snk.get("secret_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        mode: snk.get("mode").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        partition_by,
+        format: str_field(snk, "format"),
+        path: str_field(snk, "path"),
+        connection_url: str_field(snk, "connection_url"),
+        table: str_field(snk, "table"),
+        database: str_field(snk, "database"),
+        secret_id: str_field(snk, "secret_id"),
+        mode: str_field(snk, "mode"),
+        partition_by: str_array_field(snk, "partition_by"),
     })
 }
 
@@ -237,34 +275,20 @@ pub fn parse_transforms(config: &Value) -> Vec<Transform> {
             continue;
         };
 
-        let columns = item
-            .get("columns")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let mapping = item
-            .get("mapping")
-            .and_then(|v| v.as_object())
-            .map(|obj| {
-                obj.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
-
         transforms.push(Transform {
             transform_type: transform_type.to_string(),
-            condition: item.get("condition").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            query: item.get("query").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            columns,
-            mapping,
-            name: item.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            expression: item.get("expression").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            source: str_field(item, "source"),
+            output: str_field(item, "output"),
+            condition: str_field(item, "condition"),
+            query: str_field(item, "query"),
+            columns: str_array_field(item, "columns"),
+            mapping: str_map_field(item, "mapping"),
+            name: str_field(item, "name"),
+            expression: str_field(item, "expression"),
+            left: str_field(item, "left"),
+            right: str_field(item, "right"),
+            on: str_field(item, "on"),
+            how: str_field(item, "how"),
         });
     }
 
@@ -293,14 +317,14 @@ mod tests {
     fn make_job(job_type: &str, config: serde_json::Value) -> JobDefinition {
         let imports = parse_imports(&config);
         let body = parse_body(&config);
-        let source = parse_source(&config);
+        let sources = parse_sources(&config);
         let sink = parse_sink(&config);
         let transforms = parse_transforms(&config);
         JobDefinition {
             job_type: job_type.to_string(),
             imports,
             body,
-            source,
+            sources,
             sink,
             transforms,
             config,

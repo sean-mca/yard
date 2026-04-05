@@ -127,7 +127,7 @@ fn discover_jobs(search_root: &PathBuf) -> Result<HashMap<String, JobDefinition>
         let config = yaml_to_json(job_doc);
         let imports = yard_core::parse_imports(&config);
         let body = yard_core::parse_body(&config);
-        let source = yard_core::parse_source(&config);
+        let sources = yard_core::parse_sources(&config);
         let sink = yard_core::parse_sink(&config);
         let transforms = yard_core::parse_transforms(&config);
 
@@ -137,7 +137,7 @@ fn discover_jobs(search_root: &PathBuf) -> Result<HashMap<String, JobDefinition>
                 job_type,
                 imports,
                 body,
-                source,
+                sources,
                 sink,
                 transforms,
                 config,

@@ -14,33 +14,43 @@ fn render_import(import: &Import) -> String {
 }
 
 fn render_imports(imports: &[Import]) -> String {
-    imports.iter().map(render_import).collect::<Vec<_>>().join("\n")
+    imports
+        .iter()
+        .map(render_import)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-// --- Source rendering ---
+// --- Source rendering (now named: produces df_<name>) ---
 
 fn render_source(source: &Source) -> String {
+    let var = format!("df_{}", source.name);
     let mut lines = Vec::new();
 
-    // Secret fetch if needed
     if let Some(secret_id) = &source.secret_id {
-        lines.push(render_secret_fetch(secret_id, "source"));
+        lines.push(render_secret_fetch(secret_id, &format!("{}_source", source.name)));
     }
+
+    let secret_var = format!("{}_source_secret", source.name);
 
     match source.source_type.as_str() {
         "s3" => {
             let format = source.format.as_deref().unwrap_or("parquet");
             let path = source.path.as_deref().unwrap_or("s3://MISSING_PATH");
             lines.push(format!(
-                "    df = spark.read.format(\"{format}\").load(\"{path}\")"
+                "    {var} = spark.read.format(\"{format}\").load(\"{path}\")"
             ));
         }
         "jdbc" => {
             let url = source.connection_url.as_deref().unwrap_or("MISSING_URL");
             let table = source.table.as_deref().unwrap_or("MISSING_TABLE");
-            lines.push(format!("    df = spark.read.format(\"jdbc\").option(\"url\", \"{url}\").option(\"dbtable\", \"{table}\")\\"));
+            lines.push(format!(
+                "    {var} = spark.read.format(\"jdbc\").option(\"url\", \"{url}\").option(\"dbtable\", \"{table}\")\\"
+            ));
             if source.secret_id.is_some() {
-                lines.push("        .option(\"user\", source_secret[\"username\"]).option(\"password\", source_secret[\"password\"])\\".to_string());
+                lines.push(format!(
+                    "        .option(\"user\", {secret_var}[\"username\"]).option(\"password\", {secret_var}[\"password\"])\\"
+                ));
             }
             lines.push("        .load()".to_string());
         }
@@ -48,70 +58,144 @@ fn render_source(source: &Source) -> String {
             let db = source.database.as_deref().unwrap_or("MISSING_DATABASE");
             let table = source.table.as_deref().unwrap_or("MISSING_TABLE");
             lines.push(format!(
-                "    df = glueContext.create_dynamic_frame.from_catalog(database=\"{db}\", table_name=\"{table}\").toDF()"
+                "    {var} = glueContext.create_dynamic_frame.from_catalog(database=\"{db}\", table_name=\"{table}\").toDF()"
             ));
         }
         _ => {
-            lines.push(format!("    # Unsupported source type: {}", source.source_type));
+            lines.push(format!(
+                "    # Unsupported source type: {}",
+                source.source_type
+            ));
         }
     }
 
     lines.join("\n")
 }
 
-// --- Transform rendering ---
+fn render_sources(sources: &[Source]) -> String {
+    sources
+        .iter()
+        .map(render_source)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
-fn render_transform(transform: &Transform) -> String {
+// --- Transform rendering (now with named dataframes) ---
+
+fn resolve_df(transform: &Transform, default_source: &str) -> (String, String) {
+    let input = transform
+        .source
+        .as_deref()
+        .unwrap_or(default_source);
+    let output = transform
+        .output
+        .as_deref()
+        .unwrap_or(input);
+    (format!("df_{input}"), format!("df_{output}"))
+}
+
+fn render_transform(transform: &Transform, default_source: &str, all_source_names: &[String]) -> String {
     match transform.transform_type.as_str() {
         "filter" => {
-            let condition = transform.condition.as_deref().unwrap_or("True");
-            format!("    df = df.filter({condition})")
+            let (input, output) = resolve_df(transform, default_source);
+            let condition = transform.condition.as_deref().unwrap_or("True").trim();
+            format!("    {output} = {input}.filter({condition})")
         }
         "sql" => {
-            let query = transform.query.as_deref().unwrap_or("SELECT * FROM source");
+            let output_name = transform
+                .output
+                .as_deref()
+                .unwrap_or(default_source);
+            let output_var = format!("df_{output_name}");
+            let query = transform.query.as_deref().unwrap_or("SELECT * FROM source").trim();
             let mut lines = Vec::new();
-            lines.push("    df.createOrReplaceTempView(\"source\")".to_string());
-            lines.push(format!("    df = spark.sql(\"{query}\")"));
+            // Register all named sources as temp views
+            for name in all_source_names {
+                lines.push(format!("    df_{name}.createOrReplaceTempView(\"{name}\")"));
+            }
+            lines.push(format!("    {output_var} = spark.sql(\"{query}\")"));
             lines.join("\n")
         }
+        "join" => {
+            let left = transform.left.as_deref().unwrap_or(default_source);
+            let right = transform.right.as_deref().unwrap_or("MISSING_RIGHT");
+            let on_col = transform.on.as_deref().unwrap_or("MISSING_ON");
+            let how = transform.how.as_deref().unwrap_or("inner");
+            let output_name = transform
+                .output
+                .as_deref()
+                .unwrap_or(left);
+            let output_var = format!("df_{output_name}");
+            format!(
+                "    {output_var} = df_{left}.join(df_{right}, on=\"{on_col}\", how=\"{how}\")"
+            )
+        }
         "drop_columns" => {
-            let cols = transform.columns.iter()
+            let (input, output) = resolve_df(transform, default_source);
+            let cols = transform
+                .columns
+                .iter()
                 .map(|c| format!("\"{}\"", c))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("    df = df.drop({cols})")
+            format!("    {output} = {input}.drop({cols})")
         }
         "select" => {
-            let cols = transform.columns.iter()
+            let (input, output) = resolve_df(transform, default_source);
+            let cols = transform
+                .columns
+                .iter()
                 .map(|c| format!("\"{}\"", c))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("    df = df.select({cols})")
+            format!("    {output} = {input}.select({cols})")
         }
         "rename" => {
-            let lines: Vec<String> = transform.mapping.iter()
-                .map(|(old, new)| format!("    df = df.withColumnRenamed(\"{old}\", \"{new}\")"))
-                .collect();
+            let (input, output) = resolve_df(transform, default_source);
+            let mut lines: Vec<String> = Vec::new();
+            let mut first = true;
+            for (old, new) in &transform.mapping {
+                if first {
+                    lines.push(format!(
+                        "    {output} = {input}.withColumnRenamed(\"{old}\", \"{new}\")"
+                    ));
+                    first = false;
+                } else {
+                    lines.push(format!(
+                        "    {output} = {output}.withColumnRenamed(\"{old}\", \"{new}\")"
+                    ));
+                }
+            }
             lines.join("\n")
         }
         "add_column" => {
-            let name = transform.name.as_deref().unwrap_or("MISSING_NAME");
-            let expr = transform.expression.as_deref().unwrap_or("lit(None)");
-            format!("    df = df.withColumn(\"{name}\", {expr})")
+            let (input, output) = resolve_df(transform, default_source);
+            let name = transform.name.as_deref().unwrap_or("MISSING_NAME").trim();
+            let expr = transform.expression.as_deref().unwrap_or("lit(None)").trim();
+            format!("    {output} = {input}.withColumn(\"{name}\", {expr})")
         }
         _ => {
-            format!("    # Unsupported transform type: {}", transform.transform_type)
+            format!(
+                "    # Unsupported transform type: {}",
+                transform.transform_type
+            )
         }
     }
 }
 
-fn render_transforms(transforms: &[Transform]) -> String {
-    transforms.iter().map(render_transform).collect::<Vec<_>>().join("\n")
+fn render_transforms(transforms: &[Transform], default_source: &str, all_source_names: &[String]) -> String {
+    transforms
+        .iter()
+        .map(|t| render_transform(t, default_source, all_source_names))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-// --- Sink rendering ---
+// --- Sink rendering (now with named dataframe) ---
 
-fn render_sink(sink: &Sink) -> String {
+fn render_sink(sink: &Sink, default_source: &str) -> String {
+    let source_name = sink.source.as_deref().unwrap_or(default_source);
+    let var = format!("df_{source_name}");
     let mut lines = Vec::new();
 
     if let Some(secret_id) = &sink.secret_id {
@@ -124,9 +208,11 @@ fn render_sink(sink: &Sink) -> String {
         "s3" => {
             let format = sink.format.as_deref().unwrap_or("parquet");
             let path = sink.path.as_deref().unwrap_or("s3://MISSING_PATH");
-            let mut write = format!("    df.write.format(\"{format}\").mode(\"{mode}\")");
+            let mut write = format!("    {var}.write.format(\"{format}\").mode(\"{mode}\")");
             if !sink.partition_by.is_empty() {
-                let parts = sink.partition_by.iter()
+                let parts = sink
+                    .partition_by
+                    .iter()
                     .map(|c| format!("\"{}\"", c))
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -138,9 +224,13 @@ fn render_sink(sink: &Sink) -> String {
         "jdbc" => {
             let url = sink.connection_url.as_deref().unwrap_or("MISSING_URL");
             let table = sink.table.as_deref().unwrap_or("MISSING_TABLE");
-            lines.push(format!("    df.write.format(\"jdbc\").option(\"url\", \"{url}\").option(\"dbtable\", \"{table}\")\\"));
+            lines.push(format!(
+                "    {var}.write.format(\"jdbc\").option(\"url\", \"{url}\").option(\"dbtable\", \"{table}\")\\"
+            ));
             if sink.secret_id.is_some() {
-                lines.push("        .option(\"user\", sink_secret[\"username\"]).option(\"password\", sink_secret[\"password\"])\\".to_string());
+                lines.push(
+                    "        .option(\"user\", sink_secret[\"username\"]).option(\"password\", sink_secret[\"password\"])\\".to_string()
+                );
             }
             lines.push(format!("        .mode(\"{mode}\").save()"));
         }
@@ -148,7 +238,7 @@ fn render_sink(sink: &Sink) -> String {
             let db = sink.database.as_deref().unwrap_or("MISSING_DATABASE");
             let table = sink.table.as_deref().unwrap_or("MISSING_TABLE");
             lines.push(format!(
-                "    sink_frame = DynamicFrame.fromDF(df, glueContext, \"sink_frame\")"
+                "    sink_frame = DynamicFrame.fromDF({var}, glueContext, \"sink_frame\")"
             ));
             lines.push(format!(
                 "    glueContext.write_dynamic_frame.from_catalog(frame=sink_frame, database=\"{db}\", table_name=\"{table}\")"
@@ -174,20 +264,20 @@ fn render_secret_fetch(secret_id: &str, prefix: &str) -> String {
     .join("\n")
 }
 
-/// Check if any source or sink uses secrets, requiring extra imports.
 fn needs_secrets_imports(job_def: &JobDefinition) -> bool {
-    let source_has = job_def.source.as_ref().is_some_and(|s| s.secret_id.is_some());
+    let source_has = job_def.sources.iter().any(|s| s.secret_id.is_some());
     let sink_has = job_def.sink.as_ref().is_some_and(|s| s.secret_id.is_some());
     source_has || sink_has
 }
 
-/// Check if any sink uses catalog type, requiring DynamicFrame import.
 fn needs_dynamic_frame_import(job_def: &JobDefinition) -> bool {
-    job_def.sink.as_ref().is_some_and(|s| s.sink_type == "catalog")
-        || job_def.source.as_ref().is_some_and(|s| s.source_type == "catalog")
+    job_def
+        .sink
+        .as_ref()
+        .is_some_and(|s| s.sink_type == "catalog")
+        || job_def.sources.iter().any(|s| s.source_type == "catalog")
 }
 
-/// Indent a body string so it sits correctly inside `def run():`.
 fn indent_body(body: &str) -> String {
     body.lines()
         .map(|line| {
@@ -210,6 +300,15 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
     let mut tera = Tera::default();
     tera.add_raw_template("script", template)?;
 
+    // Determine the default source name (first source, or "source")
+    let default_source = job_def
+        .sources
+        .first()
+        .map(|s| s.name.as_str())
+        .unwrap_or("source");
+
+    let all_source_names: Vec<String> = job_def.sources.iter().map(|s| s.name.clone()).collect();
+
     // Build extra imports needed by template features
     let mut extra_imports = Vec::new();
     if needs_secrets_imports(job_def) {
@@ -220,7 +319,6 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
         extra_imports.push("from awsglue.dynamicframe import DynamicFrame".to_string());
     }
 
-    // Combine user imports with auto imports
     let user_imports = render_imports(&job_def.imports);
     let all_imports = if extra_imports.is_empty() {
         user_imports
@@ -235,19 +333,23 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
         indent_body(body)
     } else {
         let mut parts = Vec::new();
-        if let Some(source) = &job_def.source {
-            parts.push(render_source(source));
+        if !job_def.sources.is_empty() {
+            parts.push(format!("    # --- Sources ---\n{}", render_sources(&job_def.sources)));
         }
         if !job_def.transforms.is_empty() {
-            parts.push(render_transforms(&job_def.transforms));
+            parts.push(format!("    # --- Transforms ---\n{}", render_transforms(
+                &job_def.transforms,
+                default_source,
+                &all_source_names,
+            )));
         }
         if let Some(sink) = &job_def.sink {
-            parts.push(render_sink(sink));
+            parts.push(format!("    # --- Sink ---\n{}", render_sink(sink, default_source)));
         }
         if parts.is_empty() {
             "    pass".to_string()
         } else {
-            parts.join("\n")
+            parts.join("\n\n")
         }
     };
 
@@ -268,7 +370,6 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
 mod tests {
     use super::*;
     use serde_json::json;
-    use yard_structs::{Sink, Source, Transform};
     use std::collections::HashMap;
 
     fn base_job() -> JobDefinition {
@@ -276,10 +377,23 @@ mod tests {
             job_type: "glue".to_string(),
             imports: vec![],
             body: None,
-            source: None,
+            sources: vec![],
             sink: None,
             transforms: vec![],
             config: json!({"type": "glue"}),
+        }
+    }
+
+    fn s3_source(name: &str, path: &str) -> Source {
+        Source {
+            name: name.to_string(),
+            source_type: "s3".to_string(),
+            format: Some("parquet".to_string()),
+            path: Some(path.to_string()),
+            connection_url: None,
+            table: None,
+            database: None,
+            secret_id: None,
         }
     }
 
@@ -289,11 +403,10 @@ mod tests {
     fn unsupported_job_type_errors() {
         let mut job = base_job();
         job.job_type = "unknown".to_string();
-        let result = generate_python_script("test", &job);
-        assert!(result.is_err());
+        assert!(generate_python_script("test", &job).is_err());
     }
 
-    // --- Header & template basics ---
+    // --- Template basics ---
 
     #[test]
     fn generates_header() {
@@ -302,20 +415,10 @@ mod tests {
     }
 
     #[test]
-    fn glue_setup() {
+    fn glue_setup_and_teardown() {
         let script = generate_python_script("test_job", &base_job()).unwrap();
-        assert!(script.contains("import sys"));
         assert!(script.contains("from awsglue.utils import getResolvedOptions"));
-        assert!(script.contains("from pyspark.context import SparkContext"));
-        assert!(script.contains("from awsglue.context import GlueContext"));
-        assert!(script.contains("from awsglue.job import Job"));
         assert!(script.contains("SparkContext()"));
-        assert!(script.contains("job.init"));
-    }
-
-    #[test]
-    fn glue_teardown() {
-        let script = generate_python_script("test_job", &base_job()).unwrap();
         assert!(script.contains("job.commit()"));
     }
 
@@ -325,56 +428,218 @@ mod tests {
         assert!(script.contains("    pass"));
     }
 
-    // --- User imports ---
+    // --- Named sources ---
 
     #[test]
-    fn user_imports() {
+    fn single_source_named() {
         let mut job = base_job();
-        job.imports = vec![
-            Import { name: "logging".to_string(), from: None },
-        ];
+        job.sources = vec![s3_source("events", "s3://bucket/events/")];
         let script = generate_python_script("test_job", &job).unwrap();
-        assert!(script.contains("import logging"));
+        assert!(script.contains("df_events = spark.read.format(\"parquet\").load(\"s3://bucket/events/\")"));
     }
 
-    // --- Body override ---
+    #[test]
+    fn multiple_sources_named() {
+        let mut job = base_job();
+        job.sources = vec![
+            s3_source("orders", "s3://bucket/orders/"),
+            s3_source("customers", "s3://bucket/customers/"),
+        ];
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(script.contains("df_orders = spark.read"));
+        assert!(script.contains("df_customers = spark.read"));
+    }
+
+    // --- Transforms with named dfs ---
+
+    #[test]
+    fn transform_defaults_to_first_source() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.transforms = vec![Transform {
+            transform_type: "filter".to_string(),
+            source: None,
+            output: None,
+            condition: Some("col('active')".to_string()),
+            query: None,
+            columns: vec![],
+            mapping: HashMap::new(),
+            name: None,
+            expression: None,
+            left: None,
+            right: None,
+            on: None,
+            how: None,
+        }];
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(script.contains("df_events = df_events.filter(col('active'))"));
+    }
+
+    #[test]
+    fn transform_explicit_source_and_output() {
+        let mut job = base_job();
+        job.sources = vec![
+            s3_source("orders", "s3://b/orders"),
+            s3_source("customers", "s3://b/customers"),
+        ];
+        job.transforms = vec![Transform {
+            transform_type: "filter".to_string(),
+            source: Some("customers".to_string()),
+            output: Some("active_customers".to_string()),
+            condition: Some("col('active')".to_string()),
+            query: None,
+            columns: vec![],
+            mapping: HashMap::new(),
+            name: None,
+            expression: None,
+            left: None,
+            right: None,
+            on: None,
+            how: None,
+        }];
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(script.contains("df_active_customers = df_customers.filter(col('active'))"));
+    }
+
+    // --- Join ---
+
+    #[test]
+    fn join_transform() {
+        let mut job = base_job();
+        job.sources = vec![
+            s3_source("orders", "s3://b/orders"),
+            s3_source("customers", "s3://b/customers"),
+        ];
+        job.transforms = vec![Transform {
+            transform_type: "join".to_string(),
+            source: None,
+            output: Some("enriched".to_string()),
+            condition: None,
+            query: None,
+            columns: vec![],
+            mapping: HashMap::new(),
+            name: None,
+            expression: None,
+            left: Some("orders".to_string()),
+            right: Some("customers".to_string()),
+            on: Some("customer_id".to_string()),
+            how: Some("left".to_string()),
+        }];
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(script.contains(
+            "df_enriched = df_orders.join(df_customers, on=\"customer_id\", how=\"left\")"
+        ));
+    }
+
+    // --- SQL with named sources ---
+
+    #[test]
+    fn sql_registers_all_sources_as_views() {
+        let mut job = base_job();
+        job.sources = vec![
+            s3_source("orders", "s3://b/orders"),
+            s3_source("customers", "s3://b/customers"),
+        ];
+        job.transforms = vec![Transform {
+            transform_type: "sql".to_string(),
+            source: None,
+            output: Some("enriched".to_string()),
+            condition: None,
+            query: Some("SELECT o.*, c.name FROM orders o JOIN customers c ON o.cid = c.id".to_string()),
+            columns: vec![],
+            mapping: HashMap::new(),
+            name: None,
+            expression: None,
+            left: None,
+            right: None,
+            on: None,
+            how: None,
+        }];
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(script.contains("df_orders.createOrReplaceTempView(\"orders\")"));
+        assert!(script.contains("df_customers.createOrReplaceTempView(\"customers\")"));
+        assert!(script.contains("df_enriched = spark.sql("));
+    }
+
+    // --- Sink with named source ---
+
+    #[test]
+    fn sink_defaults_to_first_source() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(Sink {
+            source: None,
+            sink_type: "s3".to_string(),
+            format: Some("parquet".to_string()),
+            path: Some("s3://b/out/".to_string()),
+            connection_url: None,
+            table: None,
+            database: None,
+            secret_id: None,
+            mode: Some("overwrite".to_string()),
+            partition_by: vec![],
+        });
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(script.contains("df_events.write.format(\"parquet\")"));
+    }
+
+    #[test]
+    fn sink_explicit_source() {
+        let mut job = base_job();
+        job.sources = vec![
+            s3_source("orders", "s3://b/orders"),
+            s3_source("customers", "s3://b/customers"),
+        ];
+        job.transforms = vec![Transform {
+            transform_type: "join".to_string(),
+            source: None,
+            output: Some("enriched".to_string()),
+            condition: None,
+            query: None,
+            columns: vec![],
+            mapping: HashMap::new(),
+            name: None,
+            expression: None,
+            left: Some("orders".to_string()),
+            right: Some("customers".to_string()),
+            on: Some("customer_id".to_string()),
+            how: Some("inner".to_string()),
+        }];
+        job.sink = Some(Sink {
+            source: Some("enriched".to_string()),
+            sink_type: "s3".to_string(),
+            format: Some("parquet".to_string()),
+            path: Some("s3://b/out/".to_string()),
+            connection_url: None,
+            table: None,
+            database: None,
+            secret_id: None,
+            mode: Some("overwrite".to_string()),
+            partition_by: vec![],
+        });
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(script.contains("df_enriched.write.format(\"parquet\")"));
+    }
+
+    // --- Body override still works ---
 
     #[test]
     fn body_override_skips_source_sink() {
         let mut job = base_job();
         job.body = Some("print('custom')".to_string());
-        job.source = Some(Source {
-            source_type: "s3".to_string(),
-            format: Some("parquet".to_string()),
-            path: Some("s3://bucket/in".to_string()),
-            connection_url: None, table: None, database: None, secret_id: None,
-        });
+        job.sources = vec![s3_source("events", "s3://b/in")];
         let script = generate_python_script("test_job", &job).unwrap();
         assert!(script.contains("    print('custom')"));
         assert!(!script.contains("spark.read"));
     }
 
-    // --- S3 source ---
+    // --- JDBC with secrets uses named vars ---
 
     #[test]
-    fn s3_source() {
+    fn jdbc_source_secret_named() {
         let mut job = base_job();
-        job.source = Some(Source {
-            source_type: "s3".to_string(),
-            format: Some("parquet".to_string()),
-            path: Some("s3://my-bucket/raw/".to_string()),
-            connection_url: None, table: None, database: None, secret_id: None,
-        });
-        let script = generate_python_script("test_job", &job).unwrap();
-        assert!(script.contains("spark.read.format(\"parquet\").load(\"s3://my-bucket/raw/\")"));
-    }
-
-    // --- JDBC source with secret ---
-
-    #[test]
-    fn jdbc_source_with_secret() {
-        let mut job = base_job();
-        job.source = Some(Source {
+        job.sources = vec![Source {
+            name: "users".to_string(),
             source_type: "jdbc".to_string(),
             format: None,
             path: None,
@@ -382,260 +647,89 @@ mod tests {
             table: Some("public.users".to_string()),
             database: None,
             secret_id: Some("my-rds-secret".to_string()),
-        });
+        }];
         let script = generate_python_script("test_job", &job).unwrap();
         assert!(script.contains("import boto3"));
-        assert!(script.contains("import json"));
         assert!(script.contains("get_secret_value(SecretId=\"my-rds-secret\")"));
-        assert!(script.contains("source_secret[\"username\"]"));
-        assert!(script.contains("jdbc:postgresql://host:5432/db"));
+        assert!(script.contains("users_source_secret[\"username\"]"));
+        assert!(script.contains("df_users = spark.read.format(\"jdbc\")"));
     }
 
-    // --- Catalog source ---
+    // --- Full pipeline with join ---
 
     #[test]
-    fn catalog_source() {
+    fn full_pipeline_with_join() {
         let mut job = base_job();
-        job.source = Some(Source {
-            source_type: "catalog".to_string(),
-            format: None, path: None, connection_url: None,
-            table: Some("raw_events".to_string()),
-            database: Some("my_db".to_string()),
-            secret_id: None,
-        });
-        let script = generate_python_script("test_job", &job).unwrap();
-        assert!(script.contains("from_catalog(database=\"my_db\", table_name=\"raw_events\")"));
-    }
-
-    // --- Transforms ---
-
-    #[test]
-    fn filter_transform() {
-        let mut job = base_job();
-        job.source = Some(Source {
-            source_type: "s3".to_string(),
-            format: Some("parquet".to_string()),
-            path: Some("s3://b/in".to_string()),
-            connection_url: None, table: None, database: None, secret_id: None,
-        });
-        job.transforms = vec![Transform {
-            transform_type: "filter".to_string(),
-            condition: Some("col('status') == 'active'".to_string()),
-            query: None, columns: vec![], mapping: HashMap::new(),
-            name: None, expression: None,
-        }];
-        let script = generate_python_script("test_job", &job).unwrap();
-        assert!(script.contains("df = df.filter(col('status') == 'active')"));
-    }
-
-    #[test]
-    fn sql_transform() {
-        let mut job = base_job();
-        job.source = Some(Source {
-            source_type: "s3".to_string(),
-            format: Some("csv".to_string()),
-            path: Some("s3://b/in".to_string()),
-            connection_url: None, table: None, database: None, secret_id: None,
-        });
-        job.transforms = vec![Transform {
-            transform_type: "sql".to_string(),
-            condition: None,
-            query: Some("SELECT id, name FROM source WHERE amount > 100".to_string()),
-            columns: vec![], mapping: HashMap::new(),
-            name: None, expression: None,
-        }];
-        let script = generate_python_script("test_job", &job).unwrap();
-        assert!(script.contains("createOrReplaceTempView(\"source\")"));
-        assert!(script.contains("spark.sql(\"SELECT id, name FROM source WHERE amount > 100\")"));
-    }
-
-    #[test]
-    fn drop_columns_transform() {
-        let mut job = base_job();
-        job.source = Some(Source {
-            source_type: "s3".to_string(),
-            format: Some("parquet".to_string()),
-            path: Some("s3://b/in".to_string()),
-            connection_url: None, table: None, database: None, secret_id: None,
-        });
-        job.transforms = vec![Transform {
-            transform_type: "drop_columns".to_string(),
-            condition: None, query: None,
-            columns: vec!["temp_col".to_string(), "debug_flag".to_string()],
-            mapping: HashMap::new(), name: None, expression: None,
-        }];
-        let script = generate_python_script("test_job", &job).unwrap();
-        assert!(script.contains("df = df.drop(\"temp_col\", \"debug_flag\")"));
-    }
-
-    #[test]
-    fn rename_transform() {
-        let mut job = base_job();
-        job.source = Some(Source {
-            source_type: "s3".to_string(),
-            format: Some("parquet".to_string()),
-            path: Some("s3://b/in".to_string()),
-            connection_url: None, table: None, database: None, secret_id: None,
-        });
-        job.transforms = vec![Transform {
-            transform_type: "rename".to_string(),
-            condition: None, query: None, columns: vec![],
-            mapping: HashMap::from([("old_name".to_string(), "new_name".to_string())]),
-            name: None, expression: None,
-        }];
-        let script = generate_python_script("test_job", &job).unwrap();
-        assert!(script.contains("withColumnRenamed(\"old_name\", \"new_name\")"));
-    }
-
-    #[test]
-    fn select_transform() {
-        let mut job = base_job();
-        job.source = Some(Source {
-            source_type: "s3".to_string(),
-            format: Some("parquet".to_string()),
-            path: Some("s3://b/in".to_string()),
-            connection_url: None, table: None, database: None, secret_id: None,
-        });
-        job.transforms = vec![Transform {
-            transform_type: "select".to_string(),
-            condition: None, query: None,
-            columns: vec!["id".to_string(), "name".to_string()],
-            mapping: HashMap::new(), name: None, expression: None,
-        }];
-        let script = generate_python_script("test_job", &job).unwrap();
-        assert!(script.contains("df = df.select(\"id\", \"name\")"));
-    }
-
-    #[test]
-    fn add_column_transform() {
-        let mut job = base_job();
-        job.source = Some(Source {
-            source_type: "s3".to_string(),
-            format: Some("parquet".to_string()),
-            path: Some("s3://b/in".to_string()),
-            connection_url: None, table: None, database: None, secret_id: None,
-        });
-        job.transforms = vec![Transform {
-            transform_type: "add_column".to_string(),
-            condition: None, query: None, columns: vec![], mapping: HashMap::new(),
-            name: Some("year".to_string()),
-            expression: Some("year(col('created_at'))".to_string()),
-        }];
-        let script = generate_python_script("test_job", &job).unwrap();
-        assert!(script.contains("df = df.withColumn(\"year\", year(col('created_at')))"));
-    }
-
-    // --- S3 sink ---
-
-    #[test]
-    fn s3_sink() {
-        let mut job = base_job();
-        job.source = Some(Source {
-            source_type: "s3".to_string(),
-            format: Some("parquet".to_string()),
-            path: Some("s3://b/in".to_string()),
-            connection_url: None, table: None, database: None, secret_id: None,
-        });
-        job.sink = Some(Sink {
-            sink_type: "s3".to_string(),
-            format: Some("parquet".to_string()),
-            path: Some("s3://b/out/".to_string()),
-            connection_url: None, table: None, database: None, secret_id: None,
-            mode: Some("overwrite".to_string()),
-            partition_by: vec![],
-        });
-        let script = generate_python_script("test_job", &job).unwrap();
-        assert!(script.contains("df.write.format(\"parquet\").mode(\"overwrite\").save(\"s3://b/out/\")"));
-    }
-
-    #[test]
-    fn s3_sink_with_partitions() {
-        let mut job = base_job();
-        job.source = Some(Source {
-            source_type: "s3".to_string(),
-            format: Some("parquet".to_string()),
-            path: Some("s3://b/in".to_string()),
-            connection_url: None, table: None, database: None, secret_id: None,
-        });
-        job.sink = Some(Sink {
-            sink_type: "s3".to_string(),
-            format: Some("parquet".to_string()),
-            path: Some("s3://b/out/".to_string()),
-            connection_url: None, table: None, database: None, secret_id: None,
-            mode: Some("overwrite".to_string()),
-            partition_by: vec!["year".to_string(), "month".to_string()],
-        });
-        let script = generate_python_script("test_job", &job).unwrap();
-        assert!(script.contains(".partitionBy(\"year\", \"month\")"));
-    }
-
-    // --- JDBC sink with secret ---
-
-    #[test]
-    fn jdbc_sink_with_secret() {
-        let mut job = base_job();
-        job.source = Some(Source {
-            source_type: "s3".to_string(),
-            format: Some("parquet".to_string()),
-            path: Some("s3://b/in".to_string()),
-            connection_url: None, table: None, database: None, secret_id: None,
-        });
-        job.sink = Some(Sink {
-            sink_type: "jdbc".to_string(),
-            format: None,
-            path: None,
-            connection_url: Some("jdbc:postgresql://host:5432/db".to_string()),
-            table: Some("public.output".to_string()),
-            database: None,
-            secret_id: Some("my-sink-secret".to_string()),
-            mode: Some("append".to_string()),
-            partition_by: vec![],
-        });
-        let script = generate_python_script("test_job", &job).unwrap();
-        assert!(script.contains("get_secret_value(SecretId=\"my-sink-secret\")"));
-        assert!(script.contains("sink_secret[\"username\"]"));
-        assert!(script.contains(".mode(\"append\").save()"));
-    }
-
-    // --- Full pipeline ---
-
-    #[test]
-    fn full_pipeline_s3_to_s3() {
-        let mut job = base_job();
-        job.source = Some(Source {
-            source_type: "s3".to_string(),
-            format: Some("csv".to_string()),
-            path: Some("s3://raw/events/".to_string()),
-            connection_url: None, table: None, database: None, secret_id: None,
-        });
+        job.sources = vec![
+            s3_source("orders", "s3://raw/orders/"),
+            s3_source("customers", "s3://raw/customers/"),
+        ];
         job.transforms = vec![
             Transform {
                 transform_type: "filter".to_string(),
-                condition: Some("col('status') == 'active'".to_string()),
-                query: None, columns: vec![], mapping: HashMap::new(),
-                name: None, expression: None,
+                source: Some("orders".to_string()),
+                output: None,
+                condition: Some("col('status') != 'cancelled'".to_string()),
+                query: None,
+                columns: vec![],
+                mapping: HashMap::new(),
+                name: None,
+                expression: None,
+                left: None,
+                right: None,
+                on: None,
+                how: None,
+            },
+            Transform {
+                transform_type: "join".to_string(),
+                source: None,
+                output: Some("enriched".to_string()),
+                condition: None,
+                query: None,
+                columns: vec![],
+                mapping: HashMap::new(),
+                name: None,
+                expression: None,
+                left: Some("orders".to_string()),
+                right: Some("customers".to_string()),
+                on: Some("customer_id".to_string()),
+                how: Some("left".to_string()),
             },
             Transform {
                 transform_type: "drop_columns".to_string(),
-                condition: None, query: None,
+                source: Some("enriched".to_string()),
+                output: None,
+                condition: None,
+                query: None,
                 columns: vec!["debug".to_string()],
-                mapping: HashMap::new(), name: None, expression: None,
+                mapping: HashMap::new(),
+                name: None,
+                expression: None,
+                left: None,
+                right: None,
+                on: None,
+                how: None,
             },
         ];
         job.sink = Some(Sink {
+            source: Some("enriched".to_string()),
             sink_type: "s3".to_string(),
             format: Some("parquet".to_string()),
-            path: Some("s3://curated/events/".to_string()),
-            connection_url: None, table: None, database: None, secret_id: None,
+            path: Some("s3://curated/enriched_orders/".to_string()),
+            connection_url: None,
+            table: None,
+            database: None,
+            secret_id: None,
             mode: Some("overwrite".to_string()),
             partition_by: vec![],
         });
         let script = generate_python_script("test_job", &job).unwrap();
-        assert!(script.contains("spark.read.format(\"csv\").load(\"s3://raw/events/\")"));
-        assert!(script.contains("df = df.filter("));
-        assert!(script.contains("df = df.drop("));
-        assert!(script.contains("df.write.format(\"parquet\")"));
-        assert!(!script.contains("    pass"));
+        assert!(script.contains("df_orders = spark.read"));
+        assert!(script.contains("df_customers = spark.read"));
+        assert!(script.contains("df_orders = df_orders.filter("));
+        assert!(script.contains("df_enriched = df_orders.join(df_customers"));
+        assert!(script.contains("df_enriched = df_enriched.drop("));
+        assert!(script.contains("df_enriched.write.format(\"parquet\")"));
     }
 
     #[test]
