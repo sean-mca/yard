@@ -246,6 +246,89 @@ pub async fn force_unlock(
     Ok(existing)
 }
 
+/// Result of destroying jobs.
+pub struct DestroyResult {
+    pub destroyed: Vec<String>,
+}
+
+/// Destroy a single job: tear down provider resources, delete state, delete generated script.
+pub async fn destroy_job(
+    backend: &yard_structs::StateBackend,
+    provider_configs: &HashMap<String, Value>,
+    job_name: &str,
+    root_dir: &Path,
+    dry_run: bool,
+) -> Result<bool> {
+    let storage = storage::get_storage(backend).await?;
+
+    let job_state = match storage.read_job(job_name).await? {
+        Some(s) => s,
+        None => return Ok(false),
+    };
+
+    let lock = storage.lock(job_name).await?;
+
+    let result: Result<()> = async {
+        // Destroy provider resources if they exist
+        if !dry_run && !job_state.deployment.resources.is_empty() {
+            let job_type = job_state
+                .deployment
+                .config
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+
+            if let Some(provider_config) = provider_configs.get(job_type) {
+                let provider = providers::get_provider(job_type, provider_config).await?;
+                provider
+                    .destroy(job_name, &job_state.deployment.resources)
+                    .await?;
+            }
+        }
+
+        // Delete state file
+        storage.delete_job(job_name).await?;
+
+        // Delete generated script
+        let script_path = root_dir
+            .join(".yard/generated")
+            .join(format!("{job_name}.py"));
+        if script_path.exists() {
+            let _ = std::fs::remove_file(script_path);
+        }
+
+        Ok(())
+    }
+    .await;
+
+    storage.unlock(job_name, &lock).await?;
+    result?;
+
+    Ok(true)
+}
+
+/// Destroy all jobs that have state.
+pub async fn destroy_all(
+    backend: &yard_structs::StateBackend,
+    provider_configs: &HashMap<String, Value>,
+    root_dir: &Path,
+    dry_run: bool,
+) -> Result<DestroyResult> {
+    let storage = storage::get_storage(backend).await?;
+    let job_names = storage.list_jobs().await?;
+    let mut result = DestroyResult {
+        destroyed: Vec::new(),
+    };
+
+    for name in job_names {
+        if destroy_job(backend, provider_configs, &name, root_dir, dry_run).await? {
+            result.destroyed.push(name);
+        }
+    }
+
+    Ok(result)
+}
+
 /// Extract optional body override from a job config.
 pub fn parse_body(config: &Value) -> Option<String> {
     config.get("body").and_then(|v| v.as_str()).map(|s| s.to_string())
@@ -614,6 +697,96 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&job_state_path).unwrap()).unwrap();
         assert_eq!(job_state.job_name, "new_job");
         assert_eq!(job_state.deployment.status, "generated");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn destroy_job_removes_state_and_script() {
+        let dir = std::env::temp_dir().join(format!("yard_destroy_{}", std::process::id()));
+        let state_dir = dir.join(".yard/state");
+
+        let job = make_job("glue", json!({"type": "glue", "script_name": "doomed"}));
+        let backend = StateBackend::Local {
+            path: state_dir.clone(),
+        };
+        let manifest = ProjectManifest {
+            project: "test".to_string(),
+            state: backend.clone(),
+            providers: HashMap::new(),
+            jobs: HashMap::from([("doomed".to_string(), job)]),
+        };
+
+        // Apply first to create state + script
+        apply(&manifest, &empty_state(), &dir, true).await.unwrap();
+        assert!(state_dir.join("doomed.json").exists());
+        assert!(dir.join(".yard/generated/doomed.py").exists());
+
+        // Destroy it
+        let destroyed =
+            destroy_job(&backend, &HashMap::new(), "doomed", &dir, true).await.unwrap();
+        assert!(destroyed);
+
+        // State and script should be gone
+        assert!(!state_dir.join("doomed.json").exists());
+        assert!(!dir.join(".yard/generated/doomed.py").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn destroy_job_nonexistent_returns_false() {
+        let dir = std::env::temp_dir().join(format!("yard_destroy_ne_{}", std::process::id()));
+        let backend = StateBackend::Local {
+            path: dir.join(".yard/state"),
+        };
+
+        let destroyed =
+            destroy_job(&backend, &HashMap::new(), "nope", &dir, true).await.unwrap();
+        assert!(!destroyed);
+    }
+
+    #[tokio::test]
+    async fn destroy_all_removes_everything() {
+        let dir = std::env::temp_dir().join(format!("yard_destroy_all_{}", std::process::id()));
+        let state_dir = dir.join(".yard/state");
+
+        let backend = StateBackend::Local {
+            path: state_dir.clone(),
+        };
+        let manifest = ProjectManifest {
+            project: "test".to_string(),
+            state: backend.clone(),
+            providers: HashMap::new(),
+            jobs: HashMap::from([
+                (
+                    "job_a".to_string(),
+                    make_job("glue", json!({"type": "glue", "script_name": "a"})),
+                ),
+                (
+                    "job_b".to_string(),
+                    make_job("glue", json!({"type": "glue", "script_name": "b"})),
+                ),
+            ]),
+        };
+
+        // Apply both
+        apply(&manifest, &empty_state(), &dir, true).await.unwrap();
+        assert!(state_dir.join("job_a.json").exists());
+        assert!(state_dir.join("job_b.json").exists());
+
+        // Destroy all
+        let result =
+            destroy_all(&backend, &HashMap::new(), &dir, true).await.unwrap();
+        let mut destroyed = result.destroyed.clone();
+        destroyed.sort();
+        assert_eq!(destroyed, vec!["job_a", "job_b"]);
+
+        // Everything should be gone
+        assert!(!state_dir.join("job_a.json").exists());
+        assert!(!state_dir.join("job_b.json").exists());
+        assert!(!dir.join(".yard/generated/job_a.py").exists());
+        assert!(!dir.join(".yard/generated/job_b.py").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

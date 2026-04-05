@@ -323,6 +323,39 @@ Applying changes for my-data-pipeline (dry run -- skipping provider deployment).
 State updated successfully.
 ```
 
+### `yard destroy [job_name] [directory] [--dry-run]`
+
+Tear down deployed jobs and remove their state. Without a job name, destroys all jobs in the project. For each job, YARD calls the provider's destroy method to remove cloud resources, deletes the state file, and removes the generated script.
+
+```
+$ yard destroy
+Destroying all jobs in my-project...
+  - Destroyed: orders
+  - Destroyed: customers
+  - Destroyed: enriched_orders
+
+All jobs destroyed.
+```
+
+To destroy a single job:
+
+```
+$ yard destroy orders
+  - Destroyed: orders
+```
+
+Use `--dry-run` to see what would be destroyed without tearing anything down:
+
+```
+$ yard destroy --dry-run
+Would destroy all jobs in my-project (dry run).
+  - Destroyed: orders
+  - Destroyed: customers
+  - Destroyed: enriched_orders
+
+All jobs destroyed.
+```
+
 ### `yard force-unlock <job_name> [directory]`
 
 Remove a stale lock on a job. This is an escape hatch for when a process dies mid-apply and leaves a lock behind.

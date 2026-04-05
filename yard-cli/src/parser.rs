@@ -37,6 +37,20 @@ pub enum Commands {
         directory: Option<String>,
     },
 
+    /// Destroy deployed jobs and remove state
+    Destroy {
+        /// Specific job to destroy (omit to destroy all)
+        #[arg(index = 1)]
+        job_name: Option<String>,
+
+        #[arg(index = 2)]
+        directory: Option<String>,
+
+        /// Skip provider teardown (state and local files only)
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Force-unlock a locked job
     ForceUnlock {
         /// The job name to unlock
