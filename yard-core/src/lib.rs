@@ -128,10 +128,10 @@ pub async fn apply(
     root_dir: &Path,
     dry_run: bool,
 ) -> Result<ApplyResult> {
-    // Validate all jobs up front — abort before making any changes
+    // Validate all jobs up front (schema + syntax) — abort before making any changes
     let mut all_errors: Vec<(String, Vec<yard_structs::ValidationError>)> = Vec::new();
     for (name, job_def) in &manifest.jobs {
-        let errors = validation::validate_job(job_def);
+        let errors = validation::validate_job_full(name, job_def);
         if !errors.is_empty() {
             all_errors.push((name.clone(), errors));
         }

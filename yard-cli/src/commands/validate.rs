@@ -14,7 +14,7 @@ pub async fn execute(directory: Option<String>) -> Result<()> {
 
     for name in job_names {
         let job_def = &project.manifest.jobs[name];
-        let errors = yard_core::validation::validate_job(job_def);
+        let errors = yard_core::validation::validate_job_full(name, job_def);
 
         if errors.is_empty() {
             println!("[PASS] {}.yaml", name);

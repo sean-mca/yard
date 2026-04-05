@@ -329,7 +329,7 @@ $ yard plan
 
 ### `yard validate [directory]`
 
-Validate all job definitions against the schema. Checks source types, required fields, transform references, and sink configuration.
+Validate all job definitions. Checks the schema (source types, required fields, transform references, sink configuration, provider-specific config) and then generates each script and validates it is syntactically valid Python. Requires `python3` on the path.
 
 ```bash
 $ yard validate
