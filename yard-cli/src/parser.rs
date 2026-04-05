@@ -26,4 +26,10 @@ pub enum Commands {
         #[arg(index = 1)]
         directory: Option<String>,
     },
+
+    /// Validate all job configurations
+    Validate {
+        #[arg(index = 1)]
+        directory: Option<String>,
+    },
 }

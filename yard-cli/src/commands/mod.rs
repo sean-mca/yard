@@ -1,6 +1,7 @@
 pub mod apply;
 pub mod init;
 pub mod plan;
+pub mod validate;
 
 use crate::utils::yaml_to_json;
 use anyhow::{Context, Result, anyhow};
