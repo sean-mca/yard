@@ -4,6 +4,7 @@ use aws_config::BehaviorVersion;
 use aws_sdk_glue::Client as GlueClient;
 use aws_sdk_s3::Client as S3Client;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use yard_structs::Resource;
@@ -13,47 +14,116 @@ pub struct GlueProvider {
     s3_client: S3Client,
     script_bucket: String,
     script_prefix: String,
-    deploy_role: Option<String>,
+    // Runtime defaults (from merged provider + job config)
+    glue_version: String,
+    worker_type: String,
+    number_of_workers: i32,
+    timeout: Option<i32>,
+    max_retries: Option<i32>,
+    max_concurrent_runs: Option<i32>,
+    bookmark: Option<String>,
+    connections: Vec<String>,
+    default_arguments: HashMap<String, String>,
 }
 
 impl GlueProvider {
-    pub async fn new(provider_config: &Value) -> Result<Self> {
-        let region = provider_config
+    pub async fn new(config: &Value) -> Result<Self> {
+        let region = config
             .get("region")
             .and_then(|v| v.as_str())
             .unwrap_or("us-east-1");
 
-        let script_bucket = provider_config
+        let script_bucket = config
             .get("script_bucket")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("providers.glue.script_bucket is required"))?
             .to_string();
 
-        let script_prefix = provider_config
+        let script_prefix = config
             .get("script_prefix")
             .and_then(|v| v.as_str())
             .unwrap_or("yard-scripts/")
             .to_string();
 
-        let deploy_role = provider_config
-            .get("role")
+        let glue_version = config
+            .get("glue_version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("4.0")
+            .to_string();
+
+        let worker_type = config
+            .get("worker_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("G.1X")
+            .to_string();
+
+        let number_of_workers = config
+            .get("number_of_workers")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(2) as i32;
+
+        let timeout = config
+            .get("timeout")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32);
+
+        let max_retries = config
+            .get("max_retries")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32);
+
+        let max_concurrent_runs = config
+            .get("max_concurrent_runs")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32);
+
+        let bookmark = config
+            .get("bookmark")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        let config = aws_config::defaults(BehaviorVersion::latest())
+        let connections = config
+            .get("connections")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let default_arguments = config
+            .get("default_arguments")
+            .and_then(|v| v.as_object())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let aws_config = aws_config::defaults(BehaviorVersion::latest())
             .region(aws_config::Region::new(region.to_string()))
             .load()
             .await;
 
-        let glue_client = GlueClient::new(&config);
-        let s3_client = S3Client::new(&config);
+        let glue_client = GlueClient::new(&aws_config);
+        let s3_client = S3Client::new(&aws_config);
 
         Ok(Self {
             glue_client,
             s3_client,
             script_bucket,
             script_prefix,
-            deploy_role,
+            glue_version,
+            worker_type,
+            number_of_workers,
+            timeout,
+            max_retries,
+            max_concurrent_runs,
+            bookmark,
+            connections,
+            default_arguments,
         })
     }
 
@@ -61,7 +131,6 @@ impl GlueProvider {
         let prefix = if self.script_prefix.ends_with('/') {
             &self.script_prefix
         } else {
-            // shouldn't happen given the default, but be safe
             return format!("{}/{}.py", self.script_prefix, job_name);
         };
         format!("{prefix}{job_name}.py")
@@ -78,7 +147,12 @@ impl GlueProvider {
             .content_type("text/x-python")
             .send()
             .await
-            .with_context(|| format!("Failed to upload script to s3://{}/{}", self.script_bucket, key))?;
+            .with_context(|| {
+                format!(
+                    "Failed to upload script to s3://{}/{}",
+                    self.script_bucket, key
+                )
+            })?;
 
         Ok(format!("s3://{}/{}", self.script_bucket, key))
     }
@@ -92,9 +166,33 @@ impl GlueProvider {
             .key(&key)
             .send()
             .await
-            .with_context(|| format!("Failed to delete script at s3://{}/{}", self.script_bucket, key))?;
+            .with_context(|| {
+                format!(
+                    "Failed to delete script at s3://{}/{}",
+                    self.script_bucket, key
+                )
+            })?;
 
         Ok(())
+    }
+
+    fn build_default_arguments(&self) -> HashMap<String, String> {
+        let mut args = self.default_arguments.clone();
+
+        // Wire bookmark setting into default arguments
+        if let Some(ref bookmark) = self.bookmark {
+            let enabled = matches!(bookmark.as_str(), "enabled" | "true");
+            args.insert(
+                "--job-bookmark-option".to_string(),
+                if enabled {
+                    "job-bookmark-enable".to_string()
+                } else {
+                    "job-bookmark-disable".to_string()
+                },
+            );
+        }
+
+        args
     }
 
     async fn create_or_update_glue_job(
@@ -106,22 +204,9 @@ impl GlueProvider {
         let execution_role = job_config
             .get("role")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("Job \"{job_name}\" requires a \"role\" (Glue execution role)"))?;
-
-        let glue_version = job_config
-            .get("glue_version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("4.0");
-
-        let worker_type = job_config
-            .get("worker_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("G.1X");
-
-        let num_workers = job_config
-            .get("number_of_workers")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(2) as i32;
+            .ok_or_else(|| {
+                anyhow!("Job \"{job_name}\" requires a \"role\" (Glue execution role)")
+            })?;
 
         let command = aws_sdk_glue::types::JobCommand::builder()
             .name("glueetl")
@@ -129,38 +214,94 @@ impl GlueProvider {
             .python_version("3")
             .build();
 
-        // Try update first, fall back to create
+        let default_args = self.build_default_arguments();
+
+        // Build the update first, fall back to create if job doesn't exist
+        let mut update_builder = aws_sdk_glue::types::JobUpdate::builder()
+            .role(execution_role)
+            .command(command.clone())
+            .glue_version(&self.glue_version)
+            .worker_type(aws_sdk_glue::types::WorkerType::from(
+                self.worker_type.as_str(),
+            ))
+            .number_of_workers(self.number_of_workers);
+
+        if let Some(timeout) = self.timeout {
+            update_builder = update_builder.timeout(timeout);
+        }
+        if let Some(max_retries) = self.max_retries {
+            update_builder = update_builder.max_retries(max_retries);
+        }
+        if let Some(max_concurrent) = self.max_concurrent_runs {
+            update_builder = update_builder.execution_property(
+                aws_sdk_glue::types::ExecutionProperty::builder()
+                    .max_concurrent_runs(max_concurrent)
+                    .build(),
+            );
+        }
+        if !self.connections.is_empty() {
+            update_builder = update_builder.connections(
+                aws_sdk_glue::types::ConnectionsList::builder()
+                    .set_connections(Some(self.connections.clone()))
+                    .build(),
+            );
+        }
+        for (k, v) in &default_args {
+            update_builder = update_builder.default_arguments(k.clone(), v.clone());
+        }
+
         let update_result = self
             .glue_client
             .update_job()
             .job_name(job_name)
-            .job_update(
-                aws_sdk_glue::types::JobUpdate::builder()
-                    .role(execution_role)
-                    .command(command.clone())
-                    .glue_version(glue_version)
-                    .worker_type(aws_sdk_glue::types::WorkerType::from(worker_type))
-                    .number_of_workers(num_workers)
-                    .build(),
-            )
+            .job_update(update_builder.build())
             .send()
             .await;
 
         match update_result {
             Ok(_) => Ok(()),
             Err(e) => {
-                // If the job doesn't exist, create it
                 if e.as_service_error()
                     .is_some_and(|se| se.is_entity_not_found_exception())
                 {
-                    self.glue_client
+                    let mut create_builder = self
+                        .glue_client
                         .create_job()
                         .name(job_name)
                         .role(execution_role)
                         .command(command)
-                        .glue_version(glue_version)
-                        .worker_type(aws_sdk_glue::types::WorkerType::from(worker_type))
-                        .number_of_workers(num_workers)
+                        .glue_version(&self.glue_version)
+                        .worker_type(aws_sdk_glue::types::WorkerType::from(
+                            self.worker_type.as_str(),
+                        ))
+                        .number_of_workers(self.number_of_workers);
+
+                    if let Some(timeout) = self.timeout {
+                        create_builder = create_builder.timeout(timeout);
+                    }
+                    if let Some(max_retries) = self.max_retries {
+                        create_builder = create_builder.max_retries(max_retries);
+                    }
+                    if let Some(max_concurrent) = self.max_concurrent_runs {
+                        create_builder = create_builder.execution_property(
+                            aws_sdk_glue::types::ExecutionProperty::builder()
+                                .max_concurrent_runs(max_concurrent)
+                                .build(),
+                        );
+                    }
+                    if !self.connections.is_empty() {
+                        create_builder = create_builder.connections(
+                            aws_sdk_glue::types::ConnectionsList::builder()
+                                .set_connections(Some(self.connections.clone()))
+                                .build(),
+                        );
+                    }
+                    for (k, v) in &default_args {
+                        create_builder =
+                            create_builder.default_arguments(k.clone(), v.clone());
+                    }
+
+                    create_builder
                         .send()
                         .await
                         .with_context(|| format!("Failed to create Glue job \"{job_name}\""))?;
@@ -196,14 +337,11 @@ impl Provider for GlueProvider {
         let job_config = job_config.clone();
 
         Box::pin(async move {
-            // 1. Upload script to S3
             let script_location = self.upload_script(&job_name, &artifact).await?;
 
-            // 2. Create or update the Glue job
             self.create_or_update_glue_job(&job_name, &script_location, &job_config)
                 .await?;
 
-            // 3. Return resources for state tracking
             Ok(vec![
                 Resource {
                     r#type: "s3_object".to_string(),
@@ -228,20 +366,12 @@ impl Provider for GlueProvider {
         let resources = resources.to_vec();
 
         Box::pin(async move {
-            // Delete the Glue job first, then clean up the script
             for resource in &resources {
-                match resource.r#type.as_str() {
-                    "glue_job" => {
-                        self.delete_glue_job(&resource.id).await?;
-                    }
-                    "s3_object" => {
-                        // Script cleanup handled below
-                    }
-                    _ => {}
+                if resource.r#type == "glue_job" {
+                    self.delete_glue_job(&resource.id).await?;
                 }
             }
 
-            // Delete the script from S3
             self.delete_script(&job_name).await?;
 
             Ok(())
