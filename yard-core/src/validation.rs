@@ -57,30 +57,30 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
         match source.source_type.as_str() {
             "s3" => {
                 if source.path.is_none() {
-                    errors.push(err(&format!("{prefix}"), "type \"s3\" requires \"path\""));
+                    errors.push(err(&prefix.to_string(), "type \"s3\" requires \"path\""));
                 }
             }
             "jdbc" => {
                 if source.connection_url.is_none() {
                     errors.push(err(
-                        &format!("{prefix}"),
+                        &prefix.to_string(),
                         "type \"jdbc\" requires \"connection_url\"",
                     ));
                 }
                 if source.table.is_none() {
-                    errors.push(err(&format!("{prefix}"), "type \"jdbc\" requires \"table\""));
+                    errors.push(err(&prefix.to_string(), "type \"jdbc\" requires \"table\""));
                 }
             }
             "catalog" => {
                 if source.database.is_none() {
                     errors.push(err(
-                        &format!("{prefix}"),
+                        &prefix.to_string(),
                         "type \"catalog\" requires \"database\"",
                     ));
                 }
                 if source.table.is_none() {
                     errors.push(err(
-                        &format!("{prefix}"),
+                        &prefix.to_string(),
                         "type \"catalog\" requires \"table\"",
                     ));
                 }
@@ -107,72 +107,67 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
         }
 
         // Reference checks
-        if let Some(ref src) = transform.source {
-            if !known_names.contains(src) {
-                errors.push(err(
-                    &format!("{prefix}.source"),
-                    &format!("\"{}\" does not reference a known source or transform output", src),
-                ));
-            }
+        if let Some(ref src) = transform.source
+            && !known_names.contains(src)
+        {
+            errors.push(err(
+                &format!("{prefix}.source"),
+                &format!(
+                    "\"{}\" does not reference a known source or transform output",
+                    src
+                ),
+            ));
         }
 
         match transform.transform_type.as_str() {
             "filter" => {
                 if transform.condition.is_none() {
                     errors.push(err(
-                        &format!("{prefix}"),
+                        &prefix.to_string(),
                         "type \"filter\" requires \"condition\"",
                     ));
                 }
             }
             "sql" => {
                 if transform.query.is_none() {
-                    errors.push(err(
-                        &format!("{prefix}"),
-                        "type \"sql\" requires \"query\"",
-                    ));
+                    errors.push(err(&prefix.to_string(), "type \"sql\" requires \"query\""));
                 }
             }
             "join" => {
-                if transform.left.is_none() {
-                    errors.push(err(
-                        &format!("{prefix}"),
-                        "type \"join\" requires \"left\"",
-                    ));
-                } else if !known_names.contains(transform.left.as_ref().unwrap()) {
-                    errors.push(err(
-                        &format!("{prefix}.left"),
-                        &format!(
-                            "\"{}\" does not reference a known source or transform output",
-                            transform.left.as_ref().unwrap()
-                        ),
-                    ));
+                if let Some(left) = &transform.left {
+                    if !known_names.contains(left) {
+                        errors.push(err(
+                            &format!("{prefix}.left"),
+                            &format!(
+                                "\"{}\" does not reference a known source or transform output",
+                                left
+                            ),
+                        ));
+                    }
+                } else {
+                    errors.push(err(&prefix.to_string(), "type \"join\" requires \"left\""));
                 }
-                if transform.right.is_none() {
-                    errors.push(err(
-                        &format!("{prefix}"),
-                        "type \"join\" requires \"right\"",
-                    ));
-                } else if !known_names.contains(transform.right.as_ref().unwrap()) {
-                    errors.push(err(
-                        &format!("{prefix}.right"),
-                        &format!(
-                            "\"{}\" does not reference a known source or transform output",
-                            transform.right.as_ref().unwrap()
-                        ),
-                    ));
+                if let Some(right) = &transform.right {
+                    if !known_names.contains(right) {
+                        errors.push(err(
+                            &format!("{prefix}.right"),
+                            &format!(
+                                "\"{}\" does not reference a known source or transform output",
+                                right
+                            ),
+                        ));
+                    }
+                } else {
+                    errors.push(err(&prefix.to_string(), "type \"join\" requires \"right\""));
                 }
                 if transform.on.is_none() {
-                    errors.push(err(
-                        &format!("{prefix}"),
-                        "type \"join\" requires \"on\"",
-                    ));
+                    errors.push(err(&prefix.to_string(), "type \"join\" requires \"on\""));
                 }
             }
             "drop_columns" | "select" => {
                 if transform.columns.is_empty() {
                     errors.push(err(
-                        &format!("{prefix}"),
+                        &prefix.to_string(),
                         &format!(
                             "type \"{}\" requires non-empty \"columns\"",
                             transform.transform_type
@@ -183,7 +178,7 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
             "rename" => {
                 if transform.mapping.is_empty() {
                     errors.push(err(
-                        &format!("{prefix}"),
+                        &prefix.to_string(),
                         "type \"rename\" requires non-empty \"mapping\"",
                     ));
                 }
@@ -191,13 +186,13 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
             "add_column" => {
                 if transform.name.is_none() {
                     errors.push(err(
-                        &format!("{prefix}"),
+                        &prefix.to_string(),
                         "type \"add_column\" requires \"name\"",
                     ));
                 }
                 if transform.expression.is_none() {
                     errors.push(err(
-                        &format!("{prefix}"),
+                        &prefix.to_string(),
                         "type \"add_column\" requires \"expression\"",
                     ));
                 }
@@ -227,16 +222,16 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
             ));
         }
 
-        if let Some(ref src) = sink.source {
-            if !known_names.contains(src) {
-                errors.push(err(
-                    "sink.source",
-                    &format!(
-                        "\"{}\" does not reference a known source or transform output",
-                        src
-                    ),
-                ));
-            }
+        if let Some(ref src) = sink.source
+            && !known_names.contains(src)
+        {
+            errors.push(err(
+                "sink.source",
+                &format!(
+                    "\"{}\" does not reference a known source or transform output",
+                    src
+                ),
+            ));
         }
 
         match sink.sink_type.as_str() {
@@ -266,10 +261,10 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
     }
 
     // Provider-specific config validation
-    if job.job_type == "glue" {
-        if let Some(glue_config) = job.config.get("glue") {
-            validate_glue_config(glue_config, &mut errors);
-        }
+    if job.job_type == "glue"
+        && let Some(glue_config) = job.config.get("glue")
+    {
+        validate_glue_config(glue_config, &mut errors);
     }
 
     errors
@@ -279,75 +274,75 @@ const VALID_WORKER_TYPES: &[&str] = &["G.025X", "G.1X", "G.2X", "G.4X", "G.8X", 
 const VALID_BOOKMARK_VALUES: &[&str] = &["enabled", "disabled"];
 
 fn validate_glue_config(config: &serde_json::Value, errors: &mut Vec<ValidationError>) {
-    if let Some(wt) = config.get("worker_type").and_then(|v| v.as_str()) {
-        if !VALID_WORKER_TYPES.contains(&wt) {
-            errors.push(err(
-                "glue.worker_type",
-                &format!(
-                    "\"{}\" is not a valid worker type (expected: {})",
-                    wt,
-                    VALID_WORKER_TYPES.join(", ")
-                ),
-            ));
-        }
+    if let Some(wt) = config.get("worker_type").and_then(|v| v.as_str())
+        && !VALID_WORKER_TYPES.contains(&wt)
+    {
+        errors.push(err(
+            "glue.worker_type",
+            &format!(
+                "\"{}\" is not a valid worker type (expected: {})",
+                wt,
+                VALID_WORKER_TYPES.join(", ")
+            ),
+        ));
     }
 
-    if let Some(n) = config.get("number_of_workers").and_then(|v| v.as_i64()) {
-        if n < 1 {
-            errors.push(err(
-                "glue.number_of_workers",
-                "must be at least 1",
-            ));
-        }
+    if let Some(n) = config.get("number_of_workers").and_then(|v| v.as_i64())
+        && n < 1
+    {
+        errors.push(err("glue.number_of_workers", "must be at least 1"));
     }
 
-    if let Some(v) = config.get("glue_version").and_then(|v| v.as_str()) {
-        if !["3.0", "4.0"].contains(&v) {
-            errors.push(err(
-                "glue.glue_version",
-                &format!("\"{}\" is not a supported Glue version (expected: 3.0, 4.0)", v),
-            ));
-        }
+    if let Some(v) = config.get("glue_version").and_then(|v| v.as_str())
+        && !["3.0", "4.0"].contains(&v)
+    {
+        errors.push(err(
+            "glue.glue_version",
+            &format!(
+                "\"{}\" is not a supported Glue version (expected: 3.0, 4.0)",
+                v
+            ),
+        ));
     }
 
-    if let Some(t) = config.get("timeout").and_then(|v| v.as_i64()) {
-        if t < 1 {
-            errors.push(err("glue.timeout", "must be at least 1 (minutes)"));
-        }
+    if let Some(t) = config.get("timeout").and_then(|v| v.as_i64())
+        && t < 1
+    {
+        errors.push(err("glue.timeout", "must be at least 1 (minutes)"));
     }
 
-    if let Some(r) = config.get("max_retries").and_then(|v| v.as_i64()) {
-        if r < 0 {
-            errors.push(err("glue.max_retries", "cannot be negative"));
-        }
+    if let Some(r) = config.get("max_retries").and_then(|v| v.as_i64())
+        && r < 0
+    {
+        errors.push(err("glue.max_retries", "cannot be negative"));
     }
 
-    if let Some(b) = config.get("bookmark").and_then(|v| v.as_str()) {
-        if !VALID_BOOKMARK_VALUES.contains(&b) {
-            errors.push(err(
-                "glue.bookmark",
-                &format!(
-                    "\"{}\" is not valid (expected: {})",
-                    b,
-                    VALID_BOOKMARK_VALUES.join(", ")
-                ),
-            ));
-        }
+    if let Some(b) = config.get("bookmark").and_then(|v| v.as_str())
+        && !VALID_BOOKMARK_VALUES.contains(&b)
+    {
+        errors.push(err(
+            "glue.bookmark",
+            &format!(
+                "\"{}\" is not valid (expected: {})",
+                b,
+                VALID_BOOKMARK_VALUES.join(", ")
+            ),
+        ));
     }
 
-    if let Some(conns) = config.get("connections") {
-        if !conns.is_array() {
-            errors.push(err("glue.connections", "must be an array of strings"));
-        }
+    if let Some(conns) = config.get("connections")
+        && !conns.is_array()
+    {
+        errors.push(err("glue.connections", "must be an array of strings"));
     }
 
-    if let Some(args) = config.get("default_arguments") {
-        if !args.is_object() {
-            errors.push(err(
-                "glue.default_arguments",
-                "must be a map of string keys to string values",
-            ));
-        }
+    if let Some(args) = config.get("default_arguments")
+        && !args.is_object()
+    {
+        errors.push(err(
+            "glue.default_arguments",
+            "must be a map of string keys to string values",
+        ));
     }
 }
 
@@ -470,7 +465,11 @@ mod tests {
             secret_id: None,
         }];
         let errors = validate_job(&job);
-        assert!(errors.iter().any(|e| e.message.contains("requires \"path\"")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("requires \"path\""))
+        );
     }
 
     #[test]
@@ -487,10 +486,16 @@ mod tests {
             secret_id: None,
         }];
         let errors = validate_job(&job);
-        assert!(errors
-            .iter()
-            .any(|e| e.message.contains("requires \"connection_url\"")));
-        assert!(errors.iter().any(|e| e.message.contains("requires \"table\"")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("requires \"connection_url\""))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("requires \"table\""))
+        );
     }
 
     #[test]
@@ -507,10 +512,16 @@ mod tests {
             secret_id: None,
         }];
         let errors = validate_job(&job);
-        assert!(errors
-            .iter()
-            .any(|e| e.message.contains("requires \"database\"")));
-        assert!(errors.iter().any(|e| e.message.contains("requires \"table\"")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("requires \"database\""))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("requires \"table\""))
+        );
     }
 
     // --- Transform types ---
@@ -558,9 +569,11 @@ mod tests {
             how: None,
         }];
         let errors = validate_job(&job);
-        assert!(errors
-            .iter()
-            .any(|e| e.message.contains("requires \"condition\"")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("requires \"condition\""))
+        );
     }
 
     #[test]
@@ -582,9 +595,11 @@ mod tests {
             how: None,
         }];
         let errors = validate_job(&job);
-        assert!(errors
-            .iter()
-            .any(|e| e.message.contains("requires \"query\"")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("requires \"query\""))
+        );
     }
 
     #[test]
@@ -606,15 +621,17 @@ mod tests {
             how: None,
         }];
         let errors = validate_job(&job);
-        assert!(errors
-            .iter()
-            .any(|e| e.message.contains("requires \"left\"")));
-        assert!(errors
-            .iter()
-            .any(|e| e.message.contains("requires \"right\"")));
-        assert!(errors
-            .iter()
-            .any(|e| e.message.contains("requires \"on\"")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("requires \"left\""))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("requires \"right\""))
+        );
+        assert!(errors.iter().any(|e| e.message.contains("requires \"on\"")));
     }
 
     #[test]
@@ -636,9 +653,11 @@ mod tests {
             how: None,
         }];
         let errors = validate_job(&job);
-        assert!(errors
-            .iter()
-            .any(|e| e.message.contains("requires non-empty \"columns\"")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("requires non-empty \"columns\""))
+        );
     }
 
     #[test]
@@ -660,9 +679,11 @@ mod tests {
             how: None,
         }];
         let errors = validate_job(&job);
-        assert!(errors
-            .iter()
-            .any(|e| e.message.contains("requires non-empty \"mapping\"")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("requires non-empty \"mapping\""))
+        );
     }
 
     #[test]
@@ -684,12 +705,16 @@ mod tests {
             how: None,
         }];
         let errors = validate_job(&job);
-        assert!(errors
-            .iter()
-            .any(|e| e.message.contains("requires \"name\"")));
-        assert!(errors
-            .iter()
-            .any(|e| e.message.contains("requires \"expression\"")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("requires \"name\""))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("requires \"expression\""))
+        );
     }
 
     // --- Sink validation ---
@@ -729,7 +754,11 @@ mod tests {
             partition_by: vec![],
         });
         let errors = validate_job(&job);
-        assert!(errors.iter().any(|e| e.message.contains("requires \"path\"")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("requires \"path\""))
+        );
     }
 
     // --- Reference checking ---
@@ -763,10 +792,11 @@ mod tests {
             how: None,
         }];
         let errors = validate_job(&job);
-        assert!(errors
-            .iter()
-            .any(|e| e.field == "transforms[0].source"
-                && e.message.contains("nonexistent")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "transforms[0].source" && e.message.contains("nonexistent"))
+        );
     }
 
     #[test]
@@ -785,9 +815,11 @@ mod tests {
             partition_by: vec![],
         });
         let errors = validate_job(&job);
-        assert!(errors
-            .iter()
-            .any(|e| e.field == "sink.source" && e.message.contains("nonexistent")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "sink.source" && e.message.contains("nonexistent"))
+        );
     }
 
     #[test]
@@ -819,9 +851,11 @@ mod tests {
             how: None,
         }];
         let errors = validate_job(&job);
-        assert!(errors
-            .iter()
-            .any(|e| e.field == "transforms[0].right" && e.message.contains("ghost")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "transforms[0].right" && e.message.contains("ghost"))
+        );
     }
 
     #[test]

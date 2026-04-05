@@ -54,7 +54,13 @@ impl Storage {
             }
             Storage::S3(s) => {
                 let key = format!("{}{job_name}.json", s.prefix);
-                let result = s.client.get_object().bucket(&s.bucket).key(&key).send().await;
+                let result = s
+                    .client
+                    .get_object()
+                    .bucket(&s.bucket)
+                    .key(&key)
+                    .send()
+                    .await;
 
                 match result {
                     Ok(resp) => {
@@ -134,10 +140,10 @@ impl Storage {
                 let mut entries = tokio::fs::read_dir(&s.path).await?;
                 while let Some(entry) = entries.next_entry().await? {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    if let Some(job_name) = name.strip_suffix(".json") {
-                        if !job_name.ends_with(".lock") {
-                            jobs.push(job_name.to_string());
-                        }
+                    if let Some(job_name) = name.strip_suffix(".json")
+                        && !job_name.ends_with(".lock")
+                    {
+                        jobs.push(job_name.to_string());
                     }
                 }
                 Ok(jobs)
@@ -155,10 +161,11 @@ impl Storage {
                 for obj in resp.contents() {
                     if let Some(key) = obj.key() {
                         let relative = key.strip_prefix(&s.prefix).unwrap_or(key);
-                        if let Some(job_name) = relative.strip_suffix(".json") {
-                            if !job_name.ends_with(".lock") && !job_name.contains('/') {
-                                jobs.push(job_name.to_string());
-                            }
+                        if let Some(job_name) = relative.strip_suffix(".json")
+                            && !job_name.ends_with(".lock")
+                            && !job_name.contains('/')
+                        {
+                            jobs.push(job_name.to_string());
                         }
                     }
                 }
@@ -291,7 +298,13 @@ impl Storage {
             }
             Storage::S3(s) => {
                 let key = format!("{}{job_name}.json.lock", s.prefix);
-                let result = s.client.get_object().bucket(&s.bucket).key(&key).send().await;
+                let result = s
+                    .client
+                    .get_object()
+                    .bucket(&s.bucket)
+                    .key(&key)
+                    .send()
+                    .await;
                 match result {
                     Ok(resp) => {
                         let data = resp.body.collect().await?.into_bytes();
@@ -316,7 +329,11 @@ impl Storage {
 pub async fn get_storage(backend: &StateBackend) -> Result<Storage> {
     match backend {
         StateBackend::Local { path } => Ok(Storage::Local(LocalStorage { path: path.clone() })),
-        StateBackend::S3 { bucket, key, region } => {
+        StateBackend::S3 {
+            bucket,
+            key,
+            region,
+        } => {
             let config = aws_config::defaults(BehaviorVersion::latest())
                 .region(aws_config::Region::new(region.clone()))
                 .load()

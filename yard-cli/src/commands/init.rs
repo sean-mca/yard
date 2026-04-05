@@ -17,7 +17,7 @@ pub async fn execute(directory: Option<String>) -> Result<()> {
     let docs =
         YamlLoader::load_from_str(&content).map_err(|e| anyhow!("YAML Scan Error: {}", e))?;
 
-    let doc = docs.get(0).ok_or_else(|| anyhow!("yard.yaml is empty"))?;
+    let doc = docs.first().ok_or_else(|| anyhow!("yard.yaml is empty"))?;
 
     let project = doc["project"]
         .as_str()
@@ -44,10 +44,7 @@ pub async fn execute(directory: Option<String>) -> Result<()> {
                 .as_str()
                 .unwrap_or("us-east-1")
                 .to_string(),
-            key: state_node["key"]
-                .as_str()
-                .unwrap_or("state/")
-                .to_string(),
+            key: state_node["key"].as_str().unwrap_or("state/").to_string(),
         },
         _ => return Err(anyhow!("Unsupported state type: {}", state_type)),
     };

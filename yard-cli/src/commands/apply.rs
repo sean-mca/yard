@@ -46,9 +46,13 @@ pub async fn execute(directory: Option<String>, dry_run: bool, auto_approve: boo
 
     println!("\nApplying...");
 
-    let result =
-        yard_core::apply(&project.manifest, &project.current_state, &project.root_dir, dry_run)
-            .await?;
+    let result = yard_core::apply(
+        &project.manifest,
+        &project.current_state,
+        &project.root_dir,
+        dry_run,
+    )
+    .await?;
 
     for name in &result.created {
         println!("  + Created: {}", name);

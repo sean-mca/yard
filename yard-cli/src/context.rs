@@ -20,7 +20,7 @@ pub fn find_and_parse_context(start_path: &Path, filename: &str, required: bool)
                 .map_err(|e| anyhow!("YAML Scan Error in {}: {}", target.display(), e))?;
 
             let doc = docs
-                .get(0)
+                .first()
                 .ok_or_else(|| anyhow!("{} is empty", target.display()))?;
 
             return Ok(utils::yaml_to_json(doc));
@@ -79,10 +79,7 @@ mod tests {
 
     fn make_temp_dir() -> PathBuf {
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "yard_ctx_{}_{id}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("yard_ctx_{}_{id}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
