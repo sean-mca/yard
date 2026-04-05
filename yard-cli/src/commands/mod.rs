@@ -163,19 +163,5 @@ fn discover_jobs(search_root: &PathBuf) -> Result<HashMap<String, JobDefinition>
 }
 
 async fn load_state(backend: &StateBackend, project: &str) -> Result<ProjectState> {
-    let storage = yard_core::storage::get_storage(backend).await?;
-    let job_names = storage.list_jobs().await?;
-    let mut deployments = HashMap::new();
-
-    for name in job_names {
-        if let Some(job_state) = storage.read_job(&name).await? {
-            deployments.insert(name, job_state.deployment);
-        }
-    }
-
-    Ok(ProjectState {
-        project: project.to_string(),
-        last_updated: chrono::Utc::now().to_rfc3339(),
-        deployments,
-    })
+    yard_core::load_state(backend, project).await
 }

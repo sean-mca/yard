@@ -13,6 +13,41 @@ use yard_structs::{
     Transform,
 };
 
+/// Load the current project state by reading all per-job state files.
+/// Errors (permissions, network, corrupt files) are propagated — only
+/// genuinely missing state is treated as "no deployments yet."
+pub async fn load_state(
+    backend: &yard_structs::StateBackend,
+    project: &str,
+) -> Result<ProjectState> {
+    let storage = storage::get_storage(backend)
+        .await
+        .context("Failed to initialize state backend")?;
+
+    let job_names = storage
+        .list_jobs()
+        .await
+        .context("Failed to list jobs from state backend. Check permissions and connectivity.")?;
+
+    let mut deployments = HashMap::new();
+    for name in job_names {
+        let job_state = storage
+            .read_job(&name)
+            .await
+            .with_context(|| format!("Failed to read state for job \"{name}\". The state file may be corrupt."))?;
+
+        if let Some(state) = job_state {
+            deployments.insert(name, state.deployment);
+        }
+    }
+
+    Ok(ProjectState {
+        project: project.to_string(),
+        last_updated: chrono::Utc::now().to_rfc3339(),
+        deployments,
+    })
+}
+
 /// Compute the diff between the manifest and the current state.
 /// Used by both plan (read-only) and apply (before executing changes).
 pub fn calculate_diff(manifest: &ProjectManifest, state: &ProjectState) -> Vec<JobDiff> {
