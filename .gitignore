@@ -3,3 +3,6 @@ target/
 
 yard.yaml
 .yard/
+
+
+.DS_Store
