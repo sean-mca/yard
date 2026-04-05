@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  check:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        id: fmt
+        run: cargo fmt --all -- --check 2>&1 | tee /tmp/fmt.txt
+        continue-on-error: true
+
+      - name: Run clippy
+        id: clippy
+        run: cargo clippy --all-targets -- -D warnings 2>&1 | tee /tmp/clippy.txt
+        continue-on-error: true
+
+      - name: Run tests
+        id: tests
+        run: cargo test 2>&1 | tee /tmp/tests.txt
+        continue-on-error: true
+
+      - name: Post PR comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            const fmtOk = '${{ steps.fmt.outcome }}' === 'success';
+            const clippyOk = '${{ steps.clippy.outcome }}' === 'success';
+            const testsOk = '${{ steps.tests.outcome }}' === 'success';
+            const allOk = fmtOk && clippyOk && testsOk;
+
+            const icon = (ok) => ok ? ':white_check_mark:' : ':x:';
+
+            let body = allOk
+              ? `## ${icon(true)} CI Passed\n\n`
+              : `## ${icon(false)} CI Failed\n\n`;
+
+            body += `| Check | Status |\n|-------|--------|\n`;
+            body += `| Formatting | ${icon(fmtOk)} |\n`;
+            body += `| Clippy | ${icon(clippyOk)} |\n`;
+            body += `| Tests | ${icon(testsOk)} |\n`;
+
+            if (!fmtOk) {
+              const fmt = fs.readFileSync('/tmp/fmt.txt', 'utf8').trim();
+              body += `\n<details><summary>Formatting output</summary>\n\n\`\`\`\n${fmt}\n\`\`\`\n</details>\n`;
+            }
+
+            if (!clippyOk) {
+              const clippy = fs.readFileSync('/tmp/clippy.txt', 'utf8').trim();
+              body += `\n<details><summary>Clippy output</summary>\n\n\`\`\`\n${clippy}\n\`\`\`\n</details>\n`;
+            }
+
+            if (!testsOk) {
+              const tests = fs.readFileSync('/tmp/tests.txt', 'utf8').trim();
+              body += `\n<details><summary>Test output</summary>\n\n\`\`\`\n${tests}\n\`\`\`\n</details>\n`;
+            }
+
+            // Find and update existing CI comment, or create new one
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const botComment = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('CI Passed') || c.body.includes('CI Failed')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Fail if any check failed
+        if: steps.fmt.outcome == 'failure' || steps.clippy.outcome == 'failure' || steps.tests.outcome == 'failure'
+        run: exit 1

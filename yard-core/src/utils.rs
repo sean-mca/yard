@@ -104,7 +104,7 @@ mod tests {
     #[test]
     fn json_hash_stable_regardless_of_key_order() {
         let a = json!({"x": 1, "y": 2});
-        let b = json!({"y": 2, "x": 1});
+        let _b = json!({"y": 2, "x": 1});
         // serde_json serialization of Value is key-order dependent,
         // but these were constructed with the same underlying BTreeMap-like order.
         // This test documents the current behavior.

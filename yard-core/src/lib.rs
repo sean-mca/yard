@@ -49,10 +49,9 @@ pub async fn load_state(
 
     let mut deployments = HashMap::new();
     for name in job_names {
-        let job_state = storage
-            .read_job(&name)
-            .await
-            .with_context(|| format!("Failed to read state for job \"{name}\". The state file may be corrupt."))?;
+        let job_state = storage.read_job(&name).await.with_context(|| {
+            format!("Failed to read state for job \"{name}\". The state file may be corrupt.")
+        })?;
 
         if let Some(state) = job_state {
             deployments.insert(name, state.deployment);
@@ -179,9 +178,7 @@ pub async fn apply(
 
                     // Deploy via provider if configured (skip in dry-run mode)
                     let resources = if !dry_run {
-                        if let Some(provider_defaults) =
-                            manifest.providers.get(&job_def.job_type)
-                        {
+                        if let Some(provider_defaults) = manifest.providers.get(&job_def.job_type) {
                             // Merge provider defaults with job-level overrides
                             let job_overrides = job_def
                                 .config
@@ -191,12 +188,11 @@ pub async fn apply(
                             let merged_config =
                                 merge_provider_config(provider_defaults, &job_overrides);
 
-                            let provider = providers::get_provider(
-                                &job_def.job_type,
-                                &merged_config,
-                            )
-                            .await?;
-                            provider.deploy(&diff.name, &script_content, &job_def.config).await?
+                            let provider =
+                                providers::get_provider(&job_def.job_type, &merged_config).await?;
+                            provider
+                                .deploy(&diff.name, &script_content, &job_def.config)
+                                .await?
                         } else {
                             Vec::new()
                         }
@@ -238,28 +234,27 @@ pub async fn apply(
                 }
                 DiffType::Delete => {
                     // Destroy via provider if configured and resources exist (skip in dry-run)
-                    if !dry_run {
-                        if let Some(existing) = current_state.deployments.get(&diff.name) {
-                            if !existing.resources.is_empty() {
-                                let job_type = existing
-                                    .config
-                                    .get("type")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown");
+                    if !dry_run
+                        && let Some(existing) = current_state.deployments.get(&diff.name)
+                        && !existing.resources.is_empty()
+                    {
+                        let job_type = existing
+                            .config
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
 
-                                if let Some(provider_defaults) = manifest.providers.get(job_type) {
-                                    let job_overrides = existing
-                                        .config
-                                        .get(job_type)
-                                        .unwrap_or(&Value::Null)
-                                        .clone();
-                                    let merged_config =
-                                        merge_provider_config(provider_defaults, &job_overrides);
-                                    let provider =
-                                        providers::get_provider(job_type, &merged_config).await?;
-                                    provider.destroy(&diff.name, &existing.resources).await?;
-                                }
-                            }
+                        if let Some(provider_defaults) = manifest.providers.get(job_type) {
+                            let job_overrides = existing
+                                .config
+                                .get(job_type)
+                                .unwrap_or(&Value::Null)
+                                .clone();
+                            let merged_config =
+                                merge_provider_config(provider_defaults, &job_overrides);
+                            let provider =
+                                providers::get_provider(job_type, &merged_config).await?;
+                            provider.destroy(&diff.name, &existing.resources).await?;
                         }
                     }
 
@@ -427,7 +422,10 @@ pub async fn destroy_all(
 
 /// Extract optional body override from a job config.
 pub fn parse_body(config: &Value) -> Option<String> {
-    config.get("body").and_then(|v| v.as_str()).map(|s| s.to_string())
+    config
+        .get("body")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Extract imports from a job config's "imports" array.
@@ -439,7 +437,10 @@ pub fn parse_imports(config: &Value) -> Vec<Import> {
                 Some(n) => n.to_string(),
                 None => continue,
             };
-            let from = item.get("from").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let from = item
+                .get("from")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             imports.push(Import { name, from });
         }
     }
@@ -499,10 +500,10 @@ pub fn parse_sources(config: &Value) -> Vec<Source> {
             .collect();
     }
     // Fall back to `source:` (single)
-    if let Some(src) = config.get("source") {
-        if let Some(parsed) = parse_single_source(src, "source") {
-            return vec![parsed];
-        }
+    if let Some(src) = config.get("source")
+        && let Some(parsed) = parse_single_source(src, "source")
+    {
+        return vec![parsed];
     }
     vec![]
 }
@@ -771,7 +772,9 @@ mod tests {
         let job = make_job("glue", json!({"type": "glue", "script_name": "new_job"}));
         let manifest = ProjectManifest {
             project: "test".to_string(),
-            state: StateBackend::Local { path: state_dir.clone() },
+            state: StateBackend::Local {
+                path: state_dir.clone(),
+            },
             providers: HashMap::new(),
             jobs: HashMap::from([("new_job".to_string(), job)]),
         };
@@ -819,8 +822,9 @@ mod tests {
         assert!(dir.join(".yard/generated/doomed.py").exists());
 
         // Destroy it
-        let destroyed =
-            destroy_job(&backend, &HashMap::new(), "doomed", &dir, true).await.unwrap();
+        let destroyed = destroy_job(&backend, &HashMap::new(), "doomed", &dir, true)
+            .await
+            .unwrap();
         assert!(destroyed);
 
         // State and script should be gone
@@ -837,8 +841,9 @@ mod tests {
             path: dir.join(".yard/state"),
         };
 
-        let destroyed =
-            destroy_job(&backend, &HashMap::new(), "nope", &dir, true).await.unwrap();
+        let destroyed = destroy_job(&backend, &HashMap::new(), "nope", &dir, true)
+            .await
+            .unwrap();
         assert!(!destroyed);
     }
 
@@ -872,8 +877,9 @@ mod tests {
         assert!(state_dir.join("job_b.json").exists());
 
         // Destroy all
-        let result =
-            destroy_all(&backend, &HashMap::new(), &dir, true).await.unwrap();
+        let result = destroy_all(&backend, &HashMap::new(), &dir, true)
+            .await
+            .unwrap();
         let mut destroyed = result.destroyed.clone();
         destroyed.sort();
         assert_eq!(destroyed, vec!["job_a", "job_b"]);
@@ -905,7 +911,12 @@ mod tests {
 
         let result = apply(&manifest, &empty_state(), &dir, true).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Validation failed"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Validation failed")
+        );
 
         // No state or scripts should have been created
         assert!(!state_dir.exists());

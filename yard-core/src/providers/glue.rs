@@ -297,8 +297,7 @@ impl GlueProvider {
                         );
                     }
                     for (k, v) in &default_args {
-                        create_builder =
-                            create_builder.default_arguments(k.clone(), v.clone());
+                        create_builder = create_builder.default_arguments(k.clone(), v.clone());
                     }
 
                     create_builder

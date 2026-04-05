@@ -33,7 +33,7 @@ pub async fn resolve_project(directory: Option<String>) -> Result<ResolvedProjec
     let root_content = fs::read_to_string(&root_path)?;
     let root_docs = YamlLoader::load_from_str(&root_content)?;
     let root_doc = root_docs
-        .get(0)
+        .first()
         .ok_or_else(|| anyhow!("yard.yaml is empty"))?;
 
     // 2. EXTRACT GLOBAL CONFIG
@@ -53,10 +53,7 @@ pub async fn resolve_project(directory: Option<String>) -> Result<ResolvedProjec
                 .as_str()
                 .unwrap_or("us-east-1")
                 .to_string(),
-            key: state_node["key"]
-                .as_str()
-                .unwrap_or("state/")
-                .to_string(),
+            key: state_node["key"].as_str().unwrap_or("state/").to_string(),
         },
         _ => return Err(anyhow!("Unsupported state type in root")),
     };
@@ -104,7 +101,7 @@ fn discover_jobs(search_root: &PathBuf) -> Result<HashMap<String, JobDefinition>
     for entry in walkdir::WalkDir::new(search_root)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "yaml"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "yaml"))
     {
         let path = entry.path();
         let file_name = path.file_name().unwrap().to_str().unwrap();
@@ -133,7 +130,7 @@ fn discover_jobs(search_root: &PathBuf) -> Result<HashMap<String, JobDefinition>
 
         let job_docs = YamlLoader::load_from_str(&resolved_job_str)?;
         let job_doc = job_docs
-            .get(0)
+            .first()
             .ok_or_else(|| anyhow!("Job file {} is empty", file_name))?;
 
         let job_name = file_name.replace(".yaml", "");

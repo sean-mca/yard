@@ -28,7 +28,10 @@ fn render_source(source: &Source) -> String {
     let mut lines = Vec::new();
 
     if let Some(secret_id) = &source.secret_id {
-        lines.push(render_secret_fetch(secret_id, &format!("{}_source", source.name)));
+        lines.push(render_secret_fetch(
+            secret_id,
+            &format!("{}_source", source.name),
+        ));
     }
 
     let secret_var = format!("{}_source_secret", source.name);
@@ -83,18 +86,16 @@ fn render_sources(sources: &[Source]) -> String {
 // --- Transform rendering (now with named dataframes) ---
 
 fn resolve_df(transform: &Transform, default_source: &str) -> (String, String) {
-    let input = transform
-        .source
-        .as_deref()
-        .unwrap_or(default_source);
-    let output = transform
-        .output
-        .as_deref()
-        .unwrap_or(input);
+    let input = transform.source.as_deref().unwrap_or(default_source);
+    let output = transform.output.as_deref().unwrap_or(input);
     (format!("df_{input}"), format!("df_{output}"))
 }
 
-fn render_transform(transform: &Transform, default_source: &str, all_source_names: &[String]) -> String {
+fn render_transform(
+    transform: &Transform,
+    default_source: &str,
+    all_source_names: &[String],
+) -> String {
     match transform.transform_type.as_str() {
         "filter" => {
             let (input, output) = resolve_df(transform, default_source);
@@ -102,12 +103,13 @@ fn render_transform(transform: &Transform, default_source: &str, all_source_name
             format!("    {output} = {input}.filter({condition})")
         }
         "sql" => {
-            let output_name = transform
-                .output
-                .as_deref()
-                .unwrap_or(default_source);
+            let output_name = transform.output.as_deref().unwrap_or(default_source);
             let output_var = format!("df_{output_name}");
-            let query = transform.query.as_deref().unwrap_or("SELECT * FROM source").trim();
+            let query = transform
+                .query
+                .as_deref()
+                .unwrap_or("SELECT * FROM source")
+                .trim();
             let mut lines = Vec::new();
             // Register all named sources as temp views
             for name in all_source_names {
@@ -121,14 +123,9 @@ fn render_transform(transform: &Transform, default_source: &str, all_source_name
             let right = transform.right.as_deref().unwrap_or("MISSING_RIGHT");
             let on_col = transform.on.as_deref().unwrap_or("MISSING_ON");
             let how = transform.how.as_deref().unwrap_or("inner");
-            let output_name = transform
-                .output
-                .as_deref()
-                .unwrap_or(left);
+            let output_name = transform.output.as_deref().unwrap_or(left);
             let output_var = format!("df_{output_name}");
-            format!(
-                "    {output_var} = df_{left}.join(df_{right}, on=\"{on_col}\", how=\"{how}\")"
-            )
+            format!("    {output_var} = df_{left}.join(df_{right}, on=\"{on_col}\", how=\"{how}\")")
         }
         "drop_columns" => {
             let (input, output) = resolve_df(transform, default_source);
@@ -171,7 +168,11 @@ fn render_transform(transform: &Transform, default_source: &str, all_source_name
         "add_column" => {
             let (input, output) = resolve_df(transform, default_source);
             let name = transform.name.as_deref().unwrap_or("MISSING_NAME").trim();
-            let expr = transform.expression.as_deref().unwrap_or("lit(None)").trim();
+            let expr = transform
+                .expression
+                .as_deref()
+                .unwrap_or("lit(None)")
+                .trim();
             format!("    {output} = {input}.withColumn(\"{name}\", {expr})")
         }
         _ => {
@@ -183,7 +184,11 @@ fn render_transform(transform: &Transform, default_source: &str, all_source_name
     }
 }
 
-fn render_transforms(transforms: &[Transform], default_source: &str, all_source_names: &[String]) -> String {
+fn render_transforms(
+    transforms: &[Transform],
+    default_source: &str,
+    all_source_names: &[String],
+) -> String {
     transforms
         .iter()
         .map(|t| render_transform(t, default_source, all_source_names))
@@ -334,17 +339,22 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
     } else {
         let mut parts = Vec::new();
         if !job_def.sources.is_empty() {
-            parts.push(format!("    # --- Sources ---\n{}", render_sources(&job_def.sources)));
+            parts.push(format!(
+                "    # --- Sources ---\n{}",
+                render_sources(&job_def.sources)
+            ));
         }
         if !job_def.transforms.is_empty() {
-            parts.push(format!("    # --- Transforms ---\n{}", render_transforms(
-                &job_def.transforms,
-                default_source,
-                &all_source_names,
-            )));
+            parts.push(format!(
+                "    # --- Transforms ---\n{}",
+                render_transforms(&job_def.transforms, default_source, &all_source_names,)
+            ));
         }
         if let Some(sink) = &job_def.sink {
-            parts.push(format!("    # --- Sink ---\n{}", render_sink(sink, default_source)));
+            parts.push(format!(
+                "    # --- Sink ---\n{}",
+                render_sink(sink, default_source)
+            ));
         }
         if parts.is_empty() {
             "    pass".to_string()
@@ -435,7 +445,11 @@ mod tests {
         let mut job = base_job();
         job.sources = vec![s3_source("events", "s3://bucket/events/")];
         let script = generate_python_script("test_job", &job).unwrap();
-        assert!(script.contains("df_events = spark.read.format(\"parquet\").load(\"s3://bucket/events/\")"));
+        assert!(
+            script.contains(
+                "df_events = spark.read.format(\"parquet\").load(\"s3://bucket/events/\")"
+            )
+        );
     }
 
     #[test]
@@ -545,7 +559,9 @@ mod tests {
             source: None,
             output: Some("enriched".to_string()),
             condition: None,
-            query: Some("SELECT o.*, c.name FROM orders o JOIN customers c ON o.cid = c.id".to_string()),
+            query: Some(
+                "SELECT o.*, c.name FROM orders o JOIN customers c ON o.cid = c.id".to_string(),
+            ),
             columns: vec![],
             mapping: HashMap::new(),
             name: None,
