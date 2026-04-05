@@ -3,6 +3,7 @@ pub mod destroy;
 pub mod force_unlock;
 pub mod init;
 pub mod plan;
+pub mod show;
 pub mod validate;
 
 use crate::utils::yaml_to_json;
