@@ -5,6 +5,14 @@ use clap::{Parser, Subcommand};
 #[command(about = "YAML Architecture for Rapid Development", long_about = None)]
 #[command(version)]
 pub struct Cli {
+    /// Disable colored output
+    #[arg(long, global = true)]
+    pub no_color: bool,
+
+    /// Use colorblind-friendly palette (cyan/blue/magenta instead of green/yellow/red)
+    #[arg(long, global = true)]
+    pub colorblind: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -20,6 +28,10 @@ pub enum Commands {
     Plan {
         #[arg(index = 1)]
         directory: Option<String>,
+
+        /// Only plan a specific job
+        #[arg(long)]
+        target: Option<String>,
     },
 
     Apply {
@@ -33,6 +45,10 @@ pub enum Commands {
         /// Skip confirmation prompt
         #[arg(long)]
         auto_approve: bool,
+
+        /// Only apply a specific job
+        #[arg(long)]
+        target: Option<String>,
     },
 
     /// Show the generated script for a job

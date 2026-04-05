@@ -9,14 +9,24 @@ use clap::Parser;
 pub async fn run() -> Result<()> {
     let cli = parser::Cli::parse();
 
+    // Respect --no-color flag and NO_COLOR env var (https://no-color.org)
+    if cli.no_color || std::env::var("NO_COLOR").is_ok() {
+        utils::disable_color();
+    } else if cli.colorblind {
+        utils::enable_colorblind_mode();
+    }
+
     match cli.command {
         parser::Commands::Init { directory } => commands::init::execute(directory).await?,
-        parser::Commands::Plan { directory } => commands::plan::execute(directory).await?,
+        parser::Commands::Plan { directory, target } => {
+            commands::plan::execute(directory, target).await?
+        }
         parser::Commands::Apply {
             directory,
             dry_run,
             auto_approve,
-        } => commands::apply::execute(directory, dry_run, auto_approve).await?,
+            target,
+        } => commands::apply::execute(directory, dry_run, auto_approve, target).await?,
         parser::Commands::Show {
             job_name,
             directory,

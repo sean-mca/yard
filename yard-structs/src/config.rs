@@ -15,7 +15,7 @@ pub enum StateBackend {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProjectManifest {
     pub project: String,
     pub state: StateBackend,

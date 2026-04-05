@@ -315,6 +315,8 @@ if __name__ == "__main__":
 
 ## CLI commands
 
+All commands support `--no-color` to disable colored output, and `--colorblind` to use a palette distinguishable for red/green color vision deficiency (cyan/blue/magenta instead of green/yellow/red). The `NO_COLOR` environment variable is also respected.
+
 ### `yard init [directory]`
 
 Initialize per-job state files for all jobs in the project. Skips jobs that already have state.
@@ -326,17 +328,26 @@ Initialized state for job "customers".
 Initialized state for job "enriched_orders".
 ```
 
-### `yard plan [directory]`
+### `yard plan [directory] [--target <job_name>]`
 
-Show what would change without modifying anything. Compares the current YAML definitions against stored state.
+Show what would change without modifying anything. Compares the current YAML definitions against stored state. Use `--target` to scope to a single job.
 
-```bash
+```
 $ yard plan
---- Plan for my-data-pipeline ---
-+ Create job [orders] (a1b2c3...)
-~ Modify job [customers]
-    script_name : "v1" -> "v2"
-- Delete job [old_job]
+--- Plan for my-project ---
+
+  + Create job [orders]
+  ~ Modify job [customers]
+      script_name : "v1" -> "v2"
+  - Delete job [old_job]
+```
+
+```
+$ yard plan --target orders
+--- Plan for my-project ---
+(targeting: orders)
+
+  + Create job [orders]
 ```
 
 ### `yard show <job_name> [directory]`
@@ -365,7 +376,7 @@ Validating job "orders"... OK
 Validating job "customers"... OK
 ```
 
-### `yard apply [directory] [--dry-run] [--auto-approve]`
+### `yard apply [directory] [--dry-run] [--auto-approve] [--target <job_name>]`
 
 Apply changes: generate scripts, deploy to providers, and update state. All jobs are validated before any changes are made -- if any job has an invalid configuration, the entire apply is aborted. Shows the plan and asks for confirmation before proceeding. Each job is locked during its apply to prevent concurrent modifications.
 

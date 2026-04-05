@@ -1,5 +1,5 @@
 use super::resolve_project;
-use crate::utils::confirm;
+use crate::utils::{bold, color_delete, confirm};
 use anyhow::Result;
 
 pub async fn execute(
@@ -12,8 +12,9 @@ pub async fn execute(
 
     match job_name {
         Some(name) => {
-            println!("--- Destroy plan ---\n");
-            println!("  - Destroy job [{}]", name);
+            println!("{}", bold("--- Destroy plan ---"));
+            println!();
+            println!("{}", color_delete(&format!("  - Destroy job [{}]", name)));
 
             if dry_run {
                 println!("\nDry run -- no changes applied.");
@@ -40,7 +41,7 @@ pub async fn execute(
             .await?;
 
             if destroyed {
-                println!("  - Destroyed: {}", name);
+                println!("{}", color_delete(&format!("  - Destroyed: {}", name)));
             } else {
                 println!("No state found for job \"{}\".", name);
             }
@@ -54,9 +55,16 @@ pub async fn execute(
                 return Ok(());
             }
 
-            println!("--- Destroy plan for {} ---\n", project.manifest.project);
+            println!(
+                "{}",
+                bold(&format!(
+                    "--- Destroy plan for {} ---",
+                    project.manifest.project
+                ))
+            );
+            println!();
             for name in &job_names {
-                println!("  - Destroy job [{}]", name);
+                println!("{}", color_delete(&format!("  - Destroy job [{}]", name)));
             }
 
             if dry_run {
@@ -83,7 +91,7 @@ pub async fn execute(
             .await?;
 
             for name in &result.destroyed {
-                println!("  - Destroyed: {}", name);
+                println!("{}", color_delete(&format!("  - Destroyed: {}", name)));
             }
 
             println!("\nAll jobs destroyed.");

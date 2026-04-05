@@ -1,4 +1,48 @@
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicU8, Ordering};
+
+// 0 = normal colors, 1 = no color, 2 = colorblind mode
+static COLOR_MODE: AtomicU8 = AtomicU8::new(0);
+
+pub fn disable_color() {
+    COLOR_MODE.store(1, Ordering::Relaxed);
+}
+
+pub fn enable_colorblind_mode() {
+    COLOR_MODE.store(2, Ordering::Relaxed);
+}
+
+fn colorize(s: &str, normal_code: &str, colorblind_code: &str) -> String {
+    let mode = COLOR_MODE.load(Ordering::Relaxed);
+    if mode == 1 || !io::stdout().is_terminal() {
+        return s.to_string();
+    }
+    let code = if mode == 2 {
+        colorblind_code
+    } else {
+        normal_code
+    };
+    format!("\x1b[{code}m{s}\x1b[0m")
+}
+
+/// Creates: green (normal), cyan (colorblind)
+pub fn color_create(s: &str) -> String {
+    colorize(s, "32", "36")
+}
+
+/// Modifies: yellow (normal), blue (colorblind)
+pub fn color_modify(s: &str) -> String {
+    colorize(s, "33", "34")
+}
+
+/// Deletes: red (normal), magenta (colorblind)
+pub fn color_delete(s: &str) -> String {
+    colorize(s, "31", "35")
+}
+
+pub fn bold(s: &str) -> String {
+    colorize(s, "1", "1")
+}
 
 /// Prompt the user for confirmation. Returns true if they enter "y" or "yes".
 pub fn confirm(prompt: &str) -> bool {
