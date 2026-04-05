@@ -106,10 +106,10 @@ pub async fn apply(
                     },
                 );
 
-                match &diff.diff_type {
-                    DiffType::Create => result.created.push(diff.name.clone()),
-                    DiffType::Modify { .. } => result.modified.push(diff.name.clone()),
-                    _ => {}
+                if matches!(&diff.diff_type, DiffType::Create) {
+                    result.created.push(diff.name.clone());
+                } else {
+                    result.modified.push(diff.name.clone());
                 }
             }
             DiffType::Delete => {
@@ -124,7 +124,6 @@ pub async fn apply(
 
                 result.deleted.push(diff.name.clone());
             }
-            _ => {}
         }
     }
 
@@ -141,11 +140,15 @@ pub async fn init(manifest: &ProjectManifest) -> Result<()> {
 
     let mut deployments = HashMap::new();
     for (name, job_def) in &manifest.jobs {
+        let script_content = codegen::generate_python_script(name, job_def)
+            .unwrap_or_else(|_| "".to_string());
+        let script_hash = utils::calculate_hash(&script_content);
+
         deployments.insert(
             name.clone(),
             Deployment {
                 env: Some("default".to_string()),
-                config_hash: utils::calculate_json_hash(&job_def.config),
+                config_hash: script_hash,
                 config: job_def.config.clone(),
                 status: "initialized".to_string(),
                 applied_at: chrono::Utc::now().to_rfc3339(),

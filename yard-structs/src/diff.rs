@@ -8,7 +8,6 @@ pub enum DiffType {
         changes: HashMap<String, (String, String)>,
     },
     Delete,
-    None,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

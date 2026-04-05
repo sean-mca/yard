@@ -30,7 +30,6 @@ pub async fn execute(directory: Option<String>) -> Result<()> {
             yard_structs::DiffType::Delete => {
                 println!("- Delete job [{}]", diff.name);
             }
-            _ => {}
         }
     }
 
