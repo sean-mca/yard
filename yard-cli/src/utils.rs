@@ -1,3 +1,14 @@
+use std::io::{self, Write};
+
+/// Prompt the user for confirmation. Returns true if they enter "y" or "yes".
+pub fn confirm(prompt: &str) -> bool {
+    print!("{prompt} ");
+    io::stdout().flush().unwrap();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap();
+    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
 pub fn yaml_to_json(yaml: &yaml_rust2::Yaml) -> serde_json::Value {
     match yaml {
         yaml_rust2::Yaml::Real(s) | yaml_rust2::Yaml::String(s) => {
