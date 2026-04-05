@@ -439,6 +439,14 @@ pub fn parse_body(config: &Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Extract optional job_file path from a job config.
+pub fn parse_job_file(config: &Value) -> Option<String> {
+    config
+        .get("job_file")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 /// Extract imports from a job config's "imports" array.
 pub fn parse_imports(config: &Value) -> Vec<Import> {
     let mut imports = Vec::new();
@@ -590,6 +598,7 @@ mod tests {
     fn make_job(job_type: &str, config: serde_json::Value) -> JobDefinition {
         let imports = parse_imports(&config);
         let body = parse_body(&config);
+        let job_file = parse_job_file(&config);
         let sources = parse_sources(&config);
         let sink = parse_sink(&config);
         let transforms = parse_transforms(&config);
@@ -597,6 +606,7 @@ mod tests {
             job_type: job_type.to_string(),
             imports,
             body,
+            job_file,
             sources,
             sink,
             transforms,

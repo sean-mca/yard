@@ -297,6 +297,12 @@ fn indent_body(body: &str) -> String {
 }
 
 pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result<String> {
+    // If job_file is specified, use the external file as the complete script
+    if let Some(ref path) = job_def.job_file {
+        return std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read job_file: {path}"));
+    }
+
     let template = match job_def.job_type.as_str() {
         "glue" => GLUE_TEMPLATE,
         other => return Err(anyhow!("Unsupported job type: {}", other)),
@@ -387,6 +393,7 @@ mod tests {
             job_type: "glue".to_string(),
             imports: vec![],
             body: None,
+            job_file: None,
             sources: vec![],
             sink: None,
             transforms: vec![],
@@ -753,5 +760,34 @@ mod tests {
         let a = generate_python_script("job_a", &base_job()).unwrap();
         let b = generate_python_script("job_b", &base_job()).unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn job_file_uses_external_script() {
+        let dir = std::env::temp_dir().join(format!("yard_jf_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let script_path = dir.join("custom.py");
+        std::fs::write(&script_path, "print('custom script')\n").unwrap();
+
+        let mut job = base_job();
+        job.job_file = Some(script_path.to_string_lossy().to_string());
+
+        let result = generate_python_script("test_job", &job).unwrap();
+        assert_eq!(result, "print('custom script')\n");
+
+        // Should NOT contain Glue boilerplate
+        assert!(!result.contains("GlueContext"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn job_file_missing_file_errors() {
+        let mut job = base_job();
+        job.job_file = Some("/tmp/nonexistent_yard_test.py".to_string());
+
+        let result = generate_python_script("test_job", &job);
+        assert!(result.is_err());
     }
 }
