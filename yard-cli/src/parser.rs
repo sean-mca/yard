@@ -29,6 +29,10 @@ pub enum Commands {
         /// Skip provider deployment (codegen and state only)
         #[arg(long)]
         dry_run: bool,
+
+        /// Skip confirmation prompt
+        #[arg(long)]
+        auto_approve: bool,
     },
 
     /// Validate all job configurations
@@ -49,6 +53,10 @@ pub enum Commands {
         /// Skip provider teardown (state and local files only)
         #[arg(long)]
         dry_run: bool,
+
+        /// Skip confirmation prompt
+        #[arg(long)]
+        auto_approve: bool,
     },
 
     /// Force-unlock a locked job

@@ -300,36 +300,59 @@ Validating job "orders"... OK
 Validating job "customers"... OK
 ```
 
-### `yard apply [directory] [--dry-run]`
+### `yard apply [directory] [--dry-run] [--auto-approve]`
 
-Apply changes: generate scripts, deploy to providers, and update state. Each job is locked during its apply to prevent concurrent modifications.
+Apply changes: generate scripts, deploy to providers, and update state. Shows the plan and asks for confirmation before proceeding. Each job is locked during its apply to prevent concurrent modifications.
 
 ```
 $ yard apply
-Applying changes for my-data-pipeline...
+--- Plan for my-project ---
+
+  + Create job [orders]
+  ~ Modify job [customers]
+      script_name : "v1" -> "v2"
+
+Do you want to apply these changes? (y/n) y
+
+Applying...
   + Created: orders
   ~ Modified: customers
 
 State updated successfully.
 ```
 
-Use `--dry-run` to generate scripts and update state without calling any cloud APIs:
+Use `--dry-run` to see the plan without applying anything:
 
 ```
 $ yard apply --dry-run
-Applying changes for my-data-pipeline (dry run -- skipping provider deployment)...
-  + Created: orders
+--- Plan for my-project ---
 
-State updated successfully.
+  + Create job [orders]
+
+Dry run -- no changes applied.
 ```
 
-### `yard destroy [job_name] [directory] [--dry-run]`
+Use `--auto-approve` to skip the confirmation prompt (useful in CI):
 
-Tear down deployed jobs and remove their state. Without a job name, destroys all jobs in the project. For each job, YARD calls the provider's destroy method to remove cloud resources, deletes the state file, and removes the generated script.
+```
+$ yard apply --auto-approve
+```
+
+### `yard destroy [job_name] [directory] [--dry-run] [--auto-approve]`
+
+Tear down deployed jobs and remove their state. Shows what will be destroyed and asks for confirmation. Without a job name, destroys all jobs in the project. For each job, YARD calls the provider's destroy method to remove cloud resources, deletes the state file, and removes the generated script.
 
 ```
 $ yard destroy
-Destroying all jobs in my-project...
+--- Destroy plan for my-project ---
+
+  - Destroy job [orders]
+  - Destroy job [customers]
+  - Destroy job [enriched_orders]
+
+Do you want to destroy all jobs? (y/n) y
+
+Destroying...
   - Destroyed: orders
   - Destroyed: customers
   - Destroyed: enriched_orders
@@ -341,20 +364,17 @@ To destroy a single job:
 
 ```
 $ yard destroy orders
+--- Destroy plan ---
+
+  - Destroy job [orders]
+
+Do you want to destroy this job? (y/n) y
+
+Destroying...
   - Destroyed: orders
 ```
 
-Use `--dry-run` to see what would be destroyed without tearing anything down:
-
-```
-$ yard destroy --dry-run
-Would destroy all jobs in my-project (dry run).
-  - Destroyed: orders
-  - Destroyed: customers
-  - Destroyed: enriched_orders
-
-All jobs destroyed.
-```
+Use `--dry-run` to see what would be destroyed, or `--auto-approve` to skip the prompt.
 
 ### `yard force-unlock <job_name> [directory]`
 
