@@ -1,5 +1,6 @@
 use super::Provider;
 use anyhow::{Context, Result, anyhow};
+use yard_structs::ValidationError;
 use aws_config::BehaviorVersion;
 use aws_sdk_glue::Client as GlueClient;
 use aws_sdk_s3::Client as S3Client;
@@ -375,5 +376,99 @@ impl Provider for GlueProvider {
 
             Ok(())
         })
+    }
+}
+
+// ---- Validation ----
+
+const VALID_WORKER_TYPES: &[&str] = &["G.025X", "G.1X", "G.2X", "G.4X", "G.8X", "Z.2X"];
+const VALID_BOOKMARK_VALUES: &[&str] = &["enabled", "disabled"];
+
+fn validation_err(field: &str, message: &str) -> ValidationError {
+    ValidationError {
+        field: field.to_string(),
+        message: message.to_string(),
+    }
+}
+
+pub fn validate_config(config: &serde_json::Value, errors: &mut Vec<ValidationError>) {
+    if let Some(wt) = config.get("worker_type").and_then(|v| v.as_str())
+        && !VALID_WORKER_TYPES.contains(&wt)
+    {
+        errors.push(validation_err(
+            "glue.worker_type",
+            &format!(
+                "\"{}\" is not a valid worker type (expected: {})",
+                wt,
+                VALID_WORKER_TYPES.join(", ")
+            ),
+        ));
+    }
+
+    if let Some(n) = config.get("number_of_workers").and_then(|v| v.as_i64())
+        && n < 1
+    {
+        errors.push(validation_err(
+            "glue.number_of_workers",
+            "must be at least 1",
+        ));
+    }
+
+    if let Some(v) = config.get("glue_version").and_then(|v| v.as_str())
+        && !["3.0", "4.0"].contains(&v)
+    {
+        errors.push(validation_err(
+            "glue.glue_version",
+            &format!(
+                "\"{}\" is not a supported Glue version (expected: 3.0, 4.0)",
+                v
+            ),
+        ));
+    }
+
+    if let Some(t) = config.get("timeout").and_then(|v| v.as_i64())
+        && t < 1
+    {
+        errors.push(validation_err(
+            "glue.timeout",
+            "must be at least 1 (minutes)",
+        ));
+    }
+
+    if let Some(r) = config.get("max_retries").and_then(|v| v.as_i64())
+        && r < 0
+    {
+        errors.push(validation_err("glue.max_retries", "cannot be negative"));
+    }
+
+    if let Some(b) = config.get("bookmark").and_then(|v| v.as_str())
+        && !VALID_BOOKMARK_VALUES.contains(&b)
+    {
+        errors.push(validation_err(
+            "glue.bookmark",
+            &format!(
+                "\"{}\" is not valid (expected: {})",
+                b,
+                VALID_BOOKMARK_VALUES.join(", ")
+            ),
+        ));
+    }
+
+    if let Some(conns) = config.get("connections")
+        && !conns.is_array()
+    {
+        errors.push(validation_err(
+            "glue.connections",
+            "must be an array of strings",
+        ));
+    }
+
+    if let Some(args) = config.get("default_arguments")
+        && !args.is_object()
+    {
+        errors.push(validation_err(
+            "glue.default_arguments",
+            "must be a map of string keys to string values",
+        ));
     }
 }
