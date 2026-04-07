@@ -6,8 +6,10 @@ use axum::{
     routing::post,
     Router,
 };
+use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tokio::process::Command;
+use tracing::{info, warn, error};
 
 use super::client::GitHubClient;
 use super::webhook::{parse_webhook, WebhookAction};
@@ -23,6 +25,88 @@ pub fn github_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/webhook/github", post(handle_webhook))
         .with_state(state)
+}
+
+/// Clone a repo at a specific SHA into a temp directory, return the path.
+/// Caller is responsible for cleaning up via `cleanup_workdir`.
+async fn clone_at_sha(clone_url: &str, sha: &str) -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join(format!("yard-{sha}"));
+
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)
+            .map_err(|e| format!("Failed to clean existing workdir: {e}"))?;
+    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create workdir: {e}"))?;
+
+    let output = Command::new("git")
+        .args(["clone", "--depth", "1", clone_url, "."])
+        .current_dir(&dir)
+        .output()
+        .await
+        .map_err(|e| format!("git clone failed: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "git clone failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let output = Command::new("git")
+        .args(["fetch", "origin", sha, "--depth", "1"])
+        .current_dir(&dir)
+        .output()
+        .await
+        .map_err(|e| format!("git fetch failed: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "git fetch failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let output = Command::new("git")
+        .args(["checkout", sha])
+        .current_dir(&dir)
+        .output()
+        .await
+        .map_err(|e| format!("git checkout failed: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "git checkout failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    Ok(dir)
+}
+
+fn cleanup_workdir(dir: &std::path::Path) {
+    if let Err(e) = std::fs::remove_dir_all(dir) {
+        warn!("Failed to clean up workdir {}: {e}", dir.display());
+    }
+}
+
+/// Run `yard plan` or `yard apply` in the given directory, return stdout.
+async fn run_yard(command: &str, workdir: &std::path::Path) -> Result<String, String> {
+    let output = Command::new("yard")
+        .arg(command)
+        .current_dir(workdir)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run yard {command}: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if !output.status.success() {
+        return Err(format!("yard {command} failed:\n{stdout}\n{stderr}"));
+    }
+
+    Ok(if stdout.is_empty() { stderr } else { stdout })
 }
 
 async fn handle_webhook(
@@ -53,12 +137,23 @@ async fn handle_webhook(
                 "Running yard plan"
             );
 
-            // TODO: clone repo at head_sha, detect changed job files,
-            // run yard plan via yard-core, collect output
-            let plan_output = format!(
-                "Plan for {owner}/{repo}#{pr_number} at {}\n\n(plan execution not yet wired)",
-                &head_sha[..8]
-            );
+            let plan_output = match clone_at_sha(&clone_url, &head_sha).await {
+                Ok(workdir) => {
+                    let result = match run_yard("plan", &workdir).await {
+                        Ok(output) => output,
+                        Err(e) => {
+                            error!(pr = pr_number, "yard plan failed: {e}");
+                            format!("yard plan failed:\n{e}")
+                        }
+                    };
+                    cleanup_workdir(&workdir);
+                    result
+                }
+                Err(e) => {
+                    error!(pr = pr_number, "Clone failed: {e}");
+                    format!("Failed to clone repo:\n{e}")
+                }
+            };
 
             match state
                 .github_client
@@ -80,7 +175,7 @@ async fn handle_webhook(
             repo,
             pr_number,
             head_sha,
-            ..
+            clone_url,
         } => {
             info!(
                 pr = pr_number,
@@ -89,9 +184,26 @@ async fn handle_webhook(
                 "Running yard apply"
             );
 
-            // TODO: clone repo at head_sha, detect changed job files,
-            // run yard apply via yard-core
-            StatusCode::OK
+            match clone_at_sha(&clone_url, &head_sha).await {
+                Ok(workdir) => {
+                    let status = match run_yard("apply", &workdir).await {
+                        Ok(output) => {
+                            info!(pr = pr_number, "yard apply succeeded:\n{output}");
+                            StatusCode::OK
+                        }
+                        Err(e) => {
+                            error!(pr = pr_number, "yard apply failed: {e}");
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        }
+                    };
+                    cleanup_workdir(&workdir);
+                    status
+                }
+                Err(e) => {
+                    error!(pr = pr_number, "Clone failed: {e}");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }
         }
         WebhookAction::Ignore => StatusCode::OK,
     }

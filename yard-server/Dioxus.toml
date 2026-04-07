@@ -2,6 +2,7 @@
 name = "yard-server"
 default_platform = "fullstack"
 
+
 [web.app]
 title = "yard-server"
 

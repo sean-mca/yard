@@ -8,6 +8,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("server"))
 
 [dependencies]
 dioxus = { version = "0.7", features = ["fullstack"] }
+reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1.0.228", features = ["derive"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -18,4 +19,6 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
