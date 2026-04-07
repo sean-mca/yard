@@ -47,9 +47,9 @@ fn start_api_server() {
                 let github_token = std::env::var("YARD_GITHUB_TOKEN").unwrap_or_default();
                 let webhook_secret = std::env::var("YARD_WEBHOOK_SECRET").unwrap_or_default();
                 let repo_owner = std::env::var("YARD_REPO_OWNER")
-                    .unwrap_or_else(|_| "sean-mca".to_string());
+                    .expect("YARD_REPO_OWNER must be set");
                 let repo_name = std::env::var("YARD_REPO_NAME")
-                    .unwrap_or_else(|_| "yard-example".to_string());
+                    .expect("YARD_REPO_NAME must be set");
 
                 // Initialize DynamoDB persistence
                 let db_config = DbConfig::from_env();

@@ -484,12 +484,40 @@ This means two people can apply changes to different jobs concurrently without b
 
 All transforms support optional `source` (which dataframe to operate on) and `output` (name for the result). If omitted, they default to the first source.
 
+## yard-server
+
+YARD includes a web server (`yard-server`) that provides a dashboard, GitHub webhook integration, and drift detection. It runs a Dioxus fullstack app with an axum API backend.
+
+### Environment variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `YARD_GITHUB_TOKEN` | Yes | — | GitHub personal access token for API access |
+| `YARD_WEBHOOK_SECRET` | Yes | — | Secret for verifying GitHub webhook signatures |
+| `YARD_REPO_OWNER` | Yes | — | GitHub repository owner |
+| `YARD_REPO_NAME` | Yes | — | GitHub repository name |
+| `YARD_DB_TABLE_PREFIX` | No | `yard` | DynamoDB table name prefix (table: `{prefix}_yard`) |
+| `YARD_DB_REGION` | No | `us-east-1` | AWS region for DynamoDB (falls back to `AWS_REGION`) |
+
+Standard AWS credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, or an IAM role/profile) must be configured for DynamoDB access. The server creates the table and indexes automatically on first startup.
+
+### DynamoDB permissions
+
+The IAM identity running yard-server needs the following DynamoDB permissions on the `{prefix}_yard` table:
+
+- `dynamodb:CreateTable`
+- `dynamodb:DescribeTable`
+- `dynamodb:PutItem`
+- `dynamodb:GetItem`
+- `dynamodb:Query`
+
 ## Architecture
 
-YARD is a Rust workspace with three crates:
+YARD is a Rust workspace with four crates:
 
 - **yard-cli** -- Thin CLI wrapper. Parses arguments, calls into core, formats output.
 - **yard-core** -- All business logic. Codegen, state management, storage, validation, provider deployment.
 - **yard-structs** -- Shared data types. Job definitions, state structs, config types.
+- **yard-server** -- Web dashboard and GitHub webhook handler. Dioxus fullstack app with DynamoDB persistence.
 
 The provider system uses a trait-based architecture, so adding support for new services (EMR, Databricks, etc.) means implementing the `Provider` trait without touching existing code.
