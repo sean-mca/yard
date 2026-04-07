@@ -3,6 +3,7 @@ use tera::{Context, Tera};
 use yard_structs::{Import, JobDefinition, Sink, Source, Transform};
 
 const GLUE_TEMPLATE: &str = include_str!("templates/glue.py.tera");
+const EMR_TEMPLATE: &str = include_str!("templates/emr.py.tera");
 
 // --- Import rendering ---
 
@@ -305,6 +306,7 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
 
     let template = match job_def.job_type.as_str() {
         "glue" => GLUE_TEMPLATE,
+        "emr" => EMR_TEMPLATE,
         other => return Err(anyhow!("Unsupported job type: {}", other)),
     };
 
