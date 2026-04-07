@@ -23,22 +23,63 @@ async fn fetch_jobs() -> Result<JobsData, String> {
 #[component]
 pub fn Jobs() -> Element {
     let data = use_resource(fetch_jobs);
+    let mut search = use_signal(String::new);
 
     match &*data.read() {
-        Some(Ok(jobs_data)) => rsx! {
-            div { class: "p-6",
-                div { class: "mb-4 flex items-center justify-between",
-                    {
-                        let count = jobs_data.jobs.len();
-                        let suffix = if count != 1 { "s" } else { "" };
-                        rsx! {
-                            p { class: "text-sm text-zinc-500",
-                                "{count} job{suffix} tracked"
+        Some(Ok(jobs_data)) => {
+            let query = search().to_lowercase();
+            let filtered: Vec<JobInfo> = jobs_data
+                .jobs
+                .iter()
+                .filter(|j| {
+                    query.is_empty()
+                        || j.name.to_lowercase().contains(&query)
+                        || j.path.to_lowercase().contains(&query)
+                })
+                .cloned()
+                .collect();
+            let total = jobs_data.jobs.len();
+            let shown = filtered.len();
+
+            rsx! {
+                div { class: "p-6",
+                    div { class: "mb-4 flex items-center justify-between",
+                        {
+                            let label = if total == shown {
+                                let s = if total != 1 { "s" } else { "" };
+                                format!("{total} job{s} tracked")
+                            } else {
+                                format!("{shown} of {total} jobs")
+                            };
+                            rsx! {
+                                p { class: "text-sm text-zinc-500", "{label}" }
+                            }
+                        }
+                        div { class: "relative",
+                            svg {
+                                xmlns: "http://www.w3.org/2000/svg",
+                                width: "14", height: "14",
+                                view_box: "0 0 24 24",
+                                fill: "none",
+                                stroke: "currentColor",
+                                stroke_width: "2",
+                                stroke_linecap: "round",
+                                stroke_linejoin: "round",
+                                class: "absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-400",
+                                circle { cx: "11", cy: "11", r: "8" }
+                                line { x1: "21", y1: "21", x2: "16.65", y2: "16.65" }
+                            }
+                            input {
+                                r#type: "text",
+                                placeholder: "Search jobs...",
+                                class: "pl-8 pr-3 py-1.5 text-sm rounded-md border border-zinc-200 bg-white focus:outline-none focus:ring-2 focus:ring-zinc-300 w-56",
+                                value: "{search}",
+                                oninput: move |e| search.set(e.value()),
                             }
                         }
                     }
+                    JobsTable { jobs: filtered }
                 }
-                JobsTable { jobs: jobs_data.jobs.clone() }
             }
         },
         Some(Err(e)) => rsx! {
