@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tracing::warn;
 
+
 /// Clone a repo at a specific SHA into a temp directory, return the path.
 /// Caller is responsible for cleaning up via `cleanup_workdir`.
 pub async fn clone_at_sha(clone_url: &str, sha: &str) -> Result<PathBuf, String> {
