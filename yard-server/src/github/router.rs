@@ -6,6 +6,7 @@ use axum::{
     routing::post,
     Router,
 };
+use chrono::Utc;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -13,11 +14,13 @@ use tracing::{info, warn, error};
 
 use super::client::GitHubClient;
 use super::webhook::{parse_webhook, WebhookAction};
+use crate::db::{DynamoDatabase, PlanResultRow, PlanStatus, WebhookEvent};
 
 /// Shared state for the webhook handler.
 pub struct AppState {
     pub github_client: GitHubClient,
     pub webhook_secret: String,
+    pub db: Arc<DynamoDatabase>,
 }
 
 /// Build the axum router for GitHub webhook endpoints.
@@ -137,6 +140,23 @@ async fn handle_webhook(
                 "Running yard plan"
             );
 
+            // Persist the webhook event
+            let webhook_event = WebhookEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                pr_number,
+                action: "plan".to_string(),
+                sha: head_sha.clone(),
+                payload: serde_json::json!({
+                    "owner": owner,
+                    "repo": repo,
+                    "clone_url": clone_url,
+                }),
+                received_at: Utc::now(),
+            };
+            if let Err(e) = state.db.insert_webhook_event(&webhook_event).await {
+                warn!(pr = pr_number, error = %e, "Failed to persist webhook event");
+            }
+
             let plan_output = match clone_at_sha(&clone_url, &head_sha).await {
                 Ok(workdir) => {
                     let result = match run_yard("plan", &workdir).await {
@@ -154,6 +174,28 @@ async fn handle_webhook(
                     format!("Failed to clone repo:\n{e}")
                 }
             };
+
+            // Determine plan status from output
+            let plan_failed = plan_output.contains("failed");
+            let status = if plan_failed {
+                PlanStatus::Failure
+            } else {
+                PlanStatus::Success
+            };
+
+            // Persist the plan result
+            let plan_result = PlanResultRow {
+                id: uuid::Uuid::new_v4().to_string(),
+                pr_number,
+                sha: head_sha.clone(),
+                status,
+                raw_output: plan_output.clone(),
+                diff_summary: None,
+                created_at: Utc::now(),
+            };
+            if let Err(e) = state.db.insert_plan_result(&plan_result).await {
+                warn!(pr = pr_number, error = %e, "Failed to persist plan result");
+            }
 
             match state
                 .github_client
@@ -183,6 +225,23 @@ async fn handle_webhook(
                 repo = %format!("{owner}/{repo}"),
                 "Running yard apply"
             );
+
+            // Persist the webhook event
+            let webhook_event = WebhookEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                pr_number,
+                action: "apply".to_string(),
+                sha: head_sha.clone(),
+                payload: serde_json::json!({
+                    "owner": owner,
+                    "repo": repo,
+                    "clone_url": clone_url,
+                }),
+                received_at: Utc::now(),
+            };
+            if let Err(e) = state.db.insert_webhook_event(&webhook_event).await {
+                warn!(pr = pr_number, error = %e, "Failed to persist webhook event");
+            }
 
             match clone_at_sha(&clone_url, &head_sha).await {
                 Ok(workdir) => {

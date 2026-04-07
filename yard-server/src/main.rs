@@ -3,6 +3,8 @@ use dioxus::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
 mod api;
 #[cfg(not(target_arch = "wasm32"))]
+mod db;
+#[cfg(not(target_arch = "wasm32"))]
 mod github;
 mod types;
 mod ui;
@@ -33,6 +35,7 @@ fn main() {
 fn start_api_server() {
     use api::dashboard::{dashboard_router, ApiState};
     use api::jobs::jobs_router;
+    use db::DbConfig;
     use github::{client::GitHubClient, router::github_router, router::AppState};
     use std::sync::Arc;
     use tower_http::cors::{Any, CorsLayer};
@@ -48,18 +51,29 @@ fn start_api_server() {
                 let repo_name = std::env::var("YARD_REPO_NAME")
                     .unwrap_or_else(|_| "yard-example".to_string());
 
+                // Initialize DynamoDB persistence
+                let db_config = DbConfig::from_env();
+                let db = db::connect(&db_config)
+                    .await
+                    .expect("Failed to connect to DynamoDB");
+                db.migrate()
+                    .await
+                    .expect("Failed to run DynamoDB migrations");
+
                 let github_client =
                     GitHubClient::new(&github_token).expect("Failed to create GitHub client");
 
                 let webhook_state = Arc::new(AppState {
                     github_client,
                     webhook_secret,
+                    db: db.clone(),
                 });
 
                 let api_state = Arc::new(ApiState {
                     github_token,
                     repo_owner,
                     repo_name,
+                    db,
                 });
 
                 let cors = CorsLayer::new()

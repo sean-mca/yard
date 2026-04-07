@@ -7,14 +7,16 @@ use axum::{
 };
 use serde::Deserialize;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
+use crate::db::{DynamoDatabase, PlanStatus};
 use crate::types::*;
 
 pub struct ApiState {
     pub github_token: String,
     pub repo_owner: String,
     pub repo_name: String,
+    pub db: Arc<DynamoDatabase>,
 }
 
 pub fn dashboard_router(state: Arc<ApiState>) -> Router {
@@ -102,6 +104,20 @@ async fn fetch_dashboard_data(
             .map(|dt| format_relative_time(dt))
             .unwrap_or_else(|| "unknown".to_string());
 
+        // Look up the latest plan result from DynamoDB
+        let plan_result = match state.db.get_latest_plan_result(pr.number).await {
+            Ok(Some(row)) => match row.status {
+                PlanStatus::Success => PlanResult::Pass,
+                PlanStatus::Failure => PlanResult::Fail,
+                PlanStatus::Pending => PlanResult::Pending,
+            },
+            Ok(None) => PlanResult::None,
+            Err(e) => {
+                warn!(pr = pr.number, error = %e, "Failed to fetch plan result");
+                PlanResult::None
+            }
+        };
+
         rows.push(PrRow {
             number: pr.number,
             title: pr.title.clone().unwrap_or_default(),
@@ -111,7 +127,7 @@ async fn fetch_dashboard_data(
                 .map(|u| u.login.clone())
                 .unwrap_or_else(|| "unknown".to_string()),
             state: pr_state,
-            plan_result: PlanResult::None,
+            plan_result,
             updated,
             url: pr
                 .html_url

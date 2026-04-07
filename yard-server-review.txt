@@ -1,0 +1,47 @@
+yard & yard-server UI Review — 2026-04-07
+==========================================
+
+## UI
+
+What's good:
+- Clean, consistent design language. Tables, badges, sheets all feel cohesive.
+- The jobs page is genuinely useful — search, env filter, YAML preview with syntax highlighting.
+- Dark mode is a nice touch for a DevOps tool people stare at all day.
+- Component structure is solid — Sheet, Pagination, etc. are reusable.
+
+What's not:
+- The dashboard is a glorified PR list. The metrics bar is mostly lies — Plans Running is hardcoded to 0, Drift is hardcoded to Ok. Without real data flowing, it's a pretty shell.
+- Settings don't persist. Refresh the page and everything resets. Theme, interval, Slack config — all gone. This will feel broken to users immediately.
+- API_BASE is hardcoded to localhost:3001 in multiple files. This breaks in any non-dev environment.
+- No auth whatsoever. Anyone who can reach the port sees everything, including your GitHub token's data.
+- No real-time updates. Dashboard data is fetched once on load. PRs merge, plans run, drift happens — the user sees nothing until they refresh.
+- The "System" theme option doesn't actually detect system preference. It's just a third button that does the same as Light.
+- Zero mobile responsiveness. The tables and sheets will be unusable on smaller screens. Maybe fine for a DevOps tool, but worth acknowledging.
+- No loading/empty states are contextually helpful. "No pull requests found" when the API is down vs. when there genuinely are none — same message.
+
+
+## yard as a whole
+
+The good:
+- The core concept is strong. Terragrunt-like declarative config for data pipelines is a real gap. YAML -> Python codegen with state tracking and plan/apply is a solid model.
+- Architecture is clean. Trait-based providers, workspace with separated concerns (structs/core/cli/server), thin CLI wrapper — this is well-structured Rust.
+- State management is pragmatic. Local + S3 backends, per-job locking, config hashing for change detection — the right foundation.
+- The plan/apply workflow is the right abstraction. Data engineers understand this from Terraform. Low learning curve.
+
+The hard truths:
+- One provider (Glue), one cloud (AWS). Until there's at least Databricks or Spark on EMR, the addressable market is tiny. The Provider trait is there, but the "pluggable" story is theoretical.
+- The server is a facade. It looks like a product but there's no real backend. No persistence layer, no job state tracking, no actual drift detection. The webhook clones the whole repo on every PR event. Drift is mock data. Plan results aren't stored anywhere.
+- No tests in yard-server. Not a single one. The webhook signature verification has tests, but that's it. The API endpoints, the diff engine, the YAML highlighter — all untested.
+- Shelling out to yard for plan/apply is fragile. The binary has to be in PATH, output parsing depends on format stability, there's no structured result type. This is fine for an MVP but will be the first thing that breaks in production.
+- No database. Plan results, drift history, job status over time — all of this needs persistence. Right now every page load makes fresh GitHub API calls. That's slow and will hit rate limits fast.
+- The codegen is very opinionated. Tera templates producing PySpark scripts for Glue. If someone's Spark job doesn't fit the template model, there's no escape hatch beyond job_file.
+
+
+## What to prioritize next
+
+1. Persistence — even SQLite. Store plan results, drift snapshots, webhook events. Without this, the server is a read-only GitHub viewer.
+2. Wire up the webhook end-to-end. This is the core value prop. PR opens -> plan runs -> result posted and stored -> dashboard shows it. Until this loop works, the server is a demo.
+3. Real drift detection (type 1). Compare repo YAML hashes against stored state. No AWS SDK needed. This makes the drift page real with the architecture you already have.
+4. A second provider. Even a stub. Proves the abstraction works and signals the project isn't Glue-only.
+
+The bones are good. The risk is spending too much time polishing the UI before the backend loop is real.
