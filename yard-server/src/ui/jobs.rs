@@ -1,6 +1,9 @@
 use dioxus::prelude::*;
 
+use super::components::Pagination;
 use crate::types::*;
+
+const PER_PAGE: usize = 15;
 
 const API_BASE: &str = "http://127.0.0.1:3001";
 
@@ -89,6 +92,8 @@ fn SearchBar(mut search: Signal<String>) -> Element {
 
 #[component]
 fn FilteredJobs(jobs: Vec<JobInfo>, search: String) -> Element {
+    let mut page = use_signal(|| 1u32);
+
     let query = search.to_lowercase();
     let filtered: Vec<&JobInfo> = jobs
         .iter()
@@ -101,6 +106,16 @@ fn FilteredJobs(jobs: Vec<JobInfo>, search: String) -> Element {
     let total = jobs.len();
     let shown = filtered.len();
 
+    // Reset to page 1 when search changes
+    let max_page = ((shown as f64) / (PER_PAGE as f64)).ceil().max(1.0) as u32;
+    if page() > max_page {
+        page.set(1);
+    }
+
+    let start = ((page() - 1) as usize) * PER_PAGE;
+    let page_items: Vec<&&JobInfo> = filtered.iter().skip(start).take(PER_PAGE).collect();
+    let has_more = start + PER_PAGE < shown;
+
     let label = if total == shown {
         let s = if total != 1 { "s" } else { "" };
         format!("{total} job{s} tracked")
@@ -111,7 +126,7 @@ fn FilteredJobs(jobs: Vec<JobInfo>, search: String) -> Element {
     rsx! {
         p { class: "text-sm text-zinc-500 mb-4", "{label}" }
         div { class: "rounded-lg border border-zinc-200 overflow-hidden",
-            if filtered.is_empty() {
+            if page_items.is_empty() {
                 div { class: "px-4 py-8 text-center text-sm text-zinc-500",
                     "No jobs found."
                 }
@@ -124,7 +139,7 @@ fn FilteredJobs(jobs: Vec<JobInfo>, search: String) -> Element {
                         }
                     }
                     tbody {
-                        for job in filtered.iter() {
+                        for job in page_items.iter() {
                             tr { class: "border-b border-zinc-100 hover:bg-zinc-50/50 transition-colors",
                                 td { class: "px-4 py-3 font-medium", "{job.name}" }
                                 td { class: "px-4 py-3 text-zinc-500 font-mono text-xs", "{job.path}" }
@@ -132,6 +147,20 @@ fn FilteredJobs(jobs: Vec<JobInfo>, search: String) -> Element {
                         }
                     }
                 }
+            }
+        }
+        if shown > PER_PAGE {
+            Pagination {
+                page: page(),
+                has_more,
+                on_prev: move |_| {
+                    if page() > 1 {
+                        page -= 1;
+                    }
+                },
+                on_next: move |_| {
+                    page += 1;
+                },
             }
         }
     }
