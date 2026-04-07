@@ -45,13 +45,44 @@ async fn fetch_jobs() -> Result<JobsData, String> {
 pub fn Jobs() -> Element {
     let data = use_resource(fetch_jobs);
     let mut search = use_signal(String::new);
+    let mut env_filter = use_signal(|| None::<String>);
 
     rsx! {
         div { class: "p-6",
-            SearchBar { search }
             match &*data.read() {
                 Some(Ok(jobs_data)) => {
-                    rsx! { FilteredJobs { jobs: jobs_data.jobs.clone(), search: search() } }
+                    rsx! {
+                        EnvFilter { jobs: jobs_data.jobs.clone(), selected: env_filter }
+                        div { class: "flex items-center justify-between mb-4",
+                            {
+                                let query = search().to_lowercase();
+                                let env = env_filter();
+                                let count = jobs_data.jobs.iter().filter(|j| {
+                                    let env_match = env.as_ref().map_or(true, |e| &j.environment == e);
+                                    let search_match = query.is_empty()
+                                        || j.name.to_lowercase().contains(&query)
+                                        || j.path.to_lowercase().contains(&query)
+                                        || j.environment.to_lowercase().contains(&query)
+                                        || j.region.to_lowercase().contains(&query);
+                                    env_match && search_match
+                                }).count();
+                                let total = jobs_data.jobs.len();
+                                let label = if count == total {
+                                    let s = if total != 1 { "s" } else { "" };
+                                    format!("{total} job{s} tracked")
+                                } else {
+                                    format!("{count} of {total} jobs")
+                                };
+                                rsx! { p { class: "text-sm text-zinc-500", "{label}" } }
+                            }
+                            SearchBar { search }
+                        }
+                        FilteredJobs {
+                            jobs: jobs_data.jobs.clone(),
+                            search: search(),
+                            env_filter: env_filter(),
+                        }
+                    }
                 },
                 Some(Err(e)) => rsx! {
                     div { class: "rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700",
@@ -81,27 +112,77 @@ pub fn Jobs() -> Element {
 #[component]
 fn SearchBar(mut search: Signal<String>) -> Element {
     rsx! {
-        div { class: "mb-4 flex items-center justify-end",
-            div { class: "relative",
-                svg {
-                    xmlns: "http://www.w3.org/2000/svg",
-                    width: "14", height: "14",
-                    view_box: "0 0 24 24",
-                    fill: "none",
-                    stroke: "currentColor",
-                    stroke_width: "2",
-                    stroke_linecap: "round",
-                    stroke_linejoin: "round",
-                    class: "absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-400",
-                    circle { cx: "11", cy: "11", r: "8" }
-                    line { x1: "21", y1: "21", x2: "16.65", y2: "16.65" }
+        div { class: "relative",
+            svg {
+                xmlns: "http://www.w3.org/2000/svg",
+                width: "14", height: "14",
+                view_box: "0 0 24 24",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "2",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                class: "absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-400",
+                circle { cx: "11", cy: "11", r: "8" }
+                line { x1: "21", y1: "21", x2: "16.65", y2: "16.65" }
+            }
+            input {
+                r#type: "text",
+                placeholder: "Search jobs...",
+                class: "pl-8 pr-3 py-1.5 text-sm rounded-md border border-zinc-200 bg-white focus:outline-none focus:ring-2 focus:ring-zinc-300 w-56",
+                value: "{search}",
+                oninput: move |e| search.set(e.value()),
+            }
+        }
+    }
+}
+
+#[component]
+fn EnvFilter(jobs: Vec<JobInfo>, mut selected: Signal<Option<String>>) -> Element {
+    let mut envs: Vec<String> = jobs.iter().map(|j| j.environment.clone()).collect();
+    envs.sort();
+    envs.dedup();
+
+    rsx! {
+        div { class: "flex items-center gap-1.5 mb-4",
+            {
+                let is_all = selected().is_none();
+                rsx! {
+                    button {
+                        class: format!(
+                            "px-3 py-1 rounded-full text-xs font-medium border cursor-pointer transition-colors {}",
+                            if is_all {
+                                "bg-zinc-900 text-white border-zinc-900"
+                            } else {
+                                "bg-white text-zinc-600 border-zinc-200 hover:bg-zinc-50"
+                            }
+                        ),
+                        onclick: move |_| selected.set(None),
+                        "All"
+                    }
                 }
-                input {
-                    r#type: "text",
-                    placeholder: "Search jobs...",
-                    class: "pl-8 pr-3 py-1.5 text-sm rounded-md border border-zinc-200 bg-white focus:outline-none focus:ring-2 focus:ring-zinc-300 w-56",
-                    value: "{search}",
-                    oninput: move |e| search.set(e.value()),
+            }
+            for env in envs.iter() {
+                {
+                    let env = env.clone();
+                    let is_active = selected().as_ref() == Some(&env);
+                    rsx! {
+                        button {
+                            class: format!(
+                                "px-3 py-1 rounded-full text-xs font-medium border cursor-pointer transition-colors {}",
+                                if is_active {
+                                    "bg-zinc-900 text-white border-zinc-900"
+                                } else {
+                                    "bg-white text-zinc-600 border-zinc-200 hover:bg-zinc-50"
+                                }
+                            ),
+                            onclick: {
+                                let env = env.clone();
+                                move |_| selected.set(Some(env.clone()))
+                            },
+                            "{env}"
+                        }
+                    }
                 }
             }
         }
@@ -109,7 +190,7 @@ fn SearchBar(mut search: Signal<String>) -> Element {
 }
 
 #[component]
-fn FilteredJobs(jobs: Vec<JobInfo>, search: String) -> Element {
+fn FilteredJobs(jobs: Vec<JobInfo>, search: String, env_filter: Option<String>) -> Element {
     let mut page = use_signal(|| 1u32);
     let mut selected_job = use_signal(|| None::<JobInfo>);
 
@@ -117,17 +198,18 @@ fn FilteredJobs(jobs: Vec<JobInfo>, search: String) -> Element {
     let filtered: Vec<&JobInfo> = jobs
         .iter()
         .filter(|j| {
-            query.is_empty()
+            let env_match = env_filter.as_ref().map_or(true, |e| &j.environment == e);
+            let search_match = query.is_empty()
                 || j.name.to_lowercase().contains(&query)
                 || j.path.to_lowercase().contains(&query)
                 || j.environment.to_lowercase().contains(&query)
-                || j.region.to_lowercase().contains(&query)
+                || j.region.to_lowercase().contains(&query);
+            env_match && search_match
         })
         .collect();
-    let total = jobs.len();
     let shown = filtered.len();
 
-    // Reset to page 1 when search changes
+    // Reset to page 1 when filters change
     let max_page = ((shown as f64) / (PER_PAGE as f64)).ceil().max(1.0) as u32;
     if page() > max_page {
         page.set(1);
@@ -137,15 +219,7 @@ fn FilteredJobs(jobs: Vec<JobInfo>, search: String) -> Element {
     let page_items: Vec<&&JobInfo> = filtered.iter().skip(start).take(PER_PAGE).collect();
     let has_more = start + PER_PAGE < shown;
 
-    let label = if total == shown {
-        let s = if total != 1 { "s" } else { "" };
-        format!("{total} job{s} tracked")
-    } else {
-        format!("{shown} of {total} jobs")
-    };
-
     rsx! {
-        p { class: "text-sm text-zinc-500 mb-4", "{label}" }
         div { class: "rounded-lg border border-zinc-200 overflow-hidden",
             if page_items.is_empty() {
                 div { class: "px-4 py-8 text-center text-sm text-zinc-500",
