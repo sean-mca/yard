@@ -6,10 +6,10 @@ use crate::types::*;
 
 const PER_PAGE: usize = 15;
 
-const API_BASE: &str = "http://127.0.0.1:3001";
+use super::api_base;
 
 async fn fetch_job_file(path: String) -> Result<String, String> {
-    let url = format!("{API_BASE}/api/jobs/file?path={path}");
+    let url = format!("{}/api/jobs/file?path={path}", api_base());
     let resp = reqwest::get(&url)
         .await
         .map_err(|e| format!("Request failed: {e}"))?;
@@ -26,7 +26,7 @@ async fn fetch_job_file(path: String) -> Result<String, String> {
 }
 
 async fn fetch_jobs() -> Result<JobsData, String> {
-    let resp = reqwest::get(format!("{API_BASE}/api/jobs"))
+    let resp = reqwest::get(format!("{}/api/jobs", api_base()))
         .await
         .map_err(|e| format!("Request failed: {e}"))?;
 
