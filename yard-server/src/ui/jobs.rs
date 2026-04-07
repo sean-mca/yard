@@ -233,9 +233,12 @@ fn JobSheet(mut job: Signal<Option<JobInfo>>) -> Element {
                 }
             }
             match &*file_content.read() {
-                Some(Some(Ok(content))) => rsx! {
-                    pre { class: "px-5 py-4 text-xs font-mono text-zinc-700 whitespace-pre-wrap",
-                        "{content}"
+                Some(Some(Ok(content))) => {
+                    let highlighted = highlight_yaml(content);
+                    rsx! {
+                        pre { class: "px-5 py-4 text-xs font-mono leading-5 whitespace-pre-wrap",
+                            dangerous_inner_html: "{highlighted}",
+                        }
                     }
                 },
                 Some(Some(Err(e))) => rsx! {
@@ -260,5 +263,96 @@ fn JobSheet(mut job: Signal<Option<JobInfo>>) -> Element {
             }
         }
     }
+}
+
+fn highlight_yaml(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() * 2);
+    for line in input.lines() {
+        let trimmed = line.trim_start();
+
+        if trimmed.starts_with('#') {
+            // Comment
+            let indent = &line[..line.len() - trimmed.len()];
+            out.push_str(&html_escape(indent));
+            out.push_str("<span class=\"text-zinc-400 italic\">");
+            out.push_str(&html_escape(trimmed));
+            out.push_str("</span>");
+        } else if trimmed.starts_with("- ") {
+            // List item — may contain a key: value pair
+            let indent = &line[..line.len() - trimmed.len()];
+            out.push_str(&html_escape(indent));
+            out.push_str("<span class=\"text-zinc-400\">- </span>");
+            let rest = &trimmed[2..];
+            if let Some(colon_pos) = rest.find(':') {
+                let key = &rest[..colon_pos];
+                let after_colon = &rest[colon_pos + 1..];
+                out.push_str("<span class=\"text-violet-600\">");
+                out.push_str(&html_escape(key));
+                out.push_str("</span><span class=\"text-zinc-400\">:</span>");
+                if !after_colon.is_empty() {
+                    out.push_str(&highlight_yaml_value(after_colon));
+                }
+            } else {
+                out.push_str(&highlight_yaml_value(rest));
+            }
+        } else if let Some(colon_pos) = trimmed.find(':') {
+            // Key: value
+            let indent = &line[..line.len() - trimmed.len()];
+            let key = &trimmed[..colon_pos];
+            let after_colon = &trimmed[colon_pos + 1..];
+
+            out.push_str(&html_escape(indent));
+            out.push_str("<span class=\"text-violet-600\">");
+            out.push_str(&html_escape(key));
+            out.push_str("</span><span class=\"text-zinc-400\">:</span>");
+
+            if after_colon.is_empty() {
+                // Key with no inline value (nested block follows)
+            } else {
+                out.push_str(&highlight_yaml_value(after_colon));
+            }
+        } else {
+            out.push_str(&html_escape(line));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn highlight_yaml_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return html_escape(value);
+    }
+
+    let prefix_ws = &value[..value.len() - value.trim_start().len()];
+    let mut out = html_escape(prefix_ws);
+
+    if trimmed == "true" || trimmed == "false" {
+        out.push_str("<span class=\"text-amber-600\">");
+        out.push_str(trimmed);
+        out.push_str("</span>");
+    } else if trimmed.parse::<f64>().is_ok() {
+        out.push_str("<span class=\"text-emerald-600\">");
+        out.push_str(&html_escape(trimmed));
+        out.push_str("</span>");
+    } else if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+    {
+        out.push_str("<span class=\"text-sky-600\">");
+        out.push_str(&html_escape(trimmed));
+        out.push_str("</span>");
+    } else {
+        out.push_str("<span class=\"text-zinc-700\">");
+        out.push_str(&html_escape(trimmed));
+        out.push_str("</span>");
+    }
+    out
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
