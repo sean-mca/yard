@@ -1,93 +1,101 @@
 use dioxus::prelude::*;
+use dioxus_query::prelude::*;
+use std::time::Duration;
 
 use super::components::Pagination;
 use super::metrics::{DriftStatus, MetricsBar};
 use crate::types::*;
 
 const API_BASE: &str = "http://127.0.0.1:3001";
-const DRIFT_POLL_MS: u32 = 15_000;
 
-#[cfg(target_arch = "wasm32")]
-fn set_interval(ms: u32, mut f: impl FnMut() + 'static) {
-    use wasm_bindgen::prelude::*;
-    let closure = Closure::wrap(Box::new(move || f()) as Box<dyn FnMut()>);
-    web_sys::window()
-        .unwrap()
-        .set_interval_with_callback_and_timeout_and_arguments_0(
-            closure.as_ref().unchecked_ref(),
-            ms as i32,
-        )
-        .unwrap();
-    closure.forget();
+// ---- Query types ----
+
+#[derive(Clone, PartialEq, Hash, Eq)]
+struct DashboardQuery;
+
+impl QueryCapability for DashboardQuery {
+    type Ok = DashboardData;
+    type Err = String;
+    type Keys = u32; // page number
+
+    async fn run(&self, page: &Self::Keys) -> Result<Self::Ok, Self::Err> {
+        let resp = reqwest::get(format!(
+            "{API_BASE}/api/dashboard/cached?page={page}&per_page=15"
+        ))
+        .await
+        .map_err(|e| format!("Request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Server error ({status}): {body}"));
+        }
+
+        resp.json::<DashboardData>()
+            .await
+            .map_err(|e| format!("Failed to parse response: {e}"))
+    }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn set_interval(_ms: u32, _f: impl FnMut() + 'static) {}
+#[derive(Clone, PartialEq, Hash, Eq)]
+struct DriftSummaryQuery;
 
 #[derive(serde::Deserialize)]
 struct DriftSummaryResponse {
     drifted: u32,
 }
 
-async fn fetch_drift_summary() -> Result<u32, String> {
-    let resp = reqwest::get(format!("{API_BASE}/api/drift/summary"))
-        .await
-        .map_err(|e| format!("Request failed: {e}"))?;
+impl QueryCapability for DriftSummaryQuery {
+    type Ok = u32;
+    type Err = String;
+    type Keys = ();
 
-    if !resp.status().is_success() {
-        return Ok(0);
+    async fn run(&self, _: &Self::Keys) -> Result<Self::Ok, Self::Err> {
+        let resp = reqwest::get(format!("{API_BASE}/api/drift/summary"))
+            .await
+            .map_err(|e| format!("Request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            return Ok(0);
+        }
+
+        let data = resp
+            .json::<DriftSummaryResponse>()
+            .await
+            .map_err(|e| format!("Parse failed: {e}"))?;
+
+        Ok(data.drifted)
     }
-
-    let data = resp
-        .json::<DriftSummaryResponse>()
-        .await
-        .map_err(|e| format!("Parse failed: {e}"))?;
-
-    Ok(data.drifted)
 }
 
-async fn fetch_dashboard_data(page: u32) -> Result<DashboardData, String> {
-    let resp = reqwest::get(format!("{API_BASE}/api/dashboard?page={page}&per_page=15"))
-        .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Server error ({status}): {body}"));
-    }
-
-    resp.json::<DashboardData>()
-        .await
-        .map_err(|e| format!("Failed to parse response: {e}"))
-}
+// ---- Component ----
 
 #[component]
 pub fn Dashboard() -> Element {
     let mut page = use_signal(|| 1u32);
-    let data = use_resource(move || fetch_dashboard_data(page()));
-    let mut drift_tick = use_signal(|| 0u32);
-    use_effect(move || {
-        set_interval(DRIFT_POLL_MS, move || {
-            if let Ok(mut val) = drift_tick.try_write() {
-                *val += 1;
-            }
-        });
-    });
 
-    let drift_data = use_resource(move || {
-        let _ = drift_tick();
-        fetch_drift_summary()
-    });
+    let data = use_query(
+        Query::new(page(), DashboardQuery)
+            .stale_time(Duration::from_secs(30))
+            .interval_time(Duration::from_secs(15)),
+    );
 
-    let drift_status = match &*drift_data.read() {
-        Some(Ok(0)) => DriftStatus::Ok,
-        Some(Ok(n)) => DriftStatus::Drifted(*n),
+    let drift_data = use_query(
+        Query::new((), DriftSummaryQuery)
+            .stale_time(Duration::from_secs(30))
+            .interval_time(Duration::from_secs(15)),
+    );
+
+    let drift_state = drift_data.read();
+    let drift_status = match &*drift_state.state() {
+        QueryStateData::Settled { res: Ok(0), .. } => DriftStatus::Ok,
+        QueryStateData::Settled { res: Ok(n), .. } => DriftStatus::Drifted(*n),
         _ => DriftStatus::Ok,
     };
 
-    match &*data.read() {
-        Some(Ok(dashboard)) => rsx! {
+    let data_state = data.read();
+    match &*data_state.state() {
+        QueryStateData::Settled { res: Ok(dashboard), .. } => rsx! {
             div { class: "p-6",
                 MetricsBar {
                     open_prs: dashboard.open_prs,
@@ -110,14 +118,14 @@ pub fn Dashboard() -> Element {
                 }
             }
         },
-        Some(Err(e)) => rsx! {
+        QueryStateData::Settled { res: Err(e), .. } => rsx! {
             div { class: "p-6",
                 div { class: "rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700",
                     "Failed to load dashboard: {e}"
                 }
             }
         },
-        None => rsx! {
+        _ => rsx! {
             div { class: "p-6",
                 div { class: "flex items-center gap-2 text-sm text-zinc-500",
                     svg {

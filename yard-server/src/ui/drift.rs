@@ -1,66 +1,53 @@
 use dioxus::prelude::*;
+use dioxus_query::prelude::*;
+use std::time::Duration;
 
 use super::sheet::Sheet;
 use crate::types::*;
 
 const API_BASE: &str = "http://127.0.0.1:3001";
 
-const POLL_INTERVAL_MS: u32 = 15_000;
+// ---- Query type ----
 
-#[cfg(target_arch = "wasm32")]
-fn set_interval(ms: u32, mut f: impl FnMut() + 'static) {
-    use wasm_bindgen::prelude::*;
-    let closure = Closure::wrap(Box::new(move || f()) as Box<dyn FnMut()>);
-    web_sys::window()
-        .unwrap()
-        .set_interval_with_callback_and_timeout_and_arguments_0(
-            closure.as_ref().unchecked_ref(),
-            ms as i32,
-        )
-        .unwrap();
-    closure.forget();
-}
+#[derive(Clone, PartialEq, Hash, Eq)]
+struct DriftQuery;
 
-#[cfg(not(target_arch = "wasm32"))]
-fn set_interval(_ms: u32, _f: impl FnMut() + 'static) {}
+impl QueryCapability for DriftQuery {
+    type Ok = DriftData;
+    type Err = String;
+    type Keys = ();
 
-async fn fetch_drift_cached() -> Result<DriftData, String> {
-    let resp = reqwest::get(format!("{API_BASE}/api/drift/cached"))
-        .await
-        .map_err(|e| format!("Request failed: {e}"))?;
+    async fn run(&self, _: &Self::Keys) -> Result<Self::Ok, Self::Err> {
+        let resp = reqwest::get(format!("{API_BASE}/api/drift/cached"))
+            .await
+            .map_err(|e| format!("Request failed: {e}"))?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Server error ({status}): {body}"));
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Server error ({status}): {body}"));
+        }
+
+        resp.json::<DriftData>()
+            .await
+            .map_err(|e| format!("Failed to parse response: {e}"))
     }
-
-    resp.json::<DriftData>()
-        .await
-        .map_err(|e| format!("Failed to parse response: {e}"))
 }
+
+// ---- Component ----
 
 #[component]
 pub fn Drift() -> Element {
-    let mut tick = use_signal(|| 0u32);
-
-    // Poll on interval: bump tick to trigger use_resource re-fetch
-    use_effect(move || {
-        set_interval(POLL_INTERVAL_MS, move || {
-            if let Ok(mut val) = tick.try_write() {
-                *val += 1;
-            }
-        });
-    });
-
-    let data = use_resource(move || {
-        let _ = tick();
-        fetch_drift_cached()
-    });
+    let data = use_query(
+        Query::new((), DriftQuery)
+            .stale_time(Duration::from_secs(30))
+            .interval_time(Duration::from_secs(15)),
+    );
     let mut selected = use_signal(|| None::<DriftItem>);
 
-    match &*data.read() {
-        Some(Ok(drift_data)) => {
+    let data_state = data.read();
+    match &*data_state.state() {
+        QueryStateData::Settled { res: Ok(drift_data), .. } => {
             let total = drift_data.in_sync + drift_data.drifted;
             rsx! {
                 div { class: "p-6",
@@ -100,14 +87,14 @@ pub fn Drift() -> Element {
                 }
             }
         }
-        Some(Err(e)) => rsx! {
+        QueryStateData::Settled { res: Err(e), .. } => rsx! {
             div { class: "p-6",
                 div { class: "rounded-lg border border-red-200 bg-red-50 px-4 py-8 text-center",
                     p { class: "text-sm text-red-700", "Failed to load drift data: {e}" }
                 }
             }
         },
-        None => rsx! {
+        _ => rsx! {
             div { class: "p-6",
                 div { class: "rounded-lg border border-zinc-200 dark:border-zinc-800 px-4 py-8 text-center",
                     p { class: "text-sm text-zinc-500", "Running drift check..." }

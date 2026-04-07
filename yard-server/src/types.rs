@@ -36,6 +36,37 @@ pub struct DashboardData {
     pub has_more: bool,
 }
 
+/// Cached dashboard data — full unpaginated PR list + metadata.
+/// Stored in DynamoDB, paginated on read to produce DashboardData.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DashboardCache {
+    pub prs: Vec<PrRow>,
+    pub open_prs: u32,
+    pub jobs_tracked: u32,
+}
+
+impl DashboardCache {
+    pub fn paginate(&self, page: u32, per_page: u32) -> DashboardData {
+        let start = ((page - 1) * per_page) as usize;
+        let end = (start + per_page as usize).min(self.prs.len());
+        let prs = if start < self.prs.len() {
+            self.prs[start..end].to_vec()
+        } else {
+            vec![]
+        };
+        let has_more = end < self.prs.len();
+
+        DashboardData {
+            prs,
+            open_prs: self.open_prs,
+            jobs_tracked: self.jobs_tracked,
+            page,
+            per_page,
+            has_more,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JobInfo {
     pub name: String,

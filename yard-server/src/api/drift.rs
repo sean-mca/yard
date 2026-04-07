@@ -140,7 +140,7 @@ pub async fn run_drift_check(state: &ApiState) -> Result<DriftData, String> {
 
     // Cache the full drift result so the UI can poll without triggering a full check
     let cached = serde_json::to_string(&drift_data).unwrap_or_default();
-    if let Err(e) = state.db.set_setting("drift_cache", &cached).await {
+    if let Err(e) = state.db.set_cache("drift", &cached).await {
         warn!(error = %e, "Failed to cache drift data");
     }
 
@@ -179,7 +179,7 @@ async fn get_head_sha(state: &ApiState) -> Result<String, String> {
 // ---- Cached drift data (populated by background task or full check) ----
 
 async fn get_drift_cached(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
-    match state.db.get_setting("drift_cache").await {
+    match state.db.get_cache("drift").await {
         Ok(Some(cached)) => match serde_json::from_str::<DriftData>(&cached) {
             Ok(data) => (StatusCode::OK, Json(data)).into_response(),
             Err(_) => (

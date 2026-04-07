@@ -1754,6 +1754,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dioxus-query"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1687bf3395690b561faa1452dba2c7e428b5d8c616d4e8622c33316c689d7697"
+dependencies = [
+ "dioxus",
+ "dioxus-core",
+ "futures-util",
+ "tokio",
+ "wasmtimer",
+ "web-time",
+]
+
+[[package]]
 name = "dioxus-router"
 version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4625,7 +4639,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -5318,6 +5332,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasmtimer"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c598d6b99ea013e35844697fc4670d08339d5cda15588f193c6beedd12f644b"
+dependencies = [
+ "futures",
+ "js-sys",
+ "parking_lot",
+ "pin-utils",
+ "slab",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "web-sys"
 version = "0.3.91"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5754,6 +5782,7 @@ dependencies = [
  "base64",
  "chrono",
  "dioxus",
+ "dioxus-query",
  "hex",
  "hmac",
  "octocrab",
@@ -5767,8 +5796,6 @@ dependencies = [
  "tracing",
  "uuid",
  "walkdir",
- "wasm-bindgen",
- "web-sys",
  "yaml-rust2",
  "yard-core",
  "yard-structs",

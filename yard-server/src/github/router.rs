@@ -13,6 +13,7 @@ use tracing::{info, warn, error};
 use super::client::GitHubClient;
 use super::git_ops::{clone_at_sha, run_yard, cleanup_workdir};
 use super::webhook::{parse_webhook, WebhookAction};
+use crate::api::dashboard::ApiState;
 use crate::db::{DynamoDatabase, PlanResultRow, PlanStatus, WebhookEvent};
 
 /// Shared state for the webhook handler.
@@ -20,6 +21,7 @@ pub struct AppState {
     pub github_client: GitHubClient,
     pub webhook_secret: String,
     pub db: Arc<DynamoDatabase>,
+    pub api_state: Arc<ApiState>,
 }
 
 /// Build the axum router for GitHub webhook endpoints.
@@ -114,7 +116,7 @@ async fn handle_webhook(
                 warn!(pr = pr_number, error = %e, "Failed to persist plan result");
             }
 
-            match state
+            let status = match state
                 .github_client
                 .post_plan_comment(&owner, &repo, pr_number, &plan_output)
                 .await
@@ -127,7 +129,14 @@ async fn handle_webhook(
                     warn!(pr = pr_number, error = %e, "Failed to post plan comment");
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
+            };
+
+            // Refresh dashboard cache so UI reflects the new plan result
+            if let Err(e) = crate::api::dashboard::refresh_dashboard_cache(&state.api_state).await {
+                warn!(error = %e, "Failed to refresh dashboard cache after plan");
             }
+
+            status
         }
         WebhookAction::Apply {
             owner,
@@ -160,7 +169,7 @@ async fn handle_webhook(
                 warn!(pr = pr_number, error = %e, "Failed to persist webhook event");
             }
 
-            match clone_at_sha(&clone_url, &head_sha).await {
+            let result = match clone_at_sha(&clone_url, &head_sha).await {
                 Ok(workdir) => {
                     let status = match run_yard("apply", &workdir).await {
                         Ok(output) => {
@@ -179,7 +188,14 @@ async fn handle_webhook(
                     error!(pr = pr_number, "Clone failed: {e}");
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
+            };
+
+            // Refresh dashboard cache so UI reflects the merged PR
+            if let Err(e) = crate::api::dashboard::refresh_dashboard_cache(&state.api_state).await {
+                warn!(error = %e, "Failed to refresh dashboard cache after apply");
             }
+
+            result
         }
         WebhookAction::Ignore => StatusCode::OK,
     }
