@@ -1,11 +1,29 @@
 use dioxus::prelude::*;
 
 use super::components::Pagination;
+use super::sheet::Sheet;
 use crate::types::*;
 
 const PER_PAGE: usize = 15;
 
 const API_BASE: &str = "http://127.0.0.1:3001";
+
+async fn fetch_job_file(path: String) -> Result<String, String> {
+    let url = format!("{API_BASE}/api/jobs/file?path={path}");
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| format!("Request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Server error ({status}): {body}"));
+    }
+
+    resp.text()
+        .await
+        .map_err(|e| format!("Failed to read response: {e}"))
+}
 
 async fn fetch_jobs() -> Result<JobsData, String> {
     let resp = reqwest::get(format!("{API_BASE}/api/jobs"))
@@ -93,6 +111,7 @@ fn SearchBar(mut search: Signal<String>) -> Element {
 #[component]
 fn FilteredJobs(jobs: Vec<JobInfo>, search: String) -> Element {
     let mut page = use_signal(|| 1u32);
+    let mut selected_job = use_signal(|| None::<JobInfo>);
 
     let query = search.to_lowercase();
     let filtered: Vec<&JobInfo> = jobs
@@ -144,15 +163,25 @@ fn FilteredJobs(jobs: Vec<JobInfo>, search: String) -> Element {
                     }
                     tbody {
                         for job in page_items.iter() {
-                            tr { class: "border-b border-zinc-100 hover:bg-zinc-50/50 transition-colors",
-                                td { class: "px-4 py-3 font-medium", "{job.name}" }
-                                td { class: "px-4 py-3",
-                                    span { class: "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium border bg-blue-50 text-blue-700 border-blue-200",
-                                        "{job.environment}"
+                            {
+                                let job = (*job).clone();
+                                rsx! {
+                                    tr {
+                                        class: "border-b border-zinc-100 hover:bg-zinc-50/50 cursor-pointer transition-colors",
+                                        onclick: {
+                                            let job = job.clone();
+                                            move |_| selected_job.set(Some(job.clone()))
+                                        },
+                                        td { class: "px-4 py-3 font-medium", "{job.name}" }
+                                        td { class: "px-4 py-3",
+                                            span { class: "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium border bg-blue-50 text-blue-700 border-blue-200",
+                                                "{job.environment}"
+                                            }
+                                        }
+                                        td { class: "px-4 py-3 text-zinc-500", "{job.region}" }
+                                        td { class: "px-4 py-3 text-zinc-500 font-mono text-xs", "{job.path}" }
                                     }
                                 }
-                                td { class: "px-4 py-3 text-zinc-500", "{job.region}" }
-                                td { class: "px-4 py-3 text-zinc-500 font-mono text-xs", "{job.path}" }
                             }
                         }
                     }
@@ -171,6 +200,63 @@ fn FilteredJobs(jobs: Vec<JobInfo>, search: String) -> Element {
                 on_next: move |_| {
                     page += 1;
                 },
+            }
+        }
+        JobSheet { job: selected_job }
+    }
+}
+
+#[component]
+fn JobSheet(mut job: Signal<Option<JobInfo>>) -> Element {
+    let is_open = job().is_some();
+    let title = job().as_ref().map(|j| j.name.clone()).unwrap_or_default();
+    let path = job().as_ref().map(|j| j.path.clone()).unwrap_or_default();
+
+    let file_content = use_resource(move || {
+        let path = job().as_ref().map(|j| j.path.clone());
+        async move {
+            match path {
+                Some(p) => Some(fetch_job_file(p).await),
+                None => None,
+            }
+        }
+    });
+
+    rsx! {
+        Sheet {
+            open: is_open,
+            title,
+            on_close: move |_| job.set(None),
+            if !path.is_empty() {
+                div { class: "px-5 py-3 border-b border-zinc-100",
+                    p { class: "text-xs font-mono text-zinc-400", "{path}" }
+                }
+            }
+            match &*file_content.read() {
+                Some(Some(Ok(content))) => rsx! {
+                    pre { class: "px-5 py-4 text-xs font-mono text-zinc-700 whitespace-pre-wrap",
+                        "{content}"
+                    }
+                },
+                Some(Some(Err(e))) => rsx! {
+                    div { class: "px-5 py-4 text-sm text-red-600", "Error: {e}" }
+                },
+                _ if is_open => rsx! {
+                    div { class: "px-5 py-4 flex items-center gap-2 text-sm text-zinc-500",
+                        svg {
+                            xmlns: "http://www.w3.org/2000/svg",
+                            width: "14", height: "14",
+                            view_box: "0 0 24 24",
+                            fill: "none",
+                            stroke: "currentColor",
+                            stroke_width: "2",
+                            class: "animate-spin",
+                            path { d: "M21 12a9 9 0 11-6.219-8.56" }
+                        }
+                        "Loading..."
+                    }
+                },
+                _ => rsx! {},
             }
         }
     }
