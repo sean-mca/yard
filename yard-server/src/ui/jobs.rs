@@ -44,8 +44,8 @@ async fn fetch_jobs() -> Result<JobsData, String> {
 #[component]
 pub fn Jobs() -> Element {
     let data = use_resource(fetch_jobs);
-    let mut search = use_signal(String::new);
-    let mut env_filter = use_signal(|| None::<String>);
+    let search = use_signal(String::new);
+    let env_filter = use_signal(|| None::<String>);
 
     rsx! {
         div { class: "p-6",
@@ -238,7 +238,7 @@ fn FilteredJobs(jobs: Vec<JobInfo>, search: String, env_filter: Option<String>) 
                     tbody {
                         for job in page_items.iter() {
                             {
-                                let job = (*job).clone();
+                                let job = JobInfo::clone(job);
                                 rsx! {
                                     tr {
                                         class: "border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50/50 dark:hover:bg-zinc-900/50 cursor-pointer transition-colors",

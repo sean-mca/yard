@@ -43,7 +43,7 @@ pub fn Drift() -> Element {
             .stale_time(Duration::from_secs(30))
             .interval_time(Duration::from_secs(15)),
     );
-    let mut selected = use_signal(|| None::<DriftItem>);
+    let selected = use_signal(|| None::<DriftItem>);
 
     let data_state = data.read();
     match &*data_state.state() {

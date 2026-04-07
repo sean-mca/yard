@@ -5,6 +5,7 @@ pub struct GitHubClient {
     octo: Octocrab,
 }
 
+#[allow(dead_code)]
 impl GitHubClient {
     pub fn new(token: &str) -> Result<Self, octocrab::Error> {
         let octo = Octocrab::builder()
