@@ -48,3 +48,26 @@ pub struct JobInfo {
 pub struct JobsData {
     pub jobs: Vec<JobInfo>,
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum DriftType {
+    Modified,
+    New,
+    Deleted,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DriftItem {
+    pub name: String,
+    pub environment: String,
+    pub region: String,
+    pub drift_type: DriftType,
+    pub fields_changed: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DriftData {
+    pub items: Vec<DriftItem>,
+    pub in_sync: u32,
+    pub drifted: u32,
+}
