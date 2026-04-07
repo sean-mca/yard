@@ -1,21 +1,33 @@
 use dioxus::prelude::*;
 
+use super::settings::Theme;
 use crate::Route;
 
 #[component]
 pub fn Sidebar(open: Signal<bool>, route: Route) -> Element {
+    let theme: Signal<Theme> = use_context();
+    let is_dark = matches!(theme(), Theme::Dark);
+
     rsx! {
         aside {
             class: format!(
-                "h-screen sticky top-0 flex flex-col border-r border-zinc-200 bg-zinc-50/75 transition-all duration-200 {}",
+                "h-screen sticky top-0 flex flex-col border-r transition-all duration-200 {} {}",
+                if is_dark { "border-zinc-800 bg-zinc-900/75" } else { "border-zinc-200 bg-zinc-50/75" },
                 if open() { "w-64" } else { "w-14" }
             ),
-            div { class: "flex items-center h-14 px-3 border-b border-zinc-200",
+            div {
+                class: format!(
+                    "flex items-center h-14 px-3 border-b {}",
+                    if is_dark { "border-zinc-800" } else { "border-zinc-200" }
+                ),
                 if open() {
                     span { class: "text-sm font-semibold tracking-tight pl-1", "yard" }
                 }
                 button {
-                    class: "ml-auto p-1.5 rounded-md text-zinc-500 hover:text-zinc-950 hover:bg-zinc-200/50 cursor-pointer transition-colors",
+                    class: format!(
+                        "ml-auto p-1.5 rounded-md cursor-pointer transition-colors {}",
+                        if is_dark { "text-zinc-400 hover:text-zinc-50 hover:bg-zinc-800" } else { "text-zinc-500 hover:text-zinc-950 hover:bg-zinc-200/50" }
+                    ),
                     onclick: move |_| open.toggle(),
                     if open() {
                         svg {
@@ -51,6 +63,7 @@ pub fn Sidebar(open: Signal<bool>, route: Route) -> Element {
                     label: "Dashboard",
                     expanded: open(),
                     active: matches!(route, Route::Dashboard {}),
+                    dark: is_dark,
                 }
                 SidebarLink {
                     to: Route::Jobs {},
@@ -58,6 +71,7 @@ pub fn Sidebar(open: Signal<bool>, route: Route) -> Element {
                     label: "Jobs",
                     expanded: open(),
                     active: matches!(route, Route::Jobs {}),
+                    dark: is_dark,
                 }
                 SidebarLink {
                     to: Route::Drift {},
@@ -65,6 +79,7 @@ pub fn Sidebar(open: Signal<bool>, route: Route) -> Element {
                     label: "Drift",
                     expanded: open(),
                     active: matches!(route, Route::Drift {}),
+                    dark: is_dark,
                 }
                 SidebarLink {
                     to: Route::Settings {},
@@ -72,6 +87,7 @@ pub fn Sidebar(open: Signal<bool>, route: Route) -> Element {
                     label: "Settings",
                     expanded: open(),
                     active: matches!(route, Route::Settings {}),
+                    dark: is_dark,
                 }
             }
         }
@@ -85,6 +101,7 @@ fn SidebarLink(
     label: &'static str,
     expanded: bool,
     active: bool,
+    dark: bool,
 ) -> Element {
     rsx! {
         div { class: "relative group",
@@ -94,9 +111,9 @@ fn SidebarLink(
                     "flex items-center gap-3 rounded-md text-sm cursor-pointer transition-colors {} {}",
                     if expanded { "px-2.5 py-1.5" } else { "justify-center p-2" },
                     if active {
-                        "bg-zinc-200/75 text-zinc-950 font-medium"
+                        if dark { "bg-zinc-800 text-zinc-50 font-medium" } else { "bg-zinc-200/75 text-zinc-950 font-medium" }
                     } else {
-                        "text-zinc-500 hover:text-zinc-950 hover:bg-zinc-100"
+                        if dark { "text-zinc-400 hover:text-zinc-50 hover:bg-zinc-800" } else { "text-zinc-500 hover:text-zinc-950 hover:bg-zinc-100" }
                     }
                 ),
                 svg {
@@ -117,7 +134,10 @@ fn SidebarLink(
             }
             if !expanded {
                 div {
-                    class: "absolute left-full top-1/2 -translate-y-1/2 ml-2 px-2 py-1 rounded-md bg-zinc-950 text-zinc-50 text-xs whitespace-nowrap opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50",
+                    class: format!(
+                        "absolute left-full top-1/2 -translate-y-1/2 ml-2 px-2 py-1 rounded-md text-xs whitespace-nowrap opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50 {}",
+                        if dark { "bg-zinc-50 text-zinc-950" } else { "bg-zinc-950 text-zinc-50" }
+                    ),
                     "{label}"
                 }
             }

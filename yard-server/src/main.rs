@@ -82,6 +82,9 @@ fn start_api_server() {
 }
 
 fn app() -> Element {
+    let theme = use_signal(|| ui::settings::Theme::Light);
+    use_context_provider(|| theme);
+
     rsx! {
         document::Stylesheet { href: TAILWIND_CSS }
         Router::<Route> {}
@@ -92,6 +95,9 @@ fn app() -> Element {
 fn Shell() -> Element {
     let sidebar_open = use_signal(|| true);
     let route: Route = use_route();
+    let theme: Signal<ui::settings::Theme> = use_context();
+
+    let is_dark = matches!(theme(), ui::settings::Theme::Dark);
 
     let title = match &route {
         Route::Dashboard {} => "Dashboard",
@@ -101,10 +107,19 @@ fn Shell() -> Element {
     };
 
     rsx! {
-        div { class: "min-h-screen bg-white text-zinc-950 flex",
+        div {
+            class: format!(
+                "min-h-screen flex {} {}",
+                if is_dark { "bg-zinc-950 text-zinc-50" } else { "bg-white text-zinc-950" },
+                if is_dark { "dark" } else { "" }
+            ),
             ui::sidebar::Sidebar { open: sidebar_open, route }
             main { class: "flex-1 min-h-screen",
-                div { class: "h-14 flex items-center px-6 border-b border-zinc-200",
+                div {
+                    class: format!(
+                        "h-14 flex items-center px-6 border-b {}",
+                        if is_dark { "border-zinc-800" } else { "border-zinc-200" }
+                    ),
                     h1 { class: "text-sm font-semibold", "{title}" }
                 }
                 Outlet::<Route> {}
@@ -130,5 +145,6 @@ fn Drift() -> Element {
 
 #[component]
 fn Settings() -> Element {
-    rsx! { ui::settings::Settings {} }
+    let theme: Signal<ui::settings::Theme> = use_context();
+    rsx! { ui::settings::Settings { theme } }
 }
