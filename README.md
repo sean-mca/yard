@@ -498,8 +498,23 @@ YARD includes a web server (`yard-server`) that provides a dashboard, GitHub web
 | `YARD_REPO_NAME` | Yes | — | GitHub repository name |
 | `YARD_DB_TABLE_PREFIX` | No | `yard` | DynamoDB table name prefix (table: `{prefix}_yard`) |
 | `YARD_DB_REGION` | No | `us-east-1` | AWS region for DynamoDB (falls back to `AWS_REGION`) |
+| `YARD_DB_ENDPOINT_URL` | No | — | Custom DynamoDB endpoint (for local dev with ministack) |
 
 Standard AWS credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, or an IAM role/profile) must be configured for DynamoDB access. The server creates the table and indexes automatically on first startup.
+
+### Local development
+
+A `docker-compose.yml` is provided to run [ministack](https://ministack.org) for local S3 and DynamoDB:
+
+```bash
+docker compose up -d
+```
+
+This creates the DynamoDB table (`yard_yard`) and an S3 bucket (`yard-state`) on `localhost:4566`. Copy `env.local.example` to `.env.local`, fill in your GitHub token, then:
+
+```bash
+export $(cat .env.local | xargs) && dx serve
+```
 
 ### DynamoDB permissions
 

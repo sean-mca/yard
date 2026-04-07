@@ -6,3 +6,6 @@ yard.yaml
 
 
 .DS_Store
+
+
+.env.local

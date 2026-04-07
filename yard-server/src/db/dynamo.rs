@@ -17,11 +17,19 @@ pub struct DynamoDatabase {
 }
 
 impl DynamoDatabase {
-    pub async fn connect(table_name: &str, region: &str) -> Result<Self> {
-        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(aws_config::Region::new(region.to_string()))
-            .load()
-            .await;
+    pub async fn connect(
+        table_name: &str,
+        region: &str,
+        endpoint_url: Option<&str>,
+    ) -> Result<Self> {
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new(region.to_string()));
+
+        if let Some(url) = endpoint_url {
+            loader = loader.endpoint_url(url);
+        }
+
+        let config = loader.load().await;
 
         let client = Client::new(&config);
 

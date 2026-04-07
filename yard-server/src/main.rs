@@ -8,6 +8,8 @@ mod db;
 mod github;
 mod types;
 mod ui;
+#[cfg(not(target_arch = "wasm32"))]
+mod yard_runner;
 
 const TAILWIND_CSS: Asset = asset!("/assets/tailwind.css");
 
@@ -34,12 +36,16 @@ fn main() {
 #[cfg(not(target_arch = "wasm32"))]
 fn start_api_server() {
     use api::dashboard::{dashboard_router, ApiState};
+    use api::drift::drift_router;
     use api::jobs::jobs_router;
     use api::settings::settings_router;
     use db::DbConfig;
     use github::{client::GitHubClient, router::github_router, router::AppState};
     use std::sync::Arc;
     use tower_http::cors::{Any, CorsLayer};
+
+    // Install rustls crypto provider before any TLS clients are created
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     std::thread::spawn(|| {
         tokio::runtime::Runtime::new()
@@ -86,6 +92,7 @@ fn start_api_server() {
                     .merge(github_router(webhook_state))
                     .merge(dashboard_router(api_state.clone()))
                     .merge(jobs_router(api_state.clone()))
+                    .merge(drift_router(api_state.clone()))
                     .merge(settings_router(api_state))
                     .layer(cors);
 

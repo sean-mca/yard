@@ -3,94 +3,84 @@ use dioxus::prelude::*;
 use super::sheet::Sheet;
 use crate::types::*;
 
-fn mock_drift_data() -> DriftData {
-    DriftData {
-        in_sync: 3,
-        drifted: 3,
-        items: vec![
-            DriftItem {
-                name: "jdbc-test".to_string(),
-                environment: "dev".to_string(),
-                region: "us-east-2".to_string(),
-                drift_type: DriftType::Modified,
-                fields_changed: vec!["config".to_string(), "transforms".to_string(), "sink".to_string()],
-                old_config: Some(
-                    "type: glue\nconfig:\n  timeout: 30\n  max_retries: 3\n  worker_type: G.1X\n  num_workers: 2\nsources:\n  - name: users\n    type: jdbc\n    connection: pg-main\ntransforms:\n  - type: filter\n    condition: \"status = 'active'\"\nsink:\n  write_mode: overwrite\n  path: s3://lake/users/".to_string(),
-                ),
-                new_config: Some(
-                    "type: glue\nconfig:\n  timeout: 60\n  max_retries: 5\n  worker_type: G.2X\n  num_workers: 4\nsources:\n  - name: users\n    type: jdbc\n    connection: pg-main\ntransforms:\n  - type: filter\n    condition: \"status = 'active'\"\n  - type: sql\n    query: \"SELECT *, NOW() as loaded_at FROM users\"\nsink:\n  write_mode: append\n  path: s3://lake/users/".to_string(),
-                ),
-            },
-            DriftItem {
-                name: "s3-ingest".to_string(),
-                environment: "dev".to_string(),
-                region: "us-east-2".to_string(),
-                drift_type: DriftType::New,
-                fields_changed: vec![],
-                old_config: None,
-                new_config: Some(
-                    "type: glue\nconfig:\n  timeout: 30\n  worker_type: G.1X\nsources:\n  - name: events\n    type: s3\n    path: s3://raw/events/\nsink:\n  write_mode: append\n  path: s3://lake/events/".to_string(),
-                ),
-            },
-            DriftItem {
-                name: "legacy-etl".to_string(),
-                environment: "prod".to_string(),
-                region: "us-east-1".to_string(),
-                drift_type: DriftType::Deleted,
-                fields_changed: vec![],
-                old_config: Some(
-                    "type: glue\nconfig:\n  timeout: 120\n  worker_type: G.1X\nsources:\n  - name: orders\n    type: jdbc\n    connection: mysql-legacy\nsink:\n  write_mode: overwrite\n  path: s3://lake/orders/".to_string(),
-                ),
-                new_config: None,
-            },
-        ],
+const API_BASE: &str = "http://127.0.0.1:3001";
+
+async fn fetch_drift_data() -> Result<DriftData, String> {
+    let resp = reqwest::get(format!("{API_BASE}/api/drift"))
+        .await
+        .map_err(|e| format!("Request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Server error ({status}): {body}"));
     }
+
+    resp.json::<DriftData>()
+        .await
+        .map_err(|e| format!("Failed to parse response: {e}"))
 }
 
 #[component]
 pub fn Drift() -> Element {
-    let data = mock_drift_data();
+    let data = use_resource(|| fetch_drift_data());
     let mut selected = use_signal(|| None::<DriftItem>);
 
-    let total = data.in_sync + data.drifted;
-
-    rsx! {
-        div { class: "p-6",
-            // Summary cards
-            div { class: "grid grid-cols-3 gap-4 mb-6",
-                SummaryCard { label: "Total Jobs", value: format!("{total}") }
-                SummaryCard { label: "In Sync", value: format!("{}", data.in_sync), accent: "emerald" }
-                SummaryCard {
-                    label: "Drifted",
-                    value: format!("{}", data.drifted),
-                    accent: if data.drifted > 0 { "amber" } else { "emerald" },
-                }
-            }
-
-            if data.items.is_empty() {
-                div { class: "rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-8 text-center",
-                    div { class: "flex items-center justify-center gap-2 text-emerald-700",
-                        svg {
-                            xmlns: "http://www.w3.org/2000/svg",
-                            width: "18", height: "18",
-                            view_box: "0 0 24 24",
-                            fill: "none",
-                            stroke: "currentColor",
-                            stroke_width: "2",
-                            stroke_linecap: "round",
-                            stroke_linejoin: "round",
-                            path { d: "M22 11.08V12a10 10 0 11-5.93-9.14" }
-                            path { d: "M22 4L12 14.01l-3-3" }
+    match &*data.read() {
+        Some(Ok(drift_data)) => {
+            let total = drift_data.in_sync + drift_data.drifted;
+            rsx! {
+                div { class: "p-6",
+                    div { class: "grid grid-cols-3 gap-4 mb-6",
+                        SummaryCard { label: "Total Jobs", value: format!("{total}") }
+                        SummaryCard { label: "In Sync", value: format!("{}", drift_data.in_sync), accent: "emerald" }
+                        SummaryCard {
+                            label: "Drifted",
+                            value: format!("{}", drift_data.drifted),
+                            accent: if drift_data.drifted > 0 { "amber" } else { "emerald" },
                         }
-                        p { class: "text-sm font-medium", "All jobs in sync" }
                     }
-                }
-            } else {
-                DriftTable { items: data.items.clone(), selected }
-            }
 
-            DriftSheet { item: selected }
+                    if drift_data.items.is_empty() {
+                        div { class: "rounded-lg border border-emerald-200 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950 px-4 py-8 text-center",
+                            div { class: "flex items-center justify-center gap-2 text-emerald-700 dark:text-emerald-300",
+                                svg {
+                                    xmlns: "http://www.w3.org/2000/svg",
+                                    width: "18", height: "18",
+                                    view_box: "0 0 24 24",
+                                    fill: "none",
+                                    stroke: "currentColor",
+                                    stroke_width: "2",
+                                    stroke_linecap: "round",
+                                    stroke_linejoin: "round",
+                                    path { d: "M22 11.08V12a10 10 0 11-5.93-9.14" }
+                                    path { d: "M22 4L12 14.01l-3-3" }
+                                }
+                                p { class: "text-sm font-medium", "All jobs in sync" }
+                            }
+                        }
+                    } else {
+                        DriftTable { items: drift_data.items.clone(), selected }
+                    }
+
+                    DriftSheet { item: selected }
+                }
+            }
         }
+        Some(Err(e)) => rsx! {
+            div { class: "p-6",
+                div { class: "rounded-lg border border-red-200 bg-red-50 px-4 py-8 text-center",
+                    p { class: "text-sm text-red-700", "Failed to load drift data: {e}" }
+                }
+            }
+        },
+        None => rsx! {
+            div { class: "p-6",
+                div { class: "rounded-lg border border-zinc-200 dark:border-zinc-800 px-4 py-8 text-center",
+                    p { class: "text-sm text-zinc-500", "Running drift check..." }
+                }
+            }
+        },
     }
 }
 

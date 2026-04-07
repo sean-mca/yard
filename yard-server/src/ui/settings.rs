@@ -1,4 +1,5 @@
 use dioxus::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 const API_BASE: &str = "http://127.0.0.1:3001";
@@ -29,7 +30,7 @@ async fn fetch_settings() -> Result<HashMap<String, String>, String> {
         return Err(format!("Server error: {}", resp.status()));
     }
 
-    #[derive(serde::Deserialize)]
+    #[derive(Deserialize)]
     struct SettingsResponse {
         settings: HashMap<String, String>,
     }
@@ -42,6 +43,11 @@ async fn fetch_settings() -> Result<HashMap<String, String>, String> {
     Ok(body.settings)
 }
 
+#[derive(Serialize)]
+struct SettingsPayload {
+    settings: HashMap<String, String>,
+}
+
 async fn save_setting(key: &str, value: &str) -> Result<(), String> {
     let mut settings = HashMap::new();
     settings.insert(key.to_string(), value.to_string());
@@ -49,7 +55,7 @@ async fn save_setting(key: &str, value: &str) -> Result<(), String> {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{API_BASE}/api/settings"))
-        .json(&serde_json::json!({ "settings": settings }))
+        .json(&SettingsPayload { settings })
         .send()
         .await
         .map_err(|e| format!("Request failed: {e}"))?;

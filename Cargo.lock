@@ -5758,6 +5758,7 @@ dependencies = [
  "hmac",
  "octocrab",
  "reqwest",
+ "rustls 0.23.37",
  "serde",
  "serde_json",
  "sha2",
@@ -5765,6 +5766,10 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
+ "walkdir",
+ "yaml-rust2",
+ "yard-core",
+ "yard-structs",
 ]
 
 [[package]]

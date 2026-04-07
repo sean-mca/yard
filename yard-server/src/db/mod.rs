@@ -76,6 +76,7 @@ pub struct Setting {
 pub struct DbConfig {
     pub table_name: String,
     pub region: String,
+    pub endpoint_url: Option<String>,
 }
 
 impl DbConfig {
@@ -85,10 +86,12 @@ impl DbConfig {
         let region = std::env::var("YARD_DB_REGION")
             .or_else(|_| std::env::var("AWS_REGION"))
             .unwrap_or_else(|_| "us-east-1".to_string());
+        let endpoint_url = std::env::var("YARD_DB_ENDPOINT_URL").ok();
 
         DbConfig {
             table_name: format!("{prefix}_yard"),
             region,
+            endpoint_url,
         }
     }
 }
@@ -96,6 +99,11 @@ impl DbConfig {
 // ---- Factory ----
 
 pub async fn connect(config: &DbConfig) -> anyhow::Result<Arc<DynamoDatabase>> {
-    let db = DynamoDatabase::connect(&config.table_name, &config.region).await?;
+    let db = DynamoDatabase::connect(
+        &config.table_name,
+        &config.region,
+        config.endpoint_url.as_deref(),
+    )
+    .await?;
     Ok(Arc::new(db))
 }

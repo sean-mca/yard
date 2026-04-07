@@ -6,6 +6,28 @@ use crate::types::*;
 
 const API_BASE: &str = "http://127.0.0.1:3001";
 
+#[derive(serde::Deserialize)]
+struct DriftSummaryResponse {
+    drifted: u32,
+}
+
+async fn fetch_drift_summary() -> Result<u32, String> {
+    let resp = reqwest::get(format!("{API_BASE}/api/drift/summary"))
+        .await
+        .map_err(|e| format!("Request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Ok(0);
+    }
+
+    let data = resp
+        .json::<DriftSummaryResponse>()
+        .await
+        .map_err(|e| format!("Parse failed: {e}"))?;
+
+    Ok(data.drifted)
+}
+
 async fn fetch_dashboard_data(page: u32) -> Result<DashboardData, String> {
     let resp = reqwest::get(format!("{API_BASE}/api/dashboard?page={page}&per_page=15"))
         .await
@@ -26,6 +48,13 @@ async fn fetch_dashboard_data(page: u32) -> Result<DashboardData, String> {
 pub fn Dashboard() -> Element {
     let mut page = use_signal(|| 1u32);
     let data = use_resource(move || fetch_dashboard_data(page()));
+    let drift_data = use_resource(|| fetch_drift_summary());
+
+    let drift_status = match &*drift_data.read() {
+        Some(Ok(0)) => DriftStatus::Ok,
+        Some(Ok(n)) => DriftStatus::Drifted(*n),
+        _ => DriftStatus::Ok,
+    };
 
     match &*data.read() {
         Some(Ok(dashboard)) => rsx! {
@@ -33,7 +62,7 @@ pub fn Dashboard() -> Element {
                 MetricsBar {
                     open_prs: dashboard.open_prs,
                     plans_running: 0,
-                    drift: DriftStatus::Ok,
+                    drift: drift_status,
                     jobs_tracked: dashboard.jobs_tracked,
                 }
                 PrTable { rows: dashboard.prs.clone() }
