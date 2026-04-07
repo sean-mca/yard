@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 aws-config = { version = "1.8.15", features = ["behavior-version-latest"] }
+aws-sdk-emr = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-glue = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = { version = "1.127.0", features = ["behavior-version-latest"] }
 blake3 = { version = "1.8.3", features = ["serde"] }
