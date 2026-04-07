@@ -113,7 +113,14 @@ fn PrTable(rows: Vec<PrRow>) -> Element {
 fn PrTableRow(row: PrRow) -> Element {
     rsx! {
         tr { class: "border-b border-zinc-100 hover:bg-zinc-50/50 transition-colors",
-            td { class: "px-4 py-3 font-mono text-zinc-500", "#{row.number}" }
+            td { class: "px-4 py-3 font-mono",
+                a {
+                    href: "{row.url}",
+                    target: "_blank",
+                    class: "text-blue-600 hover:text-blue-800 hover:underline cursor-pointer",
+                    "#{row.number}"
+                }
+            }
             td { class: "px-4 py-3 font-medium", "{row.title}" }
             td { class: "px-4 py-3 text-zinc-500", "{row.author}" }
             td { class: "px-4 py-3", StateBadge { state: row.state.clone() } }

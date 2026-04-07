@@ -113,6 +113,11 @@ async fn fetch_dashboard_data(
             state: pr_state,
             plan_result: PlanResult::None,
             updated,
+            url: pr
+                .html_url
+                .as_ref()
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
         });
     }
 

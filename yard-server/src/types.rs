@@ -23,6 +23,7 @@ pub struct PrRow {
     pub state: PrState,
     pub plan_result: PlanResult,
     pub updated: String,
+    pub url: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
