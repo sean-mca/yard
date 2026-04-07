@@ -39,6 +39,8 @@ pub struct DashboardData {
 pub struct JobInfo {
     pub name: String,
     pub path: String,
+    pub environment: String,
+    pub region: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

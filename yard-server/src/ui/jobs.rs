@@ -101,6 +101,8 @@ fn FilteredJobs(jobs: Vec<JobInfo>, search: String) -> Element {
             query.is_empty()
                 || j.name.to_lowercase().contains(&query)
                 || j.path.to_lowercase().contains(&query)
+                || j.environment.to_lowercase().contains(&query)
+                || j.region.to_lowercase().contains(&query)
         })
         .collect();
     let total = jobs.len();
@@ -135,6 +137,8 @@ fn FilteredJobs(jobs: Vec<JobInfo>, search: String) -> Element {
                     thead {
                         tr { class: "border-b border-zinc-200 bg-zinc-50/50",
                             th { class: "text-left font-medium text-zinc-500 px-4 py-3", "Name" }
+                            th { class: "text-left font-medium text-zinc-500 px-4 py-3", "Environment" }
+                            th { class: "text-left font-medium text-zinc-500 px-4 py-3", "Region" }
                             th { class: "text-left font-medium text-zinc-500 px-4 py-3", "Path" }
                         }
                     }
@@ -142,6 +146,12 @@ fn FilteredJobs(jobs: Vec<JobInfo>, search: String) -> Element {
                         for job in page_items.iter() {
                             tr { class: "border-b border-zinc-100 hover:bg-zinc-50/50 transition-colors",
                                 td { class: "px-4 py-3 font-medium", "{job.name}" }
+                                td { class: "px-4 py-3",
+                                    span { class: "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium border bg-blue-50 text-blue-700 border-blue-200",
+                                        "{job.environment}"
+                                    }
+                                }
+                                td { class: "px-4 py-3 text-zinc-500", "{job.region}" }
                                 td { class: "px-4 py-3 text-zinc-500 font-mono text-xs", "{job.path}" }
                             }
                         }
@@ -166,32 +176,3 @@ fn FilteredJobs(jobs: Vec<JobInfo>, search: String) -> Element {
     }
 }
 
-#[component]
-fn JobsTable(jobs: Vec<JobInfo>) -> Element {
-    rsx! {
-        div { class: "rounded-lg border border-zinc-200 overflow-hidden",
-            if jobs.is_empty() {
-                div { class: "px-4 py-8 text-center text-sm text-zinc-500",
-                    "No jobs found in repository."
-                }
-            } else {
-                table { class: "w-full text-sm",
-                    thead {
-                        tr { class: "border-b border-zinc-200 bg-zinc-50/50",
-                            th { class: "text-left font-medium text-zinc-500 px-4 py-3", "Name" }
-                            th { class: "text-left font-medium text-zinc-500 px-4 py-3", "Path" }
-                        }
-                    }
-                    tbody {
-                        for job in jobs.iter() {
-                            tr { class: "border-b border-zinc-100 hover:bg-zinc-50/50 transition-colors",
-                                td { class: "px-4 py-3 font-medium", "{job.name}" }
-                                td { class: "px-4 py-3 text-zinc-500 font-mono text-xs", "{job.path}" }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}

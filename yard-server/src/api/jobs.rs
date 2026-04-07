@@ -68,15 +68,20 @@ async fn fetch_jobs(state: &ApiState) -> Result<JobsData, String> {
                         && !p.contains("transforms.yaml")
                 })
                 .map(|p| {
-                    let name = p
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(p)
+                    let segments: Vec<&str> = p.split('/').collect();
+                    let name = segments
+                        .last()
+                        .unwrap_or(&p)
                         .trim_end_matches(".yaml")
                         .to_string();
+                    // Path convention: <provider>/<env>/<region>/job.yaml
+                    let environment = segments.get(1).unwrap_or(&"—").to_string();
+                    let region = segments.get(2).unwrap_or(&"—").to_string();
                     JobInfo {
                         name,
                         path: p.to_string(),
+                        environment,
+                        region,
                     }
                 })
                 .collect()
