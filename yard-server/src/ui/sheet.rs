@@ -5,6 +5,8 @@ pub fn Sheet(
     open: bool,
     title: String,
     on_close: EventHandler<MouseEvent>,
+    #[props(default = "w-[480px]".to_string())]
+    width: String,
     children: Element,
 ) -> Element {
     rsx! {
@@ -18,7 +20,7 @@ pub fn Sheet(
         // Panel
         div {
             class: format!(
-                "fixed top-0 right-0 h-full w-[480px] bg-white border-l border-zinc-200 shadow-xl z-50 transform transition-transform duration-200 {}",
+                "fixed top-0 right-0 h-full {width} bg-white border-l border-zinc-200 shadow-xl z-50 transform transition-transform duration-200 {}",
                 if open { "translate-x-0" } else { "translate-x-full" }
             ),
             // Header

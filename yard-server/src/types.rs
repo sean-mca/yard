@@ -63,6 +63,8 @@ pub struct DriftItem {
     pub region: String,
     pub drift_type: DriftType,
     pub fields_changed: Vec<String>,
+    pub old_config: Option<String>,
+    pub new_config: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
