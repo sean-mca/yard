@@ -16,6 +16,7 @@ pub struct DynamoDatabase {
     table_name: String,
 }
 
+#[allow(dead_code)]
 impl DynamoDatabase {
     pub async fn connect(
         table_name: &str,
@@ -503,6 +504,7 @@ fn get_dt(item: &HashMap<String, AttributeValue>, key: &str) -> Option<DateTime<
     DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.to_utc())
 }
 
+#[allow(dead_code)]
 fn parse_webhook_event(item: &HashMap<String, AttributeValue>) -> Option<WebhookEvent> {
     let payload_str = get_s(item, "payload")?;
     let payload: Value = serde_json::from_str(&payload_str).ok()?;

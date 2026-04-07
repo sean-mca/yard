@@ -2,7 +2,7 @@ use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-const API_BASE: &str = "http://127.0.0.1:3001";
+use super::api_base;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Theme {
@@ -22,7 +22,7 @@ impl Theme {
 }
 
 async fn fetch_settings() -> Result<HashMap<String, String>, String> {
-    let resp = reqwest::get(format!("{API_BASE}/api/settings"))
+    let resp = reqwest::get(format!("{}/api/settings", api_base()))
         .await
         .map_err(|e| format!("Request failed: {e}"))?;
 
@@ -54,7 +54,7 @@ async fn save_setting(key: &str, value: &str) -> Result<(), String> {
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("{API_BASE}/api/settings"))
+        .post(format!("{}/api/settings", api_base()))
         .json(&SettingsPayload { settings })
         .send()
         .await

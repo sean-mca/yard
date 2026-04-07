@@ -6,10 +6,10 @@ use crate::types::*;
 
 const PER_PAGE: usize = 15;
 
-const API_BASE: &str = "http://127.0.0.1:3001";
+use super::api_base;
 
 async fn fetch_job_file(path: String) -> Result<String, String> {
-    let url = format!("{API_BASE}/api/jobs/file?path={path}");
+    let url = format!("{}/api/jobs/file?path={path}", api_base());
     let resp = reqwest::get(&url)
         .await
         .map_err(|e| format!("Request failed: {e}"))?;
@@ -26,7 +26,7 @@ async fn fetch_job_file(path: String) -> Result<String, String> {
 }
 
 async fn fetch_jobs() -> Result<JobsData, String> {
-    let resp = reqwest::get(format!("{API_BASE}/api/jobs"))
+    let resp = reqwest::get(format!("{}/api/jobs", api_base()))
         .await
         .map_err(|e| format!("Request failed: {e}"))?;
 
@@ -44,8 +44,8 @@ async fn fetch_jobs() -> Result<JobsData, String> {
 #[component]
 pub fn Jobs() -> Element {
     let data = use_resource(fetch_jobs);
-    let mut search = use_signal(String::new);
-    let mut env_filter = use_signal(|| None::<String>);
+    let search = use_signal(String::new);
+    let env_filter = use_signal(|| None::<String>);
 
     rsx! {
         div { class: "p-6",
@@ -238,7 +238,7 @@ fn FilteredJobs(jobs: Vec<JobInfo>, search: String, env_filter: Option<String>) 
                     tbody {
                         for job in page_items.iter() {
                             {
-                                let job = (*job).clone();
+                                let job = JobInfo::clone(job);
                                 rsx! {
                                     tr {
                                         class: "border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50/50 dark:hover:bg-zinc-900/50 cursor-pointer transition-colors",

@@ -11,10 +11,11 @@ use std::sync::Arc;
 use tracing::{info, warn, error};
 
 use super::client::GitHubClient;
-use super::git_ops::{clone_at_sha, run_yard, cleanup_workdir};
+use super::git_ops::{clone_at_sha, cleanup_workdir};
 use super::webhook::{parse_webhook, WebhookAction};
 use crate::api::dashboard::ApiState;
 use crate::db::{DynamoDatabase, PlanResultRow, PlanStatus, WebhookEvent};
+use crate::yard_runner;
 
 /// Shared state for the webhook handler.
 pub struct AppState {
@@ -29,6 +30,56 @@ pub fn github_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/webhook/github", post(handle_webhook))
         .with_state(state)
+}
+
+/// Format diffs as text for a PR comment.
+fn format_plan_output(diffs: &[yard_structs::JobDiff], project_name: &str) -> String {
+    let mut output = format!("### yard plan for {project_name}\n\n");
+
+    if diffs.is_empty() {
+        output.push_str("No changes. Infrastructure is up to date.\n");
+        return output;
+    }
+
+    for diff in diffs {
+        match &diff.diff_type {
+            yard_structs::DiffType::Create => {
+                output.push_str(&format!("  + Create job [{}]\n", diff.name));
+            }
+            yard_structs::DiffType::Modify { changes } => {
+                output.push_str(&format!("  ~ Modify job [{}]\n", diff.name));
+                for (key, (old, new)) in changes {
+                    output.push_str(&format!("      {key} : {old} -> {new}\n"));
+                }
+            }
+            yard_structs::DiffType::Delete => {
+                output.push_str(&format!("  - Delete job [{}]\n", diff.name));
+            }
+        }
+    }
+
+    output
+}
+
+/// Format apply result as text for logging.
+fn format_apply_output(result: &yard_core::ApplyResult) -> String {
+    let mut output = String::new();
+
+    for name in &result.created {
+        output.push_str(&format!("  + Created: {name}\n"));
+    }
+    for name in &result.modified {
+        output.push_str(&format!("  ~ Modified: {name}\n"));
+    }
+    for name in &result.deleted {
+        output.push_str(&format!("  - Deleted: {name}\n"));
+    }
+
+    if output.is_empty() {
+        output.push_str("No changes applied.\n");
+    }
+
+    output
 }
 
 async fn handle_webhook(
@@ -76,10 +127,17 @@ async fn handle_webhook(
                 warn!(pr = pr_number, error = %e, "Failed to persist webhook event");
             }
 
+            // Clone and run plan via yard-core
             let plan_output = match clone_at_sha(&clone_url, &head_sha).await {
                 Ok(workdir) => {
-                    let result = match run_yard("plan", &workdir).await {
-                        Ok(output) => output,
+                    let result = match yard_runner::resolve_project(&workdir).await {
+                        Ok(project) => {
+                            let diffs = yard_core::calculate_diff(
+                                &project.manifest,
+                                &project.current_state,
+                            );
+                            format_plan_output(&diffs, &project.manifest.project)
+                        }
                         Err(e) => {
                             error!(pr = pr_number, "yard plan failed: {e}");
                             format!("yard plan failed:\n{e}")
@@ -94,7 +152,7 @@ async fn handle_webhook(
                 }
             };
 
-            // Determine plan status from output
+            // Determine plan status
             let plan_failed = plan_output.contains("failed");
             let status = if plan_failed {
                 PlanStatus::Failure
@@ -131,7 +189,7 @@ async fn handle_webhook(
                 }
             };
 
-            // Refresh dashboard cache so UI reflects the new plan result
+            // Refresh dashboard cache
             if let Err(e) = crate::api::dashboard::refresh_dashboard_cache(&state.api_state).await {
                 warn!(error = %e, "Failed to refresh dashboard cache after plan");
             }
@@ -169,15 +227,32 @@ async fn handle_webhook(
                 warn!(pr = pr_number, error = %e, "Failed to persist webhook event");
             }
 
+            // Clone and run apply via yard-core
             let result = match clone_at_sha(&clone_url, &head_sha).await {
                 Ok(workdir) => {
-                    let status = match run_yard("apply", &workdir).await {
-                        Ok(output) => {
-                            info!(pr = pr_number, "yard apply succeeded:\n{output}");
-                            StatusCode::OK
+                    let status = match yard_runner::resolve_project(&workdir).await {
+                        Ok(project) => {
+                            match yard_core::apply(
+                                &project.manifest,
+                                &project.current_state,
+                                &project.root_dir,
+                                false,
+                            )
+                            .await
+                            {
+                                Ok(apply_result) => {
+                                    let output = format_apply_output(&apply_result);
+                                    info!(pr = pr_number, "yard apply succeeded:\n{output}");
+                                    StatusCode::OK
+                                }
+                                Err(e) => {
+                                    error!(pr = pr_number, "yard apply failed: {e}");
+                                    StatusCode::INTERNAL_SERVER_ERROR
+                                }
+                            }
                         }
                         Err(e) => {
-                            error!(pr = pr_number, "yard apply failed: {e}");
+                            error!(pr = pr_number, "Failed to resolve project: {e}");
                             StatusCode::INTERNAL_SERVER_ERROR
                         }
                     };
@@ -190,7 +265,7 @@ async fn handle_webhook(
                 }
             };
 
-            // Refresh dashboard cache so UI reflects the merged PR
+            // Refresh dashboard cache
             if let Err(e) = crate::api::dashboard::refresh_dashboard_cache(&state.api_state).await {
                 warn!(error = %e, "Failed to refresh dashboard cache after apply");
             }

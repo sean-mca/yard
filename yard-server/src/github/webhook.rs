@@ -36,6 +36,7 @@ pub struct PullRequestEvent {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct PullRequest {
     pub head: GitRef,
     pub base: GitRef,
@@ -43,6 +44,7 @@ pub struct PullRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct GitRef {
     #[serde(rename = "ref")]
     pub ref_name: String,

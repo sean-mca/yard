@@ -6,7 +6,7 @@ use super::components::Pagination;
 use super::metrics::{DriftStatus, MetricsBar};
 use crate::types::*;
 
-const API_BASE: &str = "http://127.0.0.1:3001";
+use super::api_base;
 
 // ---- Query types ----
 
@@ -20,7 +20,8 @@ impl QueryCapability for DashboardQuery {
 
     async fn run(&self, page: &Self::Keys) -> Result<Self::Ok, Self::Err> {
         let resp = reqwest::get(format!(
-            "{API_BASE}/api/dashboard/cached?page={page}&per_page=15"
+            "{}/api/dashboard/cached?page={page}&per_page=15",
+            api_base()
         ))
         .await
         .map_err(|e| format!("Request failed: {e}"))?;
@@ -51,7 +52,7 @@ impl QueryCapability for DriftSummaryQuery {
     type Keys = ();
 
     async fn run(&self, _: &Self::Keys) -> Result<Self::Ok, Self::Err> {
-        let resp = reqwest::get(format!("{API_BASE}/api/drift/summary"))
+        let resp = reqwest::get(format!("{}/api/drift/summary", api_base()))
             .await
             .map_err(|e| format!("Request failed: {e}"))?;
 

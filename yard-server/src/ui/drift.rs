@@ -5,7 +5,7 @@ use std::time::Duration;
 use super::sheet::Sheet;
 use crate::types::*;
 
-const API_BASE: &str = "http://127.0.0.1:3001";
+use super::api_base;
 
 // ---- Query type ----
 
@@ -18,7 +18,7 @@ impl QueryCapability for DriftQuery {
     type Keys = ();
 
     async fn run(&self, _: &Self::Keys) -> Result<Self::Ok, Self::Err> {
-        let resp = reqwest::get(format!("{API_BASE}/api/drift/cached"))
+        let resp = reqwest::get(format!("{}/api/drift/cached", api_base()))
             .await
             .map_err(|e| format!("Request failed: {e}"))?;
 
@@ -43,7 +43,7 @@ pub fn Drift() -> Element {
             .stale_time(Duration::from_secs(30))
             .interval_time(Duration::from_secs(15)),
     );
-    let mut selected = use_signal(|| None::<DriftItem>);
+    let selected = use_signal(|| None::<DriftItem>);
 
     let data_state = data.read();
     match &*data_state.state() {
