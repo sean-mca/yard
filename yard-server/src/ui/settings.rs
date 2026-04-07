@@ -12,8 +12,6 @@ pub fn Settings(theme: Signal<Theme>) -> Element {
     let mut drift_interval = use_signal(|| "3".to_string());
     let mut slack_url = use_signal(String::new);
     let mut slack_enabled = use_signal(|| false);
-    let mut email = use_signal(String::new);
-    let mut email_enabled = use_signal(|| false);
 
     rsx! {
         div { class: "p-6 max-w-2xl",
@@ -53,16 +51,6 @@ pub fn Settings(theme: Signal<Theme>) -> Element {
                     field_value: slack_url,
                 }
 
-                // Email
-                NotificationCard {
-                    label: "Email",
-                    description: "Send email alerts when drift is detected.",
-                    icon: "M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z",
-                    enabled: email_enabled,
-                    field_label: "Email address",
-                    field_placeholder: "alerts@example.com",
-                    field_value: email,
-                }
             }
         }
     }
