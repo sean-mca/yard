@@ -9,6 +9,19 @@ mod ui;
 
 const TAILWIND_CSS: Asset = asset!("/assets/tailwind.css");
 
+#[derive(Debug, Clone, PartialEq, Routable)]
+enum Route {
+    #[layout(Shell)]
+    #[route("/")]
+    Dashboard {},
+    #[route("/jobs")]
+    Jobs {},
+    #[route("/drift")]
+    Drift {},
+    #[route("/settings")]
+    Settings {},
+}
+
 fn main() {
     #[cfg(not(target_arch = "wasm32"))]
     start_api_server();
@@ -19,6 +32,7 @@ fn main() {
 #[cfg(not(target_arch = "wasm32"))]
 fn start_api_server() {
     use api::dashboard::{dashboard_router, ApiState};
+    use api::jobs::jobs_router;
     use github::{client::GitHubClient, router::github_router, router::AppState};
     use std::sync::Arc;
     use tower_http::cors::{Any, CorsLayer};
@@ -55,7 +69,8 @@ fn start_api_server() {
 
                 let router = axum::Router::new()
                     .merge(github_router(webhook_state))
-                    .merge(dashboard_router(api_state))
+                    .merge(dashboard_router(api_state.clone()))
+                    .merge(jobs_router(api_state))
                     .layer(cors);
 
                 let addr: std::net::SocketAddr = "0.0.0.0:3001".parse().unwrap();
@@ -67,18 +82,53 @@ fn start_api_server() {
 }
 
 fn app() -> Element {
-    let sidebar_open = use_signal(|| true);
-
     rsx! {
         document::Stylesheet { href: TAILWIND_CSS }
+        Router::<Route> {}
+    }
+}
+
+#[component]
+fn Shell() -> Element {
+    let sidebar_open = use_signal(|| true);
+    let route: Route = use_route();
+
+    let title = match &route {
+        Route::Dashboard {} => "Dashboard",
+        Route::Jobs {} => "Jobs",
+        Route::Drift {} => "Drift",
+        Route::Settings {} => "Settings",
+    };
+
+    rsx! {
         div { class: "min-h-screen bg-white text-zinc-950 flex",
-            ui::sidebar::Sidebar { open: sidebar_open }
+            ui::sidebar::Sidebar { open: sidebar_open, route }
             main { class: "flex-1 min-h-screen",
                 div { class: "h-14 flex items-center px-6 border-b border-zinc-200",
-                    h1 { class: "text-sm font-semibold", "Dashboard" }
+                    h1 { class: "text-sm font-semibold", "{title}" }
                 }
-                ui::dashboard::Dashboard {}
+                Outlet::<Route> {}
             }
         }
     }
+}
+
+#[component]
+fn Dashboard() -> Element {
+    rsx! { ui::dashboard::Dashboard {} }
+}
+
+#[component]
+fn Jobs() -> Element {
+    rsx! { ui::jobs::Jobs {} }
+}
+
+#[component]
+fn Drift() -> Element {
+    rsx! { ui::drift::Drift {} }
+}
+
+#[component]
+fn Settings() -> Element {
+    rsx! { ui::settings::Settings {} }
 }

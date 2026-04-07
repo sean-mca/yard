@@ -1,7 +1,9 @@
 use dioxus::prelude::*;
 
+use crate::Route;
+
 #[component]
-pub fn Sidebar(open: Signal<bool>) -> Element {
+pub fn Sidebar(open: Signal<bool>, route: Route) -> Element {
     rsx! {
         aside {
             class: format!(
@@ -43,20 +45,51 @@ pub fn Sidebar(open: Signal<bool>) -> Element {
                 }
             }
             nav { class: "flex-1 flex flex-col gap-1 p-2",
-                SidebarItem { icon: "M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-4 0a1 1 0 01-1-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 01-1 1", label: "Dashboard", expanded: open(), active: true }
-                SidebarItem { icon: "M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2", label: "Jobs", expanded: open(), active: false }
-                SidebarItem { icon: "M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15", label: "Drift", expanded: open(), active: false }
-                SidebarItem { icon: "M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z", label: "Settings", expanded: open(), active: false }
+                SidebarLink {
+                    to: Route::Dashboard {},
+                    icon: "M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-4 0a1 1 0 01-1-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 01-1 1",
+                    label: "Dashboard",
+                    expanded: open(),
+                    active: matches!(route, Route::Dashboard {}),
+                }
+                SidebarLink {
+                    to: Route::Jobs {},
+                    icon: "M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2",
+                    label: "Jobs",
+                    expanded: open(),
+                    active: matches!(route, Route::Jobs {}),
+                }
+                SidebarLink {
+                    to: Route::Drift {},
+                    icon: "M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15",
+                    label: "Drift",
+                    expanded: open(),
+                    active: matches!(route, Route::Drift {}),
+                }
+                SidebarLink {
+                    to: Route::Settings {},
+                    icon: "M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z",
+                    label: "Settings",
+                    expanded: open(),
+                    active: matches!(route, Route::Settings {}),
+                }
             }
         }
     }
 }
 
 #[component]
-fn SidebarItem(icon: &'static str, label: &'static str, expanded: bool, active: bool) -> Element {
+fn SidebarLink(
+    to: Route,
+    icon: &'static str,
+    label: &'static str,
+    expanded: bool,
+    active: bool,
+) -> Element {
     rsx! {
         div { class: "relative group",
-            button {
+            Link {
+                to,
                 class: format!(
                     "flex items-center gap-3 rounded-md text-sm cursor-pointer transition-colors {} {}",
                     if expanded { "px-2.5 py-1.5" } else { "justify-center p-2" },

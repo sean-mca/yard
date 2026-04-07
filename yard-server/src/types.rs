@@ -34,3 +34,14 @@ pub struct DashboardData {
     pub per_page: u32,
     pub has_more: bool,
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct JobInfo {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct JobsData {
+    pub jobs: Vec<JobInfo>,
+}
