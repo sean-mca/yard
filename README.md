@@ -1,28 +1,65 @@
+
 # YARD
 
 **YAML Architecture for Rapid Development**
 
-YARD is a declarative infrastructure tool for data engineering. You define ETL jobs in YAML, and YARD generates the underlying scripts, manages state, and deploys to cloud services like AWS Glue.
+[![CI](https://github.com/sean-mca/yard/actions/workflows/ci.yml/badge.svg)](https://github.com/sean-mca/yard/actions/workflows/ci.yml)
+[![License: BSL 1.1](https://img.shields.io/badge/License-BSL_1.1-blue.svg)](LICENSE)
 
-If you've used Terragrunt to manage Terraform across multiple environments, YARD applies the same ideas to data pipelines: hierarchical configuration, variable inheritance, per-job state files, and job-level locking.
+Declarative infrastructure for data pipelines. Define ETL jobs in YAML, and YARD generates the PySpark scripts, manages state, and deploys to AWS. Think Terragrunt, but for data engineering.
 
-## Why YARD?
+## Demo
 
-Writing Glue jobs by hand means copy-pasting boilerplate, managing script uploads, and keeping track of what's deployed where. YARD lets you describe what your job does and handles the rest.
+```yaml
+# orders.yaml
+type: glue
+role: arn:aws:iam::123456789:role/GlueJobExecutionRole
 
-- Define sources, transforms, and sinks in YAML
-- YARD generates the PySpark script and Glue boilerplate
-- State is tracked per-job (locally or in S3), so changes are diffed before applying
-- Job-level locking prevents concurrent modifications
-- Provider-based architecture supports Glue today, with EMR, Databricks, and others planned
+source:
+  type: s3
+  format: parquet
+  path: s3://data-lake/raw/orders/
+
+transforms:
+  - type: filter
+    condition: "col('status') != 'cancelled'"
+
+sink:
+  type: s3
+  format: parquet
+  path: s3://data-lake/curated/orders/
+  mode: overwrite
+```
+
+```
+$ yard plan
+--- Plan for my-project ---
+
+  + Create job [orders]
+
+$ yard apply --auto-approve
+Applying...
+  + Created: orders
+
+State updated successfully.
+```
+
+That's it. YARD generated the PySpark script, uploaded it to S3, and created the Glue job.
+
+## Providers
+
+| Provider | Status | What it does |
+|----------|--------|--------------|
+| AWS Glue | Stable | Generates PySpark scripts, uploads to S3, creates/updates Glue jobs |
+| AWS EMR (classic) | Stable | Generates PySpark scripts, uploads to S3, submits steps to existing clusters |
+| AWS EMR Serverless | Planned | Submit job runs to serverless Spark applications |
+| Databricks | Planned | -- |
 
 ## Project structure
 
-A typical YARD project looks like this:
-
 ```
 my-project/
-  yard.yaml                      # Root config: project name, state backend, provider settings
+  yard.yaml                      # Root config: project name, state backend, providers
   aws/
     dev/
       account.yaml               # Account-level context (inherited by jobs below)
@@ -37,7 +74,7 @@ my-project/
         orders.yaml
 ```
 
-The directory hierarchy mirrors your cloud topology: cloud provider, account, region. Context files (`account.yaml`, `region.yaml`) at each level are inherited by all job files below them, so the same job definition can be deployed across environments by placing it under different account/region directories.
+Directory hierarchy mirrors your cloud topology. Context files (`account.yaml`, `region.yaml`) at each level are inherited by all job files below them. Variables are referenced with `${account.id}`, `${region.id}`, etc.
 
 ### Root config (`yard.yaml`)
 
@@ -45,7 +82,7 @@ The directory hierarchy mirrors your cloud topology: cloud provider, account, re
 project: my-project
 
 state:
-  type: local
+  type: local            # or s3
   path: .yard/state/
 
 providers:
@@ -54,15 +91,20 @@ providers:
     script_bucket: my-company-glue-scripts
     script_prefix: yard-scripts/
     role: arn:aws:iam::123456789:role/YardDeployRole
-    # Runtime defaults for all Glue jobs
     worker_type: G.1X
     number_of_workers: 2
     glue_version: "4.0"
     timeout: 60
     bookmark: enabled
+
+  emr:
+    region: us-east-1
+    script_bucket: my-company-spark-scripts
+    script_prefix: yard-scripts/
+    cluster_id: j-ABC123DEF456
 ```
 
-The `state` block controls where per-job state files are stored. For teams, use S3:
+For teams, use S3 state:
 
 ```yaml
 state:
@@ -72,31 +114,11 @@ state:
   key: my-project/state/
 ```
 
-The `providers` block configures deployment credentials and settings. The `role` here is the IAM role YARD uses to deploy -- it is separate from the execution role each job runs as.
-
-Runtime settings like `worker_type`, `number_of_workers`, and `timeout` defined here serve as defaults for all jobs of that type. Individual jobs can override them.
-
-### Context files
-
-YARD uses hierarchical context files to inject variables into job definitions. These are resolved by walking up the directory tree from each job file, similar to how Terragrunt finds configuration in parent directories.
-
-`account.yaml`:
-```yaml
-id: "123456789"
-name: production
-```
-
-`region.yaml`:
-```yaml
-id: us-east-1
-```
-
-Variables are referenced in job YAML with `${account.id}`, `${region.id}`, etc. They are made available automatically and do not need to be referenced / called in a locals block.
-
 ### Job definitions
 
-A job YAML file describes what the ETL job does: where it reads from, what transformations to apply, and where to write. Jobs inherit runtime settings from the `providers` block in `yard.yaml`, but can override any of them with a provider-specific block at the job level.
+Jobs describe what the ETL does: sources, transforms, and sinks. Runtime settings inherit from providers in `yard.yaml` but can be overridden per-job.
 
+**Glue job:**
 ```yaml
 type: glue
 role: arn:aws:iam::123456789:role/GlueJobExecutionRole
@@ -106,39 +128,41 @@ source:
   format: parquet
   path: s3://data-lake/raw/orders/
 
-transforms:
-  - type: filter
-    condition: "col('status') != 'cancelled'"
-  - type: add_column
-    name: processed_at
-    expression: "current_timestamp()"
+sink:
+  type: s3
+  format: parquet
+  path: s3://data-lake/curated/orders/
+  mode: overwrite
+```
+
+**EMR job:**
+```yaml
+type: emr
+
+source:
+  type: s3
+  format: parquet
+  path: s3://data-lake/raw/orders/
 
 sink:
   type: s3
   format: parquet
   path: s3://data-lake/curated/orders/
   mode: overwrite
-  partition_by:
-    - year
-    - month
 ```
 
-The `role` on the job is the Glue execution role -- the IAM role the job runs as when processing data. This is distinct from the provider deploy role in `yard.yaml`.
+Same YAML structure, different `type`. YARD generates the right template -- Glue gets `GlueContext`/`Job` boilerplate, EMR gets a plain `SparkSession`.
 
 #### Overriding provider defaults
-
-If a specific job needs different runtime settings from the defaults in `yard.yaml`, add a provider-specific block to the job file. Job-level values take precedence over provider defaults:
 
 ```yaml
 type: glue
 role: arn:aws:iam::123456789:role/GlueJobExecutionRole
 
-# Override defaults from yard.yaml for this job only
 glue:
   worker_type: G.2X
   number_of_workers: 10
   timeout: 180
-  bookmark: disabled
 
 source:
   type: s3
@@ -152,11 +176,7 @@ sink:
   mode: overwrite
 ```
 
-In this example, `worker_type`, `number_of_workers`, `timeout`, and `bookmark` are overridden for this job, while `glue_version`, `script_bucket`, and other settings are still inherited from the provider defaults.
-
 #### Multiple sources and joins
-
-Jobs can read from multiple sources and join them:
 
 ```yaml
 type: glue
@@ -182,11 +202,6 @@ transforms:
     on: customer_id
     how: left
     output: enriched
-  - type: drop_columns
-    source: enriched
-    columns:
-      - internal_id
-      - debug_flag
 
 sink:
   source: enriched
@@ -196,40 +211,11 @@ sink:
   mode: overwrite
 ```
 
-#### JDBC and Catalog sources
-
-YARD supports reading from and writing to JDBC databases and the Glue Data Catalog:
-
-```yaml
-source:
-  type: jdbc
-  connection_url: jdbc:postgresql://host:5432/mydb
-  table: public.users
-  secret_id: my-rds-secret
-
-sink:
-  type: catalog
-  database: curated
-  table: users_clean
-```
-
-When a `secret_id` is specified, YARD generates code to fetch credentials from AWS Secrets Manager automatically.
-
 #### SQL transforms
 
-For complex logic, you can use SQL directly. All sources are registered as temp views:
+All sources are registered as temp views:
 
 ```yaml
-sources:
-  - name: orders
-    type: s3
-    format: parquet
-    path: s3://data-lake/raw/orders/
-  - name: customers
-    type: s3
-    format: parquet
-    path: s3://data-lake/raw/customers/
-
 transforms:
   - type: sql
     output: enriched
@@ -240,299 +226,123 @@ transforms:
       WHERE o.total > 0
 ```
 
-#### External script file
+#### Source types
 
-For jobs with complex logic, you can point to an external Python file instead of using YARD's codegen. The file replaces YARD's generated script entirely — no Glue boilerplate is added, no sources/transforms/sinks are processed.
+| Type | Required fields | Description |
+|------|-----------------|-------------|
+| `s3` | `path` | Read from S3 (parquet, csv, json) |
+| `jdbc` | `connection_url`, `table` | Read from a database via JDBC |
+| `catalog` | `database`, `table` | Read from the Glue Data Catalog |
+
+JDBC sources support `secret_id` for automatic Secrets Manager credential fetching.
+
+#### Transforms
+
+| Type | Required fields | Description |
+|------|-----------------|-------------|
+| `filter` | `condition` | Filter rows |
+| `sql` | `query` | Run a SQL query (sources as temp views) |
+| `join` | `left`, `right`, `on` | Join two dataframes |
+| `select` | `columns` | Select specific columns |
+| `drop_columns` | `columns` | Drop columns |
+| `rename` | `mapping` | Rename columns |
+| `add_column` | `name`, `expression` | Add a computed column |
+
+All transforms support optional `source` and `output` fields. Default to first source if omitted.
+
+#### External scripts
+
+For complex jobs, point to your own Python file. YARD handles deployment and state, you write the script:
 
 ```yaml
 type: glue
 role: arn:aws:iam::123456789:role/GlueJobExecutionRole
-
 job_file: ./my_custom_job.py
 ```
 
-The path is relative to the job YAML file. This is useful when a job is complex enough that writing it in Python directly is more practical than expressing it in YAML. YARD still handles deployment, state tracking, and locking — it just uses your script as-is.
-
-You can also use `body:` for short inline overrides that still get wrapped in the Glue template:
+Or inline with `body:` (gets wrapped in the provider template):
 
 ```yaml
-type: glue
-role: arn:aws:iam::123456789:role/GlueJobExecutionRole
-
 body: |
   df = spark.read.format("parquet").load("s3://bucket/input/")
   df.write.format("parquet").save("s3://bucket/output/")
 ```
 
-`body` and `job_file` cannot both be specified on the same job.
-
-### Generated output
-
-Given the first job example above, YARD generates a complete Glue script:
-
-```python
-# Generated by YARD for job: orders
-
-import sys
-import logging
-from awsglue.utils import getResolvedOptions
-from pyspark.context import SparkContext
-from awsglue.context import GlueContext
-from awsglue.job import Job
-
-logger = logging.getLogger("yard")
-logger.setLevel(logging.INFO)
-
-# --- Glue Setup ---
-args = getResolvedOptions(sys.argv, ['JOB_NAME'])
-sc = SparkContext()
-glueContext = GlueContext(sc)
-spark = glueContext.spark_session
-job = Job(glueContext)
-job.init(args['JOB_NAME'], args)
-
-
-def run():
-    # --- Sources ---
-    df_source = spark.read.format("parquet").load("s3://data-lake/raw/orders/")
-
-    # --- Transforms ---
-    df_source = df_source.filter(col('status') != 'cancelled')
-    df_source = df_source.withColumn("processed_at", current_timestamp())
-
-    # --- Sink ---
-    df_source.write.format("parquet").mode("overwrite").partitionBy("year", "month").save("s3://data-lake/curated/orders/")
-
-
-if __name__ == "__main__":
-    try:
-        run()
-        job.commit()
-    except Exception as e:
-        logger.error(f"Job failed: {str(e)}")
-        raise
-```
-
-## CLI commands
-
-All commands support `--no-color` to disable colored output, and `--colorblind` to use a palette distinguishable for red/green color vision deficiency (cyan/blue/magenta instead of green/yellow/red). The `NO_COLOR` environment variable is also respected.
-
-### `yard init [directory]`
-
-Initialize per-job state files for all jobs in the project. Skips jobs that already have state.
-
-```bash
-$ yard init
-Initialized state for job "orders".
-Initialized state for job "customers".
-Initialized state for job "enriched_orders".
-```
-
-### `yard plan [directory] [--target <job_name>]`
-
-Show what would change without modifying anything. Compares the current YAML definitions against stored state. Use `--target` to scope to a single job.
+## CLI
 
 ```
-$ yard plan
---- Plan for my-project ---
-
-  + Create job [orders]
-  ~ Modify job [customers]
-      script_name : "v1" -> "v2"
-  - Delete job [old_job]
+yard init              Initialize state for all jobs
+yard plan              Show what would change
+yard apply             Deploy changes (with confirmation)
+yard show <job>        Display the generated script
+yard validate          Check all job definitions
+yard destroy [job]     Tear down deployed jobs
+yard force-unlock <job>  Remove a stale lock
 ```
 
-```
-$ yard plan --target orders
---- Plan for my-project ---
-(targeting: orders)
-
-  + Create job [orders]
-```
-
-### `yard show <job_name> [directory]`
-
-Display the generated script for a job without deploying or modifying state. Useful for reviewing what YARD will produce before running apply.
-
-```
-$ yard show orders
-# Generated by YARD for job: orders
-
-import sys
-import logging
-from awsglue.utils import getResolvedOptions
-...
-```
-
-The output goes to stdout, so you can pipe it to a file or a pager: `yard show orders | less`.
-
-### `yard validate [directory]`
-
-Validate all job definitions. Checks the schema (source types, required fields, transform references, sink configuration, provider-specific config) and then generates each script and validates it is syntactically valid Python. Requires `python3` on the path.
-
-```bash
-$ yard validate
-Validating job "orders"... OK
-Validating job "customers"... OK
-```
-
-### `yard apply [directory] [--dry-run] [--auto-approve] [--target <job_name>]`
-
-Apply changes: generate scripts, deploy to providers, and update state. All jobs are validated before any changes are made -- if any job has an invalid configuration, the entire apply is aborted. Shows the plan and asks for confirmation before proceeding. Each job is locked during its apply to prevent concurrent modifications.
-
-```bash
-$ yard apply
---- Plan for my-project ---
-
-  + Create job [orders]
-  ~ Modify job [customers]
-      script_name : "v1" -> "v2"
-
-Do you want to apply these changes? (y/n) y
-
-Applying...
-  + Created: orders
-  ~ Modified: customers
-
-State updated successfully.
-```
-
-Use `--dry-run` to see the plan without applying anything:
-
-```bash
-$ yard apply --dry-run
---- Plan for my-project ---
-
-  + Create job [orders]
-
-Dry run -- no changes applied.
-```
-
-Use `--auto-approve` to skip the confirmation prompt (useful in CI):
-
-```bash
-$ yard apply --auto-approve
-```
-
-### `yard destroy [job_name] [directory] [--dry-run] [--auto-approve]`
-
-Tear down deployed jobs and remove their state. Shows what will be destroyed and asks for confirmation. Without a job name, destroys all jobs in the project. For each job, YARD calls the provider's destroy method to remove cloud resources, deletes the state file, and removes the generated script.
-
-```bash
-$ yard destroy
---- Destroy plan for my-project ---
-
-  - Destroy job [orders]
-  - Destroy job [customers]
-  - Destroy job [enriched_orders]
-
-Do you want to destroy all jobs? (y/n) y
-
-Destroying...
-  - Destroyed: orders
-  - Destroyed: customers
-  - Destroyed: enriched_orders
-
-All jobs destroyed.
-```
-
-To destroy a single job:
-
-```bash
-$ yard destroy orders
---- Destroy plan ---
-
-  - Destroy job [orders]
-
-Do you want to destroy this job? (y/n) y
-
-Destroying...
-  - Destroyed: orders
-```
-
-Use `--dry-run` to see what would be destroyed, or `--auto-approve` to skip the prompt.
-
-### `yard force-unlock <job_name> [directory]`
-
-Remove a stale lock on a job. This is an escape hatch for when a process dies mid-apply and leaves a lock behind.
-
-```bash
-$ yard force-unlock orders
-Removing lock on job "orders" (held by sean since 2026-04-05T14:30:00Z)
-Lock removed.
-```
+All commands support `--no-color` and `--colorblind` (cyan/blue/magenta palette). `--target <job>` scopes plan/apply to a single job. `--auto-approve` and `--dry-run` work on apply and destroy.
 
 ## State management
 
-YARD tracks state per-job, not as a single project blob. Each job gets its own state file (`<job_name>.json`) and its own lock file (`<job_name>.json.lock`).
+State is tracked per-job, not as a single blob. Each job gets its own state file and lock file. Two people can apply changes to different jobs concurrently -- same model as Terragrunt with independent modules.
 
-For local state, these live in the `.yard/state/` directory. For S3, they live under the configured key prefix.
-
-This means two people can apply changes to different jobs concurrently without blocking each other -- the same model Terragrunt uses for independent modules.
-
-## Supported transforms
-
-| Type | Description | Required fields |
-|------|-------------|-----------------|
-| `filter` | Filter rows by condition | `condition` |
-| `sql` | Run a SQL query (sources registered as temp views) | `query` |
-| `join` | Join two dataframes | `left`, `right`, `on` |
-| `select` | Select specific columns | `columns` |
-| `drop_columns` | Drop specific columns | `columns` |
-| `rename` | Rename columns | `mapping` |
-| `add_column` | Add a computed column | `name`, `expression` |
-
-All transforms support optional `source` (which dataframe to operate on) and `output` (name for the result). If omitted, they default to the first source.
+State backends: local filesystem (`.yard/state/`) or S3.
 
 ## yard-server
 
-YARD includes a web server (`yard-server`) that provides a dashboard, GitHub webhook integration, and drift detection. It runs a Dioxus fullstack app with an axum API backend.
+Web dashboard with GitHub webhook integration and drift detection. Dioxus fullstack app with axum API backend and DynamoDB persistence.
+
+- PR-driven workflow (Atlantis-style): plan runs automatically on PR open, apply triggered by commenting `yard apply` on the PR
+- Live drift detection -- compares repo config against deployed state on a configurable interval
+- Dashboard with PR status, plan results, job counts
+- Settings persistence (theme, drift interval, Slack webhook)
+
+### GitHub webhook setup
+
+Configure your repo's webhook to send `pull_request` and `issue_comment` events to `https://your-server/api/webhook/github`. Set the secret to match `YARD_WEBHOOK_SECRET`.
+
+**Flow:**
+1. Open a PR -- yard-server auto-runs `yard plan` and posts the result as a comment
+2. Review the plan output in the PR
+3. Comment `yard apply` -- yard-server runs `yard apply` and posts the result
+4. Merge the PR
 
 ### Environment variables
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `YARD_GITHUB_TOKEN` | Yes | — | GitHub personal access token for API access |
-| `YARD_WEBHOOK_SECRET` | Yes | — | Secret for verifying GitHub webhook signatures |
-| `YARD_REPO_OWNER` | Yes | — | GitHub repository owner |
-| `YARD_REPO_NAME` | Yes | — | GitHub repository name |
-| `YARD_DB_TABLE_PREFIX` | No | `yard` | DynamoDB table name prefix (table: `{prefix}_yard`) |
-| `YARD_DB_REGION` | No | `us-east-1` | AWS region for DynamoDB (falls back to `AWS_REGION`) |
-| `YARD_DB_ENDPOINT_URL` | No | — | Custom DynamoDB endpoint (for local dev with ministack) |
+| `YARD_GITHUB_TOKEN` | Yes | -- | GitHub personal access token |
+| `YARD_WEBHOOK_SECRET` | Yes | -- | Webhook HMAC secret |
+| `YARD_REPO_OWNER` | Yes | -- | GitHub repo owner |
+| `YARD_REPO_NAME` | Yes | -- | GitHub repo name |
+| `YARD_DB_TABLE_PREFIX` | No | `yard` | DynamoDB table prefix |
+| `YARD_DB_REGION` | No | `us-east-1` | AWS region for DynamoDB |
+| `YARD_DB_ENDPOINT_URL` | No | -- | Custom endpoint (for local dev) |
+| `YARD_API_BASE` | No | `http://127.0.0.1:3001` | API base URL (compile-time, set to `""` for production) |
 
-Standard AWS credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, or an IAM role/profile) must be configured for DynamoDB access. The server creates the table and indexes automatically on first startup.
+AWS credentials are required for DynamoDB. The server creates the table and indexes on first startup.
 
 ### Local development
 
-A `docker-compose.yml` is provided to run [ministack](https://ministack.org) for local S3 and DynamoDB:
-
 ```bash
-docker compose up -d
-```
-
-This creates the DynamoDB table (`yard_yard`) and an S3 bucket (`yard-state`) on `localhost:4566`. Copy `env.local.example` to `.env.local`, fill in your GitHub token, then:
-
-```bash
-export $(cat .env.local | xargs) && dx serve
+docker compose up -d                              # ministack: S3 + DynamoDB on localhost:4566
+cp env.local.example .env.local                    # fill in GitHub token
+set -a && source .env.local && set +a && dx serve  # start the server
 ```
 
 ### DynamoDB permissions
 
-The IAM identity running yard-server needs the following DynamoDB permissions on the `{prefix}_yard` table:
-
-- `dynamodb:CreateTable`
-- `dynamodb:DescribeTable`
-- `dynamodb:PutItem`
-- `dynamodb:GetItem`
-- `dynamodb:Query`
+`dynamodb:CreateTable`, `dynamodb:DescribeTable`, `dynamodb:PutItem`, `dynamodb:GetItem`, `dynamodb:Query`
 
 ## Architecture
 
-YARD is a Rust workspace with four crates:
+Rust workspace with four crates:
 
-- **yard-cli** -- Thin CLI wrapper. Parses arguments, calls into core, formats output.
-- **yard-core** -- All business logic. Codegen, state management, storage, validation, provider deployment.
-- **yard-structs** -- Shared data types. Job definitions, state structs, config types.
-- **yard-server** -- Web dashboard and GitHub webhook handler. Dioxus fullstack app with DynamoDB persistence.
+| Crate | Purpose |
+|-------|---------|
+| `yard-cli` | Thin CLI wrapper -- parses args, calls core, formats output |
+| `yard-core` | Business logic -- codegen, state, storage, validation, providers |
+| `yard-structs` | Shared types -- job definitions, state, config |
+| `yard-server` | Web dashboard -- Dioxus fullstack, axum API, DynamoDB |
 
-The provider system uses a trait-based architecture, so adding support for new services (EMR, Databricks, etc.) means implementing the `Provider` trait without touching existing code.
+Provider system is trait-based. Adding a new provider means implementing the `Provider` trait -- no changes to existing code.

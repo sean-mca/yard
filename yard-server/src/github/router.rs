@@ -82,6 +82,21 @@ fn format_apply_output(result: &yard_core::ApplyResult) -> String {
     output
 }
 
+async fn resolve_pr_head_sha(api_state: &ApiState, pr_number: u64) -> Result<String, String> {
+    let octo = octocrab::Octocrab::builder()
+        .personal_token(api_state.github_token.clone())
+        .build()
+        .map_err(|e| format!("Failed to build octocrab: {e}"))?;
+
+    let pr = octo
+        .pulls(&api_state.repo_owner, &api_state.repo_name)
+        .get(pr_number)
+        .await
+        .map_err(|e| format!("Failed to fetch PR #{pr_number}: {e}"))?;
+
+    Ok(pr.head.sha)
+}
+
 async fn handle_webhook(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -203,11 +218,24 @@ async fn handle_webhook(
             head_sha,
             clone_url,
         } => {
+            // Resolve head SHA if not provided (issue_comment events don't include it)
+            let head_sha = if head_sha.is_empty() {
+                match resolve_pr_head_sha(&state.api_state, pr_number).await {
+                    Ok(sha) => sha,
+                    Err(e) => {
+                        error!(pr = pr_number, "Failed to resolve PR head SHA: {e}");
+                        return StatusCode::INTERNAL_SERVER_ERROR;
+                    }
+                }
+            } else {
+                head_sha
+            };
+
             info!(
                 pr = pr_number,
                 sha = %head_sha,
                 repo = %format!("{owner}/{repo}"),
-                "Running yard apply"
+                "Running yard apply (triggered by comment)"
             );
 
             // Persist the webhook event
@@ -228,9 +256,9 @@ async fn handle_webhook(
             }
 
             // Clone and run apply via yard-core
-            let result = match clone_at_sha(&clone_url, &head_sha).await {
+            let apply_output = match clone_at_sha(&clone_url, &head_sha).await {
                 Ok(workdir) => {
-                    let status = match yard_runner::resolve_project(&workdir).await {
+                    let result = match yard_runner::resolve_project(&workdir).await {
                         Ok(project) => {
                             match yard_core::apply(
                                 &project.manifest,
@@ -242,25 +270,40 @@ async fn handle_webhook(
                             {
                                 Ok(apply_result) => {
                                     let output = format_apply_output(&apply_result);
-                                    info!(pr = pr_number, "yard apply succeeded:\n{output}");
-                                    StatusCode::OK
+                                    format!("### yard apply\n\n{output}")
                                 }
                                 Err(e) => {
                                     error!(pr = pr_number, "yard apply failed: {e}");
-                                    StatusCode::INTERNAL_SERVER_ERROR
+                                    format!("### yard apply failed\n\n{e}")
                                 }
                             }
                         }
                         Err(e) => {
                             error!(pr = pr_number, "Failed to resolve project: {e}");
-                            StatusCode::INTERNAL_SERVER_ERROR
+                            format!("### yard apply failed\n\nFailed to resolve project:\n{e}")
                         }
                     };
                     cleanup_workdir(&workdir);
-                    status
+                    result
                 }
                 Err(e) => {
                     error!(pr = pr_number, "Clone failed: {e}");
+                    format!("### yard apply failed\n\nFailed to clone repo:\n{e}")
+                }
+            };
+
+            // Post apply result as PR comment
+            let status = match state
+                .github_client
+                .post_plan_comment(&owner, &repo, pr_number, &apply_output)
+                .await
+            {
+                Ok(_) => {
+                    info!(pr = pr_number, "Posted apply comment");
+                    StatusCode::OK
+                }
+                Err(e) => {
+                    warn!(pr = pr_number, error = %e, "Failed to post apply comment");
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
             };
@@ -270,7 +313,7 @@ async fn handle_webhook(
                 warn!(error = %e, "Failed to refresh dashboard cache after apply");
             }
 
-            result
+            status
         }
         WebhookAction::Ignore => StatusCode::OK,
     }

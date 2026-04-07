@@ -35,6 +35,32 @@ pub struct PullRequestEvent {
     pub repository: Repository,
 }
 
+/// Subset of a GitHub issue_comment event payload.
+#[derive(Debug, Deserialize)]
+pub struct IssueCommentEvent {
+    pub action: String,
+    pub comment: Comment,
+    pub issue: Issue,
+    pub repository: Repository,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Comment {
+    pub body: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Issue {
+    pub number: u64,
+    pub pull_request: Option<IssuePullRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct IssuePullRequest {
+    pub url: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct PullRequest {
@@ -75,7 +101,7 @@ pub enum WebhookAction {
         head_sha: String,
         clone_url: String,
     },
-    /// PR merged — run yard apply
+    /// User commented "yard apply" — run yard apply
     Apply {
         owner: String,
         repo: String,
@@ -109,18 +135,19 @@ pub fn parse_webhook(
         .and_then(|v| v.to_str().ok())
         .ok_or(StatusCode::BAD_REQUEST)?;
 
-    if event_type != "pull_request" {
-        return Ok(WebhookAction::Ignore);
+    match event_type {
+        "pull_request" => parse_pull_request_event(body),
+        "issue_comment" => parse_issue_comment_event(body),
+        _ => Ok(WebhookAction::Ignore),
     }
+}
 
-    // Parse payload
-    let event: PullRequestEvent = serde_json::from_slice(body)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+fn parse_pull_request_event(body: &Bytes) -> Result<WebhookAction, StatusCode> {
+    let event: PullRequestEvent =
+        serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let (owner, repo): (&str, &str) = event.repository.owner_repo();
-    let clone_url = event.repository.clone_url
-        .clone()
-        .unwrap_or_default();
+    let (owner, repo) = event.repository.owner_repo();
+    let clone_url = event.repository.clone_url.clone().unwrap_or_default();
 
     match event.action.as_str() {
         "opened" | "synchronize" => Ok(WebhookAction::Plan {
@@ -130,15 +157,43 @@ pub fn parse_webhook(
             head_sha: event.pull_request.head.sha.clone(),
             clone_url,
         }),
-        "closed" if event.pull_request.merged == Some(true) => Ok(WebhookAction::Apply {
-            owner: owner.to_string(),
-            repo: repo.to_string(),
-            pr_number: event.number,
-            head_sha: event.pull_request.head.sha.clone(),
-            clone_url,
-        }),
+        // Merge does not trigger apply — use "yard apply" comment instead
         _ => Ok(WebhookAction::Ignore),
     }
+}
+
+fn parse_issue_comment_event(body: &Bytes) -> Result<WebhookAction, StatusCode> {
+    let event: IssueCommentEvent =
+        serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // Only act on new comments (not edits or deletions)
+    if event.action != "created" {
+        return Ok(WebhookAction::Ignore);
+    }
+
+    // Only act on PR comments (issues have no pull_request field)
+    if event.issue.pull_request.is_none() {
+        return Ok(WebhookAction::Ignore);
+    }
+
+    // Check for "yard apply" command
+    let body_trimmed = event.comment.body.trim().to_lowercase();
+    if body_trimmed != "yard apply" {
+        return Ok(WebhookAction::Ignore);
+    }
+
+    let (owner, repo) = event.repository.owner_repo();
+    let clone_url = event.repository.clone_url.clone().unwrap_or_default();
+
+    // issue_comment events don't include the head SHA — we need to fetch it.
+    // Return the action with an empty SHA; the handler will resolve it via GitHub API.
+    Ok(WebhookAction::Apply {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        pr_number: event.issue.number,
+        head_sha: String::new(), // resolved by handler
+        clone_url,
+    })
 }
 
 #[cfg(test)]
