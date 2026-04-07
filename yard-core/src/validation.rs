@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::process::Command;
 use yard_structs::{JobDefinition, ValidationError};
 
-const SUPPORTED_JOB_TYPES: &[&str] = &["glue"];
+const SUPPORTED_JOB_TYPES: &[&str] = &["glue", "emr"];
 const SUPPORTED_SOURCE_TYPES: &[&str] = &["s3", "jdbc", "catalog"];
 const SUPPORTED_SINK_TYPES: &[&str] = &["s3", "jdbc", "catalog"];
 const SUPPORTED_TRANSFORM_TYPES: &[&str] = &[
@@ -274,6 +274,11 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
         "glue" => {
             if let Some(config) = job.config.get("glue") {
                 crate::providers::glue::validate_config(config, &mut errors);
+            }
+        }
+        "emr" => {
+            if let Some(config) = job.config.get("emr") {
+                crate::providers::emr::validate_config(config, &mut errors);
             }
         }
         _ => {}

@@ -142,9 +142,9 @@ impl EmrProvider {
                     .args("--deploy-mode")
                     .args(&self.deploy_mode)
                     .args(script_location)
-                    .build()?,
+                    .build(),
             )
-            .build()?;
+            .build();
 
         let resp = self
             .emr_client

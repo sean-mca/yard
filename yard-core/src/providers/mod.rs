@@ -1,3 +1,4 @@
+pub mod emr;
 pub mod glue;
 
 use anyhow::{Result, anyhow};
@@ -33,6 +34,7 @@ pub trait Provider: Send + Sync {
 pub async fn get_provider(job_type: &str, provider_config: &Value) -> Result<Box<dyn Provider>> {
     match job_type {
         "glue" => Ok(Box::new(glue::GlueProvider::new(provider_config).await?)),
+        "emr" => Ok(Box::new(emr::EmrProvider::new(provider_config).await?)),
         other => Err(anyhow!("No provider for job type: {other}")),
     }
 }
