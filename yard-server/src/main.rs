@@ -109,17 +109,12 @@ fn Shell() -> Element {
     rsx! {
         div {
             class: format!(
-                "min-h-screen flex {} {}",
-                if is_dark { "bg-zinc-950 text-zinc-50" } else { "bg-white text-zinc-950" },
+                "min-h-screen flex bg-white text-zinc-950 dark:bg-zinc-950 dark:text-zinc-50 {}",
                 if is_dark { "dark" } else { "" }
             ),
             ui::sidebar::Sidebar { open: sidebar_open, route }
             main { class: "flex-1 min-h-screen",
-                div {
-                    class: format!(
-                        "h-14 flex items-center px-6 border-b {}",
-                        if is_dark { "border-zinc-800" } else { "border-zinc-200" }
-                    ),
+                div { class: "h-14 flex items-center px-6 border-b border-zinc-200 dark:border-zinc-800",
                     h1 { class: "text-sm font-semibold", "{title}" }
                 }
                 Outlet::<Route> {}

@@ -20,14 +20,14 @@ pub fn Sheet(
         // Panel
         div {
             class: format!(
-                "fixed top-0 right-0 h-full {width} bg-white border-l border-zinc-200 shadow-xl z-50 transform transition-transform duration-200 {}",
+                "fixed top-0 right-0 h-full {width} bg-white dark:bg-zinc-900 border-l border-zinc-200 dark:border-zinc-800 shadow-xl z-50 transform transition-transform duration-200 {}",
                 if open { "translate-x-0" } else { "translate-x-full" }
             ),
             // Header
-            div { class: "flex items-center justify-between h-14 px-5 border-b border-zinc-200",
+            div { class: "flex items-center justify-between h-14 px-5 border-b border-zinc-200 dark:border-zinc-800",
                 h2 { class: "text-sm font-semibold truncate", "{title}" }
                 button {
-                    class: "p-1.5 rounded-md text-zinc-400 hover:text-zinc-950 hover:bg-zinc-100 cursor-pointer transition-colors",
+                    class: "p-1.5 rounded-md text-zinc-400 hover:text-zinc-950 dark:hover:text-zinc-50 hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer transition-colors",
                     onclick: move |e| on_close.call(e),
                     svg {
                         xmlns: "http://www.w3.org/2000/svg",

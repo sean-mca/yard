@@ -26,8 +26,8 @@ pub fn MetricsBar(
 #[component]
 fn MetricCard(label: &'static str, value: String) -> Element {
     rsx! {
-        div { class: "rounded-lg border border-zinc-200 bg-white p-4",
-            p { class: "text-xs font-medium text-zinc-500 mb-1", "{label}" }
+        div { class: "rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-4",
+            p { class: "text-xs font-medium text-zinc-500 dark:text-zinc-400 mb-1", "{label}" }
             p { class: "text-2xl font-semibold tracking-tight", "{value}" }
         }
     }
@@ -51,8 +51,8 @@ fn DriftCard(status: DriftStatus) -> Element {
     };
 
     rsx! {
-        div { class: format!("rounded-lg border p-4 {bg}"),
-            p { class: "text-xs font-medium text-zinc-500 mb-1", "Drift Status" }
+        div { class: format!("rounded-lg border p-4 {bg} dark:bg-zinc-900 dark:border-zinc-800"),
+            p { class: "text-xs font-medium text-zinc-500 dark:text-zinc-400 mb-1", "Drift Status" }
             div { class: "flex items-center gap-2",
                 match &status {
                     DriftStatus::Ok => rsx! {

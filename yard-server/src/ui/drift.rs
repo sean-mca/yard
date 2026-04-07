@@ -108,8 +108,8 @@ fn SummaryCard(label: &'static str, value: String, #[props(default)] accent: Str
     };
 
     rsx! {
-        div { class: format!("rounded-lg border bg-white p-4 {border}"),
-            p { class: "text-xs font-medium text-zinc-500 mb-1", "{label}" }
+        div { class: format!("rounded-lg border bg-white dark:bg-zinc-900 p-4 {border} dark:border-zinc-800"),
+            p { class: "text-xs font-medium text-zinc-500 dark:text-zinc-400 mb-1", "{label}" }
             p { class: format!("text-2xl font-semibold tracking-tight {value_color}"), "{value}" }
         }
     }
@@ -118,15 +118,15 @@ fn SummaryCard(label: &'static str, value: String, #[props(default)] accent: Str
 #[component]
 fn DriftTable(items: Vec<DriftItem>, mut selected: Signal<Option<DriftItem>>) -> Element {
     rsx! {
-        div { class: "rounded-lg border border-zinc-200 overflow-hidden",
+        div { class: "rounded-lg border border-zinc-200 dark:border-zinc-800 overflow-hidden",
             table { class: "w-full text-sm",
                 thead {
-                    tr { class: "border-b border-zinc-200 bg-zinc-50/50",
-                        th { class: "text-left font-medium text-zinc-500 px-4 py-3", "Name" }
-                        th { class: "text-left font-medium text-zinc-500 px-4 py-3", "Environment" }
-                        th { class: "text-left font-medium text-zinc-500 px-4 py-3", "Region" }
-                        th { class: "text-left font-medium text-zinc-500 px-4 py-3", "Drift" }
-                        th { class: "text-left font-medium text-zinc-500 px-4 py-3", "Fields Changed" }
+                    tr { class: "border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-900/50",
+                        th { class: "text-left font-medium text-zinc-500 dark:text-zinc-400 px-4 py-3", "Name" }
+                        th { class: "text-left font-medium text-zinc-500 dark:text-zinc-400 px-4 py-3", "Environment" }
+                        th { class: "text-left font-medium text-zinc-500 dark:text-zinc-400 px-4 py-3", "Region" }
+                        th { class: "text-left font-medium text-zinc-500 dark:text-zinc-400 px-4 py-3", "Drift" }
+                        th { class: "text-left font-medium text-zinc-500 dark:text-zinc-400 px-4 py-3", "Fields Changed" }
                     }
                 }
                 tbody {
@@ -135,7 +135,7 @@ fn DriftTable(items: Vec<DriftItem>, mut selected: Signal<Option<DriftItem>>) ->
                             let item = item.clone();
                             rsx! {
                                 tr {
-                                    class: "border-b border-zinc-100 hover:bg-zinc-50/50 cursor-pointer transition-colors",
+                                    class: "border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50/50 dark:hover:bg-zinc-900/50 cursor-pointer transition-colors",
                                     onclick: {
                                         let item = item.clone();
                                         move |_| selected.set(Some(item.clone()))
@@ -146,9 +146,9 @@ fn DriftTable(items: Vec<DriftItem>, mut selected: Signal<Option<DriftItem>>) ->
                                             "{item.environment}"
                                         }
                                     }
-                                    td { class: "px-4 py-3 text-zinc-500", "{item.region}" }
+                                    td { class: "px-4 py-3 text-zinc-500 dark:text-zinc-400", "{item.region}" }
                                     td { class: "px-4 py-3", DriftBadge { drift_type: item.drift_type.clone() } }
-                                    td { class: "px-4 py-3 text-zinc-500 text-xs",
+                                    td { class: "px-4 py-3 text-zinc-500 dark:text-zinc-400 text-xs",
                                         if item.fields_changed.is_empty() {
                                             "—"
                                         } else {
@@ -194,7 +194,7 @@ fn DriftSheet(mut item: Signal<Option<DriftItem>>) -> Element {
             match &*item.read() {
                 Some(drift_item) => rsx! {
                     // Meta
-                    div { class: "px-5 py-3 border-b border-zinc-100 flex items-center gap-3",
+                    div { class: "px-5 py-3 border-b border-zinc-100 dark:border-zinc-800 flex items-center gap-3",
                         span { class: "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium border bg-blue-50 text-blue-700 border-blue-200",
                             "{drift_item.environment}"
                         }
@@ -267,9 +267,9 @@ fn DriftSheet(mut item: Signal<Option<DriftItem>>) -> Element {
 #[component]
 fn ConfigPanel(label: &'static str, color: &'static str, html: String) -> Element {
     let (border, header_bg, header_text, dot) = match color {
-        "blue" => ("border-blue-200", "bg-blue-50", "text-blue-700", "bg-blue-400"),
-        "violet" => ("border-violet-200", "bg-violet-50", "text-violet-700", "bg-violet-400"),
-        _ => ("border-zinc-200", "bg-zinc-50", "text-zinc-700", "bg-zinc-400"),
+        "blue" => ("border-blue-200 dark:border-blue-800", "bg-blue-50 dark:bg-blue-950", "text-blue-700 dark:text-blue-300", "bg-blue-400"),
+        "violet" => ("border-violet-200 dark:border-violet-800", "bg-violet-50 dark:bg-violet-950", "text-violet-700 dark:text-violet-300", "bg-violet-400"),
+        _ => ("border-zinc-200 dark:border-zinc-700", "bg-zinc-50 dark:bg-zinc-800", "text-zinc-700 dark:text-zinc-300", "bg-zinc-400"),
     };
 
     rsx! {

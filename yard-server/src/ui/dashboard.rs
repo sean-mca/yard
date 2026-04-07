@@ -81,21 +81,21 @@ pub fn Dashboard() -> Element {
 #[component]
 fn PrTable(rows: Vec<PrRow>) -> Element {
     rsx! {
-        div { class: "rounded-lg border border-zinc-200 overflow-hidden",
+        div { class: "rounded-lg border border-zinc-200 dark:border-zinc-800 overflow-hidden",
             if rows.is_empty() {
-                div { class: "px-4 py-8 text-center text-sm text-zinc-500",
+                div { class: "px-4 py-8 text-center text-sm text-zinc-500 dark:text-zinc-400",
                     "No pull requests found."
                 }
             } else {
                 table { class: "w-full text-sm",
                     thead {
-                        tr { class: "border-b border-zinc-200 bg-zinc-50/50",
-                            th { class: "text-left font-medium text-zinc-500 px-4 py-3", "PR" }
-                            th { class: "text-left font-medium text-zinc-500 px-4 py-3", "Title" }
-                            th { class: "text-left font-medium text-zinc-500 px-4 py-3", "Author" }
-                            th { class: "text-left font-medium text-zinc-500 px-4 py-3", "Status" }
-                            th { class: "text-left font-medium text-zinc-500 px-4 py-3", "Plan" }
-                            th { class: "text-left font-medium text-zinc-500 px-4 py-3", "Updated" }
+                        tr { class: "border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-900/50",
+                            th { class: "text-left font-medium text-zinc-500 dark:text-zinc-400 px-4 py-3", "PR" }
+                            th { class: "text-left font-medium text-zinc-500 dark:text-zinc-400 px-4 py-3", "Title" }
+                            th { class: "text-left font-medium text-zinc-500 dark:text-zinc-400 px-4 py-3", "Author" }
+                            th { class: "text-left font-medium text-zinc-500 dark:text-zinc-400 px-4 py-3", "Status" }
+                            th { class: "text-left font-medium text-zinc-500 dark:text-zinc-400 px-4 py-3", "Plan" }
+                            th { class: "text-left font-medium text-zinc-500 dark:text-zinc-400 px-4 py-3", "Updated" }
                         }
                     }
                     tbody {
@@ -112,7 +112,7 @@ fn PrTable(rows: Vec<PrRow>) -> Element {
 #[component]
 fn PrTableRow(row: PrRow) -> Element {
     rsx! {
-        tr { class: "border-b border-zinc-100 hover:bg-zinc-50/50 transition-colors",
+        tr { class: "border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50/50 dark:hover:bg-zinc-900/50 transition-colors",
             td { class: "px-4 py-3 font-mono",
                 a {
                     href: "{row.url}",
@@ -122,10 +122,10 @@ fn PrTableRow(row: PrRow) -> Element {
                 }
             }
             td { class: "px-4 py-3 font-medium", "{row.title}" }
-            td { class: "px-4 py-3 text-zinc-500", "{row.author}" }
+            td { class: "px-4 py-3 text-zinc-500 dark:text-zinc-400", "{row.author}" }
             td { class: "px-4 py-3", StateBadge { state: row.state.clone() } }
             td { class: "px-4 py-3", PlanBadge { result: row.plan_result.clone() } }
-            td { class: "px-4 py-3 text-zinc-500", "{row.updated}" }
+            td { class: "px-4 py-3 text-zinc-500 dark:text-zinc-400", "{row.updated}" }
         }
     }
 }

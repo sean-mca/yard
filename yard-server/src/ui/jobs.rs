@@ -73,7 +73,7 @@ pub fn Jobs() -> Element {
                                 } else {
                                     format!("{count} of {total} jobs")
                                 };
-                                rsx! { p { class: "text-sm text-zinc-500", "{label}" } }
+                                rsx! { p { class: "text-sm text-zinc-500 dark:text-zinc-400", "{label}" } }
                             }
                             SearchBar { search }
                         }
@@ -129,7 +129,7 @@ fn SearchBar(mut search: Signal<String>) -> Element {
             input {
                 r#type: "text",
                 placeholder: "Search jobs...",
-                class: "pl-8 pr-3 py-1.5 text-sm rounded-md border border-zinc-200 bg-white focus:outline-none focus:ring-2 focus:ring-zinc-300 w-56",
+                class: "pl-8 pr-3 py-1.5 text-sm rounded-md border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 dark:text-zinc-50 focus:outline-none focus:ring-2 focus:ring-zinc-300 dark:focus:ring-zinc-600 w-56",
                 value: "{search}",
                 oninput: move |e| search.set(e.value()),
             }
@@ -152,9 +152,9 @@ fn EnvFilter(jobs: Vec<JobInfo>, mut selected: Signal<Option<String>>) -> Elemen
                         class: format!(
                             "px-3 py-1 rounded-full text-xs font-medium border cursor-pointer transition-colors {}",
                             if is_all {
-                                "bg-zinc-900 text-white border-zinc-900"
+                                "bg-zinc-900 text-white border-zinc-900 dark:bg-zinc-50 dark:text-zinc-900 dark:border-zinc-50"
                             } else {
-                                "bg-white text-zinc-600 border-zinc-200 hover:bg-zinc-50"
+                                "bg-white text-zinc-600 border-zinc-200 hover:bg-zinc-50 dark:bg-zinc-900 dark:text-zinc-400 dark:border-zinc-700 dark:hover:bg-zinc-800"
                             }
                         ),
                         onclick: move |_| selected.set(None),
@@ -171,9 +171,9 @@ fn EnvFilter(jobs: Vec<JobInfo>, mut selected: Signal<Option<String>>) -> Elemen
                             class: format!(
                                 "px-3 py-1 rounded-full text-xs font-medium border cursor-pointer transition-colors {}",
                                 if is_active {
-                                    "bg-zinc-900 text-white border-zinc-900"
+                                    "bg-zinc-900 text-white border-zinc-900 dark:bg-zinc-50 dark:text-zinc-900 dark:border-zinc-50"
                                 } else {
-                                    "bg-white text-zinc-600 border-zinc-200 hover:bg-zinc-50"
+                                    "bg-white text-zinc-600 border-zinc-200 hover:bg-zinc-50 dark:bg-zinc-900 dark:text-zinc-400 dark:border-zinc-700 dark:hover:bg-zinc-800"
                                 }
                             ),
                             onclick: {
@@ -220,19 +220,19 @@ fn FilteredJobs(jobs: Vec<JobInfo>, search: String, env_filter: Option<String>) 
     let has_more = start + PER_PAGE < shown;
 
     rsx! {
-        div { class: "rounded-lg border border-zinc-200 overflow-hidden",
+        div { class: "rounded-lg border border-zinc-200 dark:border-zinc-800 overflow-hidden",
             if page_items.is_empty() {
-                div { class: "px-4 py-8 text-center text-sm text-zinc-500",
+                div { class: "px-4 py-8 text-center text-sm text-zinc-500 dark:text-zinc-400",
                     "No jobs found."
                 }
             } else {
                 table { class: "w-full text-sm",
                     thead {
-                        tr { class: "border-b border-zinc-200 bg-zinc-50/50",
-                            th { class: "text-left font-medium text-zinc-500 px-4 py-3", "Name" }
-                            th { class: "text-left font-medium text-zinc-500 px-4 py-3", "Environment" }
-                            th { class: "text-left font-medium text-zinc-500 px-4 py-3", "Region" }
-                            th { class: "text-left font-medium text-zinc-500 px-4 py-3", "Path" }
+                        tr { class: "border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-900/50",
+                            th { class: "text-left font-medium text-zinc-500 dark:text-zinc-400 px-4 py-3", "Name" }
+                            th { class: "text-left font-medium text-zinc-500 dark:text-zinc-400 px-4 py-3", "Environment" }
+                            th { class: "text-left font-medium text-zinc-500 dark:text-zinc-400 px-4 py-3", "Region" }
+                            th { class: "text-left font-medium text-zinc-500 dark:text-zinc-400 px-4 py-3", "Path" }
                         }
                     }
                     tbody {
@@ -241,7 +241,7 @@ fn FilteredJobs(jobs: Vec<JobInfo>, search: String, env_filter: Option<String>) 
                                 let job = (*job).clone();
                                 rsx! {
                                     tr {
-                                        class: "border-b border-zinc-100 hover:bg-zinc-50/50 cursor-pointer transition-colors",
+                                        class: "border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50/50 dark:hover:bg-zinc-900/50 cursor-pointer transition-colors",
                                         onclick: {
                                             let job = job.clone();
                                             move |_| selected_job.set(Some(job.clone()))
@@ -252,8 +252,8 @@ fn FilteredJobs(jobs: Vec<JobInfo>, search: String, env_filter: Option<String>) 
                                                 "{job.environment}"
                                             }
                                         }
-                                        td { class: "px-4 py-3 text-zinc-500", "{job.region}" }
-                                        td { class: "px-4 py-3 text-zinc-500 font-mono text-xs", "{job.path}" }
+                                        td { class: "px-4 py-3 text-zinc-500 dark:text-zinc-400", "{job.region}" }
+                                        td { class: "px-4 py-3 text-zinc-500 dark:text-zinc-400 font-mono text-xs", "{job.path}" }
                                     }
                                 }
                             }
@@ -302,7 +302,7 @@ fn JobSheet(mut job: Signal<Option<JobInfo>>) -> Element {
             title,
             on_close: move |_| job.set(None),
             if !path.is_empty() {
-                div { class: "px-5 py-3 border-b border-zinc-100",
+                div { class: "px-5 py-3 border-b border-zinc-100 dark:border-zinc-800",
                     p { class: "text-xs font-mono text-zinc-400", "{path}" }
                 }
             }
@@ -345,24 +345,22 @@ fn highlight_yaml(input: &str) -> String {
         let trimmed = line.trim_start();
 
         if trimmed.starts_with('#') {
-            // Comment
             let indent = &line[..line.len() - trimmed.len()];
             out.push_str(&html_escape(indent));
-            out.push_str("<span class=\"text-zinc-400 italic\">");
+            out.push_str("<span class=\"text-zinc-400 dark:text-zinc-500 italic\">");
             out.push_str(&html_escape(trimmed));
             out.push_str("</span>");
         } else if trimmed.starts_with("- ") {
-            // List item — may contain a key: value pair
             let indent = &line[..line.len() - trimmed.len()];
             out.push_str(&html_escape(indent));
-            out.push_str("<span class=\"text-zinc-400\">- </span>");
+            out.push_str("<span class=\"text-zinc-400 dark:text-zinc-500\">- </span>");
             let rest = &trimmed[2..];
             if let Some(colon_pos) = rest.find(':') {
                 let key = &rest[..colon_pos];
                 let after_colon = &rest[colon_pos + 1..];
-                out.push_str("<span class=\"text-violet-600\">");
+                out.push_str("<span class=\"text-violet-600 dark:text-violet-400\">");
                 out.push_str(&html_escape(key));
-                out.push_str("</span><span class=\"text-zinc-400\">:</span>");
+                out.push_str("</span><span class=\"text-zinc-400 dark:text-zinc-500\">:</span>");
                 if !after_colon.is_empty() {
                     out.push_str(&highlight_yaml_value(after_colon));
                 }
@@ -370,18 +368,16 @@ fn highlight_yaml(input: &str) -> String {
                 out.push_str(&highlight_yaml_value(rest));
             }
         } else if let Some(colon_pos) = trimmed.find(':') {
-            // Key: value
             let indent = &line[..line.len() - trimmed.len()];
             let key = &trimmed[..colon_pos];
             let after_colon = &trimmed[colon_pos + 1..];
 
             out.push_str(&html_escape(indent));
-            out.push_str("<span class=\"text-violet-600\">");
+            out.push_str("<span class=\"text-violet-600 dark:text-violet-400\">");
             out.push_str(&html_escape(key));
-            out.push_str("</span><span class=\"text-zinc-400\">:</span>");
+            out.push_str("</span><span class=\"text-zinc-400 dark:text-zinc-500\">:</span>");
 
             if after_colon.is_empty() {
-                // Key with no inline value (nested block follows)
             } else {
                 out.push_str(&highlight_yaml_value(after_colon));
             }
@@ -403,21 +399,21 @@ fn highlight_yaml_value(value: &str) -> String {
     let mut out = html_escape(prefix_ws);
 
     if trimmed == "true" || trimmed == "false" {
-        out.push_str("<span class=\"text-amber-600\">");
+        out.push_str("<span class=\"text-amber-600 dark:text-amber-400\">");
         out.push_str(trimmed);
         out.push_str("</span>");
     } else if trimmed.parse::<f64>().is_ok() {
-        out.push_str("<span class=\"text-emerald-600\">");
+        out.push_str("<span class=\"text-emerald-600 dark:text-emerald-400\">");
         out.push_str(&html_escape(trimmed));
         out.push_str("</span>");
     } else if (trimmed.starts_with('"') && trimmed.ends_with('"'))
         || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
     {
-        out.push_str("<span class=\"text-sky-600\">");
+        out.push_str("<span class=\"text-sky-600 dark:text-sky-400\">");
         out.push_str(&html_escape(trimmed));
         out.push_str("</span>");
     } else {
-        out.push_str("<span class=\"text-zinc-700\">");
+        out.push_str("<span class=\"text-zinc-700 dark:text-zinc-300\">");
         out.push_str(&html_escape(trimmed));
         out.push_str("</span>");
     }
