@@ -65,23 +65,3 @@ pub fn cleanup_workdir(dir: &Path) {
         warn!("Failed to clean up workdir {}: {e}", dir.display());
     }
 }
-
-/// Run `yard plan` or `yard apply` in the given directory, return stdout.
-pub async fn run_yard(command: &str, workdir: &Path) -> Result<String, String> {
-    let output = Command::new("yard")
-        .arg(command)
-        .env("NO_COLOR", "1")
-        .current_dir(workdir)
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run yard {command}: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    if !output.status.success() {
-        return Err(format!("yard {command} failed:\n{stdout}\n{stderr}"));
-    }
-
-    Ok(if stdout.is_empty() { stderr } else { stdout })
-}
