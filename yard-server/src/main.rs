@@ -70,17 +70,18 @@ fn start_api_server() {
                 let github_client =
                     GitHubClient::new(&github_token).expect("Failed to create GitHub client");
 
-                let webhook_state = Arc::new(AppState {
-                    github_client,
-                    webhook_secret,
-                    db: db.clone(),
-                });
-
                 let api_state = Arc::new(ApiState {
                     github_token,
                     repo_owner,
                     repo_name,
+                    db: db.clone(),
+                });
+
+                let webhook_state = Arc::new(AppState {
+                    github_client,
+                    webhook_secret,
                     db,
+                    api_state: api_state.clone(),
                 });
 
                 let cors = CorsLayer::new()
@@ -96,8 +97,9 @@ fn start_api_server() {
                     .merge(settings_router(api_state.clone()))
                     .layer(cors);
 
-                // Spawn background drift polling task
-                tokio::spawn(drift_poll_loop(api_state));
+                // Spawn background polling tasks
+                tokio::spawn(drift_poll_loop(api_state.clone()));
+                tokio::spawn(dashboard_poll_loop(api_state));
 
                 let addr: std::net::SocketAddr = "0.0.0.0:3001".parse().unwrap();
                 eprintln!("API server listening on {addr}");
@@ -137,6 +139,40 @@ async fn drift_poll_loop(state: std::sync::Arc<api::dashboard::ApiState>) {
                 warn!("Scheduled drift check failed: {e}");
             }
         }
+
+        tokio::time::sleep(std::time::Duration::from_secs(interval_mins * 60)).await;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn dashboard_poll_loop(state: std::sync::Arc<api::dashboard::ApiState>) {
+    use tracing::{info, warn};
+
+    const DEFAULT_INTERVAL_MINS: u64 = 5;
+
+    // Wait for server to be ready before first refresh
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    loop {
+        info!("Refreshing dashboard cache");
+
+        match api::dashboard::refresh_dashboard_cache(&state).await {
+            Ok(cache) => {
+                info!(
+                    total_prs = cache.prs.len(),
+                    open_prs = cache.open_prs,
+                    "Dashboard cache refreshed"
+                );
+            }
+            Err(e) => {
+                warn!("Dashboard cache refresh failed: {e}");
+            }
+        }
+
+        let interval_mins = match state.db.get_setting("dashboard_interval").await {
+            Ok(Some(val)) => val.parse::<u64>().unwrap_or(DEFAULT_INTERVAL_MINS),
+            _ => DEFAULT_INTERVAL_MINS,
+        };
 
         tokio::time::sleep(std::time::Duration::from_secs(interval_mins * 60)).await;
     }

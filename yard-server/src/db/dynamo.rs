@@ -447,6 +447,45 @@ impl DynamoDatabase {
             })
             .collect())
     }
+    // ---- Cache ----
+
+    pub async fn set_cache(&self, key: &str, data: &str) -> Result<()> {
+        let pk = format!("CACHE#{key}");
+
+        self.client
+            .put_item()
+            .table_name(&self.table_name)
+            .item("PK", AttributeValue::S(pk.clone()))
+            .item("SK", AttributeValue::S(pk))
+            .item("GSI1PK", AttributeValue::S("CACHE".to_string()))
+            .item("GSI1SK", AttributeValue::S(key.to_string()))
+            .item("data", AttributeValue::S(data.to_string()))
+            .send()
+            .await
+            .context("set cache")?;
+
+        Ok(())
+    }
+
+    pub async fn get_cache(&self, key: &str) -> Result<Option<String>> {
+        let pk = format!("CACHE#{key}");
+
+        let resp = self
+            .client
+            .get_item()
+            .table_name(&self.table_name)
+            .key("PK", AttributeValue::S(pk.clone()))
+            .key("SK", AttributeValue::S(pk))
+            .send()
+            .await
+            .context("get cache")?;
+
+        Ok(resp
+            .item()
+            .and_then(|item| item.get("data"))
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.to_string()))
+    }
 }
 
 // ---- Item Parsers ----
