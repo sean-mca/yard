@@ -35,6 +35,7 @@ fn main() {
 fn start_api_server() {
     use api::dashboard::{dashboard_router, ApiState};
     use api::jobs::jobs_router;
+    use api::settings::settings_router;
     use db::DbConfig;
     use github::{client::GitHubClient, router::github_router, router::AppState};
     use std::sync::Arc;
@@ -84,7 +85,8 @@ fn start_api_server() {
                 let router = axum::Router::new()
                     .merge(github_router(webhook_state))
                     .merge(dashboard_router(api_state.clone()))
-                    .merge(jobs_router(api_state))
+                    .merge(jobs_router(api_state.clone()))
+                    .merge(settings_router(api_state))
                     .layer(cors);
 
                 let addr: std::net::SocketAddr = "0.0.0.0:3001".parse().unwrap();

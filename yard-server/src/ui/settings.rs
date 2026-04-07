@@ -1,4 +1,7 @@
 use dioxus::prelude::*;
+use std::collections::HashMap;
+
+const API_BASE: &str = "http://127.0.0.1:3001";
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Theme {
@@ -7,11 +10,84 @@ pub enum Theme {
     System,
 }
 
+impl Theme {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "dark" => Theme::Dark,
+            "system" => Theme::System,
+            _ => Theme::Light,
+        }
+    }
+}
+
+async fn fetch_settings() -> Result<HashMap<String, String>, String> {
+    let resp = reqwest::get(format!("{API_BASE}/api/settings"))
+        .await
+        .map_err(|e| format!("Request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Server error: {}", resp.status()));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct SettingsResponse {
+        settings: HashMap<String, String>,
+    }
+
+    let body = resp
+        .json::<SettingsResponse>()
+        .await
+        .map_err(|e| format!("Parse failed: {e}"))?;
+
+    Ok(body.settings)
+}
+
+async fn save_setting(key: &str, value: &str) -> Result<(), String> {
+    let mut settings = HashMap::new();
+    settings.insert(key.to_string(), value.to_string());
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{API_BASE}/api/settings"))
+        .json(&serde_json::json!({ "settings": settings }))
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Server error: {}", resp.status()));
+    }
+
+    Ok(())
+}
+
 #[component]
 pub fn Settings(theme: Signal<Theme>) -> Element {
     let mut drift_interval = use_signal(|| "3".to_string());
     let mut slack_url = use_signal(String::new);
     let mut slack_enabled = use_signal(|| false);
+    let mut loaded = use_signal(|| false);
+
+    // Load settings from API on mount
+    use_effect(move || {
+        spawn(async move {
+            if let Ok(settings) = fetch_settings().await {
+                if let Some(t) = settings.get("theme") {
+                    theme.set(Theme::from_str(t));
+                }
+                if let Some(v) = settings.get("drift_interval") {
+                    drift_interval.set(v.clone());
+                }
+                if let Some(v) = settings.get("slack_webhook_url") {
+                    slack_url.set(v.clone());
+                }
+                if let Some(v) = settings.get("slack_enabled") {
+                    slack_enabled.set(v == "true");
+                }
+            }
+            loaded.set(true);
+        });
+    });
 
     rsx! {
         div { class: "p-6 max-w-2xl",
@@ -21,7 +97,7 @@ pub fn Settings(theme: Signal<Theme>) -> Element {
                     title: "Appearance",
                     description: "Customize the look of the dashboard.",
                 }
-                ThemePicker { theme }
+                ThemePicker { theme, loaded }
 
                 Divider {}
 
@@ -30,7 +106,7 @@ pub fn Settings(theme: Signal<Theme>) -> Element {
                     title: "Drift Detection",
                     description: "Configure how often yard checks for configuration drift.",
                 }
-                IntervalPicker { value: drift_interval }
+                IntervalPicker { value: drift_interval, loaded }
 
                 Divider {}
 
@@ -49,6 +125,7 @@ pub fn Settings(theme: Signal<Theme>) -> Element {
                     field_label: "Webhook URL",
                     field_placeholder: "https://hooks.slack.com/services/...",
                     field_value: slack_url,
+                    loaded,
                 }
 
             }
@@ -72,26 +149,41 @@ fn Divider() -> Element {
 }
 
 #[component]
-fn ThemePicker(mut theme: Signal<Theme>) -> Element {
+fn ThemePicker(mut theme: Signal<Theme>, loaded: Signal<bool>) -> Element {
     rsx! {
         div { class: "flex gap-2 mt-3",
             ThemeOption {
                 label: "Light",
                 active: theme() == Theme::Light,
                 icon: "M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z",
-                on_click: move |_| theme.set(Theme::Light),
+                on_click: move |_| {
+                    theme.set(Theme::Light);
+                    if loaded() {
+                        spawn(async move { let _ = save_setting("theme", "light").await; });
+                    }
+                },
             }
             ThemeOption {
                 label: "Dark",
                 active: theme() == Theme::Dark,
                 icon: "M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z",
-                on_click: move |_| theme.set(Theme::Dark),
+                on_click: move |_| {
+                    theme.set(Theme::Dark);
+                    if loaded() {
+                        spawn(async move { let _ = save_setting("theme", "dark").await; });
+                    }
+                },
             }
             ThemeOption {
                 label: "System",
                 active: theme() == Theme::System,
                 icon: "M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z",
-                on_click: move |_| theme.set(Theme::System),
+                on_click: move |_| {
+                    theme.set(Theme::System);
+                    if loaded() {
+                        spawn(async move { let _ = save_setting("theme", "system").await; });
+                    }
+                },
             }
         }
     }
@@ -132,7 +224,7 @@ fn ThemeOption(
 }
 
 #[component]
-fn IntervalPicker(mut value: Signal<String>) -> Element {
+fn IntervalPicker(mut value: Signal<String>, loaded: Signal<bool>) -> Element {
     let options = [("1", "1 min"), ("3", "3 min"), ("5", "5 min"), ("10", "10 min")];
 
     rsx! {
@@ -152,7 +244,12 @@ fn IntervalPicker(mut value: Signal<String>) -> Element {
                                         "border-zinc-200 text-zinc-600 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800"
                                     }
                                 ),
-                                onclick: move |_| value.set(val.to_string()),
+                                onclick: move |_| {
+                                    value.set(val.to_string());
+                                    if loaded() {
+                                        spawn(async move { let _ = save_setting("drift_interval", val).await; });
+                                    }
+                                },
                                 "{label}"
                             }
                         }
@@ -172,6 +269,7 @@ fn NotificationCard(
     field_label: &'static str,
     field_placeholder: &'static str,
     mut field_value: Signal<String>,
+    loaded: Signal<bool>,
 ) -> Element {
     rsx! {
         div { class: "rounded-lg border border-zinc-200 dark:border-zinc-700 p-4 mt-3",
@@ -204,7 +302,13 @@ fn NotificationCard(
                             "bg-zinc-200 dark:bg-zinc-700"
                         }
                     ),
-                    onclick: move |_| enabled.toggle(),
+                    onclick: move |_| {
+                        enabled.toggle();
+                        if loaded() {
+                            let val = enabled().to_string();
+                            spawn(async move { let _ = save_setting("slack_enabled", &val).await; });
+                        }
+                    },
                     span {
                         class: format!(
                             "absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white dark:bg-zinc-900 transition-transform {}",
@@ -222,6 +326,12 @@ fn NotificationCard(
                         class: "w-full px-3 py-1.5 text-sm rounded-md border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-zinc-300 dark:focus:ring-zinc-600",
                         value: "{field_value}",
                         oninput: move |e| field_value.set(e.value()),
+                        onchange: move |e| {
+                            let val = e.value();
+                            if loaded() {
+                                spawn(async move { let _ = save_setting("slack_webhook_url", &val).await; });
+                            }
+                        },
                     }
                 }
             }
