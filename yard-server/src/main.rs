@@ -93,8 +93,11 @@ fn start_api_server() {
                     .merge(dashboard_router(api_state.clone()))
                     .merge(jobs_router(api_state.clone()))
                     .merge(drift_router(api_state.clone()))
-                    .merge(settings_router(api_state))
+                    .merge(settings_router(api_state.clone()))
                     .layer(cors);
+
+                // Spawn background drift polling task
+                tokio::spawn(drift_poll_loop(api_state));
 
                 let addr: std::net::SocketAddr = "0.0.0.0:3001".parse().unwrap();
                 eprintln!("API server listening on {addr}");
@@ -102,6 +105,41 @@ fn start_api_server() {
                 axum::serve(listener, router).await.unwrap();
             });
     });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn drift_poll_loop(state: std::sync::Arc<api::dashboard::ApiState>) {
+    use tracing::{info, warn};
+
+    const DEFAULT_INTERVAL_MINS: u64 = 3;
+
+    // Wait for server to be ready before first check
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+    loop {
+        // Read interval from settings (stored as minutes string)
+        let interval_mins = match state.db.get_setting("drift_interval").await {
+            Ok(Some(val)) => val.parse::<u64>().unwrap_or(DEFAULT_INTERVAL_MINS),
+            _ => DEFAULT_INTERVAL_MINS,
+        };
+
+        info!(interval_mins = interval_mins, "Running scheduled drift check");
+
+        match api::drift::run_drift_check(&state).await {
+            Ok(data) => {
+                info!(
+                    drifted = data.drifted,
+                    in_sync = data.in_sync,
+                    "Scheduled drift check complete"
+                );
+            }
+            Err(e) => {
+                warn!("Scheduled drift check failed: {e}");
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(interval_mins * 60)).await;
+    }
 }
 
 fn app() -> Element {

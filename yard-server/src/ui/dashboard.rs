@@ -5,6 +5,24 @@ use super::metrics::{DriftStatus, MetricsBar};
 use crate::types::*;
 
 const API_BASE: &str = "http://127.0.0.1:3001";
+const DRIFT_POLL_MS: u32 = 15_000;
+
+#[cfg(target_arch = "wasm32")]
+fn set_interval(ms: u32, mut f: impl FnMut() + 'static) {
+    use wasm_bindgen::prelude::*;
+    let closure = Closure::wrap(Box::new(move || f()) as Box<dyn FnMut()>);
+    web_sys::window()
+        .unwrap()
+        .set_interval_with_callback_and_timeout_and_arguments_0(
+            closure.as_ref().unchecked_ref(),
+            ms as i32,
+        )
+        .unwrap();
+    closure.forget();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn set_interval(_ms: u32, _f: impl FnMut() + 'static) {}
 
 #[derive(serde::Deserialize)]
 struct DriftSummaryResponse {
@@ -48,7 +66,19 @@ async fn fetch_dashboard_data(page: u32) -> Result<DashboardData, String> {
 pub fn Dashboard() -> Element {
     let mut page = use_signal(|| 1u32);
     let data = use_resource(move || fetch_dashboard_data(page()));
-    let drift_data = use_resource(|| fetch_drift_summary());
+    let mut drift_tick = use_signal(|| 0u32);
+    use_effect(move || {
+        set_interval(DRIFT_POLL_MS, move || {
+            if let Ok(mut val) = drift_tick.try_write() {
+                *val += 1;
+            }
+        });
+    });
+
+    let drift_data = use_resource(move || {
+        let _ = drift_tick();
+        fetch_drift_summary()
+    });
 
     let drift_status = match &*drift_data.read() {
         Some(Ok(0)) => DriftStatus::Ok,

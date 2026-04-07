@@ -21,6 +21,7 @@ use crate::yard_runner;
 pub fn drift_router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/api/drift", get(get_drift))
+        .route("/api/drift/cached", get(get_drift_cached))
         .route("/api/drift/summary", get(get_drift_summary))
         .with_state(state)
 }
@@ -37,7 +38,7 @@ async fn get_drift(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     }
 }
 
-async fn run_drift_check(state: &ApiState) -> Result<DriftData, String> {
+pub async fn run_drift_check(state: &ApiState) -> Result<DriftData, String> {
     // 1. Get latest commit SHA
     let sha = get_head_sha(state).await?;
 
@@ -131,11 +132,19 @@ async fn run_drift_check(state: &ApiState) -> Result<DriftData, String> {
 
     info!(drifted = drifted, in_sync = in_sync, "Drift check complete");
 
-    Ok(DriftData {
+    let drift_data = DriftData {
         items,
         in_sync,
         drifted,
-    })
+    };
+
+    // Cache the full drift result so the UI can poll without triggering a full check
+    let cached = serde_json::to_string(&drift_data).unwrap_or_default();
+    if let Err(e) = state.db.set_setting("drift_cache", &cached).await {
+        warn!(error = %e, "Failed to cache drift data");
+    }
+
+    Ok(drift_data)
 }
 
 async fn run_drift_check_in_dir(
@@ -165,6 +174,34 @@ async fn get_head_sha(state: &ApiState) -> Result<String, String> {
         .first()
         .map(|c| c.sha.clone())
         .ok_or_else(|| "No commits found".to_string())
+}
+
+// ---- Cached drift data (populated by background task or full check) ----
+
+async fn get_drift_cached(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    match state.db.get_setting("drift_cache").await {
+        Ok(Some(cached)) => match serde_json::from_str::<DriftData>(&cached) {
+            Ok(data) => (StatusCode::OK, Json(data)).into_response(),
+            Err(_) => (
+                StatusCode::OK,
+                Json(DriftData {
+                    items: vec![],
+                    in_sync: 0,
+                    drifted: 0,
+                }),
+            )
+                .into_response(),
+        },
+        _ => (
+            StatusCode::OK,
+            Json(DriftData {
+                items: vec![],
+                in_sync: 0,
+                drifted: 0,
+            }),
+        )
+            .into_response(),
+    }
 }
 
 // ---- Lightweight summary from DynamoDB ----

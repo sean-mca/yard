@@ -5767,6 +5767,8 @@ dependencies = [
  "tracing",
  "uuid",
  "walkdir",
+ "wasm-bindgen",
+ "web-sys",
  "yaml-rust2",
  "yard-core",
  "yard-structs",

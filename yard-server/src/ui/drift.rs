@@ -5,8 +5,27 @@ use crate::types::*;
 
 const API_BASE: &str = "http://127.0.0.1:3001";
 
-async fn fetch_drift_data() -> Result<DriftData, String> {
-    let resp = reqwest::get(format!("{API_BASE}/api/drift"))
+const POLL_INTERVAL_MS: u32 = 15_000;
+
+#[cfg(target_arch = "wasm32")]
+fn set_interval(ms: u32, mut f: impl FnMut() + 'static) {
+    use wasm_bindgen::prelude::*;
+    let closure = Closure::wrap(Box::new(move || f()) as Box<dyn FnMut()>);
+    web_sys::window()
+        .unwrap()
+        .set_interval_with_callback_and_timeout_and_arguments_0(
+            closure.as_ref().unchecked_ref(),
+            ms as i32,
+        )
+        .unwrap();
+    closure.forget();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn set_interval(_ms: u32, _f: impl FnMut() + 'static) {}
+
+async fn fetch_drift_cached() -> Result<DriftData, String> {
+    let resp = reqwest::get(format!("{API_BASE}/api/drift/cached"))
         .await
         .map_err(|e| format!("Request failed: {e}"))?;
 
@@ -23,7 +42,21 @@ async fn fetch_drift_data() -> Result<DriftData, String> {
 
 #[component]
 pub fn Drift() -> Element {
-    let data = use_resource(|| fetch_drift_data());
+    let mut tick = use_signal(|| 0u32);
+
+    // Poll on interval: bump tick to trigger use_resource re-fetch
+    use_effect(move || {
+        set_interval(POLL_INTERVAL_MS, move || {
+            if let Ok(mut val) = tick.try_write() {
+                *val += 1;
+            }
+        });
+    });
+
+    let data = use_resource(move || {
+        let _ = tick();
+        fetch_drift_cached()
+    });
     let mut selected = use_signal(|| None::<DriftItem>);
 
     match &*data.read() {
