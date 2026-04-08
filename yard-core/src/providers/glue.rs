@@ -1,7 +1,6 @@
-use super::Provider;
+use super::{Provider, aws_config};
 use anyhow::{Context, Result, anyhow};
 use yard_structs::ValidationError;
-use aws_config::BehaviorVersion;
 use aws_sdk_glue::Client as GlueClient;
 use aws_sdk_s3::Client as S3Client;
 use serde_json::Value;
@@ -103,13 +102,9 @@ impl GlueProvider {
             })
             .unwrap_or_default();
 
-        let aws_config = aws_config::defaults(BehaviorVersion::latest())
-            .region(aws_config::Region::new(region.to_string()))
-            .load()
-            .await;
-
-        let glue_client = GlueClient::new(&aws_config);
-        let s3_client = S3Client::new(&aws_config);
+        let config = aws_config(region).await;
+        let glue_client = GlueClient::new(&config);
+        let s3_client = S3Client::new(&config);
 
         Ok(Self {
             glue_client,

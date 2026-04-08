@@ -1,6 +1,5 @@
-use super::Provider;
+use super::{Provider, aws_config};
 use anyhow::{Context, Result, anyhow};
-use aws_config::BehaviorVersion;
 use aws_sdk_emr::Client as EmrClient;
 use aws_sdk_s3::Client as S3Client;
 use serde_json::Value;
@@ -55,13 +54,9 @@ impl EmrProvider {
             .unwrap_or("CONTINUE")
             .to_string();
 
-        let aws_config = aws_config::defaults(BehaviorVersion::latest())
-            .region(aws_config::Region::new(region.to_string()))
-            .load()
-            .await;
-
-        let emr_client = EmrClient::new(&aws_config);
-        let s3_client = S3Client::new(&aws_config);
+        let config = aws_config(region).await;
+        let emr_client = EmrClient::new(&config);
+        let s3_client = S3Client::new(&config);
 
         Ok(Self {
             emr_client,
