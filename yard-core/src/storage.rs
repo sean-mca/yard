@@ -284,6 +284,34 @@ impl Storage {
         }
     }
 
+    /// Acquire locks for multiple jobs atomically. If any lock fails,
+    /// all previously acquired locks are rolled back.
+    pub async fn lock_jobs(&self, names: &[String]) -> Result<Vec<(String, LockInfo)>> {
+        let mut acquired: Vec<(String, LockInfo)> = Vec::new();
+
+        for name in names {
+            match self.lock(name).await {
+                Ok(info) => acquired.push((name.clone(), info)),
+                Err(e) => {
+                    // Roll back all locks acquired so far
+                    self.unlock_jobs(&acquired).await;
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(acquired)
+    }
+
+    /// Release multiple locks. Best-effort: logs failures but does not abort.
+    pub async fn unlock_jobs(&self, locks: &[(String, LockInfo)]) {
+        for (name, info) in locks.iter().rev() {
+            if let Err(e) = self.unlock(name, info).await {
+                eprintln!("Warning: failed to unlock job \"{name}\": {e}");
+            }
+        }
+    }
+
     /// Read current lock info for a job, if any.
     pub async fn get_lock(&self, job_name: &str) -> Result<Option<LockInfo>> {
         match self {
@@ -526,5 +554,62 @@ mod tests {
         };
         let storage = get_storage(&backend).await.unwrap();
         assert!(matches!(storage, Storage::Local(_)));
+    }
+
+    // --- Batch locking ---
+
+    #[tokio::test]
+    async fn lock_jobs_acquires_all() {
+        let storage = temp_storage("lockjobs");
+        let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+
+        let locks = storage.lock_jobs(&names).await.unwrap();
+        assert_eq!(locks.len(), 3);
+
+        // All three should be locked
+        for name in &names {
+            let lock = storage.get_lock(name).await.unwrap();
+            assert!(lock.is_some());
+        }
+
+        let _ = std::fs::remove_dir_all(storage_path(&storage));
+    }
+
+    #[tokio::test]
+    async fn lock_jobs_rolls_back_on_failure() {
+        let storage = temp_storage("lockrollback");
+
+        // Pre-lock "b" so locking ["a", "b", "c"] fails on "b"
+        let _held = storage.lock("b").await.unwrap();
+
+        let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let result = storage.lock_jobs(&names).await;
+        assert!(result.is_err());
+
+        // "a" should have been rolled back (unlocked)
+        let a_lock = storage.get_lock("a").await.unwrap();
+        assert!(a_lock.is_none(), "lock for 'a' should have been rolled back");
+
+        // "c" was never attempted
+        let c_lock = storage.get_lock("c").await.unwrap();
+        assert!(c_lock.is_none());
+
+        let _ = std::fs::remove_dir_all(storage_path(&storage));
+    }
+
+    #[tokio::test]
+    async fn unlock_jobs_releases_all() {
+        let storage = temp_storage("unlockjobs");
+        let names = vec!["x".to_string(), "y".to_string()];
+
+        let locks = storage.lock_jobs(&names).await.unwrap();
+        storage.unlock_jobs(&locks).await;
+
+        for name in &names {
+            let lock = storage.get_lock(name).await.unwrap();
+            assert!(lock.is_none());
+        }
+
+        let _ = std::fs::remove_dir_all(storage_path(&storage));
     }
 }
