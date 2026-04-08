@@ -58,7 +58,7 @@ pub fn Jobs() -> Element {
                                 let query = search().to_lowercase();
                                 let env = env_filter();
                                 let count = jobs_data.jobs.iter().filter(|j| {
-                                    let env_match = env.as_ref().map_or(true, |e| &j.environment == e);
+                                    let env_match = env.as_ref().is_none_or(|e| &j.environment == e);
                                     let search_match = query.is_empty()
                                         || j.name.to_lowercase().contains(&query)
                                         || j.path.to_lowercase().contains(&query)
@@ -198,7 +198,7 @@ fn FilteredJobs(jobs: Vec<JobInfo>, search: String, env_filter: Option<String>) 
     let filtered: Vec<&JobInfo> = jobs
         .iter()
         .filter(|j| {
-            let env_match = env_filter.as_ref().map_or(true, |e| &j.environment == e);
+            let env_match = env_filter.as_ref().is_none_or(|e| &j.environment == e);
             let search_match = query.is_empty()
                 || j.name.to_lowercase().contains(&query)
                 || j.path.to_lowercase().contains(&query)
@@ -350,11 +350,10 @@ fn highlight_yaml(input: &str) -> String {
             out.push_str("<span class=\"text-zinc-400 dark:text-zinc-500 italic\">");
             out.push_str(&html_escape(trimmed));
             out.push_str("</span>");
-        } else if trimmed.starts_with("- ") {
+        } else if let Some(rest) = trimmed.strip_prefix("- ") {
             let indent = &line[..line.len() - trimmed.len()];
             out.push_str(&html_escape(indent));
             out.push_str("<span class=\"text-zinc-400 dark:text-zinc-500\">- </span>");
-            let rest = &trimmed[2..];
             if let Some(colon_pos) = rest.find(':') {
                 let key = &rest[..colon_pos];
                 let after_colon = &rest[colon_pos + 1..];

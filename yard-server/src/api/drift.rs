@@ -115,7 +115,7 @@ pub async fn run_drift_check(state: &ApiState) -> Result<DriftData, String> {
     }
 
     // Store in-sync jobs
-    for (name, _) in &job_files {
+    for name in job_files.keys() {
         if !diffs.iter().any(|d| &d.name == name) {
             let snapshot = DriftSnapshot {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -269,35 +269,34 @@ fn walk_for_jobs(dir: &Path, workdir: &Path, jobs: &mut HashMap<String, JobFileI
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if !name.starts_with('.') {
-                    walk_for_jobs(&path, workdir, jobs);
-                }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && !name.starts_with('.')
+            {
+                walk_for_jobs(&path, workdir, jobs);
             }
-        } else if let Some(ext) = path.extension() {
-            if ext == "yaml" {
-                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                    if matches!(
-                        file_name,
-                        "yard.yaml" | "account.yaml" | "region.yaml" | "transforms.yaml"
-                    ) {
-                        continue;
-                    }
-
-                    let job_name = file_name.trim_end_matches(".yaml").to_string();
-                    let (environment, region) = extract_env_region(&path, workdir);
-                    let content = std::fs::read_to_string(&path).unwrap_or_default();
-
-                    jobs.insert(
-                        job_name,
-                        JobFileInfo {
-                            environment,
-                            region,
-                            content,
-                        },
-                    );
-                }
+        } else if let Some(ext) = path.extension()
+            && ext == "yaml"
+            && let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+        {
+            if matches!(
+                file_name,
+                "yard.yaml" | "account.yaml" | "region.yaml" | "transforms.yaml"
+            ) {
+                continue;
             }
+
+            let job_name = file_name.trim_end_matches(".yaml").to_string();
+            let (environment, region) = extract_env_region(&path, workdir);
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+
+            jobs.insert(
+                job_name,
+                JobFileInfo {
+                    environment,
+                    region,
+                    content,
+                },
+            );
         }
     }
 }

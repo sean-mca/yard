@@ -366,8 +366,8 @@ fn render_panel_collapsed(content: &str, changed_lines: &[usize], color: &str) -
     for &idx in changed_lines {
         let start = idx.saturating_sub(CONTEXT_LINES);
         let end = (idx + CONTEXT_LINES + 1).min(total);
-        for i in start..end {
-            visible[i] = true;
+        for v in &mut visible[start..end] {
+            *v = true;
         }
     }
 
