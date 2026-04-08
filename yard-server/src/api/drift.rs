@@ -42,13 +42,14 @@ pub async fn run_drift_check(state: &ApiState) -> Result<DriftData, String> {
     // 1. Get latest commit SHA
     let sha = get_head_sha(state).await?;
 
-    // 2. Clone repo
+    // 2. Clone repo — token is passed separately so it never appears in URLs
     let clone_url = format!(
-        "https://x-access-token:{}@github.com/{}/{}.git",
-        state.github_token, state.repo_owner, state.repo_name
+        "https://github.com/{}/{}.git",
+        state.repo_owner, state.repo_name
     );
 
-    let workdir = clone_at_sha(&clone_url, &sha).await?;
+    let workdir =
+        clone_at_sha(&clone_url, &sha, Some(&state.github_token)).await?;
 
     // 3. Resolve project and calculate diff using yard-core directly
     let result = run_drift_check_in_dir(&workdir).await;

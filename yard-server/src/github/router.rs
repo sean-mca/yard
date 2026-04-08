@@ -142,8 +142,14 @@ async fn handle_webhook(
                 warn!(pr = pr_number, error = %e, "Failed to persist webhook event");
             }
 
-            // Clone and run plan via yard-core
-            let plan_output = match clone_at_sha(&clone_url, &head_sha).await {
+            // Clone and run plan via yard-core — token passed via env, not in URL
+            let plan_output = match clone_at_sha(
+                &clone_url,
+                &head_sha,
+                Some(&state.api_state.github_token),
+            )
+            .await
+            {
                 Ok(workdir) => {
                     let result = match yard_runner::resolve_project(&workdir).await {
                         Ok(project) => {
@@ -260,8 +266,14 @@ async fn handle_webhook(
                 warn!(pr = pr_number, error = %e, "Failed to persist webhook event");
             }
 
-            // Clone and run apply via yard-core
-            let apply_output = match clone_at_sha(&clone_url, &head_sha).await {
+            // Clone and run apply via yard-core — token passed via env, not in URL
+            let apply_output = match clone_at_sha(
+                &clone_url,
+                &head_sha,
+                Some(&state.api_state.github_token),
+            )
+            .await
+            {
                 Ok(workdir) => {
                     let result = match yard_runner::resolve_project(&workdir).await {
                         Ok(project) => {
