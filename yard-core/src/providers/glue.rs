@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use yard_structs::Resource;
+use yard_structs::{Resource, ResourceStatus};
 
 pub struct GlueProvider {
     glue_client: GlueClient,
@@ -323,6 +323,51 @@ impl GlueProvider {
 
         Ok(())
     }
+
+    async fn s3_object_exists(&self, key: &str) -> Result<bool> {
+        let result = self
+            .s3_client
+            .head_object()
+            .bucket(&self.script_bucket)
+            .key(key)
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                if e.as_service_error()
+                    .is_some_and(|se| se.is_not_found())
+                {
+                    Ok(false)
+                } else {
+                    Err(e).with_context(|| format!("Failed to check S3 object: {key}"))
+                }
+            }
+        }
+    }
+
+    async fn glue_job_exists(&self, job_name: &str) -> Result<bool> {
+        let result = self
+            .glue_client
+            .get_job()
+            .job_name(job_name)
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                if e.as_service_error()
+                    .is_some_and(|se| se.is_entity_not_found_exception())
+                {
+                    Ok(false)
+                } else {
+                    Err(e).with_context(|| format!("Failed to check Glue job: {job_name}"))
+                }
+            }
+        }
+    }
 }
 
 impl Provider for GlueProvider {
@@ -375,6 +420,40 @@ impl Provider for GlueProvider {
             self.delete_script(&job_name).await?;
 
             Ok(())
+        })
+    }
+
+    fn verify_resources(
+        &self,
+        _job_name: &str,
+        resources: &[Resource],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ResourceStatus>>> + Send + '_>> {
+        let resources = resources.to_vec();
+
+        Box::pin(async move {
+            let mut statuses = Vec::new();
+
+            for resource in &resources {
+                let exists = match resource.r#type.as_str() {
+                    "s3_object" => {
+                        // resource.id is "s3://bucket/key" — extract the key
+                        let key = resource
+                            .id
+                            .strip_prefix(&format!("s3://{}/", self.script_bucket))
+                            .unwrap_or(&resource.id);
+                        self.s3_object_exists(key).await?
+                    }
+                    "glue_job" => self.glue_job_exists(&resource.id).await?,
+                    _ => true, // Unknown resource types assumed to exist
+                };
+
+                statuses.push(ResourceStatus {
+                    resource: resource.clone(),
+                    exists,
+                });
+            }
+
+            Ok(statuses)
         })
     }
 }

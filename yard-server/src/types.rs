@@ -85,6 +85,7 @@ pub enum DriftType {
     Modified,
     New,
     Deleted,
+    ResourceMissing,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

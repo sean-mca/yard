@@ -9,8 +9,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 use yard_structs::{
-    Deployment, DiffType, Import, JobDiff, JobState, ProjectManifest, ProjectState, Sink, Source,
-    Transform,
+    Deployment, DiffType, Import, JobDiff, JobState, ProjectManifest, ProjectState,
+    ResourceStatus, Sink, Source, Transform,
 };
 
 /// Merge provider-level defaults with job-level overrides.
@@ -63,6 +63,52 @@ pub async fn load_state(
         last_updated: chrono::Utc::now().to_rfc3339(),
         deployments,
     })
+}
+
+/// Verify that deployed resources still exist in their target services.
+/// For each deployed job with resources and a known provider, instantiates the
+/// provider and checks each resource. Returns a map of job_name → resource statuses.
+/// Jobs without a matching provider config are silently skipped.
+pub async fn verify_deployed_resources(
+    manifest: &ProjectManifest,
+    state: &ProjectState,
+) -> Result<HashMap<String, Vec<ResourceStatus>>> {
+    let mut results: HashMap<String, Vec<ResourceStatus>> = HashMap::new();
+
+    for (job_name, deployment) in &state.deployments {
+        if deployment.resources.is_empty() {
+            continue;
+        }
+
+        // Determine the job type from the deployment config
+        let job_type = match deployment.config.get("type").and_then(|v| v.as_str()) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        // Need provider config from the manifest to instantiate the provider
+        let provider_defaults = match manifest.providers.get(job_type) {
+            Some(config) => config,
+            None => continue,
+        };
+
+        // Merge provider defaults with job-level overrides (same logic as apply)
+        let job_overrides = deployment
+            .config
+            .get(job_type)
+            .unwrap_or(&Value::Null)
+            .clone();
+        let merged_config = merge_provider_config(provider_defaults, &job_overrides);
+
+        let provider = providers::get_provider(job_type, &merged_config).await?;
+        let statuses = provider
+            .verify_resources(job_name, &deployment.resources)
+            .await?;
+
+        results.insert(job_name.clone(), statuses);
+    }
+
+    Ok(results)
 }
 
 /// Compute the diff between the manifest and the current state.

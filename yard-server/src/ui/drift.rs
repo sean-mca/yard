@@ -181,6 +181,7 @@ fn DriftBadge(drift_type: DriftType) -> Element {
         DriftType::Modified => ("Modified", "bg-amber-50 text-amber-700 border-amber-200"),
         DriftType::New => ("New", "bg-emerald-50 text-emerald-700 border-emerald-200"),
         DriftType::Deleted => ("Deleted", "bg-red-50 text-red-700 border-red-200"),
+        DriftType::ResourceMissing => ("Resource Missing", "bg-purple-50 text-purple-700 border-purple-200"),
     };
 
     rsx! {
@@ -263,6 +264,27 @@ fn DriftSheet(mut item: Signal<Option<DriftItem>>) -> Element {
                                         "This job was deployed but is no longer present in config."
                                     }
                                     ConfigPanel { label: "Deployed", color: "blue", html }
+                                }
+                            }
+                        },
+                        DriftType::ResourceMissing => {
+                            rsx! {
+                                div { class: "px-5 py-4",
+                                    div { class: "rounded-md border border-purple-200 bg-purple-50 px-3 py-2 text-sm text-purple-700 mb-4",
+                                        "One or more AWS resources for this job were deleted outside of yard."
+                                    }
+                                    if !drift_item.fields_changed.is_empty() {
+                                        div { class: "mt-3",
+                                            p { class: "text-xs font-medium text-zinc-500 mb-2", "Missing resources" }
+                                            div { class: "flex gap-1.5 flex-wrap",
+                                                for resource_type in drift_item.fields_changed.iter() {
+                                                    span { class: "px-2 py-0.5 rounded-full text-xs font-medium border border-purple-200 bg-purple-50 text-purple-700",
+                                                        "{resource_type}"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         },

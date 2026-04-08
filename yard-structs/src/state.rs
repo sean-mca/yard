@@ -8,6 +8,13 @@ pub struct Resource {
     pub provider: String,
 }
 
+/// Result of verifying whether a resource still exists in AWS.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ResourceStatus {
+    pub resource: Resource,
+    pub exists: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Deployment {
     pub env: Option<String>,
