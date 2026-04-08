@@ -124,7 +124,8 @@ pub struct ApplyResult {
 
 /// Apply changes: generate scripts, deploy via provider, update state.
 /// `root_dir` is where `.yard/generated/` lives.
-/// Each job is locked individually during its apply.
+/// All affected jobs are locked upfront before diffing to prevent race conditions.
+/// State is re-read under lock to ensure the diff is computed against fresh data.
 /// All jobs are validated before any changes are made.
 pub async fn apply(
     manifest: &ProjectManifest,
@@ -150,19 +151,48 @@ pub async fn apply(
         return Err(anyhow!("{msg}"));
     }
 
-    let diffs = calculate_diff(manifest, current_state);
     let storage = storage::get_storage(&manifest.state).await?;
-    let mut result = ApplyResult {
-        created: Vec::new(),
-        modified: Vec::new(),
-        deleted: Vec::new(),
-    };
 
-    for diff in &diffs {
-        // Lock the job before making changes
-        let lock = storage.lock(&diff.name).await?;
+    // Preliminary diff to identify which jobs need locking
+    let preliminary_diffs = calculate_diff(manifest, current_state);
+    if preliminary_diffs.is_empty() {
+        return Ok(ApplyResult {
+            created: Vec::new(),
+            modified: Vec::new(),
+            deleted: Vec::new(),
+        });
+    }
 
-        let apply_result: Result<()> = async {
+    // Lock ALL affected jobs upfront — prevents concurrent applies from
+    // modifying state between diff calculation and execution
+    let job_names: Vec<String> = preliminary_diffs.iter().map(|d| d.name.clone()).collect();
+    let locks = storage.lock_jobs(&job_names).await?;
+
+    // All work happens inside this block so we always unlock on exit
+    let apply_result = async {
+        // Re-read fresh state under lock — the passed-in current_state may be stale
+        let mut fresh_deployments = HashMap::new();
+        for name in &job_names {
+            if let Some(job_state) = storage.read_job(name).await? {
+                fresh_deployments.insert(name.clone(), job_state.deployment);
+            }
+        }
+        let fresh_state = ProjectState {
+            project: current_state.project.clone(),
+            last_updated: chrono::Utc::now().to_rfc3339(),
+            deployments: fresh_deployments,
+        };
+
+        // Authoritative diff against fresh state
+        let diffs = calculate_diff(manifest, &fresh_state);
+
+        let mut result = ApplyResult {
+            created: Vec::new(),
+            modified: Vec::new(),
+            deleted: Vec::new(),
+        };
+
+        for diff in &diffs {
             match &diff.diff_type {
                 DiffType::Create | DiffType::Modify { .. } => {
                     let job_def = manifest
@@ -185,7 +215,6 @@ pub async fn apply(
                     // Deploy via provider if configured (skip in dry-run mode)
                     let resources = if !dry_run {
                         if let Some(provider_defaults) = manifest.providers.get(&job_def.job_type) {
-                            // Merge provider defaults with job-level overrides
                             let job_overrides = job_def
                                 .config
                                 .get(&job_def.job_type)
@@ -241,7 +270,7 @@ pub async fn apply(
                 DiffType::Delete => {
                     // Destroy via provider if configured and resources exist (skip in dry-run)
                     if !dry_run
-                        && let Some(existing) = current_state.deployments.get(&diff.name)
+                        && let Some(existing) = fresh_state.deployments.get(&diff.name)
                         && !existing.resources.is_empty()
                     {
                         let job_type = existing
@@ -276,16 +305,16 @@ pub async fn apply(
                     result.deleted.push(diff.name.clone());
                 }
             }
-            Ok(())
         }
-        .await;
 
-        // Always unlock, even on error
-        storage.unlock(&diff.name, &lock).await?;
-        apply_result?;
+        Ok(result)
     }
+    .await;
 
-    Ok(result)
+    // Always unlock all jobs, even on error
+    storage.unlock_jobs(&locks).await;
+
+    apply_result
 }
 
 /// Initialize per-job state files. Skips jobs that already have state.
