@@ -228,7 +228,7 @@ async fn build_pr_rows(
 
         let updated = pr
             .updated_at
-            .map(|dt| format_relative_time(dt))
+            .map(format_relative_time)
             .unwrap_or_else(|| "unknown".to_string());
 
         let plan_result = match db.get_latest_plan_result(pr.number).await {

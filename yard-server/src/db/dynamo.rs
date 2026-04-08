@@ -139,10 +139,10 @@ impl DynamoDatabase {
                 .send()
                 .await?;
 
-            if let Some(table) = resp.table() {
-                if table.table_status() == Some(&aws_sdk_dynamodb::types::TableStatus::Active) {
-                    return Ok(());
-                }
+            if let Some(table) = resp.table()
+                && table.table_status() == Some(&aws_sdk_dynamodb::types::TableStatus::Active)
+            {
+                return Ok(());
             }
 
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
