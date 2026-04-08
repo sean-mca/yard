@@ -147,11 +147,16 @@ async fn handle_webhook(
                 Ok(workdir) => {
                     let result = match yard_runner::resolve_project(&workdir).await {
                         Ok(project) => {
-                            let diffs = yard_core::calculate_diff(
+                            match yard_core::calculate_diff(
                                 &project.manifest,
                                 &project.current_state,
-                            );
-                            format_plan_output(&diffs, &project.manifest.project)
+                            ) {
+                                Ok(diffs) => format_plan_output(&diffs, &project.manifest.project),
+                                Err(e) => {
+                                    error!(pr = pr_number, "yard plan failed: {e}");
+                                    format!("yard plan failed:\n{e}")
+                                }
+                            }
                         }
                         Err(e) => {
                             error!(pr = pr_number, "yard plan failed: {e}");

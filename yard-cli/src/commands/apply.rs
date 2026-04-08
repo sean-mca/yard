@@ -10,7 +10,7 @@ pub async fn execute(
 ) -> Result<()> {
     let project = resolve_project(directory).await?;
 
-    let mut diffs = yard_core::calculate_diff(&project.manifest, &project.current_state);
+    let mut diffs = yard_core::calculate_diff(&project.manifest, &project.current_state)?;
 
     if let Some(ref name) = target {
         diffs.retain(|d| &d.name == name);

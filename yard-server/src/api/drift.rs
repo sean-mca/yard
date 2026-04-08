@@ -151,7 +151,7 @@ async fn run_drift_check_in_dir(
     workdir: &Path,
 ) -> anyhow::Result<Vec<yard_structs::JobDiff>> {
     let project = yard_runner::resolve_project(workdir).await?;
-    let diffs = yard_core::calculate_diff(&project.manifest, &project.current_state);
+    let diffs = yard_core::calculate_diff(&project.manifest, &project.current_state)?;
     Ok(diffs)
 }
 

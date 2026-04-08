@@ -67,16 +67,17 @@ pub async fn load_state(
 
 /// Compute the diff between the manifest and the current state.
 /// Used by both plan (read-only) and apply (before executing changes).
-pub fn calculate_diff(manifest: &ProjectManifest, state: &ProjectState) -> Vec<JobDiff> {
+pub fn calculate_diff(manifest: &ProjectManifest, state: &ProjectState) -> Result<Vec<JobDiff>> {
     let mut diffs = Vec::new();
 
     for (name, job_def) in &manifest.jobs {
         let script_content = crate::codegen::generate_python_script(name, job_def)
-            .unwrap_or_else(|_| "".to_string());
+            .with_context(|| format!("Failed to generate script for job \"{name}\""))?;
 
         // Hash both the script and the full job config so config-only changes
         // (e.g. worker_type, timeout) are detected even if the script is unchanged
-        let config_str = serde_json::to_string(&job_def.config).unwrap_or_default();
+        let config_str = serde_json::to_string(&job_def.config)
+            .with_context(|| format!("Failed to serialize config for job \"{name}\""))?;
         let combined = format!("{script_content}\n{config_str}");
         let current_proposed_hash = crate::utils::calculate_hash(&combined);
 
@@ -111,7 +112,7 @@ pub fn calculate_diff(manifest: &ProjectManifest, state: &ProjectState) -> Vec<J
         }
     }
 
-    diffs
+    Ok(diffs)
 }
 
 /// Result of applying changes.
@@ -154,7 +155,7 @@ pub async fn apply(
     let storage = storage::get_storage(&manifest.state).await?;
 
     // Preliminary diff to identify which jobs need locking
-    let preliminary_diffs = calculate_diff(manifest, current_state);
+    let preliminary_diffs = calculate_diff(manifest, current_state)?;
     if preliminary_diffs.is_empty() {
         return Ok(ApplyResult {
             created: Vec::new(),
@@ -184,7 +185,7 @@ pub async fn apply(
         };
 
         // Authoritative diff against fresh state
-        let diffs = calculate_diff(manifest, &fresh_state);
+        let diffs = calculate_diff(manifest, &fresh_state)?;
 
         let mut result = ApplyResult {
             created: Vec::new(),
@@ -328,9 +329,10 @@ pub async fn init(manifest: &ProjectManifest) -> Result<()> {
             continue;
         }
 
-        let script_content =
-            codegen::generate_python_script(name, job_def).unwrap_or_else(|_| "".to_string());
-        let config_str = serde_json::to_string(&job_def.config).unwrap_or_default();
+        let script_content = codegen::generate_python_script(name, job_def)
+            .with_context(|| format!("Failed to generate script for job \"{name}\""))?;
+        let config_str = serde_json::to_string(&job_def.config)
+            .with_context(|| format!("Failed to serialize config for job \"{name}\""))?;
         let combined = format!("{script_content}\n{config_str}");
         let script_hash = utils::calculate_hash(&combined);
 
@@ -690,7 +692,7 @@ mod tests {
             jobs: HashMap::from([("new_job".to_string(), job)]),
         };
 
-        let diffs = calculate_diff(&manifest, &empty_state());
+        let diffs = calculate_diff(&manifest, &empty_state()).unwrap();
         assert_eq!(diffs.len(), 1);
         assert!(matches!(diffs[0].diff_type, DiffType::Create));
         assert_eq!(diffs[0].name, "new_job");
@@ -715,7 +717,7 @@ mod tests {
             jobs: HashMap::new(),
         };
 
-        let diffs = calculate_diff(&manifest, &state);
+        let diffs = calculate_diff(&manifest, &state).unwrap();
         assert_eq!(diffs.len(), 1);
         assert!(matches!(diffs[0].diff_type, DiffType::Delete));
         assert_eq!(diffs[0].name, "old_job");
@@ -744,7 +746,7 @@ mod tests {
             jobs: HashMap::from([("stable".to_string(), job)]),
         };
 
-        let diffs = calculate_diff(&manifest, &state);
+        let diffs = calculate_diff(&manifest, &state).unwrap();
         assert!(diffs.is_empty());
     }
 
@@ -776,7 +778,7 @@ mod tests {
             jobs: HashMap::from([("my_job".to_string(), new_job)]),
         };
 
-        let diffs = calculate_diff(&manifest, &state);
+        let diffs = calculate_diff(&manifest, &state).unwrap();
         assert_eq!(diffs.len(), 1);
         assert!(matches!(diffs[0].diff_type, DiffType::Modify { .. }));
     }
@@ -804,7 +806,7 @@ mod tests {
             jobs: HashMap::from([("my_job".to_string(), new_job)]),
         };
 
-        let diffs = calculate_diff(&manifest, &state);
+        let diffs = calculate_diff(&manifest, &state).unwrap();
         assert_eq!(diffs.len(), 1);
         assert!(matches!(diffs[0].diff_type, DiffType::Modify { .. }));
     }
@@ -852,7 +854,7 @@ mod tests {
             ]),
         };
 
-        let diffs = calculate_diff(&manifest, &state);
+        let diffs = calculate_diff(&manifest, &state).unwrap();
         assert_eq!(diffs.len(), 3);
 
         let names: Vec<&str> = diffs.iter().map(|d| d.name.as_str()).collect();
