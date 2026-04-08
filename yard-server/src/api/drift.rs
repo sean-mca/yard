@@ -51,15 +51,25 @@ pub async fn run_drift_check(state: &ApiState) -> Result<DriftData, String> {
     let workdir =
         clone_at_sha(&clone_url, &sha, Some(&state.github_token)).await?;
 
-    // 3. Resolve project and calculate diff using yard-core directly
-    let result = run_drift_check_in_dir(&workdir).await;
-    let job_files = discover_job_files_with_content(&workdir);
+    // 3. Resolve project, calculate diff, and verify resources
+    let project = yard_runner::resolve_project(&workdir)
+        .await
+        .map_err(|e| format!("Failed to resolve project: {e}"))?;
+    let diffs = yard_core::calculate_diff(&project.manifest, &project.current_state)
+        .map_err(|e| format!("Failed to calculate diff: {e}"))?;
 
+    // Verify that deployed resources still exist in AWS
+    let resource_statuses = yard_core::verify_deployed_resources(
+        &project.manifest,
+        &project.current_state,
+    )
+    .await
+    .map_err(|e| format!("Failed to verify resources: {e}"))?;
+
+    let job_files = discover_job_files_with_content(&workdir);
     cleanup_workdir(&workdir);
 
-    let diffs = result.map_err(|e| format!("Failed to resolve project: {e}"))?;
-
-    // 4. Build DriftItems
+    // 4. Build DriftItems from hash-based diffs
     let mut items = Vec::new();
     for diff in &diffs {
         let (environment, region, new_config) = match job_files.get(&diff.name) {
@@ -93,6 +103,36 @@ pub async fn run_drift_check(state: &ApiState) -> Result<DriftData, String> {
             old_config: None,
             new_config,
         });
+    }
+
+    // 4b. Add drift items for jobs whose resources are missing in AWS
+    //     (these may be "in sync" by hash but have out-of-band deletions)
+    let drift_job_names: std::collections::HashSet<&str> =
+        diffs.iter().map(|d| d.name.as_str()).collect();
+
+    for (job_name, statuses) in &resource_statuses {
+        let missing: Vec<&str> = statuses
+            .iter()
+            .filter(|s| !s.exists)
+            .map(|s| s.resource.r#type.as_str())
+            .collect();
+
+        if !missing.is_empty() && !drift_job_names.contains(job_name.as_str()) {
+            let (environment, region) = match job_files.get(job_name) {
+                Some(info) => (info.environment.clone(), info.region.clone()),
+                None => ("unknown".to_string(), "unknown".to_string()),
+            };
+
+            items.push(DriftItem {
+                name: job_name.clone(),
+                environment,
+                region,
+                drift_type: DriftType::ResourceMissing,
+                fields_changed: missing.iter().map(|s| s.to_string()).collect(),
+                old_config: None,
+                new_config: None,
+            });
+        }
     }
 
     let drifted = items.len() as u32;
@@ -146,14 +186,6 @@ pub async fn run_drift_check(state: &ApiState) -> Result<DriftData, String> {
     }
 
     Ok(drift_data)
-}
-
-async fn run_drift_check_in_dir(
-    workdir: &Path,
-) -> anyhow::Result<Vec<yard_structs::JobDiff>> {
-    let project = yard_runner::resolve_project(workdir).await?;
-    let diffs = yard_core::calculate_diff(&project.manifest, &project.current_state)?;
-    Ok(diffs)
 }
 
 async fn get_head_sha(state: &ApiState) -> Result<String, String> {

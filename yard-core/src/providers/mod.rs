@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
-use yard_structs::Resource;
+use yard_structs::{Resource, ResourceStatus};
 
 /// Trait for deploying and destroying job artifacts on a target service.
 ///
@@ -28,6 +28,14 @@ pub trait Provider: Send + Sync {
         job_name: &str,
         resources: &[Resource],
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+
+    /// Verify that previously deployed resources still exist in the target service.
+    /// Used by drift detection to catch out-of-band deletions.
+    fn verify_resources(
+        &self,
+        job_name: &str,
+        resources: &[Resource],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ResourceStatus>>> + Send + '_>>;
 }
 
 /// Construct a provider from the job type and its provider-level config.

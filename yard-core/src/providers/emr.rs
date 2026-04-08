@@ -6,7 +6,7 @@ use aws_sdk_s3::Client as S3Client;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
-use yard_structs::{Resource, ValidationError};
+use yard_structs::{Resource, ResourceStatus, ValidationError};
 
 pub struct EmrProvider {
     emr_client: EmrClient,
@@ -181,6 +181,29 @@ impl EmrProvider {
 
         Ok(())
     }
+
+    async fn s3_object_exists(&self, key: &str) -> Result<bool> {
+        let result = self
+            .s3_client
+            .head_object()
+            .bucket(&self.script_bucket)
+            .key(key)
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                if e.as_service_error()
+                    .is_some_and(|se| se.is_not_found())
+                {
+                    Ok(false)
+                } else {
+                    Err(e).with_context(|| format!("Failed to check S3 object: {key}"))
+                }
+            }
+        }
+    }
 }
 
 impl Provider for EmrProvider {
@@ -232,6 +255,40 @@ impl Provider for EmrProvider {
             self.delete_script(&job_name).await?;
 
             Ok(())
+        })
+    }
+
+    fn verify_resources(
+        &self,
+        _job_name: &str,
+        resources: &[Resource],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ResourceStatus>>> + Send + '_>> {
+        let resources = resources.to_vec();
+
+        Box::pin(async move {
+            let mut statuses = Vec::new();
+
+            for resource in &resources {
+                let exists = match resource.r#type.as_str() {
+                    "s3_object" => {
+                        let key = resource
+                            .id
+                            .strip_prefix(&format!("s3://{}/", self.script_bucket))
+                            .unwrap_or(&resource.id);
+                        self.s3_object_exists(key).await?
+                    }
+                    // EMR steps are ephemeral — skip verification
+                    "emr_step" => true,
+                    _ => true,
+                };
+
+                statuses.push(ResourceStatus {
+                    resource: resource.clone(),
+                    exists,
+                });
+            }
+
+            Ok(statuses)
         })
     }
 }
