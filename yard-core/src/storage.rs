@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, anyhow};
-use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client;
 use std::path::PathBuf;
 use yard_structs::{JobState, LockInfo, StateBackend};
@@ -362,10 +361,7 @@ pub async fn get_storage(backend: &StateBackend) -> Result<Storage> {
             key,
             region,
         } => {
-            let config = aws_config::defaults(BehaviorVersion::latest())
-                .region(aws_config::Region::new(region.clone()))
-                .load()
-                .await;
+            let config = crate::providers::aws_config(region).await;
             let client = Client::new(&config);
 
             // Ensure prefix ends with `/` so job files are nested under it
