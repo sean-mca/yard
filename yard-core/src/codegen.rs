@@ -24,7 +24,7 @@ fn render_imports(imports: &[Import]) -> String {
 
 // --- Source rendering (now named: produces df_<name>) ---
 
-fn render_source(source: &Source) -> String {
+fn render_source(source: &Source) -> Result<String> {
     let var = format!("df_{}", source.name);
     let mut lines = Vec::new();
 
@@ -40,14 +40,23 @@ fn render_source(source: &Source) -> String {
     match source.source_type.as_str() {
         "s3" => {
             let format = source.format.as_deref().unwrap_or("parquet");
-            let path = source.path.as_deref().unwrap_or("s3://MISSING_PATH");
+            let path = source
+                .path
+                .as_deref()
+                .ok_or_else(|| anyhow!("source '{}': 'path' is required for s3 source", source.name))?;
             lines.push(format!(
                 "    {var} = spark.read.format(\"{format}\").load(\"{path}\")"
             ));
         }
         "jdbc" => {
-            let url = source.connection_url.as_deref().unwrap_or("MISSING_URL");
-            let table = source.table.as_deref().unwrap_or("MISSING_TABLE");
+            let url = source
+                .connection_url
+                .as_deref()
+                .ok_or_else(|| anyhow!("source '{}': 'connection_url' is required for jdbc source", source.name))?;
+            let table = source
+                .table
+                .as_deref()
+                .ok_or_else(|| anyhow!("source '{}': 'table' is required for jdbc source", source.name))?;
             lines.push(format!(
                 "    {var} = spark.read.format(\"jdbc\").option(\"url\", \"{url}\").option(\"dbtable\", \"{table}\")\\"
             ));
@@ -59,8 +68,14 @@ fn render_source(source: &Source) -> String {
             lines.push("        .load()".to_string());
         }
         "catalog" => {
-            let db = source.database.as_deref().unwrap_or("MISSING_DATABASE");
-            let table = source.table.as_deref().unwrap_or("MISSING_TABLE");
+            let db = source
+                .database
+                .as_deref()
+                .ok_or_else(|| anyhow!("source '{}': 'database' is required for catalog source", source.name))?;
+            let table = source
+                .table
+                .as_deref()
+                .ok_or_else(|| anyhow!("source '{}': 'table' is required for catalog source", source.name))?;
             lines.push(format!(
                 "    {var} = glueContext.create_dynamic_frame.from_catalog(database=\"{db}\", table_name=\"{table}\").toDF()"
             ));
@@ -73,15 +88,15 @@ fn render_source(source: &Source) -> String {
         }
     }
 
-    lines.join("\n")
+    Ok(lines.join("\n"))
 }
 
-fn render_sources(sources: &[Source]) -> String {
-    sources
+fn render_sources(sources: &[Source]) -> Result<String> {
+    let rendered: Vec<String> = sources
         .iter()
         .map(render_source)
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect::<Result<Vec<_>>>()?;
+    Ok(rendered.join("\n"))
 }
 
 // --- Transform rendering (now with named dataframes) ---
@@ -96,12 +111,12 @@ fn render_transform(
     transform: &Transform,
     default_source: &str,
     all_source_names: &[String],
-) -> String {
+) -> Result<String> {
     match transform.transform_type.as_str() {
         "filter" => {
             let (input, output) = resolve_df(transform, default_source);
             let condition = transform.condition.as_deref().unwrap_or("True").trim();
-            format!("    {output} = {input}.filter({condition})")
+            Ok(format!("    {output} = {input}.filter({condition})"))
         }
         "sql" => {
             let output_name = transform.output.as_deref().unwrap_or(default_source);
@@ -117,16 +132,22 @@ fn render_transform(
                 lines.push(format!("    df_{name}.createOrReplaceTempView(\"{name}\")"));
             }
             lines.push(format!("    {output_var} = spark.sql(\"{query}\")"));
-            lines.join("\n")
+            Ok(lines.join("\n"))
         }
         "join" => {
             let left = transform.left.as_deref().unwrap_or(default_source);
-            let right = transform.right.as_deref().unwrap_or("MISSING_RIGHT");
-            let on_col = transform.on.as_deref().unwrap_or("MISSING_ON");
+            let right = transform
+                .right
+                .as_deref()
+                .ok_or_else(|| anyhow!("join transform: 'right' is required"))?;
+            let on_col = transform
+                .on
+                .as_deref()
+                .ok_or_else(|| anyhow!("join transform: 'on' is required"))?;
             let how = transform.how.as_deref().unwrap_or("inner");
             let output_name = transform.output.as_deref().unwrap_or(left);
             let output_var = format!("df_{output_name}");
-            format!("    {output_var} = df_{left}.join(df_{right}, on=\"{on_col}\", how=\"{how}\")")
+            Ok(format!("    {output_var} = df_{left}.join(df_{right}, on=\"{on_col}\", how=\"{how}\")"))
         }
         "drop_columns" => {
             let (input, output) = resolve_df(transform, default_source);
@@ -136,7 +157,7 @@ fn render_transform(
                 .map(|c| format!("\"{}\"", c))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("    {output} = {input}.drop({cols})")
+            Ok(format!("    {output} = {input}.drop({cols})"))
         }
         "select" => {
             let (input, output) = resolve_df(transform, default_source);
@@ -146,7 +167,7 @@ fn render_transform(
                 .map(|c| format!("\"{}\"", c))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("    {output} = {input}.select({cols})")
+            Ok(format!("    {output} = {input}.select({cols})"))
         }
         "rename" => {
             let (input, output) = resolve_df(transform, default_source);
@@ -164,24 +185,26 @@ fn render_transform(
                     ));
                 }
             }
-            lines.join("\n")
+            Ok(lines.join("\n"))
         }
         "add_column" => {
             let (input, output) = resolve_df(transform, default_source);
-            let name = transform.name.as_deref().unwrap_or("MISSING_NAME").trim();
+            let name = transform
+                .name
+                .as_deref()
+                .ok_or_else(|| anyhow!("add_column transform: 'name' is required"))?
+                .trim();
             let expr = transform
                 .expression
                 .as_deref()
                 .unwrap_or("lit(None)")
                 .trim();
-            format!("    {output} = {input}.withColumn(\"{name}\", {expr})")
+            Ok(format!("    {output} = {input}.withColumn(\"{name}\", {expr})"))
         }
-        _ => {
-            format!(
-                "    # Unsupported transform type: {}",
-                transform.transform_type
-            )
-        }
+        _ => Ok(format!(
+            "    # Unsupported transform type: {}",
+            transform.transform_type
+        )),
     }
 }
 
@@ -189,17 +212,17 @@ fn render_transforms(
     transforms: &[Transform],
     default_source: &str,
     all_source_names: &[String],
-) -> String {
-    transforms
+) -> Result<String> {
+    let rendered: Vec<String> = transforms
         .iter()
         .map(|t| render_transform(t, default_source, all_source_names))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect::<Result<Vec<_>>>()?;
+    Ok(rendered.join("\n"))
 }
 
 // --- Sink rendering (now with named dataframe) ---
 
-fn render_sink(sink: &Sink, default_source: &str) -> String {
+fn render_sink(sink: &Sink, default_source: &str) -> Result<String> {
     let source_name = sink.source.as_deref().unwrap_or(default_source);
     let var = format!("df_{source_name}");
     let mut lines = Vec::new();
@@ -213,7 +236,10 @@ fn render_sink(sink: &Sink, default_source: &str) -> String {
     match sink.sink_type.as_str() {
         "s3" => {
             let format = sink.format.as_deref().unwrap_or("parquet");
-            let path = sink.path.as_deref().unwrap_or("s3://MISSING_PATH");
+            let path = sink
+                .path
+                .as_deref()
+                .ok_or_else(|| anyhow!("sink: 'path' is required for s3 sink"))?;
             let mut write = format!("    {var}.write.format(\"{format}\").mode(\"{mode}\")");
             if !sink.partition_by.is_empty() {
                 let parts = sink
@@ -228,8 +254,14 @@ fn render_sink(sink: &Sink, default_source: &str) -> String {
             lines.push(write);
         }
         "jdbc" => {
-            let url = sink.connection_url.as_deref().unwrap_or("MISSING_URL");
-            let table = sink.table.as_deref().unwrap_or("MISSING_TABLE");
+            let url = sink
+                .connection_url
+                .as_deref()
+                .ok_or_else(|| anyhow!("sink: 'connection_url' is required for jdbc sink"))?;
+            let table = sink
+                .table
+                .as_deref()
+                .ok_or_else(|| anyhow!("sink: 'table' is required for jdbc sink"))?;
             lines.push(format!(
                 "    {var}.write.format(\"jdbc\").option(\"url\", \"{url}\").option(\"dbtable\", \"{table}\")\\"
             ));
@@ -241,8 +273,14 @@ fn render_sink(sink: &Sink, default_source: &str) -> String {
             lines.push(format!("        .mode(\"{mode}\").save()"));
         }
         "catalog" => {
-            let db = sink.database.as_deref().unwrap_or("MISSING_DATABASE");
-            let table = sink.table.as_deref().unwrap_or("MISSING_TABLE");
+            let db = sink
+                .database
+                .as_deref()
+                .ok_or_else(|| anyhow!("sink: 'database' is required for catalog sink"))?;
+            let table = sink
+                .table
+                .as_deref()
+                .ok_or_else(|| anyhow!("sink: 'table' is required for catalog sink"))?;
             lines.push(format!(
                 "    sink_frame = DynamicFrame.fromDF({var}, glueContext, \"sink_frame\")"
             ));
@@ -255,7 +293,7 @@ fn render_sink(sink: &Sink, default_source: &str) -> String {
         }
     }
 
-    lines.join("\n")
+    Ok(lines.join("\n"))
 }
 
 // --- Secrets Manager helper ---
@@ -349,19 +387,19 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
         if !job_def.sources.is_empty() {
             parts.push(format!(
                 "    # --- Sources ---\n{}",
-                render_sources(&job_def.sources)
+                render_sources(&job_def.sources)?
             ));
         }
         if !job_def.transforms.is_empty() {
             parts.push(format!(
                 "    # --- Transforms ---\n{}",
-                render_transforms(&job_def.transforms, default_source, &all_source_names,)
+                render_transforms(&job_def.transforms, default_source, &all_source_names)?
             ));
         }
         if let Some(sink) = &job_def.sink {
             parts.push(format!(
                 "    # --- Sink ---\n{}",
-                render_sink(sink, default_source)
+                render_sink(sink, default_source)?
             ));
         }
         if parts.is_empty() {
@@ -791,5 +829,287 @@ mod tests {
 
         let result = generate_python_script("test_job", &job);
         assert!(result.is_err());
+    }
+
+    // --- Missing required fields return errors ---
+
+    #[test]
+    fn s3_source_missing_path_errors() {
+        let mut job = base_job();
+        job.sources = vec![Source {
+            name: "events".to_string(),
+            source_type: "s3".to_string(),
+            format: Some("parquet".to_string()),
+            path: None,
+            connection_url: None,
+            table: None,
+            database: None,
+            secret_id: None,
+        }];
+        let result = generate_python_script("test_job", &job);
+        assert!(result.is_err());
+        let msg = format!("{}", result.expect_err("expected error"));
+        assert!(msg.contains("path"), "error should mention 'path': {msg}");
+    }
+
+    #[test]
+    fn jdbc_source_missing_connection_url_errors() {
+        let mut job = base_job();
+        job.sources = vec![Source {
+            name: "users".to_string(),
+            source_type: "jdbc".to_string(),
+            format: None,
+            path: None,
+            connection_url: None,
+            table: Some("public.users".to_string()),
+            database: None,
+            secret_id: None,
+        }];
+        let result = generate_python_script("test_job", &job);
+        assert!(result.is_err());
+        let msg = format!("{}", result.expect_err("expected error"));
+        assert!(msg.contains("connection_url"), "error should mention 'connection_url': {msg}");
+    }
+
+    #[test]
+    fn jdbc_source_missing_table_errors() {
+        let mut job = base_job();
+        job.sources = vec![Source {
+            name: "users".to_string(),
+            source_type: "jdbc".to_string(),
+            format: None,
+            path: None,
+            connection_url: Some("jdbc:postgresql://host/db".to_string()),
+            table: None,
+            database: None,
+            secret_id: None,
+        }];
+        let result = generate_python_script("test_job", &job);
+        assert!(result.is_err());
+        let msg = format!("{}", result.expect_err("expected error"));
+        assert!(msg.contains("table"), "error should mention 'table': {msg}");
+    }
+
+    #[test]
+    fn catalog_source_missing_database_errors() {
+        let mut job = base_job();
+        job.sources = vec![Source {
+            name: "catalog_src".to_string(),
+            source_type: "catalog".to_string(),
+            format: None,
+            path: None,
+            connection_url: None,
+            table: Some("my_table".to_string()),
+            database: None,
+            secret_id: None,
+        }];
+        let result = generate_python_script("test_job", &job);
+        assert!(result.is_err());
+        let msg = format!("{}", result.expect_err("expected error"));
+        assert!(msg.contains("database"), "error should mention 'database': {msg}");
+    }
+
+    #[test]
+    fn catalog_source_missing_table_errors() {
+        let mut job = base_job();
+        job.sources = vec![Source {
+            name: "catalog_src".to_string(),
+            source_type: "catalog".to_string(),
+            format: None,
+            path: None,
+            connection_url: None,
+            table: None,
+            database: Some("my_db".to_string()),
+            secret_id: None,
+        }];
+        let result = generate_python_script("test_job", &job);
+        assert!(result.is_err());
+        let msg = format!("{}", result.expect_err("expected error"));
+        assert!(msg.contains("table"), "error should mention 'table': {msg}");
+    }
+
+    #[test]
+    fn join_missing_right_errors() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("orders", "s3://b/orders")];
+        job.transforms = vec![Transform {
+            transform_type: "join".to_string(),
+            source: None,
+            output: None,
+            condition: None,
+            query: None,
+            columns: vec![],
+            mapping: HashMap::new(),
+            name: None,
+            expression: None,
+            left: Some("orders".to_string()),
+            right: None,
+            on: Some("id".to_string()),
+            how: None,
+        }];
+        let result = generate_python_script("test_job", &job);
+        assert!(result.is_err());
+        let msg = format!("{}", result.expect_err("expected error"));
+        assert!(msg.contains("right"), "error should mention 'right': {msg}");
+    }
+
+    #[test]
+    fn join_missing_on_errors() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("orders", "s3://b/orders")];
+        job.transforms = vec![Transform {
+            transform_type: "join".to_string(),
+            source: None,
+            output: None,
+            condition: None,
+            query: None,
+            columns: vec![],
+            mapping: HashMap::new(),
+            name: None,
+            expression: None,
+            left: Some("orders".to_string()),
+            right: Some("customers".to_string()),
+            on: None,
+            how: None,
+        }];
+        let result = generate_python_script("test_job", &job);
+        assert!(result.is_err());
+        let msg = format!("{}", result.expect_err("expected error"));
+        assert!(msg.contains("on"), "error should mention 'on': {msg}");
+    }
+
+    #[test]
+    fn add_column_missing_name_errors() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.transforms = vec![Transform {
+            transform_type: "add_column".to_string(),
+            source: None,
+            output: None,
+            condition: None,
+            query: None,
+            columns: vec![],
+            mapping: HashMap::new(),
+            name: None,
+            expression: Some("lit(1)".to_string()),
+            left: None,
+            right: None,
+            on: None,
+            how: None,
+        }];
+        let result = generate_python_script("test_job", &job);
+        assert!(result.is_err());
+        let msg = format!("{}", result.expect_err("expected error"));
+        assert!(msg.contains("name"), "error should mention 'name': {msg}");
+    }
+
+    #[test]
+    fn s3_sink_missing_path_errors() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(Sink {
+            source: None,
+            sink_type: "s3".to_string(),
+            format: Some("parquet".to_string()),
+            path: None,
+            connection_url: None,
+            table: None,
+            database: None,
+            secret_id: None,
+            mode: None,
+            partition_by: vec![],
+        });
+        let result = generate_python_script("test_job", &job);
+        assert!(result.is_err());
+        let msg = format!("{}", result.expect_err("expected error"));
+        assert!(msg.contains("path"), "error should mention 'path': {msg}");
+    }
+
+    #[test]
+    fn jdbc_sink_missing_connection_url_errors() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(Sink {
+            source: None,
+            sink_type: "jdbc".to_string(),
+            format: None,
+            path: None,
+            connection_url: None,
+            table: Some("output_table".to_string()),
+            database: None,
+            secret_id: None,
+            mode: None,
+            partition_by: vec![],
+        });
+        let result = generate_python_script("test_job", &job);
+        assert!(result.is_err());
+        let msg = format!("{}", result.expect_err("expected error"));
+        assert!(msg.contains("connection_url"), "error should mention 'connection_url': {msg}");
+    }
+
+    #[test]
+    fn jdbc_sink_missing_table_errors() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(Sink {
+            source: None,
+            sink_type: "jdbc".to_string(),
+            format: None,
+            path: None,
+            connection_url: Some("jdbc:postgresql://host/db".to_string()),
+            table: None,
+            database: None,
+            secret_id: None,
+            mode: None,
+            partition_by: vec![],
+        });
+        let result = generate_python_script("test_job", &job);
+        assert!(result.is_err());
+        let msg = format!("{}", result.expect_err("expected error"));
+        assert!(msg.contains("table"), "error should mention 'table': {msg}");
+    }
+
+    #[test]
+    fn catalog_sink_missing_database_errors() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(Sink {
+            source: None,
+            sink_type: "catalog".to_string(),
+            format: None,
+            path: None,
+            connection_url: None,
+            table: Some("my_table".to_string()),
+            database: None,
+            secret_id: None,
+            mode: None,
+            partition_by: vec![],
+        });
+        let result = generate_python_script("test_job", &job);
+        assert!(result.is_err());
+        let msg = format!("{}", result.expect_err("expected error"));
+        assert!(msg.contains("database"), "error should mention 'database': {msg}");
+    }
+
+    #[test]
+    fn catalog_sink_missing_table_errors() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(Sink {
+            source: None,
+            sink_type: "catalog".to_string(),
+            format: None,
+            path: None,
+            connection_url: None,
+            table: None,
+            database: Some("my_db".to_string()),
+            secret_id: None,
+            mode: None,
+            partition_by: vec![],
+        });
+        let result = generate_python_script("test_job", &job);
+        assert!(result.is_err());
+        let msg = format!("{}", result.expect_err("expected error"));
+        assert!(msg.contains("table"), "error should mention 'table': {msg}");
     }
 }
