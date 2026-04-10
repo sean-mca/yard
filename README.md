@@ -327,7 +327,7 @@ AWS credentials are required for DynamoDB. The server creates the table and inde
 ```bash
 docker compose up -d                              # ministack: S3 + DynamoDB on localhost:4566
 cp env.local.example .env.local                    # fill in GitHub token
-set -a && source .env.local && set +a && dx serve  # start the server
+set -a && source .env.local && set +a && cd yard-server && dx serve  # start the server
 ```
 
 ### DynamoDB permissions

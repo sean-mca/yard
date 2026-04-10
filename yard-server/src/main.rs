@@ -33,6 +33,16 @@ fn main() {
     dioxus::launch(app);
 }
 
+/// Read a required environment variable, failing with a clear message if missing or empty.
+#[cfg(not(target_arch = "wasm32"))]
+fn required_env(name: &str) -> anyhow::Result<String> {
+    match std::env::var(name).ok() {
+        None => anyhow::bail!("{name} must be set"),
+        Some(v) if v.is_empty() => anyhow::bail!("{name} must not be empty"),
+        Some(v) => Ok(v),
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn start_api_server() {
     use api::dashboard::{dashboard_router, ApiState};
@@ -48,27 +58,25 @@ fn start_api_server() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     std::thread::spawn(|| {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(async move {
-                let github_token = std::env::var("YARD_GITHUB_TOKEN").unwrap_or_default();
-                let webhook_secret = std::env::var("YARD_WEBHOOK_SECRET").unwrap_or_default();
-                let repo_owner = std::env::var("YARD_REPO_OWNER")
-                    .expect("YARD_REPO_OWNER must be set");
-                let repo_name = std::env::var("YARD_REPO_NAME")
-                    .expect("YARD_REPO_NAME must be set");
+        let rt = tokio::runtime::Runtime::new()
+            .expect("Failed to create tokio runtime");
+        rt.block_on(async move {
+                let github_token = required_env("YARD_GITHUB_TOKEN")?;
+                let webhook_secret = required_env("YARD_WEBHOOK_SECRET")?;
+                let repo_owner = required_env("YARD_REPO_OWNER")?;
+                let repo_name = required_env("YARD_REPO_NAME")?;
 
                 // Initialize DynamoDB persistence
                 let db_config = DbConfig::from_env();
                 let db = db::connect(&db_config)
                     .await
-                    .expect("Failed to connect to DynamoDB");
+                    .map_err(|e| anyhow::anyhow!("Failed to connect to DynamoDB: {e}"))?;
                 db.migrate()
                     .await
-                    .expect("Failed to run DynamoDB migrations");
+                    .map_err(|e| anyhow::anyhow!("Failed to run DynamoDB migrations: {e}"))?;
 
-                let github_client =
-                    GitHubClient::new(&github_token).expect("Failed to create GitHub client");
+                let github_client = GitHubClient::new(&github_token)
+                    .map_err(|e| anyhow::anyhow!("Failed to create GitHub client: {e}"))?;
 
                 let api_state = Arc::new(ApiState {
                     github_token,
@@ -101,11 +109,20 @@ fn start_api_server() {
                 tokio::spawn(drift_poll_loop(api_state.clone()));
                 tokio::spawn(dashboard_poll_loop(api_state));
 
-                let addr: std::net::SocketAddr = "0.0.0.0:3001".parse().unwrap();
+                let addr: std::net::SocketAddr = "0.0.0.0:3001"
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("Invalid listen address: {e}"))?;
                 eprintln!("API server listening on {addr}");
-                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-                axum::serve(listener, router).await.unwrap();
-            });
+                let listener = tokio::net::TcpListener::bind(addr)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to bind to {addr}: {e}"))?;
+                axum::serve(listener, router)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Server error: {e}"))?;
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .expect("API server failed");
     });
 }
 
@@ -239,4 +256,21 @@ fn Drift() -> Element {
 fn Settings() -> Element {
     let theme: Signal<ui::settings::Theme> = use_context();
     rsx! { ui::settings::Settings { theme } }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn required_env_missing_var_returns_error() {
+        let result = required_env("YARD_TEST_NONEXISTENT_VAR_12345");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("must be set"),
+            "expected 'must be set' in: {msg}"
+        );
+    }
+
 }
