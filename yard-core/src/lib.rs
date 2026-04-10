@@ -687,6 +687,23 @@ mod tests {
         let sources = parse_sources(&config);
         let sink = parse_sink(&config);
         let transforms = parse_transforms(&config);
+
+        // Inject a default role for glue jobs so tests pass validation
+        let config = if job_type == "glue" && config.get("role").is_none() {
+            let mut obj = config;
+            obj.as_object_mut()
+                .expect("config must be a JSON object")
+                .insert(
+                    "role".to_string(),
+                    serde_json::Value::String(
+                        "arn:aws:iam::123456789:role/TestGlueRole".to_string(),
+                    ),
+                );
+            obj
+        } else {
+            config
+        };
+
         JobDefinition {
             job_type: job_type.to_string(),
             imports,

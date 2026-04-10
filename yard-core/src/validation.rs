@@ -272,6 +272,18 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
     // Provider-specific config validation — dispatched to provider modules
     match job.job_type.as_str() {
         "glue" => {
+            let has_role = job
+                .config
+                .get("role")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty());
+            if !has_role {
+                errors.push(err(
+                    "role",
+                    "Glue jobs require a \"role\" (execution role ARN)",
+                ));
+            }
+
             if let Some(config) = job.config.get("glue") {
                 crate::providers::glue::validate_config(config, &mut errors);
             }
@@ -409,7 +421,7 @@ mod tests {
                 on: None,
                 how: None,
             }],
-            config: json!({"type": "glue"}),
+            config: json!({"type": "glue", "role": "arn:aws:iam::123456789:role/GlueRole"}),
         }
     }
 
@@ -422,7 +434,7 @@ mod tests {
             sources: vec![],
             sink: None,
             transforms: vec![],
-            config: json!({"type": "glue"}),
+            config: json!({"type": "glue", "role": "arn:aws:iam::123456789:role/GlueRole"}),
         }
     }
 
@@ -1003,6 +1015,7 @@ mod tests {
         let mut job = minimal_job();
         job.config = json!({
             "type": "glue",
+            "role": "arn:aws:iam::123456789:role/GlueRole",
             "glue": {
                 "worker_type": "G.2X",
                 "number_of_workers": 10,
@@ -1078,6 +1091,43 @@ mod tests {
         let job = minimal_job();
         let errors = validate_job(&job);
         assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+    }
+
+    // --- Glue role validation ---
+
+    #[test]
+    fn glue_job_missing_role() {
+        let mut job = minimal_job();
+        job.config = json!({"type": "glue"});
+        let errors = validate_job(&job);
+        assert!(
+            errors.iter().any(|e| e.field == "role"),
+            "Expected role error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn glue_job_empty_role() {
+        let mut job = minimal_job();
+        job.config = json!({"type": "glue", "role": ""});
+        let errors = validate_job(&job);
+        assert!(
+            errors.iter().any(|e| e.field == "role"),
+            "Expected role error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn glue_job_with_role_passes() {
+        let job = minimal_job();
+        let errors = validate_job(&job);
+        assert!(
+            !errors.iter().any(|e| e.field == "role"),
+            "Unexpected role error: {:?}",
+            errors
+        );
     }
 
     // --- Python syntax validation ---
