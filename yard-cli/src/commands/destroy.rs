@@ -23,7 +23,7 @@ pub async fn execute(
 
             if !auto_approve {
                 println!();
-                if !confirm("Do you want to destroy this job? (y/n)") {
+                if !confirm("Do you want to destroy this job? (y/n)")? {
                     println!("Destroy cancelled.");
                     return Ok(());
                 }
@@ -74,7 +74,7 @@ pub async fn execute(
 
             if !auto_approve {
                 println!();
-                if !confirm("Do you want to destroy all jobs? (y/n)") {
+                if !confirm("Do you want to destroy all jobs? (y/n)")? {
                     println!("Destroy cancelled.");
                     return Ok(());
                 }

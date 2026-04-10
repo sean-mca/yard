@@ -29,7 +29,10 @@ pub async fn resolve_project(directory: Option<String>) -> Result<ResolvedProjec
     // 1. FIND THE ROOT yard.yaml
     let root_path = crate::context::find_in_parent_folders(&base_path, "yard.yaml")
         .context("No yard.yaml found. You must have a root yard.yaml to define state.")?;
-    let root_dir = root_path.parent().unwrap().to_path_buf();
+    let root_dir = root_path
+        .parent()
+        .context("yard.yaml path has no parent directory")?
+        .to_path_buf();
 
     let root_content = fs::read_to_string(&root_path)?;
     let root_docs = YamlLoader::load_from_str(&root_content)?;
@@ -105,7 +108,11 @@ fn discover_jobs(search_root: &PathBuf) -> Result<HashMap<String, JobDefinition>
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "yaml"))
     {
         let path = entry.path();
-        let file_name = path.file_name().unwrap().to_str().unwrap();
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| anyhow!("Path has no file name: {}", path.display()))?
+            .to_str()
+            .ok_or_else(|| anyhow!("Non-UTF8 file name: {}", path.display()))?;
 
         if file_name == "yard.yaml"
             || file_name == "account.yaml"
@@ -115,14 +122,20 @@ fn discover_jobs(search_root: &PathBuf) -> Result<HashMap<String, JobDefinition>
             continue;
         }
 
-        let job_dir = path.parent().unwrap().to_path_buf();
+        let job_dir = path
+            .parent()
+            .ok_or_else(|| anyhow!("Job file has no parent directory: {}", path.display()))?
+            .to_path_buf();
 
         let ctx = match context_cache.get(&job_dir) {
             Some(cached) => cached,
             None => {
                 let loaded = crate::context::load_context(&job_dir)?;
                 context_cache.insert(job_dir.clone(), loaded);
-                context_cache.get(&job_dir).unwrap()
+                // Safe: we just inserted this key on the line above
+                context_cache
+                    .get(&job_dir)
+                    .ok_or_else(|| anyhow!("Failed to retrieve cached context for {}", job_dir.display()))?
             }
         };
 

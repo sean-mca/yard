@@ -45,12 +45,12 @@ pub fn bold(s: &str) -> String {
 }
 
 /// Prompt the user for confirmation. Returns true if they enter "y" or "yes".
-pub fn confirm(prompt: &str) -> bool {
+pub fn confirm(prompt: &str) -> io::Result<bool> {
     print!("{prompt} ");
-    io::stdout().flush().unwrap();
+    io::stdout().flush()?;
     let mut input = String::new();
-    io::stdin().read_line(&mut input).unwrap();
-    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+    io::stdin().read_line(&mut input)?;
+    Ok(matches!(input.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 pub fn yaml_to_json(yaml: &yaml_rust2::Yaml) -> serde_json::Value {
