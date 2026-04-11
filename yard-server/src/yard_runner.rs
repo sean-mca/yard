@@ -46,7 +46,11 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
             path: root_dir.join(state_node["path"].as_str().unwrap_or(".yard/state/")),
         },
         "s3" => StateBackend::S3 {
-            bucket: state_node["bucket"].as_str().unwrap_or("").to_string(),
+            bucket: state_node["bucket"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .context("S3 state backend requires a non-empty 'bucket' field")?
+                .to_string(),
             region: state_node["region"]
                 .as_str()
                 .unwrap_or("us-east-1")
