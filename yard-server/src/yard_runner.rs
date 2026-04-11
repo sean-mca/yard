@@ -140,7 +140,10 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
             .ok_or_else(|| anyhow!("Job file {} is empty", file_name))?;
 
         let job_name = file_name.replace(".yaml", "");
-        let job_type = job_doc["type"].as_str().unwrap_or("unknown").to_string();
+        let job_type = job_doc["type"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Job '{}' is missing a 'type' field (glue, emr)", job_name))?
+            .to_string();
         let config = yaml_to_json(job_doc);
         let imports = yard_core::parse_imports(&config);
         let body = yard_core::parse_body(&config);

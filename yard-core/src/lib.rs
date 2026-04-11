@@ -324,7 +324,7 @@ pub async fn apply(
                             .config
                             .get("type")
                             .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
+                            .ok_or_else(|| anyhow!("Job '{}' state is missing a 'type' field", diff.name))?;
 
                         if let Some(provider_defaults) = manifest.providers.get(job_type) {
                             let job_overrides = existing
@@ -445,7 +445,7 @@ pub async fn destroy_job(
                 .config
                 .get("type")
                 .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
+                .ok_or_else(|| anyhow!("Job '{}' state is missing a 'type' field", job_name))?;
 
             if let Some(provider_defaults) = provider_configs.get(job_type) {
                 let job_overrides = job_state
