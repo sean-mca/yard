@@ -53,29 +53,7 @@ pub fn confirm(prompt: &str) -> io::Result<bool> {
     Ok(matches!(input.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
-pub fn yaml_to_json(yaml: &yaml_rust2::Yaml) -> serde_json::Value {
-    match yaml {
-        yaml_rust2::Yaml::Real(s) | yaml_rust2::Yaml::String(s) => {
-            serde_json::Value::String(s.clone())
-        }
-        yaml_rust2::Yaml::Integer(i) => serde_json::Value::Number((*i).into()),
-        yaml_rust2::Yaml::Boolean(b) => serde_json::Value::Bool(*b),
-        yaml_rust2::Yaml::Array(a) => {
-            serde_json::Value::Array(a.iter().map(yaml_to_json).collect())
-        }
-        yaml_rust2::Yaml::Hash(h) => {
-            let mut map = serde_json::Map::new();
-            for (k, v) in h {
-                if let Some(key_str) = k.as_str() {
-                    map.insert(key_str.to_string(), yaml_to_json(v));
-                }
-            }
-            serde_json::Value::Object(map)
-        }
-        yaml_rust2::Yaml::Null => serde_json::Value::Null,
-        _ => serde_json::Value::Null,
-    }
-}
+pub use yard_core::resolve::yaml_to_json;
 
 #[cfg(test)]
 mod tests {

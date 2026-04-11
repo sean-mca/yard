@@ -1,7 +1,3 @@
-//! Resolve a YARD project from a local directory.
-//! This replicates the resolve_project logic from yard-cli so the server
-//! can call yard-core directly without shelling out to the CLI binary.
-
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -16,13 +12,10 @@ pub struct ResolvedProject {
     pub root_dir: PathBuf,
 }
 
-/// Resolve a YARD project from a directory (cloned repo).
-/// Parses yard.yaml, discovers jobs, loads state, returns everything
-/// needed to run calculate_diff.
 pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
     // 1. Find yard.yaml
     let root_path = find_in_parent_folders(base_path, "yard.yaml")
-        .context("No yard.yaml found in repo")?;
+        .context("No yard.yaml found. You must have a root yard.yaml to define state.")?;
     let root_dir = root_path
         .parent()
         .context("yard.yaml path has no parent directory")?
@@ -37,7 +30,7 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
     // 2. Extract global config
     let project = root_doc["project"]
         .as_str()
-        .context("Missing project name in yard.yaml")?
+        .context("Missing project name in root")?
         .to_string();
     let state_node = &root_doc["state"];
 
@@ -57,10 +50,10 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
                 .to_string(),
             key: state_node["key"].as_str().unwrap_or("state/").to_string(),
         },
-        _ => return Err(anyhow!("Unsupported state type in yard.yaml")),
+        _ => return Err(anyhow!("Unsupported state type in root")),
     };
 
-    // 3. Discover jobs
+    // 3. Recursive job discovery
     let search_root = if base_path.join("jobs").exists() {
         base_path.join("jobs")
     } else {
@@ -69,7 +62,7 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
 
     let all_jobs = discover_jobs(&search_root)?;
 
-    // 4. Parse providers
+    // 4. Parse providers config
     let mut providers = HashMap::new();
     if let Some(providers_hash) = root_doc["providers"].as_hash() {
         for (key, val) in providers_hash {
@@ -87,7 +80,7 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
     };
 
     // 5. Load current state
-    let current_state = yard_core::load_state(&state_backend, &project).await?;
+    let current_state = crate::load_state(&state_backend, &project).await?;
 
     Ok(ResolvedProject {
         manifest,
@@ -112,10 +105,11 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
             .to_str()
             .ok_or_else(|| anyhow!("Non-UTF8 file name: {}", path.display()))?;
 
-        if matches!(
-            file_name,
-            "yard.yaml" | "account.yaml" | "region.yaml" | "transforms.yaml"
-        ) {
+        if file_name == "yard.yaml"
+            || file_name == "account.yaml"
+            || file_name == "region.yaml"
+            || file_name == "transforms.yaml"
+        {
             continue;
         }
 
@@ -136,7 +130,7 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
         };
 
         let raw_job_content = fs::read_to_string(path)?;
-        let resolved_job_str = yard_core::utils::resolve_variables(&raw_job_content, ctx)?;
+        let resolved_job_str = crate::utils::resolve_variables(&raw_job_content, ctx)?;
 
         let job_docs = YamlLoader::load_from_str(&resolved_job_str)?;
         let job_doc = job_docs
@@ -149,13 +143,14 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
             .ok_or_else(|| anyhow!("Job '{}' is missing a 'type' field (glue, emr)", job_name))?
             .to_string();
         let config = yaml_to_json(job_doc);
-        let imports = yard_core::parse_imports(&config);
-        let body = yard_core::parse_body(&config);
-        let sources = yard_core::parse_sources(&config);
-        let sink = yard_core::parse_sink(&config);
-        let transforms = yard_core::parse_transforms(&config);
+        let imports = crate::parse_imports(&config);
+        let body = crate::parse_body(&config);
+        let sources = crate::parse_sources(&config);
+        let sink = crate::parse_sink(&config);
+        let transforms = crate::parse_transforms(&config);
 
-        let job_file = yard_core::parse_job_file(&config).map(|p| {
+        // Resolve job_file path relative to the job YAML's directory
+        let job_file = crate::parse_job_file(&config).map(|p| {
             let resolved = job_dir.join(&p);
             resolved.to_string_lossy().to_string()
         });
@@ -178,9 +173,9 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
     Ok(all_jobs)
 }
 
-// ---- Context loading (replicated from yard-cli/src/context.rs) ----
+// ---- Context loading ----
 
-fn find_in_parent_folders(start_path: &Path, filename: &str) -> Option<PathBuf> {
+pub fn find_in_parent_folders(start_path: &Path, filename: &str) -> Option<PathBuf> {
     let mut current = start_path.to_path_buf();
     loop {
         let target = current.join(filename);
@@ -194,7 +189,7 @@ fn find_in_parent_folders(start_path: &Path, filename: &str) -> Option<PathBuf> 
     None
 }
 
-fn find_and_parse_context(start_path: &Path, filename: &str, required: bool) -> Result<Value> {
+pub fn find_and_parse_context(start_path: &Path, filename: &str, required: bool) -> Result<Value> {
     let mut current = start_path.to_path_buf();
 
     loop {
@@ -225,7 +220,7 @@ fn find_and_parse_context(start_path: &Path, filename: &str, required: bool) -> 
     }
 }
 
-fn load_context(current_dir: &Path) -> Result<YARDContext> {
+pub fn load_context(current_dir: &Path) -> Result<YARDContext> {
     let account = find_and_parse_context(current_dir, "account.yaml", true)?;
     let region = find_and_parse_context(current_dir, "region.yaml", true)?;
     let transforms = find_and_parse_context(current_dir, "transforms.yaml", false)?;
@@ -237,9 +232,9 @@ fn load_context(current_dir: &Path) -> Result<YARDContext> {
     })
 }
 
-// ---- YAML to JSON conversion (replicated from yard-cli/src/utils.rs) ----
+// ---- YAML to JSON conversion ----
 
-fn yaml_to_json(yaml: &yaml_rust2::Yaml) -> Value {
+pub fn yaml_to_json(yaml: &yaml_rust2::Yaml) -> Value {
     match yaml {
         yaml_rust2::Yaml::Real(s) | yaml_rust2::Yaml::String(s) => {
             Value::String(s.clone())

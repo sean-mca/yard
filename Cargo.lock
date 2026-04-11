@@ -5792,6 +5792,7 @@ dependencies = [
  "serde_json",
  "tera",
  "tokio",
+ "walkdir",
  "yaml-rust2",
  "yard-structs",
 ]

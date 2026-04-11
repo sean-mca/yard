@@ -16,7 +16,6 @@ use super::dashboard::ApiState;
 use crate::db::DriftSnapshot;
 use crate::github::git_ops::{WorkdirGuard, clone_at_sha};
 use crate::types::*;
-use crate::yard_runner;
 
 pub fn drift_router(state: Arc<ApiState>) -> Router {
     Router::new()
@@ -53,7 +52,7 @@ pub async fn run_drift_check(state: &ApiState) -> Result<DriftData, String> {
     );
 
     // 3. Resolve project, calculate diff, and verify resources
-    let project = yard_runner::resolve_project(workdir.path())
+    let project = yard_core::resolve::resolve_project(workdir.path())
         .await
         .map_err(|e| format!("Failed to resolve project: {e}"))?;
     let diffs = yard_core::calculate_diff(&project.manifest, &project.current_state)
