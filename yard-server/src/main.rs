@@ -51,6 +51,15 @@ fn start_api_server() {
     use github::{client::GitHubClient, router::github_router, router::AppState};
     use std::sync::Arc;
     use tower_http::cors::{Any, CorsLayer};
+    use tower_http::trace::TraceLayer;
+
+    // Initialize structured logging (controlled via RUST_LOG env var)
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     // Install rustls crypto provider before any TLS clients are created
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -101,7 +110,8 @@ fn start_api_server() {
                     .merge(jobs_router(api_state.clone()))
                     .merge(drift_router(api_state.clone()))
                     .merge(settings_router(api_state.clone()))
-                    .layer(cors);
+                    .layer(cors)
+                    .layer(TraceLayer::new_for_http());
 
                 // Spawn background polling tasks
                 tokio::spawn(drift_poll_loop(api_state.clone()));
