@@ -124,9 +124,12 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
             None => {
                 let loaded = load_context(&job_dir)?;
                 context_cache.insert(job_dir.clone(), loaded);
-                context_cache
-                    .get(&job_dir)
-                    .ok_or_else(|| anyhow!("Failed to retrieve cached context for {}", job_dir.display()))?
+                context_cache.get(&job_dir).ok_or_else(|| {
+                    anyhow!(
+                        "Failed to retrieve cached context for {}",
+                        job_dir.display()
+                    )
+                })?
             }
         };
 
@@ -174,6 +177,7 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
                 transforms,
                 airflow,
                 config,
+                dir: job_dir.clone(),
             },
         );
     }
@@ -246,9 +250,7 @@ pub fn load_context(current_dir: &Path) -> Result<YARDContext> {
 
 pub fn yaml_to_json(yaml: &yaml_rust2::Yaml) -> Value {
     match yaml {
-        yaml_rust2::Yaml::Real(s) | yaml_rust2::Yaml::String(s) => {
-            Value::String(s.clone())
-        }
+        yaml_rust2::Yaml::Real(s) | yaml_rust2::Yaml::String(s) => Value::String(s.clone()),
         yaml_rust2::Yaml::Integer(i) => Value::Number((*i).into()),
         yaml_rust2::Yaml::Boolean(b) => Value::Bool(*b),
         yaml_rust2::Yaml::Array(a) => Value::Array(a.iter().map(yaml_to_json).collect()),
