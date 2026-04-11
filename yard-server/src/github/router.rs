@@ -143,7 +143,7 @@ async fn handle_webhook(
             }
 
             // Clone and run plan via yard-core — token passed via env, not in URL
-            let plan_output = match clone_at_sha(
+            let plan_result: Result<String, String> = match clone_at_sha(
                 &clone_url,
                 &head_sha,
                 Some(&state.api_state.github_token),
@@ -158,31 +158,32 @@ async fn handle_webhook(
                                 &project.manifest,
                                 &project.current_state,
                             ) {
-                                Ok(diffs) => format_plan_output(&diffs, &project.manifest.project),
+                                Ok(diffs) => Ok(format_plan_output(&diffs, &project.manifest.project)),
                                 Err(e) => {
                                     error!(pr = pr_number, "yard plan failed: {e}");
-                                    format!("yard plan failed:\n{e}")
+                                    Err(format!("yard plan failed:\n{e}"))
                                 }
                             }
                         }
                         Err(e) => {
                             error!(pr = pr_number, "yard plan failed: {e}");
-                            format!("yard plan failed:\n{e}")
+                            Err(format!("yard plan failed:\n{e}"))
                         }
                     }
                 }
                 Err(e) => {
                     error!(pr = pr_number, "Clone failed: {e}");
-                    format!("Failed to clone repo:\n{e}")
+                    Err(format!("Failed to clone repo:\n{e}"))
                 }
             };
 
-            // Determine plan status
-            let plan_failed = plan_output.contains("failed");
-            let status = if plan_failed {
-                PlanStatus::Failure
-            } else {
+            let status = if plan_result.is_ok() {
                 PlanStatus::Success
+            } else {
+                PlanStatus::Failure
+            };
+            let plan_output = match plan_result {
+                Ok(output) | Err(output) => output,
             };
 
             // Persist the plan result
