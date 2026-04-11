@@ -65,7 +65,7 @@ pub async fn execute(
 
     if !auto_approve {
         println!();
-        if !confirm("Do you want to apply these changes? (y/n)") {
+        if !confirm("Do you want to apply these changes? (y/n)")? {
             println!("Apply cancelled.");
             return Ok(());
         }
