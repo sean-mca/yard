@@ -15,7 +15,6 @@ use super::git_ops::{clone_at_sha, WorkdirGuard};
 use super::webhook::{parse_webhook, WebhookAction};
 use crate::api::dashboard::ApiState;
 use crate::db::{DynamoDatabase, PlanResultRow, PlanStatus, WebhookEvent};
-use crate::yard_runner;
 
 /// Shared state for the webhook handler.
 pub struct AppState {
@@ -152,7 +151,7 @@ async fn handle_webhook(
             {
                 Ok(workdir_path) => {
                     let workdir = WorkdirGuard::new(workdir_path);
-                    match yard_runner::resolve_project(workdir.path()).await {
+                    match yard_core::resolve::resolve_project(workdir.path()).await {
                         Ok(project) => {
                             match yard_core::calculate_diff(
                                 &project.manifest,
@@ -276,7 +275,7 @@ async fn handle_webhook(
             {
                 Ok(workdir_path) => {
                     let workdir = WorkdirGuard::new(workdir_path);
-                    match yard_runner::resolve_project(workdir.path()).await {
+                    match yard_core::resolve::resolve_project(workdir.path()).await {
                         Ok(project) => {
                             match yard_core::apply(
                                 &project.manifest,

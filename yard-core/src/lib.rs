@@ -1,5 +1,6 @@
 pub mod codegen;
 pub mod providers;
+pub mod resolve;
 pub mod storage;
 pub mod utils;
 pub mod validation;

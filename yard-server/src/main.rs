@@ -8,8 +8,6 @@ mod db;
 mod github;
 mod types;
 mod ui;
-#[cfg(not(target_arch = "wasm32"))]
-mod yard_runner;
 
 const TAILWIND_CSS: Asset = asset!("/assets/tailwind.css");
 
