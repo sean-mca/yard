@@ -249,7 +249,8 @@ pub async fn apply(
 
                     let script_content = codegen::generate_python_script(&diff.name, job_def)
                         .context("Failed to generate Python script")?;
-                    let config_str = serde_json::to_string(&job_def.config).unwrap_or_default();
+                    let config_str = serde_json::to_string(&job_def.config)
+                        .with_context(|| format!("Failed to serialize config for job \"{}\"", diff.name))?;
                     let combined = format!("{script_content}\n{config_str}");
                     let script_hash = utils::calculate_hash(&combined);
 
