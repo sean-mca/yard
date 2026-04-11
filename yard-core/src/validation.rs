@@ -13,6 +13,8 @@ const SUPPORTED_TRANSFORM_TYPES: &[&str] = &[
     "select",
     "rename",
     "add_column",
+    "aggregate",
+    "window",
 ];
 
 fn err(field: &str, message: &str) -> ValidationError {
@@ -203,6 +205,40 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
                     errors.push(err(
                         &prefix.to_string(),
                         "type \"add_column\" requires \"expression\"",
+                    ));
+                }
+            }
+            "aggregate" => {
+                if transform.group_by.is_empty() {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        "type \"aggregate\" requires non-empty \"group_by\"",
+                    ));
+                }
+                if transform.aggs.is_empty() {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        "type \"aggregate\" requires non-empty \"aggs\"",
+                    ));
+                }
+            }
+            "window" => {
+                if transform.name.is_none() {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        "type \"window\" requires \"name\" (new column name)",
+                    ));
+                }
+                if transform.expression.is_none() {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        "type \"window\" requires \"expression\"",
+                    ));
+                }
+                if transform.partition_by.is_empty() && transform.order_by.is_empty() {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        "type \"window\" requires at least one of \"partition_by\" or \"order_by\"",
                     ));
                 }
             }
@@ -420,6 +456,10 @@ mod tests {
                 right: None,
                 on: None,
                 how: None,
+                group_by: vec![],
+                aggs: std::collections::HashMap::new(),
+                partition_by: vec![],
+                order_by: vec![],
             }],
             config: json!({"type": "glue", "role": "arn:aws:iam::123456789:role/GlueRole"}),
         }
@@ -570,6 +610,10 @@ mod tests {
             right: None,
             on: None,
             how: None,
+            group_by: vec![],
+            aggs: std::collections::HashMap::new(),
+            partition_by: vec![],
+            order_by: vec![],
         }];
         let errors = validate_job(&job);
         assert!(errors.iter().any(|e| e.field == "transforms[0].type"));
@@ -594,6 +638,10 @@ mod tests {
             right: None,
             on: None,
             how: None,
+            group_by: vec![],
+            aggs: std::collections::HashMap::new(),
+            partition_by: vec![],
+            order_by: vec![],
         }];
         let errors = validate_job(&job);
         assert!(
@@ -620,6 +668,10 @@ mod tests {
             right: None,
             on: None,
             how: None,
+            group_by: vec![],
+            aggs: std::collections::HashMap::new(),
+            partition_by: vec![],
+            order_by: vec![],
         }];
         let errors = validate_job(&job);
         assert!(
@@ -646,6 +698,10 @@ mod tests {
             right: None,
             on: None,
             how: None,
+            group_by: vec![],
+            aggs: std::collections::HashMap::new(),
+            partition_by: vec![],
+            order_by: vec![],
         }];
         let errors = validate_job(&job);
         assert!(
@@ -678,6 +734,10 @@ mod tests {
             right: None,
             on: None,
             how: None,
+            group_by: vec![],
+            aggs: std::collections::HashMap::new(),
+            partition_by: vec![],
+            order_by: vec![],
         }];
         let errors = validate_job(&job);
         assert!(
@@ -704,6 +764,10 @@ mod tests {
             right: None,
             on: None,
             how: None,
+            group_by: vec![],
+            aggs: std::collections::HashMap::new(),
+            partition_by: vec![],
+            order_by: vec![],
         }];
         let errors = validate_job(&job);
         assert!(
@@ -730,6 +794,10 @@ mod tests {
             right: None,
             on: None,
             how: None,
+            group_by: vec![],
+            aggs: std::collections::HashMap::new(),
+            partition_by: vec![],
+            order_by: vec![],
         }];
         let errors = validate_job(&job);
         assert!(
@@ -817,6 +885,10 @@ mod tests {
             right: None,
             on: None,
             how: None,
+            group_by: vec![],
+            aggs: std::collections::HashMap::new(),
+            partition_by: vec![],
+            order_by: vec![],
         }];
         let errors = validate_job(&job);
         assert!(
@@ -876,6 +948,10 @@ mod tests {
             right: Some("ghost".to_string()),
             on: Some("id".to_string()),
             how: None,
+            group_by: vec![],
+            aggs: std::collections::HashMap::new(),
+            partition_by: vec![],
+            order_by: vec![],
         }];
         let errors = validate_job(&job);
         assert!(
@@ -925,6 +1001,10 @@ mod tests {
                 right: Some("b".to_string()),
                 on: Some("id".to_string()),
                 how: None,
+                group_by: vec![],
+                aggs: std::collections::HashMap::new(),
+                partition_by: vec![],
+                order_by: vec![],
             },
             Transform {
                 transform_type: "filter".to_string(),
@@ -940,6 +1020,10 @@ mod tests {
                 right: None,
                 on: None,
                 how: None,
+                group_by: vec![],
+                aggs: std::collections::HashMap::new(),
+                partition_by: vec![],
+                order_by: vec![],
             },
         ];
         job.sink = Some(Sink {
@@ -988,6 +1072,10 @@ mod tests {
             right: None,
             on: None,
             how: None,
+            group_by: vec![],
+            aggs: std::collections::HashMap::new(),
+            partition_by: vec![],
+            order_by: vec![],
         }];
         job.sink = Some(Sink {
             source: None,
@@ -1220,5 +1308,89 @@ mod tests {
         assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- aggregate ---
+
+    #[test]
+    fn aggregate_requires_group_by_and_aggs() {
+        let mut job = minimal_job();
+        job.transforms = vec![Transform {
+            transform_type: "aggregate".to_string(),
+            ..Default::default()
+        }];
+        let errors = validate_job(&job);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("requires non-empty \"group_by\""))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("requires non-empty \"aggs\""))
+        );
+    }
+
+    #[test]
+    fn aggregate_valid() {
+        let mut job = minimal_job();
+        let mut aggs = HashMap::new();
+        aggs.insert("total".to_string(), "sum(amount)".to_string());
+        job.transforms = vec![Transform {
+            transform_type: "aggregate".to_string(),
+            group_by: vec!["region".to_string()],
+            aggs,
+            ..Default::default()
+        }];
+        let errors = validate_job(&job);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.field.starts_with("transforms[0]")),
+            "unexpected errors: {errors:?}"
+        );
+    }
+
+    // --- window ---
+
+    #[test]
+    fn window_requires_name_expression_and_partition_or_order() {
+        let mut job = minimal_job();
+        job.transforms = vec![Transform {
+            transform_type: "window".to_string(),
+            ..Default::default()
+        }];
+        let errors = validate_job(&job);
+        assert!(errors.iter().any(|e| e.message.contains("requires \"name\"")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("requires \"expression\""))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("\"partition_by\" or \"order_by\""))
+        );
+    }
+
+    #[test]
+    fn window_valid_with_partition_only() {
+        let mut job = minimal_job();
+        job.transforms = vec![Transform {
+            transform_type: "window".to_string(),
+            name: Some("row_num".to_string()),
+            expression: Some("row_number()".to_string()),
+            partition_by: vec!["customer_id".to_string()],
+            ..Default::default()
+        }];
+        let errors = validate_job(&job);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.field.starts_with("transforms[0]")),
+            "unexpected errors: {errors:?}"
+        );
     }
 }

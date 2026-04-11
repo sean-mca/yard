@@ -201,6 +201,69 @@ fn render_transform(
                 .trim();
             Ok(format!("    {output} = {input}.withColumn(\"{name}\", {expr})"))
         }
+        "aggregate" => {
+            let (input, output) = resolve_df(transform, default_source);
+            let group_cols = transform
+                .group_by
+                .iter()
+                .map(|c| format!("\"{}\"", c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut agg_entries: Vec<(&String, &String)> = transform.aggs.iter().collect();
+            agg_entries.sort_by(|a, b| a.0.cmp(b.0));
+            let agg_exprs = agg_entries
+                .iter()
+                .map(|(alias, expr)| format!("F.expr(\"{}\").alias(\"{}\")", expr.trim(), alias))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Ok(format!(
+                "    {output} = {input}.groupBy({group_cols}).agg({agg_exprs})"
+            ))
+        }
+        "window" => {
+            let (input, output) = resolve_df(transform, default_source);
+            let col_name = transform
+                .name
+                .as_deref()
+                .ok_or_else(|| anyhow!("window transform: 'name' is required"))?
+                .trim();
+            let expr = transform
+                .expression
+                .as_deref()
+                .ok_or_else(|| anyhow!("window transform: 'expression' is required"))?
+                .trim();
+            let window_var = format!("_w_{col_name}");
+            let mut spec = String::from("Window");
+            if !transform.partition_by.is_empty() {
+                let parts = transform
+                    .partition_by
+                    .iter()
+                    .map(|c| format!("\"{}\"", c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                spec.push_str(&format!(".partitionBy({parts})"));
+            }
+            if !transform.order_by.is_empty() {
+                let orders = transform
+                    .order_by
+                    .iter()
+                    .map(|o| {
+                        if o.desc {
+                            format!("F.col(\"{}\").desc()", o.column)
+                        } else {
+                            format!("F.col(\"{}\").asc()", o.column)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                spec.push_str(&format!(".orderBy({orders})"));
+            }
+            let line1 = format!("    {window_var} = {spec}");
+            let line2 = format!(
+                "    {output} = {input}.withColumn(\"{col_name}\", F.expr(\"{expr}\").over({window_var}))"
+            );
+            Ok(format!("{line1}\n{line2}"))
+        }
         _ => Ok(format!(
             "    # Unsupported transform type: {}",
             transform.transform_type
@@ -314,6 +377,20 @@ fn needs_secrets_imports(job_def: &JobDefinition) -> bool {
     source_has || sink_has
 }
 
+fn needs_functions_import(job_def: &JobDefinition) -> bool {
+    job_def
+        .transforms
+        .iter()
+        .any(|t| matches!(t.transform_type.as_str(), "aggregate" | "window"))
+}
+
+fn needs_window_import(job_def: &JobDefinition) -> bool {
+    job_def
+        .transforms
+        .iter()
+        .any(|t| t.transform_type == "window")
+}
+
 fn needs_dynamic_frame_import(job_def: &JobDefinition) -> bool {
     job_def
         .sink
@@ -368,6 +445,12 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
     }
     if needs_dynamic_frame_import(job_def) {
         extra_imports.push("from awsglue.dynamicframe import DynamicFrame".to_string());
+    }
+    if needs_functions_import(job_def) {
+        extra_imports.push("from pyspark.sql import functions as F".to_string());
+    }
+    if needs_window_import(job_def) {
+        extra_imports.push("from pyspark.sql.window import Window".to_string());
     }
 
     let user_imports = render_imports(&job_def.imports);
@@ -531,6 +614,10 @@ mod tests {
             right: None,
             on: None,
             how: None,
+            group_by: vec![],
+            aggs: std::collections::HashMap::new(),
+            partition_by: vec![],
+            order_by: vec![],
         }];
         let script = generate_python_script("test_job", &job).unwrap();
         assert!(script.contains("df_events = df_events.filter(col('active'))"));
@@ -557,6 +644,10 @@ mod tests {
             right: None,
             on: None,
             how: None,
+            group_by: vec![],
+            aggs: std::collections::HashMap::new(),
+            partition_by: vec![],
+            order_by: vec![],
         }];
         let script = generate_python_script("test_job", &job).unwrap();
         assert!(script.contains("df_active_customers = df_customers.filter(col('active'))"));
@@ -585,6 +676,10 @@ mod tests {
             right: Some("customers".to_string()),
             on: Some("customer_id".to_string()),
             how: Some("left".to_string()),
+            group_by: vec![],
+            aggs: std::collections::HashMap::new(),
+            partition_by: vec![],
+            order_by: vec![],
         }];
         let script = generate_python_script("test_job", &job).unwrap();
         assert!(script.contains(
@@ -617,6 +712,10 @@ mod tests {
             right: None,
             on: None,
             how: None,
+            group_by: vec![],
+            aggs: std::collections::HashMap::new(),
+            partition_by: vec![],
+            order_by: vec![],
         }];
         let script = generate_python_script("test_job", &job).unwrap();
         assert!(script.contains("df_orders.createOrReplaceTempView(\"orders\")"));
@@ -667,6 +766,10 @@ mod tests {
             right: Some("customers".to_string()),
             on: Some("customer_id".to_string()),
             how: Some("inner".to_string()),
+            group_by: vec![],
+            aggs: std::collections::HashMap::new(),
+            partition_by: vec![],
+            order_by: vec![],
         }];
         job.sink = Some(Sink {
             source: Some("enriched".to_string()),
@@ -742,6 +845,10 @@ mod tests {
                 right: None,
                 on: None,
                 how: None,
+                group_by: vec![],
+                aggs: std::collections::HashMap::new(),
+                partition_by: vec![],
+                order_by: vec![],
             },
             Transform {
                 transform_type: "join".to_string(),
@@ -757,6 +864,10 @@ mod tests {
                 right: Some("customers".to_string()),
                 on: Some("customer_id".to_string()),
                 how: Some("left".to_string()),
+                group_by: vec![],
+                aggs: std::collections::HashMap::new(),
+                partition_by: vec![],
+                order_by: vec![],
             },
             Transform {
                 transform_type: "drop_columns".to_string(),
@@ -772,6 +883,10 @@ mod tests {
                 right: None,
                 on: None,
                 how: None,
+                group_by: vec![],
+                aggs: std::collections::HashMap::new(),
+                partition_by: vec![],
+                order_by: vec![],
             },
         ];
         job.sink = Some(Sink {
@@ -946,6 +1061,10 @@ mod tests {
             right: None,
             on: Some("id".to_string()),
             how: None,
+            group_by: vec![],
+            aggs: std::collections::HashMap::new(),
+            partition_by: vec![],
+            order_by: vec![],
         }];
         let result = generate_python_script("test_job", &job);
         assert!(result.is_err());
@@ -971,6 +1090,10 @@ mod tests {
             right: Some("customers".to_string()),
             on: None,
             how: None,
+            group_by: vec![],
+            aggs: std::collections::HashMap::new(),
+            partition_by: vec![],
+            order_by: vec![],
         }];
         let result = generate_python_script("test_job", &job);
         assert!(result.is_err());
@@ -996,6 +1119,10 @@ mod tests {
             right: None,
             on: None,
             how: None,
+            group_by: vec![],
+            aggs: std::collections::HashMap::new(),
+            partition_by: vec![],
+            order_by: vec![],
         }];
         let result = generate_python_script("test_job", &job);
         assert!(result.is_err());
@@ -1111,5 +1238,132 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.expect_err("expected error"));
         assert!(msg.contains("table"), "error should mention 'table': {msg}");
+    }
+
+    // --- aggregate ---
+
+    #[test]
+    fn aggregate_transform_basic() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("orders", "s3://b/orders")];
+        let mut aggs = HashMap::new();
+        aggs.insert("total".to_string(), "sum(amount)".to_string());
+        aggs.insert("n".to_string(), "count(*)".to_string());
+        job.transforms = vec![Transform {
+            transform_type: "aggregate".to_string(),
+            source: Some("orders".to_string()),
+            output: Some("daily".to_string()),
+            group_by: vec!["region".to_string(), "day".to_string()],
+            aggs,
+            ..Default::default()
+        }];
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(script.contains("from pyspark.sql import functions as F"));
+        assert!(script.contains(
+            "df_daily = df_orders.groupBy(\"region\", \"day\").agg(F.expr(\"count(*)\").alias(\"n\"), F.expr(\"sum(amount)\").alias(\"total\"))"
+        ));
+    }
+
+    #[test]
+    fn aggregate_defaults_to_first_source() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/events")];
+        let mut aggs = HashMap::new();
+        aggs.insert("n".to_string(), "count(*)".to_string());
+        job.transforms = vec![Transform {
+            transform_type: "aggregate".to_string(),
+            group_by: vec!["user".to_string()],
+            aggs,
+            ..Default::default()
+        }];
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(script.contains(
+            "df_events = df_events.groupBy(\"user\").agg(F.expr(\"count(*)\").alias(\"n\"))"
+        ));
+    }
+
+    // --- window ---
+
+    #[test]
+    fn window_transform_partition_and_order() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("orders", "s3://b/orders")];
+        job.transforms = vec![Transform {
+            transform_type: "window".to_string(),
+            source: Some("orders".to_string()),
+            output: Some("ranked".to_string()),
+            name: Some("row_num".to_string()),
+            expression: Some("row_number()".to_string()),
+            partition_by: vec!["customer_id".to_string()],
+            order_by: vec![
+                yard_structs::OrderBySpec {
+                    column: "created_at".to_string(),
+                    desc: true,
+                },
+                yard_structs::OrderBySpec {
+                    column: "id".to_string(),
+                    desc: false,
+                },
+            ],
+            ..Default::default()
+        }];
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(script.contains("from pyspark.sql import functions as F"));
+        assert!(script.contains("from pyspark.sql.window import Window"));
+        assert!(script.contains(
+            "_w_row_num = Window.partitionBy(\"customer_id\").orderBy(F.col(\"created_at\").desc(), F.col(\"id\").asc())"
+        ));
+        assert!(script.contains(
+            "df_ranked = df_orders.withColumn(\"row_num\", F.expr(\"row_number()\").over(_w_row_num))"
+        ));
+    }
+
+    #[test]
+    fn window_transform_partition_only() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/events")];
+        job.transforms = vec![Transform {
+            transform_type: "window".to_string(),
+            name: Some("cnt".to_string()),
+            expression: Some("count(*)".to_string()),
+            partition_by: vec!["user".to_string()],
+            ..Default::default()
+        }];
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(script.contains("_w_cnt = Window.partitionBy(\"user\")"));
+        assert!(!script.contains(".orderBy("));
+    }
+
+    #[test]
+    fn aggregate_and_window_share_functions_import() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("orders", "s3://b/orders")];
+        let mut aggs = HashMap::new();
+        aggs.insert("total".to_string(), "sum(amount)".to_string());
+        job.transforms = vec![
+            Transform {
+                transform_type: "aggregate".to_string(),
+                output: Some("totals".to_string()),
+                group_by: vec!["region".to_string()],
+                aggs,
+                ..Default::default()
+            },
+            Transform {
+                transform_type: "window".to_string(),
+                source: Some("totals".to_string()),
+                output: Some("ranked".to_string()),
+                name: Some("rank".to_string()),
+                expression: Some("rank()".to_string()),
+                partition_by: vec!["region".to_string()],
+                ..Default::default()
+            },
+        ];
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert_eq!(
+            script.matches("from pyspark.sql import functions as F").count(),
+            1,
+            "F import should only appear once"
+        );
+        assert!(script.contains("from pyspark.sql.window import Window"));
     }
 }

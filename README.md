@@ -247,8 +247,37 @@ JDBC sources support `secret_id` for automatic Secrets Manager credential fetchi
 | `drop_columns` | `columns` | Drop columns |
 | `rename` | `mapping` | Rename columns |
 | `add_column` | `name`, `expression` | Add a computed column |
+| `aggregate` | `group_by`, `aggs` | Group and aggregate (sum, count, avg, etc.) |
+| `window` | `name`, `expression`, `partition_by` and/or `order_by` | Add a column computed with a window function |
 
 All transforms support optional `source` and `output` fields. Default to first source if omitted.
+
+#### Aggregate
+
+```yaml
+- type: aggregate
+  group_by: [region, day]
+  aggs:
+    total: "sum(amount)"
+    order_count: "count(*)"
+```
+
+`aggs` is a map of `alias -> expression`. Expressions use Spark SQL syntax and are wrapped in `F.expr(...)`, so any aggregate function available to Spark SQL works (`sum`, `avg`, `count`, `count(distinct ...)`, `percentile_approx`, etc.).
+
+#### Window functions
+
+```yaml
+- type: window
+  name: row_num
+  expression: "row_number()"
+  partition_by: [customer_id]
+  order_by:
+    - column: created_at
+      desc: true
+    - column: id
+```
+
+`order_by` entries are `{column, desc}` — `desc` defaults to `false`. At least one of `partition_by` or `order_by` is required. Each `window` transform adds a single column; chain multiple transforms for more.
 
 #### External scripts
 

@@ -571,6 +571,22 @@ fn str_array_field(obj: &Value, key: &str) -> Vec<String> {
 }
 
 /// Helper to extract a string->string map field from JSON.
+/// Helper to extract an order_by field: array of {column: string, desc: bool} objects.
+fn order_by_field(obj: &Value, key: &str) -> Vec<yard_structs::OrderBySpec> {
+    obj.get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let column = item.get("column").and_then(|v| v.as_str())?.to_string();
+                    let desc = item.get("desc").and_then(|v| v.as_bool()).unwrap_or(false);
+                    Some(yard_structs::OrderBySpec { column, desc })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn str_map_field(obj: &Value, key: &str) -> HashMap<String, String> {
     obj.get(key)
         .and_then(|v| v.as_object())
@@ -657,6 +673,10 @@ pub fn parse_transforms(config: &Value) -> Vec<Transform> {
             right: str_field(item, "right"),
             on: str_field(item, "on"),
             how: str_field(item, "how"),
+            group_by: str_array_field(item, "group_by"),
+            aggs: str_map_field(item, "aggs"),
+            partition_by: str_array_field(item, "partition_by"),
+            order_by: order_by_field(item, "order_by"),
         });
     }
 

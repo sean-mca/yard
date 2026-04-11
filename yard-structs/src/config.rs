@@ -57,22 +57,34 @@ pub struct Sink {
     pub partition_by: Vec<String>, // partition columns
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct OrderBySpec {
+    pub column: String,
+    pub desc: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct Transform {
-    pub transform_type: String, // filter, sql, drop_columns, rename, select, add_column, join
+    pub transform_type: String, // filter, sql, drop_columns, rename, select, add_column, join, aggregate, window
     pub source: Option<String>, // which df to operate on (defaults to first/only source)
     pub output: Option<String>, // name for result df (defaults to same as source)
     pub condition: Option<String>, // filter
     pub query: Option<String>,  // sql
     pub columns: Vec<String>,   // drop_columns, select
     pub mapping: HashMap<String, String>, // rename (old -> new)
-    pub name: Option<String>,   // add_column
-    pub expression: Option<String>, // add_column
+    pub name: Option<String>,   // add_column, window (new column name)
+    pub expression: Option<String>, // add_column, window (window expression)
     // join fields
     pub left: Option<String>,  // join: left df name
     pub right: Option<String>, // join: right df name
     pub on: Option<String>,    // join: column to join on
     pub how: Option<String>,   // join: inner, left, right, outer
+    // aggregate fields
+    pub group_by: Vec<String>, // aggregate: grouping columns
+    pub aggs: HashMap<String, String>, // aggregate: alias -> expression (e.g. "total" -> "sum(amount)")
+    // window fields
+    pub partition_by: Vec<String>, // window: partition columns
+    pub order_by: Vec<OrderBySpec>, // window: order spec
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
