@@ -32,6 +32,11 @@ pub fn github_router(state: Arc<AppState>) -> Router {
 }
 
 /// Format diffs as text for a PR comment.
+/// GitHub comment body limit is 65,536 characters.
+const GITHUB_COMMENT_MAX_LEN: usize = 65_536;
+const TRUNCATION_NOTICE: &str =
+    "\n\n---\n**Output truncated.** Full plan had more changes than can fit in a GitHub comment.\n";
+
 fn format_plan_output(diffs: &[yard_structs::JobDiff], project_name: &str) -> String {
     let mut output = format!("### yard plan for {project_name}\n\n");
 
@@ -40,21 +45,34 @@ fn format_plan_output(diffs: &[yard_structs::JobDiff], project_name: &str) -> St
         return output;
     }
 
+    let summary = format!("{} job(s) changed.\n\n", diffs.len());
+    output.push_str(&summary);
+
+    let max_body = GITHUB_COMMENT_MAX_LEN - TRUNCATION_NOTICE.len();
+
     for diff in diffs {
-        match &diff.diff_type {
+        let entry = match &diff.diff_type {
             yard_structs::DiffType::Create => {
-                output.push_str(&format!("  + Create job [{}]\n", diff.name));
+                format!("  + Create job [{}]\n", diff.name)
             }
             yard_structs::DiffType::Modify { changes } => {
-                output.push_str(&format!("  ~ Modify job [{}]\n", diff.name));
+                let mut s = format!("  ~ Modify job [{}]\n", diff.name);
                 for (key, (old, new)) in changes {
-                    output.push_str(&format!("      {key} : {old} -> {new}\n"));
+                    s.push_str(&format!("      {key} : {old} -> {new}\n"));
                 }
+                s
             }
             yard_structs::DiffType::Delete => {
-                output.push_str(&format!("  - Delete job [{}]\n", diff.name));
+                format!("  - Delete job [{}]\n", diff.name)
             }
+        };
+
+        if output.len() + entry.len() > max_body {
+            output.push_str(TRUNCATION_NOTICE);
+            return output;
         }
+
+        output.push_str(&entry);
     }
 
     output
