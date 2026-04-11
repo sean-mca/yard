@@ -413,6 +413,14 @@ fn indent_body(body: &str) -> String {
 }
 
 pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result<String> {
+    // Task-only job types (bash, ...) don't produce a standalone PySpark script;
+    // they participate in Airflow DAG codegen instead. Return an empty string so
+    // callers that blindly hash/write the script output continue to work — the
+    // apply path skips deploy for these types via `is_task_only`.
+    if crate::is_task_only(&job_def.job_type) {
+        return Ok(String::new());
+    }
+
     // If job_file is specified, use the external file as the complete script
     if let Some(ref path) = job_def.job_file {
         return std::fs::read_to_string(path)
@@ -514,13 +522,8 @@ mod tests {
     fn base_job() -> JobDefinition {
         JobDefinition {
             job_type: "glue".to_string(),
-            imports: vec![],
-            body: None,
-            job_file: None,
-            sources: vec![],
-            sink: None,
-            transforms: vec![],
             config: json!({"type": "glue"}),
+            ..Default::default()
         }
     }
 
@@ -1332,6 +1335,20 @@ mod tests {
         let script = generate_python_script("test_job", &job).unwrap();
         assert!(script.contains("_w_cnt = Window.partitionBy(\"user\")"));
         assert!(!script.contains(".orderBy("));
+    }
+
+    #[test]
+    fn bash_job_generates_empty_script() {
+        let job = JobDefinition {
+            job_type: "bash".to_string(),
+            config: json!({"type": "bash", "command": "echo hi"}),
+            ..Default::default()
+        };
+        let script = generate_python_script("t", &job).unwrap();
+        assert!(
+            script.is_empty(),
+            "expected empty script for task-only type, got: {script}"
+        );
     }
 
     #[test]
