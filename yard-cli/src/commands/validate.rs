@@ -1,5 +1,5 @@
 use super::resolve_project;
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 pub async fn execute(directory: Option<String>) -> Result<()> {
     let project = resolve_project(directory).await?;
@@ -34,7 +34,7 @@ pub async fn execute(directory: Option<String>) -> Result<()> {
     );
 
     if total_fail > 0 {
-        std::process::exit(1);
+        bail!("Validation failed: {total_fail} job(s) had errors");
     }
 
     Ok(())
