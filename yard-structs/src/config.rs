@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+fn default_path_buf() -> PathBuf {
+    PathBuf::new()
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum StateBackend {
@@ -80,10 +84,10 @@ pub struct Transform {
     pub on: Option<String>,    // join: column to join on
     pub how: Option<String>,   // join: inner, left, right, outer
     // aggregate fields
-    pub group_by: Vec<String>, // aggregate: grouping columns
+    pub group_by: Vec<String>,         // aggregate: grouping columns
     pub aggs: HashMap<String, String>, // aggregate: alias -> expression (e.g. "total" -> "sum(amount)")
     // window fields
-    pub partition_by: Vec<String>, // window: partition columns
+    pub partition_by: Vec<String>,  // window: partition columns
     pub order_by: Vec<OrderBySpec>, // window: order spec
 }
 
@@ -101,6 +105,11 @@ pub struct JobDefinition {
     /// `None` means the job does not participate in any DAG.
     pub airflow: Option<AirflowJobBlock>,
     pub config: serde_json::Value,
+    /// Directory containing the job's YAML file. Populated during discovery;
+    /// not serialized to state. Used to locate the nearest ancestor `dag.yaml`
+    /// when grouping jobs into DAGs.
+    #[serde(skip, default = "default_path_buf")]
+    pub dir: PathBuf,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
