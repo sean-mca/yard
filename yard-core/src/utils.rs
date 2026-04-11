@@ -8,11 +8,11 @@ pub fn calculate_hash<T: AsRef<[u8]>>(data: T) -> String {
     hash.to_hex().to_string()
 }
 
-pub fn calculate_json_hash(val: &Value) -> String {
+pub fn calculate_json_hash(val: &Value) -> Result<String> {
     // We use a stable serialization to ensure the same JSON
     // always produces the same hash regardless of key order.
-    let s = serde_json::to_string(val).unwrap_or_default();
-    calculate_hash(s)
+    let s = serde_json::to_string(val)?;
+    Ok(calculate_hash(s))
 }
 
 pub fn resolve_variables(raw_yaml: &str, ctx: &YARDContext) -> Result<String> {
@@ -110,14 +110,14 @@ mod tests {
         // This test documents the current behavior.
         // The important thing is same input -> same hash.
         let c = json!({"x": 1, "y": 2});
-        assert_eq!(calculate_json_hash(&a), calculate_json_hash(&c));
+        assert_eq!(calculate_json_hash(&a).unwrap(), calculate_json_hash(&c).unwrap());
     }
 
     #[test]
     fn json_hash_differs_for_different_values() {
         let a = json!({"x": 1});
         let b = json!({"x": 2});
-        assert_ne!(calculate_json_hash(&a), calculate_json_hash(&b));
+        assert_ne!(calculate_json_hash(&a).unwrap(), calculate_json_hash(&b).unwrap());
     }
 
     // --- resolve_json_path ---
