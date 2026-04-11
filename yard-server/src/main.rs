@@ -52,6 +52,8 @@ fn start_api_server() {
     use std::sync::Arc;
     use tower_http::cors::{Any, CorsLayer};
     use tower_http::trace::TraceLayer;
+    use tower_governor::GovernorLayer;
+    use tower_governor::governor::GovernorConfigBuilder;
 
     // Initialize structured logging (controlled via RUST_LOG env var)
     tracing_subscriber::fmt()
@@ -104,6 +106,13 @@ fn start_api_server() {
                     .allow_methods(Any)
                     .allow_headers(Any);
 
+                let rate_limit_config = GovernorConfigBuilder::default()
+                    .per_second(30)
+                    .burst_size(60)
+                    .finish()
+                    .expect("Failed to build rate limiter config");
+                let rate_limit = GovernorLayer::new(Arc::new(rate_limit_config));
+
                 let router = axum::Router::new()
                     .merge(github_router(webhook_state))
                     .merge(dashboard_router(api_state.clone()))
@@ -111,6 +120,7 @@ fn start_api_server() {
                     .merge(drift_router(api_state.clone()))
                     .merge(settings_router(api_state.clone()))
                     .layer(cors)
+                    .layer(rate_limit)
                     .layer(TraceLayer::new_for_http());
 
                 // Spawn background polling tasks
