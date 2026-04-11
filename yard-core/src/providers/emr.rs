@@ -1,4 +1,4 @@
-use super::{Provider, aws_config};
+use super::{Provider, S3ScriptOps, aws_config, validation_err};
 use anyhow::{Context, Result, anyhow};
 use aws_sdk_emr::Client as EmrClient;
 use aws_sdk_s3::Client as S3Client;
@@ -9,9 +9,7 @@ use yard_structs::{Resource, ResourceStatus, ValidationError};
 
 pub struct EmrProvider {
     emr_client: EmrClient,
-    s3_client: S3Client,
-    script_bucket: String,
-    script_prefix: String,
+    s3: S3ScriptOps,
     cluster_id: String,
     deploy_mode: String,
     action_on_failure: String,
@@ -60,62 +58,15 @@ impl EmrProvider {
 
         Ok(Self {
             emr_client,
-            s3_client,
-            script_bucket,
-            script_prefix,
+            s3: S3ScriptOps {
+                s3_client,
+                script_bucket,
+                script_prefix,
+            },
             cluster_id,
             deploy_mode,
             action_on_failure,
         })
-    }
-
-    fn script_key(&self, job_name: &str) -> String {
-        let prefix = if self.script_prefix.ends_with('/') {
-            &self.script_prefix
-        } else {
-            return format!("{}/{}.py", self.script_prefix, job_name);
-        };
-        format!("{prefix}{job_name}.py")
-    }
-
-    async fn upload_script(&self, job_name: &str, artifact: &str) -> Result<String> {
-        let key = self.script_key(job_name);
-
-        self.s3_client
-            .put_object()
-            .bucket(&self.script_bucket)
-            .key(&key)
-            .body(artifact.as_bytes().to_vec().into())
-            .content_type("text/x-python")
-            .send()
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to upload script to s3://{}/{}",
-                    self.script_bucket, key
-                )
-            })?;
-
-        Ok(format!("s3://{}/{}", self.script_bucket, key))
-    }
-
-    async fn delete_script(&self, job_name: &str) -> Result<()> {
-        let key = self.script_key(job_name);
-
-        self.s3_client
-            .delete_object()
-            .bucket(&self.script_bucket)
-            .key(&key)
-            .send()
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to delete script at s3://{}/{}",
-                    self.script_bucket, key
-                )
-            })?;
-
-        Ok(())
     }
 
     async fn submit_step(
@@ -177,28 +128,6 @@ impl EmrProvider {
         Ok(())
     }
 
-    async fn s3_object_exists(&self, key: &str) -> Result<bool> {
-        let result = self
-            .s3_client
-            .head_object()
-            .bucket(&self.script_bucket)
-            .key(key)
-            .send()
-            .await;
-
-        match result {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                if e.as_service_error()
-                    .is_some_and(|se| se.is_not_found())
-                {
-                    Ok(false)
-                } else {
-                    Err(e).with_context(|| format!("Failed to check S3 object: {key}"))
-                }
-            }
-        }
-    }
 }
 
 impl Provider for EmrProvider {
@@ -212,7 +141,7 @@ impl Provider for EmrProvider {
         let artifact = artifact.to_string();
 
         Box::pin(async move {
-            let script_location = self.upload_script(&job_name, &artifact).await?;
+            let script_location = self.s3.upload_script(&job_name, &artifact).await?;
             let step_id = self.submit_step(&job_name, &script_location).await?;
 
             Ok(vec![
@@ -247,7 +176,7 @@ impl Provider for EmrProvider {
             }
 
             // Delete the script from S3
-            self.delete_script(&job_name).await?;
+            self.s3.delete_script(&job_name).await?;
 
             Ok(())
         })
@@ -268,9 +197,9 @@ impl Provider for EmrProvider {
                     "s3_object" => {
                         let key = resource
                             .id
-                            .strip_prefix(&format!("s3://{}/", self.script_bucket))
+                            .strip_prefix(&format!("s3://{}/", self.s3.script_bucket))
                             .unwrap_or(&resource.id);
-                        self.s3_object_exists(key).await?
+                        self.s3.s3_object_exists(key).await?
                     }
                     // EMR steps are ephemeral — skip verification
                     "emr_step" => true,
@@ -292,13 +221,6 @@ impl Provider for EmrProvider {
 
 const VALID_ACTION_ON_FAILURE: &[&str] =
     &["CONTINUE", "CANCEL_AND_WAIT", "TERMINATE_CLUSTER"];
-
-fn validation_err(field: &str, message: &str) -> ValidationError {
-    ValidationError {
-        field: field.to_string(),
-        message: message.to_string(),
-    }
-}
 
 pub fn validate_config(config: &Value, errors: &mut Vec<ValidationError>) {
     if let Some(aof) = config.get("action_on_failure").and_then(|v| v.as_str())

@@ -44,7 +44,7 @@ Applying...
 State updated successfully.
 ```
 
-That's it. YARD generated the PySpark script, uploaded it to S3, and created the Glue job.
+That's it. YARD generated the PySpark script, uploaded it to S3, and created the Glue job. All you need to do is make your orchestrator aware of these new jobs, and schedule them.
 
 ## Providers
 

@@ -1,19 +1,16 @@
-use super::{Provider, aws_config};
+use super::{Provider, S3ScriptOps, aws_config, validation_err};
 use anyhow::{Context, Result, anyhow};
-use yard_structs::ValidationError;
 use aws_sdk_glue::Client as GlueClient;
 use aws_sdk_s3::Client as S3Client;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use yard_structs::{Resource, ResourceStatus};
+use yard_structs::{Resource, ResourceStatus, ValidationError};
 
 pub struct GlueProvider {
     glue_client: GlueClient,
-    s3_client: S3Client,
-    script_bucket: String,
-    script_prefix: String,
+    s3: S3ScriptOps,
     // Runtime defaults (from merged provider + job config)
     glue_version: String,
     worker_type: String,
@@ -108,9 +105,11 @@ impl GlueProvider {
 
         Ok(Self {
             glue_client,
-            s3_client,
-            script_bucket,
-            script_prefix,
+            s3: S3ScriptOps {
+                s3_client,
+                script_bucket,
+                script_prefix,
+            },
             glue_version,
             worker_type,
             number_of_workers,
@@ -121,55 +120,6 @@ impl GlueProvider {
             connections,
             default_arguments,
         })
-    }
-
-    fn script_key(&self, job_name: &str) -> String {
-        let prefix = if self.script_prefix.ends_with('/') {
-            &self.script_prefix
-        } else {
-            return format!("{}/{}.py", self.script_prefix, job_name);
-        };
-        format!("{prefix}{job_name}.py")
-    }
-
-    async fn upload_script(&self, job_name: &str, artifact: &str) -> Result<String> {
-        let key = self.script_key(job_name);
-
-        self.s3_client
-            .put_object()
-            .bucket(&self.script_bucket)
-            .key(&key)
-            .body(artifact.as_bytes().to_vec().into())
-            .content_type("text/x-python")
-            .send()
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to upload script to s3://{}/{}",
-                    self.script_bucket, key
-                )
-            })?;
-
-        Ok(format!("s3://{}/{}", self.script_bucket, key))
-    }
-
-    async fn delete_script(&self, job_name: &str) -> Result<()> {
-        let key = self.script_key(job_name);
-
-        self.s3_client
-            .delete_object()
-            .bucket(&self.script_bucket)
-            .key(&key)
-            .send()
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to delete script at s3://{}/{}",
-                    self.script_bucket, key
-                )
-            })?;
-
-        Ok(())
     }
 
     fn build_default_arguments(&self) -> HashMap<String, String> {
@@ -319,29 +269,6 @@ impl GlueProvider {
         Ok(())
     }
 
-    async fn s3_object_exists(&self, key: &str) -> Result<bool> {
-        let result = self
-            .s3_client
-            .head_object()
-            .bucket(&self.script_bucket)
-            .key(key)
-            .send()
-            .await;
-
-        match result {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                if e.as_service_error()
-                    .is_some_and(|se| se.is_not_found())
-                {
-                    Ok(false)
-                } else {
-                    Err(e).with_context(|| format!("Failed to check S3 object: {key}"))
-                }
-            }
-        }
-    }
-
     async fn glue_job_exists(&self, job_name: &str) -> Result<bool> {
         let result = self
             .glue_client
@@ -377,7 +304,7 @@ impl Provider for GlueProvider {
         let job_config = job_config.clone();
 
         Box::pin(async move {
-            let script_location = self.upload_script(&job_name, &artifact).await?;
+            let script_location = self.s3.upload_script(&job_name, &artifact).await?;
 
             self.create_or_update_glue_job(&job_name, &script_location, &job_config)
                 .await?;
@@ -412,7 +339,7 @@ impl Provider for GlueProvider {
                 }
             }
 
-            self.delete_script(&job_name).await?;
+            self.s3.delete_script(&job_name).await?;
 
             Ok(())
         })
@@ -434,9 +361,9 @@ impl Provider for GlueProvider {
                         // resource.id is "s3://bucket/key" — extract the key
                         let key = resource
                             .id
-                            .strip_prefix(&format!("s3://{}/", self.script_bucket))
+                            .strip_prefix(&format!("s3://{}/", self.s3.script_bucket))
                             .unwrap_or(&resource.id);
-                        self.s3_object_exists(key).await?
+                        self.s3.s3_object_exists(key).await?
                     }
                     "glue_job" => self.glue_job_exists(&resource.id).await?,
                     _ => true, // Unknown resource types assumed to exist
@@ -457,13 +384,6 @@ impl Provider for GlueProvider {
 
 const VALID_WORKER_TYPES: &[&str] = &["G.025X", "G.1X", "G.2X", "G.4X", "G.8X", "Z.2X"];
 const VALID_BOOKMARK_VALUES: &[&str] = &["enabled", "disabled"];
-
-fn validation_err(field: &str, message: &str) -> ValidationError {
-    ValidationError {
-        field: field.to_string(),
-        message: message.to_string(),
-    }
-}
 
 pub fn validate_config(config: &serde_json::Value, errors: &mut Vec<ValidationError>) {
     if let Some(wt) = config.get("worker_type").and_then(|v| v.as_str())
