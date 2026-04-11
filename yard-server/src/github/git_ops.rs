@@ -90,3 +90,25 @@ pub fn cleanup_workdir(dir: &Path) {
         warn!("Failed to clean up workdir {}: {e}", dir.display());
     }
 }
+
+/// RAII guard that ensures a workdir is cleaned up when dropped,
+/// regardless of whether the operation succeeded or failed.
+pub struct WorkdirGuard {
+    path: PathBuf,
+}
+
+impl WorkdirGuard {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for WorkdirGuard {
+    fn drop(&mut self) {
+        cleanup_workdir(&self.path);
+    }
+}
