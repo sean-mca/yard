@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tracing::{info, warn, error};
 
 use super::client::GitHubClient;
-use super::git_ops::{clone_at_sha, cleanup_workdir};
+use super::git_ops::{clone_at_sha, WorkdirGuard};
 use super::webhook::{parse_webhook, WebhookAction};
 use crate::api::dashboard::ApiState;
 use crate::db::{DynamoDatabase, PlanResultRow, PlanStatus, WebhookEvent};
@@ -150,8 +150,9 @@ async fn handle_webhook(
             )
             .await
             {
-                Ok(workdir) => {
-                    let result = match yard_runner::resolve_project(&workdir).await {
+                Ok(workdir_path) => {
+                    let workdir = WorkdirGuard::new(workdir_path);
+                    match yard_runner::resolve_project(workdir.path()).await {
                         Ok(project) => {
                             match yard_core::calculate_diff(
                                 &project.manifest,
@@ -168,9 +169,7 @@ async fn handle_webhook(
                             error!(pr = pr_number, "yard plan failed: {e}");
                             format!("yard plan failed:\n{e}")
                         }
-                    };
-                    cleanup_workdir(&workdir);
-                    result
+                    }
                 }
                 Err(e) => {
                     error!(pr = pr_number, "Clone failed: {e}");
@@ -274,8 +273,9 @@ async fn handle_webhook(
             )
             .await
             {
-                Ok(workdir) => {
-                    let result = match yard_runner::resolve_project(&workdir).await {
+                Ok(workdir_path) => {
+                    let workdir = WorkdirGuard::new(workdir_path);
+                    match yard_runner::resolve_project(workdir.path()).await {
                         Ok(project) => {
                             match yard_core::apply(
                                 &project.manifest,
@@ -299,9 +299,7 @@ async fn handle_webhook(
                             error!(pr = pr_number, "Failed to resolve project: {e}");
                             format!("### yard apply failed\n\nFailed to resolve project:\n{e}")
                         }
-                    };
-                    cleanup_workdir(&workdir);
-                    result
+                    }
                 }
                 Err(e) => {
                     error!(pr = pr_number, "Clone failed: {e}");

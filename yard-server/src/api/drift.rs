@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 
 use super::dashboard::ApiState;
 use crate::db::DriftSnapshot;
-use crate::github::git_ops::{cleanup_workdir, clone_at_sha};
+use crate::github::git_ops::{WorkdirGuard, clone_at_sha};
 use crate::types::*;
 use crate::yard_runner;
 
@@ -48,11 +48,12 @@ pub async fn run_drift_check(state: &ApiState) -> Result<DriftData, String> {
         state.repo_owner, state.repo_name
     );
 
-    let workdir =
-        clone_at_sha(&clone_url, &sha, Some(&state.github_token)).await?;
+    let workdir = WorkdirGuard::new(
+        clone_at_sha(&clone_url, &sha, Some(&state.github_token)).await?,
+    );
 
     // 3. Resolve project, calculate diff, and verify resources
-    let project = yard_runner::resolve_project(&workdir)
+    let project = yard_runner::resolve_project(workdir.path())
         .await
         .map_err(|e| format!("Failed to resolve project: {e}"))?;
     let diffs = yard_core::calculate_diff(&project.manifest, &project.current_state)
@@ -66,8 +67,8 @@ pub async fn run_drift_check(state: &ApiState) -> Result<DriftData, String> {
     .await
     .map_err(|e| format!("Failed to verify resources: {e}"))?;
 
-    let job_files = discover_job_files_with_content(&workdir);
-    cleanup_workdir(&workdir);
+    let job_files = discover_job_files_with_content(workdir.path());
+    drop(workdir);
 
     // 4. Build DriftItems from hash-based diffs
     let mut items = Vec::new();
