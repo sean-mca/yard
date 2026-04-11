@@ -109,6 +109,7 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
             || file_name == "account.yaml"
             || file_name == "region.yaml"
             || file_name == "transforms.yaml"
+            || file_name == "dag.yaml"
         {
             continue;
         }
@@ -140,7 +141,12 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
         let job_name = file_name.replace(".yaml", "");
         let job_type = job_doc["type"]
             .as_str()
-            .ok_or_else(|| anyhow!("Job '{}' is missing a 'type' field (glue, emr)", job_name))?
+            .ok_or_else(|| {
+                anyhow!(
+                    "Job '{}' is missing a 'type' field (glue, emr, bash)",
+                    job_name
+                )
+            })?
             .to_string();
         let config = yaml_to_json(job_doc);
         let imports = crate::parse_imports(&config);
@@ -148,6 +154,7 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
         let sources = crate::parse_sources(&config);
         let sink = crate::parse_sink(&config);
         let transforms = crate::parse_transforms(&config);
+        let airflow = crate::parse_airflow_job_block(&config);
 
         // Resolve job_file path relative to the job YAML's directory
         let job_file = crate::parse_job_file(&config).map(|p| {
@@ -165,6 +172,7 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
                 sources,
                 sink,
                 transforms,
+                airflow,
                 config,
             },
         );
@@ -224,11 +232,13 @@ pub fn load_context(current_dir: &Path) -> Result<YARDContext> {
     let account = find_and_parse_context(current_dir, "account.yaml", true)?;
     let region = find_and_parse_context(current_dir, "region.yaml", true)?;
     let transforms = find_and_parse_context(current_dir, "transforms.yaml", false)?;
+    let dag = find_and_parse_context(current_dir, "dag.yaml", false)?;
 
     Ok(YARDContext {
         account,
         region,
         transforms,
+        dag,
     })
 }
 

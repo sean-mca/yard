@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::process::Command;
 use yard_structs::{JobDefinition, ValidationError};
 
-const SUPPORTED_JOB_TYPES: &[&str] = &["glue", "emr"];
+const SUPPORTED_JOB_TYPES: &[&str] = &["glue", "emr", "bash"];
 const SUPPORTED_SOURCE_TYPES: &[&str] = &["s3", "jdbc", "catalog"];
 const SUPPORTED_SINK_TYPES: &[&str] = &["s3", "jdbc", "catalog"];
 const SUPPORTED_TRANSFORM_TYPES: &[&str] = &[
@@ -27,14 +27,6 @@ fn err(field: &str, message: &str) -> ValidationError {
 pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
-    // body and job_file are mutually exclusive
-    if job.body.is_some() && job.job_file.is_some() {
-        errors.push(err(
-            "job_file",
-            "cannot specify both \"body\" and \"job_file\"",
-        ));
-    }
-
     // Job type
     if !SUPPORTED_JOB_TYPES.contains(&job.job_type.as_str()) {
         errors.push(err(
@@ -44,6 +36,22 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
                 job.job_type,
                 SUPPORTED_JOB_TYPES.join(", ")
             ),
+        ));
+    }
+
+    // Task-only job types (bash, ...) take a separate path — they don't have
+    // sources/sinks/transforms and don't deploy anywhere. Validate them here
+    // and skip the Spark-job checks below.
+    if crate::is_task_only(&job.job_type) {
+        validate_task_only_job(job, &mut errors);
+        return errors;
+    }
+
+    // body and job_file are mutually exclusive (only relevant for Spark jobs)
+    if job.body.is_some() && job.job_file.is_some() {
+        errors.push(err(
+            "job_file",
+            "cannot specify both \"body\" and \"job_file\"",
         ));
     }
 
@@ -335,6 +343,63 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
     errors
 }
 
+/// Validate a task-only job (bash, ... future: python, sensor, dbt).
+/// These jobs must not carry Spark-job fields (sources/sink/transforms/body/job_file)
+/// and must carry their task-type-specific required fields.
+fn validate_task_only_job(job: &JobDefinition, errors: &mut Vec<ValidationError>) {
+    // Reject Spark-shaped fields on task-only jobs — they're meaningless here.
+    if !job.sources.is_empty() {
+        errors.push(err(
+            "sources",
+            &format!(
+                "task-only job type \"{}\" cannot declare sources",
+                job.job_type
+            ),
+        ));
+    }
+    if job.sink.is_some() {
+        errors.push(err(
+            "sink",
+            &format!(
+                "task-only job type \"{}\" cannot declare a sink",
+                job.job_type
+            ),
+        ));
+    }
+    if !job.transforms.is_empty() {
+        errors.push(err(
+            "transforms",
+            &format!(
+                "task-only job type \"{}\" cannot declare transforms",
+                job.job_type
+            ),
+        ));
+    }
+    if job.body.is_some() || job.job_file.is_some() {
+        errors.push(err(
+            "body",
+            &format!(
+                "task-only job type \"{}\" cannot declare body or job_file",
+                job.job_type
+            ),
+        ));
+    }
+
+    if job.job_type == "bash" {
+        let has_command = job
+            .config
+            .get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty());
+        if !has_command {
+            errors.push(err(
+                "command",
+                "bash jobs require a non-empty \"command\" field",
+            ));
+        }
+    }
+}
+
 /// Validate that a generated Python script is syntactically valid.
 /// Shells out to `python3` using `ast.parse`. Returns None if valid,
 /// or Some(error message) if the script has a syntax error.
@@ -462,19 +527,15 @@ mod tests {
                 order_by: vec![],
             }],
             config: json!({"type": "glue", "role": "arn:aws:iam::123456789:role/GlueRole"}),
+            ..Default::default()
         }
     }
 
     fn minimal_job() -> JobDefinition {
         JobDefinition {
             job_type: "glue".to_string(),
-            imports: vec![],
-            body: None,
-            job_file: None,
-            sources: vec![],
-            sink: None,
-            transforms: vec![],
             config: json!({"type": "glue", "role": "arn:aws:iam::123456789:role/GlueRole"}),
+            ..Default::default()
         }
     }
 
@@ -1308,6 +1369,99 @@ mod tests {
         assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- bash task type ---
+
+    fn bash_job(command: Option<&str>) -> JobDefinition {
+        let mut cfg = json!({"type": "bash"});
+        if let Some(c) = command {
+            cfg.as_object_mut()
+                .expect("object")
+                .insert("command".to_string(), json!(c));
+        }
+        JobDefinition {
+            job_type: "bash".to_string(),
+            config: cfg,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn bash_valid_with_command() {
+        let job = bash_job(Some("echo hello"));
+        let errors = validate_job(&job);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn bash_missing_command_errors() {
+        let job = bash_job(None);
+        let errors = validate_job(&job);
+        assert!(
+            errors.iter().any(|e| e.field == "command"),
+            "expected command error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn bash_empty_command_errors() {
+        let job = bash_job(Some("   "));
+        let errors = validate_job(&job);
+        assert!(errors.iter().any(|e| e.field == "command"));
+    }
+
+    #[test]
+    fn bash_rejects_sources() {
+        let mut job = bash_job(Some("echo hi"));
+        job.sources = vec![Source {
+            name: "s".to_string(),
+            source_type: "s3".to_string(),
+            format: None,
+            path: Some("s3://b/x".to_string()),
+            connection_url: None,
+            table: None,
+            database: None,
+            secret_id: None,
+        }];
+        let errors = validate_job(&job);
+        assert!(errors.iter().any(|e| e.field == "sources"));
+    }
+
+    #[test]
+    fn bash_rejects_sink() {
+        let mut job = bash_job(Some("echo hi"));
+        job.sink = Some(Sink {
+            source: None,
+            sink_type: "s3".to_string(),
+            format: None,
+            path: Some("s3://b/out".to_string()),
+            connection_url: None,
+            table: None,
+            database: None,
+            secret_id: None,
+            mode: None,
+            partition_by: vec![],
+        });
+        let errors = validate_job(&job);
+        assert!(errors.iter().any(|e| e.field == "sink"));
+    }
+
+    #[test]
+    fn bash_passes_validate_job_full() {
+        // validate_job_full runs generate_python_script + validate_python_syntax.
+        // Bash jobs return an empty script, which must parse as valid Python.
+        let job = bash_job(Some("echo hello"));
+        let errors = validate_job_full("bash_task", &job);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn bash_rejects_transforms_body_job_file() {
+        let mut job = bash_job(Some("echo hi"));
+        job.body = Some("pass".to_string());
+        let errors = validate_job(&job);
+        assert!(errors.iter().any(|e| e.field == "body"));
     }
 
     // --- aggregate ---

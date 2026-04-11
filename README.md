@@ -53,7 +53,7 @@ That's it. YARD generated the PySpark script, uploaded it to S3, and created the
 | AWS Glue | Stable | Generates PySpark scripts, uploads to S3, creates/updates Glue jobs |
 | AWS EMR (classic) | Stable | Generates PySpark scripts, uploads to S3, submits steps to existing clusters |
 | AWS EMR Serverless | Planned | Submit job runs to serverless Spark applications |
-| Databricks | Planned | -- |
+| Airflow DAGs | Planned | Generates Airflow DAG Python files from YAML, uploads to a DAGs bucket |
 
 ## Project structure
 

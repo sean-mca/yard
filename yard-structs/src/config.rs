@@ -87,7 +87,7 @@ pub struct Transform {
     pub order_by: Vec<OrderBySpec>, // window: order spec
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct JobDefinition {
     pub job_type: String,
     pub imports: Vec<Import>,
@@ -97,12 +97,41 @@ pub struct JobDefinition {
     pub sources: Vec<Source>,
     pub sink: Option<Sink>,
     pub transforms: Vec<Transform>,
+    /// Per-job Airflow metadata, parsed from the optional `airflow:` block.
+    /// `None` means the job does not participate in any DAG.
+    pub airflow: Option<AirflowJobBlock>,
     pub config: serde_json::Value,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct YARDContext {
     pub account: serde_json::Value,
     pub region: serde_json::Value,
     pub transforms: serde_json::Value,
+    /// Loaded from the optional `dag.yaml` marker file in a job's directory
+    /// (or the nearest ancestor). Presence marks the directory as a DAG grouping.
+    /// Contents hold DAG-level Airflow config (schedule, default_args, etc).
+    pub dag: serde_json::Value,
+}
+
+/// Airflow config shared across inheritance layers (yard.yaml, region.yaml,
+/// account.yaml, dag.yaml, and the per-job `airflow:` block). Every layer has
+/// the same shape; later layers override earlier ones via shallow merge.
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct AirflowSection {
+    pub schedule: Option<String>,
+    pub owner: Option<String>,
+    pub retries: Option<i32>,
+    pub dags_bucket: Option<String>,
+    pub dags_prefix: Option<String>,
+}
+
+/// Per-job Airflow metadata lifted out of the `airflow:` block on a job file.
+/// Includes the shared [`AirflowSection`] overrides plus job-specific fields
+/// like `depends_on`.
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct AirflowJobBlock {
+    pub depends_on: Vec<String>,
+    #[serde(flatten, default)]
+    pub overrides: AirflowSection,
 }

@@ -56,6 +56,7 @@ pub fn resolve_json_path(ctx: &YARDContext, path: &str) -> Option<serde_json::Va
         "account" => &ctx.account,
         "region" => &ctx.region,
         "transforms" => &ctx.transforms,
+        "dag" => &ctx.dag,
         _ => return None,
     };
 
@@ -76,7 +77,21 @@ mod tests {
             account: json!({"id": "123456789", "name": "dev-account"}),
             region: json!({"name": "us-east-1", "code": "ue1"}),
             transforms: json!({"suffix": "prod", "nested": {"key": "deep_val"}}),
+            dag: json!({"schedule": "@daily", "name": "orders_dag"}),
         }
+    }
+
+    #[test]
+    fn resolve_dag_field() {
+        let ctx = test_context();
+        assert_eq!(
+            resolve_json_path(&ctx, "dag.schedule"),
+            Some(json!("@daily"))
+        );
+        assert_eq!(
+            resolve_json_path(&ctx, "dag.name"),
+            Some(json!("orders_dag"))
+        );
     }
 
     // --- calculate_hash ---
