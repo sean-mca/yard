@@ -117,9 +117,10 @@ fn start_api_server() {
                 tokio::spawn(drift_poll_loop(api_state.clone()));
                 tokio::spawn(dashboard_poll_loop(api_state));
 
-                let addr: std::net::SocketAddr = "0.0.0.0:3001"
+                let port = std::env::var("YARD_PORT").unwrap_or_else(|_| "3001".to_string());
+                let addr: std::net::SocketAddr = format!("0.0.0.0:{port}")
                     .parse()
-                    .map_err(|e| anyhow::anyhow!("Invalid listen address: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("Invalid listen address (YARD_PORT={port}): {e}"))?;
                 eprintln!("API server listening on {addr}");
                 let listener = tokio::net::TcpListener::bind(addr)
                     .await
