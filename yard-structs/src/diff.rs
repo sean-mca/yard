@@ -17,3 +17,11 @@ pub struct JobDiff {
     pub old_hash: Option<String>,
     pub new_hash: Option<String>,
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DagDiff {
+    pub name: String,
+    pub diff_type: DiffType,
+    pub old_hash: Option<String>,
+    pub new_hash: Option<String>,
+}

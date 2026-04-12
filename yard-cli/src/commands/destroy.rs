@@ -14,7 +14,7 @@ pub async fn execute(
         Some(name) => {
             println!("{}", bold("--- Destroy plan ---"));
             println!();
-            println!("{}", color_delete(&format!("  - Destroy job [{}]", name)));
+            println!("{}", color_delete(&format!("  - Destroy [{}]", name)));
 
             if dry_run {
                 println!("\nDry run -- no changes applied.");
@@ -23,7 +23,7 @@ pub async fn execute(
 
             if !auto_approve {
                 println!();
-                if !confirm("Do you want to destroy this job? (y/n)")? {
+                if !confirm("Do you want to destroy this resource? (y/n)")? {
                     println!("Destroy cancelled.");
                     return Ok(());
                 }
@@ -31,7 +31,8 @@ pub async fn execute(
 
             println!("\nDestroying...");
 
-            let destroyed = yard_core::destroy_job(
+            // Try as a job first, then as a DAG
+            let destroyed_job = yard_core::destroy_job(
                 &project.manifest.state,
                 &project.manifest.providers,
                 &name,
@@ -40,18 +41,32 @@ pub async fn execute(
             )
             .await?;
 
-            if destroyed {
+            if destroyed_job {
                 println!("{}", color_delete(&format!("  - Destroyed: {}", name)));
             } else {
-                println!("No state found for job \"{}\".", name);
+                let destroyed_dag = yard_core::destroy_dag(
+                    &project.manifest.state,
+                    &project.manifest.providers,
+                    &name,
+                    &project.root_dir,
+                    dry_run,
+                )
+                .await?;
+
+                if destroyed_dag {
+                    println!("{}", color_delete(&format!("  - Destroyed DAG: {}", name)));
+                } else {
+                    println!("No state found for \"{}\".", name);
+                }
             }
         }
         None => {
             let storage = yard_core::storage::get_storage(&project.manifest.state).await?;
             let job_names = storage.list_jobs().await?;
+            let dag_names = storage.list_dags().await?;
 
-            if job_names.is_empty() {
-                println!("No jobs to destroy.");
+            if job_names.is_empty() && dag_names.is_empty() {
+                println!("No resources to destroy.");
                 return Ok(());
             }
 
@@ -66,6 +81,9 @@ pub async fn execute(
             for name in &job_names {
                 println!("{}", color_delete(&format!("  - Destroy job [{}]", name)));
             }
+            for name in &dag_names {
+                println!("{}", color_delete(&format!("  - Destroy DAG [{}]", name)));
+            }
 
             if dry_run {
                 println!("\nDry run -- no changes applied.");
@@ -74,7 +92,7 @@ pub async fn execute(
 
             if !auto_approve {
                 println!();
-                if !confirm("Do you want to destroy all jobs? (y/n)")? {
+                if !confirm("Do you want to destroy all resources? (y/n)")? {
                     println!("Destroy cancelled.");
                     return Ok(());
                 }
@@ -93,8 +111,11 @@ pub async fn execute(
             for name in &result.destroyed {
                 println!("{}", color_delete(&format!("  - Destroyed: {}", name)));
             }
+            for name in &result.dags_destroyed {
+                println!("{}", color_delete(&format!("  - Destroyed DAG: {}", name)));
+            }
 
-            println!("\nAll jobs destroyed.");
+            println!("\nAll resources destroyed.");
         }
     }
 
