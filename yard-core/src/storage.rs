@@ -1,7 +1,10 @@
 use anyhow::{Context, Result, anyhow};
 use aws_sdk_s3::Client;
 use std::path::PathBuf;
-use yard_structs::{JobState, LockInfo, StateBackend};
+use yard_structs::{DagState, JobState, LockInfo, StateBackend};
+
+/// Prefix for DAG state files to avoid colliding with job state files.
+pub const DAG_STATE_PREFIX: &str = "_dag_";
 
 // --- Storage backends ---
 
@@ -141,6 +144,7 @@ impl Storage {
                     let name = entry.file_name().to_string_lossy().to_string();
                     if let Some(job_name) = name.strip_suffix(".json")
                         && !job_name.ends_with(".lock")
+                        && !job_name.starts_with(DAG_STATE_PREFIX)
                     {
                         jobs.push(job_name.to_string());
                     }
@@ -162,6 +166,7 @@ impl Storage {
                         let relative = key.strip_prefix(&s.prefix).unwrap_or(key);
                         if let Some(job_name) = relative.strip_suffix(".json")
                             && !job_name.ends_with(".lock")
+                            && !job_name.starts_with(DAG_STATE_PREFIX)
                             && !job_name.contains('/')
                         {
                             jobs.push(job_name.to_string());
@@ -169,6 +174,149 @@ impl Storage {
                     }
                 }
                 Ok(jobs)
+            }
+        }
+    }
+
+    // --- Per-DAG state operations ---
+
+    /// Read a single DAG's state file. Returns None if the file doesn't exist.
+    pub async fn read_dag(&self, dag_name: &str) -> Result<Option<DagState>> {
+        let key = format!("{DAG_STATE_PREFIX}{dag_name}");
+        match self {
+            Storage::Local(s) => {
+                let path = s.path.join(format!("{key}.json"));
+                if !path.exists() {
+                    return Ok(None);
+                }
+                let content = tokio::fs::read_to_string(&path)
+                    .await
+                    .with_context(|| format!("Failed to read state for DAG {dag_name}"))?;
+                let state: DagState = serde_json::from_str(&content)?;
+                Ok(Some(state))
+            }
+            Storage::S3(s) => {
+                let s3_key = format!("{}{key}.json", s.prefix);
+                let result = s
+                    .client
+                    .get_object()
+                    .bucket(&s.bucket)
+                    .key(&s3_key)
+                    .send()
+                    .await;
+
+                match result {
+                    Ok(resp) => {
+                        let data = resp.body.collect().await?.into_bytes();
+                        let state: DagState = serde_json::from_slice(&data)?;
+                        Ok(Some(state))
+                    }
+                    Err(e) => {
+                        if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
+                            Ok(None)
+                        } else {
+                            Err(e.into())
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Write a single DAG's state file.
+    pub async fn write_dag(&self, dag_name: &str, state: &DagState) -> Result<()> {
+        let key = format!("{DAG_STATE_PREFIX}{dag_name}");
+        match self {
+            Storage::Local(s) => {
+                let json = serde_json::to_string_pretty(state)?;
+                tokio::fs::create_dir_all(&s.path).await?;
+                let path = s.path.join(format!("{key}.json"));
+                tokio::fs::write(&path, json).await?;
+                Ok(())
+            }
+            Storage::S3(s) => {
+                let json = serde_json::to_string_pretty(state)?;
+                let s3_key = format!("{}{key}.json", s.prefix);
+                s.client
+                    .put_object()
+                    .bucket(&s.bucket)
+                    .key(&s3_key)
+                    .body(json.into_bytes().into())
+                    .content_type("application/json")
+                    .send()
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Delete a single DAG's state file.
+    pub async fn delete_dag(&self, dag_name: &str) -> Result<()> {
+        let key = format!("{DAG_STATE_PREFIX}{dag_name}");
+        match self {
+            Storage::Local(s) => {
+                let path = s.path.join(format!("{key}.json"));
+                if path.exists() {
+                    tokio::fs::remove_file(&path).await?;
+                }
+                Ok(())
+            }
+            Storage::S3(s) => {
+                let s3_key = format!("{}{key}.json", s.prefix);
+                s.client
+                    .delete_object()
+                    .bucket(&s.bucket)
+                    .key(&s3_key)
+                    .send()
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// List all DAG names that have state files.
+    pub async fn list_dags(&self) -> Result<Vec<String>> {
+        match self {
+            Storage::Local(s) => {
+                let mut dags = Vec::new();
+                if !s.path.exists() {
+                    return Ok(dags);
+                }
+                let mut entries = tokio::fs::read_dir(&s.path).await?;
+                while let Some(entry) = entries.next_entry().await? {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if let Some(base) = name.strip_suffix(".json")
+                        && !base.ends_with(".lock")
+                        && let Some(dag_name) = base.strip_prefix(DAG_STATE_PREFIX)
+                    {
+                        dags.push(dag_name.to_string());
+                    }
+                }
+                Ok(dags)
+            }
+            Storage::S3(s) => {
+                let mut dags = Vec::new();
+                let resp = s
+                    .client
+                    .list_objects_v2()
+                    .bucket(&s.bucket)
+                    .prefix(&s.prefix)
+                    .send()
+                    .await?;
+
+                for obj in resp.contents() {
+                    if let Some(key) = obj.key() {
+                        let relative = key.strip_prefix(&s.prefix).unwrap_or(key);
+                        if let Some(base) = relative.strip_suffix(".json")
+                            && !base.ends_with(".lock")
+                            && !base.contains('/')
+                            && let Some(dag_name) = base.strip_prefix(DAG_STATE_PREFIX)
+                        {
+                            dags.push(dag_name.to_string());
+                        }
+                    }
+                }
+                Ok(dags)
             }
         }
     }
@@ -383,7 +531,7 @@ pub async fn get_storage(backend: &StateBackend) -> Result<Storage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yard_structs::Deployment;
+    use yard_structs::{DagDeployment, Deployment};
 
     fn test_job_state(job_name: &str) -> JobState {
         JobState {
@@ -607,5 +755,111 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(storage_path(&storage));
+    }
+
+    // --- DAG state operations ---
+
+    fn test_dag_state(dag_name: &str) -> DagState {
+        DagState {
+            dag_name: dag_name.to_string(),
+            project: "test-project".to_string(),
+            deployment: DagDeployment {
+                content_hash: "daghash123".to_string(),
+                config: serde_json::json!({"schedule": "@daily"}),
+                tasks: vec!["task_a".to_string(), "task_b".to_string()],
+                status: "generated".to_string(),
+                applied_at: "2025-01-01T00:00:00Z".to_string(),
+                s3_uri: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn write_and_read_dag() {
+        let storage = temp_storage("dag_rw");
+        let state = test_dag_state("my_dag");
+
+        storage.write_dag("my_dag", &state).await.unwrap();
+        let loaded = storage.read_dag("my_dag").await.unwrap();
+
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.dag_name, "my_dag");
+        assert_eq!(loaded.deployment.content_hash, "daghash123");
+        assert_eq!(loaded.deployment.tasks, vec!["task_a", "task_b"]);
+
+        let _ = std::fs::remove_dir_all(storage_path(&storage));
+    }
+
+    #[tokio::test]
+    async fn read_nonexistent_dag_returns_none() {
+        let storage = temp_storage("dag_noexist");
+        std::fs::create_dir_all(storage_path(&storage)).unwrap();
+
+        let loaded = storage.read_dag("nope").await.unwrap();
+        assert!(loaded.is_none());
+
+        let _ = std::fs::remove_dir_all(storage_path(&storage));
+    }
+
+    #[tokio::test]
+    async fn delete_dag_removes_file() {
+        let storage = temp_storage("dag_del");
+        let state = test_dag_state("doomed_dag");
+
+        storage.write_dag("doomed_dag", &state).await.unwrap();
+        assert!(storage.read_dag("doomed_dag").await.unwrap().is_some());
+
+        storage.delete_dag("doomed_dag").await.unwrap();
+        assert!(storage.read_dag("doomed_dag").await.unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(storage_path(&storage));
+    }
+
+    #[tokio::test]
+    async fn list_dags_finds_all() {
+        let storage = temp_storage("dag_list");
+        storage
+            .write_dag("dag_alpha", &test_dag_state("dag_alpha"))
+            .await
+            .unwrap();
+        storage
+            .write_dag("dag_beta", &test_dag_state("dag_beta"))
+            .await
+            .unwrap();
+
+        let mut dags = storage.list_dags().await.unwrap();
+        dags.sort();
+        assert_eq!(dags, vec!["dag_alpha", "dag_beta"]);
+
+        let _ = std::fs::remove_dir_all(storage_path(&storage));
+    }
+
+    #[tokio::test]
+    async fn list_jobs_excludes_dags() {
+        let storage = temp_storage("dag_excl");
+        storage
+            .write_job("real_job", &test_job_state("real_job"))
+            .await
+            .unwrap();
+        storage
+            .write_dag("my_dag", &test_dag_state("my_dag"))
+            .await
+            .unwrap();
+
+        let jobs = storage.list_jobs().await.unwrap();
+        assert_eq!(jobs, vec!["real_job"]);
+
+        let dags = storage.list_dags().await.unwrap();
+        assert_eq!(dags, vec!["my_dag"]);
+
+        let _ = std::fs::remove_dir_all(storage_path(&storage));
+    }
+
+    #[tokio::test]
+    async fn list_dags_empty_dir() {
+        let storage = temp_storage("dag_empty");
+        let dags = storage.list_dags().await.unwrap();
+        assert!(dags.is_empty());
     }
 }

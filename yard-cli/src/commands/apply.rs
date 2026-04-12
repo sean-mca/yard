@@ -16,7 +16,16 @@ pub async fn execute(
         diffs.retain(|d| &d.name == name);
     }
 
-    if diffs.is_empty() {
+    // Also compute DAG diffs for the plan display
+    let dags = yard_core::airflow_dag::collect_dags(&project.root_dir, &project.manifest)?;
+    let dag_state = yard_core::load_dag_state(&project.manifest.state).await?;
+    let mut dag_diffs = yard_core::calculate_dag_diffs(&project.manifest, &dags, &dag_state)?;
+
+    if let Some(ref name) = target {
+        dag_diffs.retain(|d| &d.name == name);
+    }
+
+    if diffs.is_empty() && dag_diffs.is_empty() {
         println!("No changes to apply.");
         return Ok(());
     }
@@ -53,6 +62,32 @@ pub async fn execute(
                 println!(
                     "{}",
                     color_delete(&format!("  - Delete job [{}]", diff.name))
+                );
+            }
+        }
+    }
+
+    for diff in &dag_diffs {
+        match &diff.diff_type {
+            yard_structs::DiffType::Create => {
+                println!(
+                    "{}",
+                    color_create(&format!("  + Create DAG [{}]", diff.name))
+                );
+            }
+            yard_structs::DiffType::Modify { changes } => {
+                println!(
+                    "{}",
+                    color_modify(&format!("  ~ Modify DAG [{}]", diff.name))
+                );
+                for (key, (old, new)) in changes {
+                    println!("      {} : {} -> {}", key, old, new);
+                }
+            }
+            yard_structs::DiffType::Delete => {
+                println!(
+                    "{}",
+                    color_delete(&format!("  - Delete DAG [{}]", diff.name))
                 );
             }
         }
@@ -98,6 +133,15 @@ pub async fn execute(
     }
     for name in &result.deleted {
         println!("{}", color_delete(&format!("  - Deleted: {}", name)));
+    }
+    for name in &result.dag_created {
+        println!("{}", color_create(&format!("  + Created DAG: {}", name)));
+    }
+    for name in &result.dag_modified {
+        println!("{}", color_modify(&format!("  ~ Modified DAG: {}", name)));
+    }
+    for name in &result.dag_deleted {
+        println!("{}", color_delete(&format!("  - Deleted DAG: {}", name)));
     }
 
     println!("\nState updated successfully.");

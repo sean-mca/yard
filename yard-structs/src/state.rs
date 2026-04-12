@@ -48,3 +48,27 @@ pub struct LockInfo {
     pub who: String,
     pub created_at: String,
 }
+
+/// Deployed state of a single Airflow DAG file.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct DagDeployment {
+    /// blake3 hash of the generated DAG Python content.
+    pub content_hash: String,
+    /// Serialized AirflowSection for diffing config changes.
+    pub config: serde_json::Value,
+    /// Task names in the DAG at time of deploy.
+    pub tasks: Vec<String>,
+    /// `"generated"` (local only) or `"deployed"` (uploaded to S3).
+    pub status: String,
+    pub applied_at: String,
+    /// S3 URI where the DAG file was uploaded, if any.
+    pub s3_uri: Option<String>,
+}
+
+/// Per-DAG state file, stored as `_dag_<dag_name>.json` in the state directory.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DagState {
+    pub dag_name: String,
+    pub project: String,
+    pub deployment: DagDeployment,
+}

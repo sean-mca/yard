@@ -525,6 +525,33 @@ fn python_string_literal(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
+/// Validate that no job has an `airflow:` block while living outside any DAG
+/// directory. Such blocks are meaningless without a DAG context.
+pub fn validate_orphan_airflow_blocks(
+    manifest: &ProjectManifest,
+    dags: &[ResolvedDag],
+) -> Vec<(String, String)> {
+    // Collect all job names that participate in at least one DAG
+    let dag_tasks: BTreeSet<&str> = dags
+        .iter()
+        .flat_map(|d| d.tasks.iter().map(|s| s.as_str()))
+        .collect();
+
+    let mut errors = Vec::new();
+    for (job_name, job_def) in &manifest.jobs {
+        if job_def.airflow.is_some() && !dag_tasks.contains(job_name.as_str()) {
+            errors.push((
+                job_name.clone(),
+                format!(
+                    "Job \"{job_name}\" has an airflow: block but is not inside a DAG directory \
+                     (no ancestor dag.yaml found). Remove the airflow: block or add a dag.yaml."
+                ),
+            ));
+        }
+    }
+    errors
+}
+
 // ------------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------------
@@ -936,5 +963,61 @@ mod tests {
         let dags = collect_dags(root, &manifest).unwrap();
         let script = generate_dag(&manifest, &dags[0]).unwrap();
         assert!(validate_python_syntax(&script).is_none(), "{script}");
+    }
+
+    // ---- orphan airflow block validation ----
+
+    #[test]
+    fn orphan_airflow_block_detected() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+
+        // dag_dir with a dag.yaml
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        // task_a is inside the DAG dir — fine
+        let mut task_a = bash_job("echo a", &dag_dir);
+        task_a.airflow = Some(AirflowJobBlock::default());
+
+        // orphan_job has an airflow block but lives outside any DAG dir
+        let orphan_dir = root.join("standalone");
+        std::fs::create_dir_all(&orphan_dir).unwrap();
+        let mut orphan = bash_job("echo orphan", &orphan_dir);
+        orphan.airflow = Some(AirflowJobBlock::default());
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("task_a".to_string(), task_a);
+        manifest
+            .jobs
+            .insert("orphan_job".to_string(), orphan);
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let errors = validate_orphan_airflow_blocks(&manifest, &dags);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, "orphan_job");
+    }
+
+    #[test]
+    fn no_orphan_when_all_in_dag() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut task_a = bash_job("echo a", &dag_dir);
+        task_a.airflow = Some(AirflowJobBlock::default());
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("task_a".to_string(), task_a);
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let errors = validate_orphan_airflow_blocks(&manifest, &dags);
+        assert!(errors.is_empty());
     }
 }
