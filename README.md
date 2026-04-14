@@ -133,3 +133,16 @@ Provider system is trait-based. Adding a new provider means implementing the `Pr
 - [Root config (yard.yaml)](docs/config.md) -- state backends, provider defaults
 - [Airflow DAGs](docs/airflow.md) -- DAG generation, MWAA setup, operator mapping
 - [yard-server](docs/server.md) -- dashboard setup, webhooks, drift detection
+
+
+## AI Disclosure
+Claude was used as follows:
+- yard-server 
+    - UI creation as I'm horrible at FE but wanted to try Dioxus
+- Documentation: This README & `docs/**`
+- General: a partner "architect"
+    - example: "I think I want to design feature X like this, give me pros, cons, and any critical issues"
+- General: repeating work I had already done
+    - example: "I wrote the initial commands in yard-cli/src/parser.rs, and would ask Claude to fill in new ones by copying what I did"
+- General: helping me find tech debt early
+    - example: "Find everywhere where I forgot to get rid of `unwrap()`"
