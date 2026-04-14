@@ -123,8 +123,6 @@ airflow:
     - enrich-orders
 ```
 
-This is how YARD complements dbt: Glue/EMR tasks handle the heavy Spark work (extraction, joins, format conversion), then a bash task kicks off dbt to run the SQL transforms downstream. The full pipeline -- ingest, enrich, model -- lives in one DAG.
-
 ## Dependencies
 
 Use `depends_on` in the per-job `airflow:` block to declare task ordering. Values are filenames (minus `.yaml`) of sibling jobs in the same DAG directory:
