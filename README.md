@@ -143,6 +143,6 @@ Claude was used as follows:
 - General: a partner "architect"
     - example: "I think I want to design feature X like this, give me pros, cons, and any critical issues"
 - General: repeating work I had already done
-    - example: "I wrote the initial commands in yard-cli/src/parser.rs, and would ask Claude to fill in new ones by copying what I did"
+    - example: I wrote the initial commands in yard-cli/src/parser.rs, and would ask Claude to fill in new ones by copying what I did
 - General: helping me find tech debt early
     - example: "Find all of the `unwrap()`s I missed"
