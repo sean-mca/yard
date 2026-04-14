@@ -8,9 +8,9 @@
 
 Declarative infrastructure for data pipelines. Define ETL jobs in YAML, and YARD generates the PySpark scripts, manages state, and deploys to AWS. Think Terragrunt, but for data engineering.
 
-🚧 IMPORTANT 🚧
+## Status
 
-Status: Early and actively developed. The Glue provider works end-to-end (plan / apply / destroy / show / validate), local and S3 state backends both work, and the SQL and external-script escape hatches are functional. No releases yet, no stability guarantees, and the Databricks provider is planned but not started. Expect rough edges.
+Early and actively developed. The Glue provider works end-to-end (plan / apply / destroy / show / validate), local and S3 state backends both work, and the SQL and external-script escape hatches are functional. No releases yet, no stability guarantees, and the Databricks provider is planned but not started. Expect rough edges.
 
 ## Why YARD?
 
