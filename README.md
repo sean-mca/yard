@@ -8,6 +8,8 @@
 
 Declarative infrastructure for data pipelines. Define ETL jobs in YAML, and YARD generates the PySpark scripts, manages state, and deploys to AWS. Think Terragrunt, but for data engineering.
 
+🚧 still under development 🚧
+
 ## Why YARD?
 
 Most data teams manage Glue jobs, EMR steps, and Airflow DAGs through a mix of Terraform, custom scripts, and ClickOps. When someone leaves, the knowledge of how things are wired together leaves with them.
