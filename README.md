@@ -145,4 +145,4 @@ Claude was used as follows:
 - General: repeating work I had already done
     - example: "I wrote the initial commands in yard-cli/src/parser.rs, and would ask Claude to fill in new ones by copying what I did"
 - General: helping me find tech debt early
-    - example: "Find everywhere where I forgot to get rid of `unwrap()`"
+    - example: "Find all of the `unwrap()`s I missed"
