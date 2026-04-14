@@ -409,7 +409,7 @@ pub fn validate_config(config: &serde_json::Value, errors: &mut Vec<ValidationEr
     }
 
     if let Some(v) = config.get("glue_version").and_then(|v| v.as_str())
-        && !["3.0", "4.0"].contains(&v)
+        && !["3.0", "4.0", "5.0"].contains(&v)
     {
         errors.push(validation_err(
             "glue.glue_version",
