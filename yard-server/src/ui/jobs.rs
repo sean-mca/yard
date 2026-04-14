@@ -300,6 +300,7 @@ fn JobSheet(mut job: Signal<Option<JobInfo>>) -> Element {
         Sheet {
             open: is_open,
             title,
+            width: "w-[640px]".to_string(),
             on_close: move |_| job.set(None),
             if !path.is_empty() {
                 div { class: "px-5 py-3 border-b border-zinc-100 dark:border-zinc-800",
@@ -424,4 +425,3 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
-
