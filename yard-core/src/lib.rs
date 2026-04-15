@@ -421,18 +421,16 @@ pub async fn apply(
     apply_result
 }
 
-/// Prepare the state backend for use. Local: creates the state directory.
-/// S3: runs a `head_bucket` to validate credentials and bucket existence.
+/// Validate the state backend is reachable. Local: no-op (dirs are created
+/// lazily on first write). S3: runs `head_bucket` to validate credentials and
+/// bucket existence.
 pub async fn init_state_backend(
     backend: &yard_structs::StateBackend,
     aws_cfg: Option<&Value>,
 ) -> Result<()> {
     match backend {
         yard_structs::StateBackend::Local { path } => {
-            tokio::fs::create_dir_all(path)
-                .await
-                .with_context(|| format!("Failed to create state dir {}", path.display()))?;
-            println!("Initialized state at {}", path.display());
+            println!("Local state backend at {}", path.display());
         }
         yard_structs::StateBackend::S3 { bucket, region, .. } => {
             let config = providers::aws_config(region, aws_cfg).await;
