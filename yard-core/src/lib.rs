@@ -44,18 +44,23 @@ pub fn build_provider_config(
 
 /// Merge provider-level defaults with job-level overrides.
 /// Provider config from yard.yaml is the base, job-level block wins on conflicts.
+/// Recurses into nested objects so a job overriding a single key of a nested
+/// map (e.g. `glue.default_arguments.--job-language`) preserves the sibling
+/// keys the provider defined. Arrays and scalars are replaced wholesale.
 pub fn merge_provider_config(provider_defaults: &Value, job_overrides: &Value) -> Value {
     match (provider_defaults, job_overrides) {
         (Value::Object(base), Value::Object(overrides)) => {
             let mut merged = base.clone();
             for (key, val) in overrides {
-                merged.insert(key.clone(), val.clone());
+                let next = match merged.get(key) {
+                    Some(existing) => merge_provider_config(existing, val),
+                    None => val.clone(),
+                };
+                merged.insert(key.clone(), next);
             }
             Value::Object(merged)
         }
-        // If job overrides exist but aren't an object, just use defaults
         (_, Value::Null) => provider_defaults.clone(),
-        // If defaults aren't an object, just use overrides
         _ => job_overrides.clone(),
     }
 }
@@ -1712,6 +1717,65 @@ mod tests {
         let defaults = json!({"worker_type": "G.1X", "number_of_workers": 2});
         let merged = merge_provider_config(&defaults, &Value::Null);
         assert_eq!(merged, defaults);
+    }
+
+    #[test]
+    fn merge_provider_config_deep_merges_nested_maps() {
+        // Job overrides one key of a nested map; siblings must survive.
+        let defaults = json!({
+            "default_arguments": {
+                "--enable-metrics": "true",
+                "--job-language": "python",
+                "--TempDir": "s3://temp/"
+            }
+        });
+        let overrides = json!({
+            "default_arguments": {
+                "--job-language": "scala"
+            }
+        });
+        let merged = merge_provider_config(&defaults, &overrides);
+        assert_eq!(merged["default_arguments"]["--job-language"], "scala");
+        assert_eq!(merged["default_arguments"]["--enable-metrics"], "true");
+        assert_eq!(merged["default_arguments"]["--TempDir"], "s3://temp/");
+    }
+
+    #[test]
+    fn merge_provider_config_arrays_are_replaced() {
+        // Arrays overlay-replace rather than concatenate — keeps semantics
+        // predictable (use `key: null` or re-declare the full list to clear).
+        let defaults = json!({"connections": ["conn-a", "conn-b"]});
+        let overrides = json!({"connections": ["conn-c"]});
+        let merged = merge_provider_config(&defaults, &overrides);
+        assert_eq!(merged["connections"], json!(["conn-c"]));
+    }
+
+    #[test]
+    fn merge_provider_config_scalar_overrides_nested() {
+        // If a job redeclares a nested map as a scalar (or vice-versa),
+        // override wins — we don't try to reconcile mismatched shapes.
+        let defaults = json!({"tags": {"team": "data"}});
+        let overrides = json!({"tags": "none"});
+        let merged = merge_provider_config(&defaults, &overrides);
+        assert_eq!(merged["tags"], "none");
+    }
+
+    #[test]
+    fn merge_provider_config_adds_new_nested_keys() {
+        let defaults = json!({"default_arguments": {"--a": "1"}});
+        let overrides = json!({"default_arguments": {"--b": "2"}});
+        let merged = merge_provider_config(&defaults, &overrides);
+        assert_eq!(merged["default_arguments"]["--a"], "1");
+        assert_eq!(merged["default_arguments"]["--b"], "2");
+    }
+
+    #[test]
+    fn merge_provider_config_recurses_multiple_levels() {
+        let defaults = json!({"a": {"b": {"c": 1, "d": 2}}});
+        let overrides = json!({"a": {"b": {"c": 99}}});
+        let merged = merge_provider_config(&defaults, &overrides);
+        assert_eq!(merged["a"]["b"]["c"], 99);
+        assert_eq!(merged["a"]["b"]["d"], 2);
     }
 
     // --- is_task_only ---
