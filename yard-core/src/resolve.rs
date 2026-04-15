@@ -151,7 +151,26 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
             .first()
             .ok_or_else(|| anyhow!("Job file {} is empty", file_name))?;
 
-        let job_name = file_name.replace(".yaml", "");
+        let base_name = file_name.replace(".yaml", "");
+        let folder = job_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string());
+        let env = {
+            let mut parts = Vec::new();
+            for comp in job_dir.components() {
+                parts.push(comp.as_os_str().to_string_lossy().to_string());
+            }
+            parts
+                .iter()
+                .position(|p| p == "envs")
+                .and_then(|i| parts.get(i + 1).cloned())
+        };
+        let job_name = [env, folder, Some(base_name)]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("-");
         let job_type = job_doc["type"]
             .as_str()
             .ok_or_else(|| {
