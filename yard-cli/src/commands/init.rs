@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::path::PathBuf;
 
 const STARTER_YAML: &str = "\
@@ -23,13 +23,19 @@ pub async fn execute(directory: Option<String>) -> Result<()> {
 
     let manifest_path = base_path.join("yard.yaml");
     if manifest_path.exists() {
-        bail!("yard.yaml already exists at {}", manifest_path.display());
+        println!(
+            "{} already exists, skipping scaffold.",
+            manifest_path.display()
+        );
+    } else {
+        tokio::fs::write(&manifest_path, STARTER_YAML)
+            .await
+            .with_context(|| format!("Failed to write {}", manifest_path.display()))?;
+        println!("Created {}", manifest_path.display());
     }
 
-    tokio::fs::write(&manifest_path, STARTER_YAML)
-        .await
-        .with_context(|| format!("Failed to write {}", manifest_path.display()))?;
+    let project = yard_core::resolve::resolve_project(&base_path).await?;
+    yard_core::init_state_backend(&project.manifest.state, Some(&project.manifest.aws)).await?;
 
-    println!("Created {}", manifest_path.display());
     Ok(())
 }

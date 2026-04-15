@@ -421,6 +421,34 @@ pub async fn apply(
     apply_result
 }
 
+/// Prepare the state backend for use. Local: creates the state directory.
+/// S3: runs a `head_bucket` to validate credentials and bucket existence.
+pub async fn init_state_backend(
+    backend: &yard_structs::StateBackend,
+    aws_cfg: Option<&Value>,
+) -> Result<()> {
+    match backend {
+        yard_structs::StateBackend::Local { path } => {
+            tokio::fs::create_dir_all(path)
+                .await
+                .with_context(|| format!("Failed to create state dir {}", path.display()))?;
+            println!("Initialized state at {}", path.display());
+        }
+        yard_structs::StateBackend::S3 { bucket, region, .. } => {
+            let config = providers::aws_config(region, aws_cfg).await;
+            let client = aws_sdk_s3::Client::new(&config);
+            client
+                .head_bucket()
+                .bucket(bucket)
+                .send()
+                .await
+                .with_context(|| format!("Failed to reach S3 bucket {bucket} in {region}"))?;
+            println!("Verified S3 state bucket {bucket} ({region})");
+        }
+    }
+    Ok(())
+}
+
 /// Force-unlock a job. Returns the LockInfo of the previous holder, or None if not locked.
 pub async fn force_unlock(
     backend: &yard_structs::StateBackend,
