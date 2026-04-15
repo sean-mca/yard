@@ -25,7 +25,9 @@ pub struct ProjectManifest {
     pub state: StateBackend,
     /// Per-provider config, keyed by job type (e.g. "glue", "emr").
     /// Each value is the raw provider config block from yard.yaml.
+    #[serde(default)]
     pub providers: HashMap<String, serde_json::Value>,
+    #[serde(default)]
     pub jobs: HashMap<String, JobDefinition>,
     /// Root-level `aws:` block from yard.yaml. Controls yard's own AWS
     /// credentials (AssumeRole target, session name, external id, region).

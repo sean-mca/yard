@@ -421,44 +421,6 @@ pub async fn apply(
     apply_result
 }
 
-/// Initialize per-job state files. Skips jobs that already have state.
-pub async fn init(manifest: &ProjectManifest) -> Result<()> {
-    let storage = storage::get_storage(&manifest.state).await?;
-
-    for (name, job_def) in &manifest.jobs {
-        // Skip if state already exists for this job
-        if storage.read_job(name).await?.is_some() {
-            println!("State for job \"{name}\" already exists. Skipping.");
-            continue;
-        }
-
-        let script_content = codegen::generate_python_script(name, job_def)
-            .with_context(|| format!("Failed to generate script for job \"{name}\""))?;
-        let config_str = serde_json::to_string(&job_def.config)
-            .with_context(|| format!("Failed to serialize config for job \"{name}\""))?;
-        let combined = format!("{script_content}\n{config_str}");
-        let script_hash = utils::calculate_hash(&combined);
-
-        let job_state = JobState {
-            job_name: name.clone(),
-            project: manifest.project.clone(),
-            deployment: Deployment {
-                env: Some("default".to_string()),
-                config_hash: script_hash,
-                config: job_def.config.clone(),
-                status: "initialized".to_string(),
-                applied_at: chrono::Utc::now().to_rfc3339(),
-                resources: Vec::new(),
-            },
-        };
-
-        storage.write_job(name, &job_state).await?;
-        println!("Initialized state for job \"{name}\".");
-    }
-
-    Ok(())
-}
-
 /// Force-unlock a job. Returns the LockInfo of the previous holder, or None if not locked.
 pub async fn force_unlock(
     backend: &yard_structs::StateBackend,
