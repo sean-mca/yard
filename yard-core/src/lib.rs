@@ -421,8 +421,8 @@ pub async fn apply(
     apply_result
 }
 
-/// Validate the state backend is reachable. Local: no-op (dirs are created
-/// lazily on first write). S3: runs `head_bucket` to validate credentials and
+/// Validate the state backend is reachable. Local: creates the state directory
+/// if it doesn't exist. S3: runs `head_bucket` to validate credentials and
 /// bucket existence.
 pub async fn init_state_backend(
     backend: &yard_structs::StateBackend,
@@ -430,7 +430,10 @@ pub async fn init_state_backend(
 ) -> Result<()> {
     match backend {
         yard_structs::StateBackend::Local { path } => {
-            println!("Local state backend at {}", path.display());
+            tokio::fs::create_dir_all(path)
+                .await
+                .with_context(|| format!("Failed to create state dir {}", path.display()))?;
+            println!("Initialized state at {}", path.display());
         }
         yard_structs::StateBackend::S3 { bucket, region, .. } => {
             let config = providers::aws_config(region, aws_cfg).await;
@@ -1333,7 +1336,7 @@ mod tests {
         let manifest = ProjectManifest {
             project: "test".to_string(),
             state: StateBackend::Local {
-                path: ".yard/state.json".into(),
+                path: ".yard/state".into(),
             },
             providers: HashMap::new(),
             jobs: HashMap::from([("new_job".to_string(), job)]),
@@ -1359,7 +1362,7 @@ mod tests {
         let manifest = ProjectManifest {
             project: "test".to_string(),
             state: StateBackend::Local {
-                path: ".yard/state.json".into(),
+                path: ".yard/state".into(),
             },
             providers: HashMap::new(),
             jobs: HashMap::new(),
@@ -1389,7 +1392,7 @@ mod tests {
         let manifest = ProjectManifest {
             project: "test".to_string(),
             state: StateBackend::Local {
-                path: ".yard/state.json".into(),
+                path: ".yard/state".into(),
             },
             providers: HashMap::new(),
             jobs: HashMap::from([("stable".to_string(), job)]),
@@ -1451,7 +1454,7 @@ mod tests {
         let manifest = ProjectManifest {
             project: "test".to_string(),
             state: StateBackend::Local {
-                path: ".yard/state.json".into(),
+                path: ".yard/state".into(),
             },
             providers: HashMap::new(),
             jobs: HashMap::from([("my_job".to_string(), new_job)]),
@@ -1490,7 +1493,7 @@ mod tests {
         let manifest = ProjectManifest {
             project: "test".to_string(),
             state: StateBackend::Local {
-                path: ".yard/state.json".into(),
+                path: ".yard/state".into(),
             },
             providers: HashMap::new(),
             jobs: HashMap::from([
