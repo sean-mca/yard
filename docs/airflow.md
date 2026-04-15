@@ -20,6 +20,8 @@ providers:
 
 ## Directory layout
 
+Any directory depth works — group DAGs into sub-folders under a region to keep the repo tidy.
+
 ```
 my-project/
   yard.yaml
@@ -28,12 +30,22 @@ my-project/
       account.yaml
       us-east-2/
         region.yaml
-        orders-pipeline/
-          dag.yaml              # DAG marker -- makes this directory a DAG
-          ingest-orders.yaml    # Task: Glue job (extract raw data)
-          enrich-orders.yaml    # Task: Glue job (join + transform)
-          run-dbt.yaml          # Task: bash command (run dbt models)
+        analytics/                   # grouping folder (no dag.yaml here)
+          orders-pipeline/
+            dag.yaml                 # DAG marker -- makes this directory a DAG
+            ingest-orders.yaml       # Task: Glue job
+            enrich-orders.yaml       # Task: Glue job
+            run-dbt.yaml             # Task: bash command
+          refunds-pipeline/
+            dag.yaml
+            ingest-refunds.yaml
+        finance/                     # another group, same region
+          orders-pipeline/
+            dag.yaml                 # distinct DAG, no name collision
+            ...
 ```
+
+DAG names include the relative path from the project root, so same-named DAG directories in different groups don't collide. Path separators become underscores: `my_project_aws_dev_us_east_2_analytics_orders_pipeline`.
 
 The `dag.yaml` file marks a directory as a DAG. It can be empty or contain DAG-level overrides:
 
@@ -152,7 +164,7 @@ Shallow merge at each level -- later values win. At most one job per DAG may dec
 
 ## Generated output
 
-YARD generates a Python file per DAG and uploads it to `s3://{dags_bucket}/{dags_prefix}/{dag_name}.py`. DAGs are named `{project}_{sanitized_directory_path}`.
+YARD generates a Python file per DAG and uploads it to `s3://{dags_bucket}/{dags_prefix}{dag_name}.py`. DAG name = `{project}_{sanitized_relative_path_from_project_root}` so grouping folders appear in the DAG id.
 
 Example generated DAG:
 

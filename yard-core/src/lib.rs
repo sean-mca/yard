@@ -24,6 +24,24 @@ pub fn is_task_only(job_type: &str) -> bool {
     matches!(job_type, "bash")
 }
 
+/// Build the `Value` passed to `get_provider`: provider defaults shallow-
+/// merged with the job's `<job_type>:` block, plus the per-job `_aws` block
+/// (resolved at discovery time) injected alongside.
+pub fn build_provider_config(
+    provider_defaults: &Value,
+    full_config: &Value,
+    job_type: &str,
+) -> Value {
+    let job_overrides = full_config.get(job_type).cloned().unwrap_or(Value::Null);
+    let mut merged = merge_provider_config(provider_defaults, &job_overrides);
+    if let Some(aws) = full_config.get("_aws")
+        && let Some(obj) = merged.as_object_mut()
+    {
+        obj.insert("_aws".to_string(), aws.clone());
+    }
+    merged
+}
+
 /// Merge provider-level defaults with job-level overrides.
 /// Provider config from yard.yaml is the base, job-level block wins on conflicts.
 pub fn merge_provider_config(provider_defaults: &Value, job_overrides: &Value) -> Value {
@@ -103,14 +121,7 @@ pub async fn verify_deployed_resources(
             None => continue,
         };
 
-        // Merge provider defaults with job-level overrides (same logic as apply)
-        let job_overrides = deployment
-            .config
-            .get(job_type)
-            .unwrap_or(&Value::Null)
-            .clone();
-        let merged_config = merge_provider_config(provider_defaults, &job_overrides);
-
+        let merged_config = build_provider_config(provider_defaults, &deployment.config, job_type);
         let provider = providers::get_provider(job_type, &merged_config).await?;
         let statuses = provider
             .verify_resources(job_name, &deployment.resources)
@@ -294,14 +305,11 @@ pub async fn apply(
                     } else if let Some(provider_defaults) =
                         manifest.providers.get(&job_def.job_type)
                     {
-                        let job_overrides = job_def
-                            .config
-                            .get(&job_def.job_type)
-                            .unwrap_or(&Value::Null)
-                            .clone();
-                        let merged_config =
-                            merge_provider_config(provider_defaults, &job_overrides);
-
+                        let merged_config = build_provider_config(
+                            provider_defaults,
+                            &job_def.config,
+                            &job_def.job_type,
+                        );
                         let provider =
                             providers::get_provider(&job_def.job_type, &merged_config).await?;
                         provider
@@ -358,13 +366,8 @@ pub async fn apply(
                             })?;
 
                         if let Some(provider_defaults) = manifest.providers.get(job_type) {
-                            let job_overrides = existing
-                                .config
-                                .get(job_type)
-                                .unwrap_or(&Value::Null)
-                                .clone();
                             let merged_config =
-                                merge_provider_config(provider_defaults, &job_overrides);
+                                build_provider_config(provider_defaults, &existing.config, job_type);
                             let provider =
                                 providers::get_provider(job_type, &merged_config).await?;
                             provider.destroy(&diff.name, &existing.resources).await?;
@@ -503,13 +506,8 @@ pub async fn destroy_job(
                 .ok_or_else(|| anyhow!("Job '{}' state is missing a 'type' field", job_name))?;
 
             if let Some(provider_defaults) = provider_configs.get(job_type) {
-                let job_overrides = job_state
-                    .deployment
-                    .config
-                    .get(job_type)
-                    .unwrap_or(&Value::Null)
-                    .clone();
-                let merged_config = merge_provider_config(provider_defaults, &job_overrides);
+                let merged_config =
+                    build_provider_config(provider_defaults, &job_state.deployment.config, job_type);
                 let provider = providers::get_provider(job_type, &merged_config).await?;
                 provider
                     .destroy(job_name, &job_state.deployment.resources)
@@ -542,6 +540,7 @@ pub async fn destroy_job(
 pub async fn destroy_all(
     backend: &yard_structs::StateBackend,
     provider_configs: &HashMap<String, Value>,
+    aws: &Value,
     root_dir: &Path,
     dry_run: bool,
 ) -> Result<DestroyResult> {
@@ -559,7 +558,7 @@ pub async fn destroy_all(
     }
 
     // Also destroy all DAGs
-    let dag_result = destroy_all_dags(backend, provider_configs, root_dir, dry_run).await?;
+    let dag_result = destroy_all_dags(backend, provider_configs, aws, root_dir, dry_run).await?;
     result.dags_destroyed = dag_result.destroyed;
 
     Ok(result)
@@ -782,14 +781,28 @@ async fn upload_dag_to_s3(
         .as_deref()
         .unwrap_or("dags/");
 
+    let aws_cfg = resolve_aws_for_dir(&manifest.aws, &dag.dir);
     let s3_ops = providers::S3ScriptOps {
-        s3_client: aws_sdk_s3::Client::new(&providers::aws_config(&region).await),
+        s3_client: aws_sdk_s3::Client::new(
+            &providers::aws_config(&region, Some(&aws_cfg)).await,
+        ),
         script_bucket: bucket.clone(),
         script_prefix: prefix.to_string(),
     };
 
     let uri = s3_ops.upload_script(&dag.name, content).await?;
     Ok(Some(uri))
+}
+
+/// Merge the root `aws:` block with the nearest-ancestor `account.yaml` `aws:`
+/// override found at or above `dir`. Mirrors the cascade done at discovery
+/// time so DAG uploads/deletes respect account-level overrides.
+fn resolve_aws_for_dir(root_aws: &Value, dir: &Path) -> Value {
+    let account_aws = resolve::find_and_parse_context(dir, "account.yaml", false)
+        .ok()
+        .and_then(|v| v.get("aws").cloned())
+        .unwrap_or(Value::Null);
+    merge_provider_config(root_aws, &account_aws)
 }
 
 /// Delete a DAG file from S3.
@@ -812,8 +825,12 @@ async fn delete_dag_from_s3(
     let region = extract_airflow_region(manifest)?;
     let prefix = section.dags_prefix.as_deref().unwrap_or("dags/");
 
+    // Destroy path runs without the DAG's source dir (state-only), so
+    // account.yaml overrides can't be re-resolved here — root `aws:` applies.
     let s3_ops = providers::S3ScriptOps {
-        s3_client: aws_sdk_s3::Client::new(&providers::aws_config(&region).await),
+        s3_client: aws_sdk_s3::Client::new(
+            &providers::aws_config(&region, Some(&manifest.aws)).await,
+        ),
         script_bucket: bucket.clone(),
         script_prefix: prefix.to_string(),
     };
@@ -848,6 +865,7 @@ pub struct DagDestroyResult {
 pub async fn destroy_dag(
     backend: &yard_structs::StateBackend,
     provider_configs: &HashMap<String, Value>,
+    aws: &Value,
     dag_name: &str,
     root_dir: &Path,
     dry_run: bool,
@@ -878,7 +896,7 @@ pub async fn destroy_dag(
 
                 let s3_ops = providers::S3ScriptOps {
                     s3_client: aws_sdk_s3::Client::new(
-                        &providers::aws_config(region).await,
+                        &providers::aws_config(region, Some(aws)).await,
                     ),
                     script_bucket: bucket.clone(),
                     script_prefix: prefix.to_string(),
@@ -910,6 +928,7 @@ pub async fn destroy_dag(
 pub async fn destroy_all_dags(
     backend: &yard_structs::StateBackend,
     provider_configs: &HashMap<String, Value>,
+    aws: &Value,
     root_dir: &Path,
     dry_run: bool,
 ) -> Result<DagDestroyResult> {
@@ -920,7 +939,7 @@ pub async fn destroy_all_dags(
     };
 
     for name in dag_names {
-        if destroy_dag(backend, provider_configs, &name, root_dir, dry_run).await? {
+        if destroy_dag(backend, provider_configs, aws, &name, root_dir, dry_run).await? {
             result.destroyed.push(name);
         }
     }
@@ -1036,6 +1055,32 @@ pub fn merge_airflow_sections(base: &AirflowSection, overlay: &AirflowSection) -
 }
 
 /// Extract imports from a job config's "imports" array.
+pub fn parse_partition_by(config: &Value) -> Vec<String> {
+    config
+        .get("partition_by")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn parse_partition_timestamp_column(config: &Value) -> Option<String> {
+    config
+        .get("partition_timestamp_column")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+pub fn parse_create_timestamp(config: &Value) -> bool {
+    config
+        .get("create_timestamp")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 pub fn parse_imports(config: &Value) -> Vec<Import> {
     let mut imports = Vec::new();
     if let Some(arr) = config.get("imports").and_then(|v| v.as_array()) {
@@ -1100,6 +1145,21 @@ fn str_map_field(obj: &Value, key: &str) -> HashMap<String, String> {
 }
 
 fn parse_single_source(src: &Value, default_name: &str) -> Option<Source> {
+    let headers = src
+        .get("headers")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let options = src
+        .get("options")
+        .and_then(|v| v.as_object())
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+
     Some(Source {
         name: str_field(src, "name").unwrap_or_else(|| default_name.to_string()),
         source_type: src.get("type")?.as_str()?.to_string(),
@@ -1109,6 +1169,12 @@ fn parse_single_source(src: &Value, default_name: &str) -> Option<Source> {
         table: str_field(src, "table"),
         database: str_field(src, "database"),
         secret_id: str_field(src, "secret_id"),
+        engine: str_field(src, "engine"),
+        connection_type: str_field(src, "connection_type"),
+        topic: str_field(src, "topic"),
+        url: str_field(src, "url"),
+        headers,
+        options,
     })
 }
 
@@ -1145,6 +1211,7 @@ pub fn parse_sink(config: &Value) -> Option<Sink> {
         secret_id: str_field(snk, "secret_id"),
         mode: str_field(snk, "mode"),
         partition_by: str_array_field(snk, "partition_by"),
+        fill_nulls: snk.get("fill_nulls").and_then(|v| v.as_bool()),
     })
 }
 
@@ -1237,6 +1304,9 @@ mod tests {
             sink,
             transforms,
             airflow,
+            partition_by: Vec::new(),
+            partition_timestamp_column: None,
+            create_timestamp: false,
             config,
             dir: std::path::PathBuf::new(),
         }
@@ -1279,6 +1349,7 @@ mod tests {
             },
             providers: HashMap::new(),
             jobs: HashMap::from([("new_job".to_string(), job)]),
+            aws: serde_json::Value::Null,
         };
 
         let diffs = calculate_diff(&manifest, &empty_state()).unwrap();
@@ -1304,6 +1375,7 @@ mod tests {
             },
             providers: HashMap::new(),
             jobs: HashMap::new(),
+            aws: serde_json::Value::Null,
         };
 
         let diffs = calculate_diff(&manifest, &state).unwrap();
@@ -1333,6 +1405,7 @@ mod tests {
             },
             providers: HashMap::new(),
             jobs: HashMap::from([("stable".to_string(), job)]),
+            aws: serde_json::Value::Null,
         };
 
         let diffs = calculate_diff(&manifest, &state).unwrap();
@@ -1365,6 +1438,7 @@ mod tests {
             },
             providers: HashMap::new(),
             jobs: HashMap::from([("my_job".to_string(), new_job)]),
+            aws: serde_json::Value::Null,
         };
 
         let diffs = calculate_diff(&manifest, &state).unwrap();
@@ -1393,6 +1467,7 @@ mod tests {
             },
             providers: HashMap::new(),
             jobs: HashMap::from([("my_job".to_string(), new_job)]),
+            aws: serde_json::Value::Null,
         };
 
         let diffs = calculate_diff(&manifest, &state).unwrap();
@@ -1441,6 +1516,7 @@ mod tests {
                     make_job("glue", json!({"type": "glue"})),
                 ),
             ]),
+            aws: serde_json::Value::Null,
         };
 
         let diffs = calculate_diff(&manifest, &state).unwrap();
@@ -1465,6 +1541,7 @@ mod tests {
             },
             providers: HashMap::new(),
             jobs: HashMap::from([("new_job".to_string(), job)]),
+            aws: serde_json::Value::Null,
         };
 
         let result = apply(&manifest, &empty_state(), &dir, true).await.unwrap();
@@ -1502,6 +1579,7 @@ mod tests {
             state: backend.clone(),
             providers: HashMap::new(),
             jobs: HashMap::from([("doomed".to_string(), job)]),
+            aws: serde_json::Value::Null,
         };
 
         // Apply first to create state + script
@@ -1557,6 +1635,7 @@ mod tests {
                     make_job("glue", json!({"type": "glue", "script_name": "b"})),
                 ),
             ]),
+            aws: serde_json::Value::Null,
         };
 
         // Apply both
@@ -1565,7 +1644,7 @@ mod tests {
         assert!(state_dir.join("job_b.json").exists());
 
         // Destroy all
-        let result = destroy_all(&backend, &HashMap::new(), &dir, true)
+        let result = destroy_all(&backend, &HashMap::new(), &Value::Null, &dir, true)
             .await
             .unwrap();
         let mut destroyed = result.destroyed.clone();
@@ -1595,6 +1674,7 @@ mod tests {
             },
             providers: HashMap::new(),
             jobs: HashMap::from([("bad_job".to_string(), bad_job)]),
+            aws: serde_json::Value::Null,
         };
 
         let result = apply(&manifest, &empty_state(), &dir, true).await;
@@ -1822,6 +1902,7 @@ mod tests {
                 "task_a".to_string(),
                 make_job("bash", json!({"type": "bash", "command": "echo hi"})),
             )]),
+            aws: serde_json::Value::Null,
         };
 
         let dag_deployments = HashMap::new();
@@ -1840,6 +1921,7 @@ mod tests {
             },
             providers: HashMap::new(),
             jobs: HashMap::new(),
+            aws: serde_json::Value::Null,
         };
 
         let dag_deployments = HashMap::from([(
@@ -1866,6 +1948,7 @@ mod tests {
                 "task_a".to_string(),
                 make_job("bash", json!({"type": "bash", "command": "echo hi"})),
             )]),
+            aws: serde_json::Value::Null,
         };
 
         // Generate the actual hash that would be produced
@@ -1894,6 +1977,7 @@ mod tests {
                 "task_a".to_string(),
                 make_job("bash", json!({"type": "bash", "command": "echo hi"})),
             )]),
+            aws: serde_json::Value::Null,
         };
 
         // Use a stale hash

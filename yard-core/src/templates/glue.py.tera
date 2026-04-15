@@ -3,7 +3,7 @@
 import sys
 import logging
 from awsglue.utils import getResolvedOptions
-from pyspark.context import SparkContext
+from pyspark.sql import SparkSession
 from awsglue.context import GlueContext
 from awsglue.job import Job
 {{ imports_block }}
@@ -13,9 +13,21 @@ logger.setLevel(logging.INFO)
 
 # --- Glue Setup ---
 args = getResolvedOptions(sys.argv, ['JOB_NAME'])
-sc = SparkContext()
+
+spark = (
+    SparkSession.builder
+{%- if iceberg_warehouse %}
+    .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+    .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+    .config("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+    .config("spark.sql.catalog.glue_catalog.warehouse", "{{ iceberg_warehouse }}")
+{%- endif %}
+    .getOrCreate()
+)
+
+sc = spark.sparkContext
 glueContext = GlueContext(sc)
-spark = glueContext.spark_session
 job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 

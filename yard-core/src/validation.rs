@@ -3,8 +3,11 @@ use std::process::Command;
 use yard_structs::{JobDefinition, ValidationError};
 
 const SUPPORTED_JOB_TYPES: &[&str] = &["glue", "emr", "bash"];
-const SUPPORTED_SOURCE_TYPES: &[&str] = &["s3", "jdbc", "catalog"];
-const SUPPORTED_SINK_TYPES: &[&str] = &["s3", "jdbc", "catalog"];
+const SUPPORTED_SOURCE_TYPES: &[&str] = &["s3", "jdbc", "catalog", "kafka", "api"];
+const VALID_ENGINES: &[&str] = &["spark", "glue"];
+const SUPPORTED_SINK_TYPES: &[&str] = &["s3", "jdbc", "catalog", "iceberg"];
+const VALID_PARTITION_UNITS: &[&str] = &["year", "month", "day"];
+const VALID_ICEBERG_MODES: &[&str] = &["append", "overwrite"];
 const SUPPORTED_TRANSFORM_TYPES: &[&str] = &[
     "filter",
     "sql",
@@ -89,6 +92,30 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
                 if source.table.is_none() {
                     errors.push(err(&prefix.to_string(), "type \"jdbc\" requires \"table\""));
                 }
+                if source.engine.as_deref() == Some("glue")
+                    && source.connection_type.is_none()
+                {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        "type \"jdbc\" with engine \"glue\" requires \"connection_type\" (mysql, postgresql, sqlserver, oracle, redshift)",
+                    ));
+                }
+            }
+            "kafka" => {
+                if source.connection_url.is_none() {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        "type \"kafka\" requires \"connection_url\" (bootstrap servers)",
+                    ));
+                }
+                if source.topic.is_none() {
+                    errors.push(err(&prefix.to_string(), "type \"kafka\" requires \"topic\""));
+                }
+            }
+            "api" => {
+                if source.url.is_none() {
+                    errors.push(err(&prefix.to_string(), "type \"api\" requires \"url\""));
+                }
             }
             "catalog" => {
                 if source.database.is_none() {
@@ -105,6 +132,19 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
                 }
             }
             _ => {}
+        }
+
+        if let Some(engine) = source.engine.as_deref()
+            && !VALID_ENGINES.contains(&engine)
+        {
+            errors.push(err(
+                &format!("{prefix}.engine"),
+                &format!(
+                    "\"{}\" is not a valid engine (expected: {})",
+                    engine,
+                    VALID_ENGINES.join(", ")
+                ),
+            ));
         }
 
         known_names.insert(source.name.clone());
@@ -309,8 +349,72 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
                     errors.push(err("sink", "type \"catalog\" requires \"table\""));
                 }
             }
+            "iceberg" => {
+                if sink.database.is_none() {
+                    errors.push(err("sink", "type \"iceberg\" requires \"database\""));
+                }
+                if sink.table.is_none() {
+                    errors.push(err("sink", "type \"iceberg\" requires \"table\""));
+                }
+                if let Some(mode) = sink.mode.as_deref()
+                    && !VALID_ICEBERG_MODES.contains(&mode)
+                {
+                    errors.push(err(
+                        "sink.mode",
+                        &format!(
+                            "\"{}\" is not valid for iceberg (expected: {})",
+                            mode,
+                            VALID_ICEBERG_MODES.join(", ")
+                        ),
+                    ));
+                }
+            }
             _ => {}
         }
+    }
+
+    // Job-level partition_by (Iceberg only)
+    if !job.partition_by.is_empty() {
+        for p in &job.partition_by {
+            if !VALID_PARTITION_UNITS.contains(&p.as_str()) {
+                errors.push(err(
+                    "partition_by",
+                    &format!(
+                        "\"{}\" is not a valid partition unit (expected: {})",
+                        p,
+                        VALID_PARTITION_UNITS.join(", ")
+                    ),
+                ));
+            }
+        }
+
+        let sink_is_iceberg = job
+            .sink
+            .as_ref()
+            .is_some_and(|s| s.sink_type == "iceberg");
+        if !sink_is_iceberg {
+            errors.push(err(
+                "partition_by",
+                "job-level \"partition_by\" requires an iceberg sink",
+            ));
+        }
+
+        match (job.create_timestamp, &job.partition_timestamp_column) {
+            (true, Some(_)) => errors.push(err(
+                "create_timestamp",
+                "cannot set both \"create_timestamp\" and \"partition_timestamp_column\"",
+            )),
+            (false, None) => errors.push(err(
+                "partition_by",
+                "requires one of \"create_timestamp: true\" or \"partition_timestamp_column\"",
+            )),
+            _ => {}
+        }
+    } else if job.create_timestamp || job.partition_timestamp_column.is_some() {
+        errors.push(err(
+            "partition_by",
+            "\"create_timestamp\" / \"partition_timestamp_column\" require non-empty \"partition_by\"",
+        ));
     }
 
     // Provider-specific config validation — dispatched to provider modules
@@ -494,6 +598,7 @@ mod tests {
                 table: None,
                 database: None,
                 secret_id: None,
+            ..Default::default()
             }],
             sink: Some(Sink {
                 source: None,
@@ -506,6 +611,7 @@ mod tests {
                 secret_id: None,
                 mode: Some("overwrite".to_string()),
                 partition_by: vec![],
+            fill_nulls: None,
             }),
             transforms: vec![Transform {
                 transform_type: "filter".to_string(),
@@ -572,6 +678,7 @@ mod tests {
             table: None,
             database: None,
             secret_id: None,
+            ..Default::default()
         }];
         let errors = validate_job(&job);
         assert!(errors.iter().any(|e| e.field == "sources[0].type"));
@@ -591,6 +698,7 @@ mod tests {
             table: None,
             database: None,
             secret_id: None,
+            ..Default::default()
         }];
         let errors = validate_job(&job);
         assert!(
@@ -612,6 +720,7 @@ mod tests {
             table: None,
             database: None,
             secret_id: None,
+            ..Default::default()
         }];
         let errors = validate_job(&job);
         assert!(
@@ -638,6 +747,7 @@ mod tests {
             table: None,
             database: None,
             secret_id: None,
+            ..Default::default()
         }];
         let errors = validate_job(&job);
         assert!(
@@ -889,6 +999,7 @@ mod tests {
             secret_id: None,
             mode: None,
             partition_by: vec![],
+            fill_nulls: None,
         });
         let errors = validate_job(&job);
         assert!(errors.iter().any(|e| e.field == "sink.type"));
@@ -908,6 +1019,7 @@ mod tests {
             secret_id: None,
             mode: None,
             partition_by: vec![],
+            fill_nulls: None,
         });
         let errors = validate_job(&job);
         assert!(
@@ -931,6 +1043,7 @@ mod tests {
             table: None,
             database: None,
             secret_id: None,
+            ..Default::default()
         }];
         job.transforms = vec![Transform {
             transform_type: "filter".to_string(),
@@ -973,6 +1086,7 @@ mod tests {
             secret_id: None,
             mode: None,
             partition_by: vec![],
+            fill_nulls: None,
         });
         let errors = validate_job(&job);
         assert!(
@@ -994,6 +1108,7 @@ mod tests {
             table: None,
             database: None,
             secret_id: None,
+            ..Default::default()
         }];
         job.transforms = vec![Transform {
             transform_type: "join".to_string(),
@@ -1035,6 +1150,7 @@ mod tests {
                 table: None,
                 database: None,
                 secret_id: None,
+            ..Default::default()
             },
             Source {
                 name: "b".to_string(),
@@ -1045,6 +1161,7 @@ mod tests {
                 table: None,
                 database: None,
                 secret_id: None,
+            ..Default::default()
             },
         ];
         job.transforms = vec![
@@ -1098,6 +1215,7 @@ mod tests {
             secret_id: None,
             mode: None,
             partition_by: vec![],
+            fill_nulls: None,
         });
         let errors = validate_job(&job);
         assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
@@ -1118,6 +1236,7 @@ mod tests {
             table: None,
             database: None,
             secret_id: None,
+            ..Default::default()
         }];
         job.transforms = vec![Transform {
             transform_type: "pivot".to_string(),
@@ -1149,6 +1268,7 @@ mod tests {
             secret_id: None,
             mode: None,
             partition_by: vec![],
+            fill_nulls: None,
         });
         let errors = validate_job(&job);
         assert!(errors.len() >= 3);
@@ -1423,6 +1543,7 @@ mod tests {
             table: None,
             database: None,
             secret_id: None,
+            ..Default::default()
         }];
         let errors = validate_job(&job);
         assert!(errors.iter().any(|e| e.field == "sources"));
@@ -1442,6 +1563,7 @@ mod tests {
             secret_id: None,
             mode: None,
             partition_by: vec![],
+            fill_nulls: None,
         });
         let errors = validate_job(&job);
         assert!(errors.iter().any(|e| e.field == "sink"));

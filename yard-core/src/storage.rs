@@ -509,7 +509,11 @@ pub async fn get_storage(backend: &StateBackend) -> Result<Storage> {
             key,
             region,
         } => {
-            let config = crate::providers::aws_config(region).await;
+            // State backend loads before yard.yaml is fully parsed, so no aws
+            // block is available here — fall through to the default provider
+            // chain. Users who need AssumeRole for state S3 can set
+            // AWS_PROFILE or rely on the Fargate/EC2 task role.
+            let config = crate::providers::aws_config(region, None).await;
             let client = Client::new(&config);
 
             // Ensure prefix ends with `/` so job files are nested under it

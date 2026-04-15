@@ -27,6 +27,13 @@ pub struct ProjectManifest {
     /// Each value is the raw provider config block from yard.yaml.
     pub providers: HashMap<String, serde_json::Value>,
     pub jobs: HashMap<String, JobDefinition>,
+    /// Root-level `aws:` block from yard.yaml. Controls yard's own AWS
+    /// credentials (AssumeRole target, session name, external id, region).
+    /// Per-job and per-DAG account.yaml `aws:` blocks shallow-override this.
+    /// `Value::Null` when not set — providers fall back to the default AWS
+    /// credential provider chain.
+    #[serde(default)]
+    pub aws: serde_json::Value,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -35,19 +42,40 @@ pub struct Import {
     pub from: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct Source {
     pub name: String,                   // variable name: produces df_<name>
-    pub source_type: String,            // s3, jdbc, catalog
+    pub source_type: String,            // s3, jdbc, catalog, kafka, api
     pub format: Option<String>,         // parquet, csv, json, orc
     pub path: Option<String>,           // s3 path
-    pub connection_url: Option<String>, // jdbc
+    pub connection_url: Option<String>, // jdbc url; kafka bootstrap servers
     pub table: Option<String>,          // jdbc or catalog
     pub database: Option<String>,       // catalog
     pub secret_id: Option<String>,      // Secrets Manager secret
+    /// "spark" (SparkSession.read) or "glue" (DynamicFrame). Defaults to the
+    /// provider-level `default_engine` when unset; "spark" if that's also unset.
+    /// Only meaningful for source_types where both paths exist (s3, jdbc).
+    #[serde(default)]
+    pub engine: Option<String>,
+    /// For jdbc+glue: the Glue connector name ("mysql", "postgresql", etc.).
+    #[serde(default)]
+    pub connection_type: Option<String>,
+    /// Kafka topic name.
+    #[serde(default)]
+    pub topic: Option<String>,
+    /// HTTP GET URL for `api` source.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// HTTP headers for `api` source.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Opaque passthrough to `.option()` (spark engine) or `connection_options`
+    /// (glue engine). Values are rendered as Python literals.
+    #[serde(default)]
+    pub options: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct Sink {
     pub source: Option<String>, // which df to write (defaults to first/only source)
     pub sink_type: String,      // s3, jdbc, catalog
@@ -59,6 +87,11 @@ pub struct Sink {
     pub secret_id: Option<String>, // Secrets Manager secret
     pub mode: Option<String>,   // overwrite, append, error
     pub partition_by: Vec<String>, // partition columns
+    /// For iceberg sinks only: coerce nulls/voids to type-appropriate defaults
+    /// before writing (prevents `void`-typed columns from failing the write).
+    /// Defaults to true on iceberg. Explicit `false` opts out.
+    #[serde(default)]
+    pub fill_nulls: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -104,6 +137,19 @@ pub struct JobDefinition {
     /// Per-job Airflow metadata, parsed from the optional `airflow:` block.
     /// `None` means the job does not participate in any DAG.
     pub airflow: Option<AirflowJobBlock>,
+    /// Job-level partition columns for Iceberg sinks. Only "year", "month",
+    /// "day" are supported. Codegen derives these from a timestamp column.
+    #[serde(default)]
+    pub partition_by: Vec<String>,
+    /// Existing timestamp column to derive year/month/day from. Mutually
+    /// exclusive with `create_timestamp`.
+    #[serde(default)]
+    pub partition_timestamp_column: Option<String>,
+    /// If true, codegen adds an `ingestion_timestamp = current_timestamp()`
+    /// column and derives partitions from it. Mutually exclusive with
+    /// `partition_timestamp_column`.
+    #[serde(default)]
+    pub create_timestamp: bool,
     pub config: serde_json::Value,
     /// Directory containing the job's YAML file. Populated during discovery;
     /// not serialized to state. Used to locate the nearest ancestor `dag.yaml`

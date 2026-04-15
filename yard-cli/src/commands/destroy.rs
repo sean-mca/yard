@@ -47,6 +47,7 @@ pub async fn execute(
                 let destroyed_dag = yard_core::destroy_dag(
                     &project.manifest.state,
                     &project.manifest.providers,
+                    &project.manifest.aws,
                     &name,
                     &project.root_dir,
                     dry_run,
@@ -103,6 +104,7 @@ pub async fn execute(
             let result = yard_core::destroy_all(
                 &project.manifest.state,
                 &project.manifest.providers,
+                &project.manifest.aws,
                 &project.root_dir,
                 dry_run,
             )

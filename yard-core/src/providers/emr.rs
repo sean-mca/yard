@@ -52,9 +52,10 @@ impl EmrProvider {
             .unwrap_or("CONTINUE")
             .to_string();
 
-        let config = aws_config(region).await;
-        let emr_client = EmrClient::new(&config);
-        let s3_client = S3Client::new(&config);
+        let aws_cfg = config.get("_aws");
+        let sdk_config = aws_config(region, aws_cfg).await;
+        let emr_client = EmrClient::new(&sdk_config);
+        let s3_client = S3Client::new(&sdk_config);
 
         Ok(Self {
             emr_client,

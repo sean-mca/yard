@@ -604,6 +604,7 @@ mod tests {
             },
             providers: HashMap::new(),
             jobs: HashMap::new(),
+            aws: serde_json::Value::Null,
         }
     }
 

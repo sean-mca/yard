@@ -72,11 +72,21 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
         }
     }
 
+    // Root-level aws block — yard's own AWS credential config (AssumeRole etc.)
+    let root_aws = yaml_to_json(&root_doc["aws"]);
+
+    // Cascade provider defaults into each job's `config.<job_type>` block so
+    // codegen and validation see the merged view (e.g. warehouse, default_engine).
+    // Deploy-time provider instantiation still re-merges via `merge_provider_config`;
+    // this cascade only widens visibility — precedence is unchanged.
+    let all_jobs = cascade_provider_defaults(all_jobs, &providers, &root_aws);
+
     let manifest = ProjectManifest {
         project: project.clone(),
         state: state_backend.clone(),
         providers,
         jobs: all_jobs,
+        aws: root_aws,
     };
 
     // 5. Load current state
@@ -165,6 +175,10 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
             resolved.to_string_lossy().to_string()
         });
 
+        let partition_by = crate::parse_partition_by(&config);
+        let partition_timestamp_column = crate::parse_partition_timestamp_column(&config);
+        let create_timestamp = crate::parse_create_timestamp(&config);
+
         all_jobs.insert(
             job_name,
             JobDefinition {
@@ -176,6 +190,9 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
                 sink,
                 transforms,
                 airflow,
+                partition_by,
+                partition_timestamp_column,
+                create_timestamp,
                 config,
                 dir: job_dir.clone(),
             },
@@ -183,6 +200,38 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
     }
 
     Ok(all_jobs)
+}
+
+fn cascade_provider_defaults(
+    mut jobs: HashMap<String, JobDefinition>,
+    providers: &HashMap<String, Value>,
+    root_aws: &Value,
+) -> HashMap<String, JobDefinition> {
+    for job in jobs.values_mut() {
+        if let Some(defaults) = providers.get(&job.job_type) {
+            let overrides = job
+                .config
+                .get(&job.job_type)
+                .cloned()
+                .unwrap_or(Value::Null);
+            let merged = crate::merge_provider_config(defaults, &overrides);
+            if let Some(obj) = job.config.as_object_mut() {
+                obj.insert(job.job_type.clone(), merged);
+            }
+        }
+
+        // Merge root aws with the job's nearest-ancestor account.yaml `aws:`
+        // block and stash under `config._aws` for providers to read.
+        let account_aws = find_and_parse_context(&job.dir, "account.yaml", false)
+            .ok()
+            .and_then(|v| v.get("aws").cloned())
+            .unwrap_or(Value::Null);
+        let merged_aws = crate::merge_provider_config(root_aws, &account_aws);
+        if let Some(obj) = job.config.as_object_mut() {
+            obj.insert("_aws".to_string(), merged_aws);
+        }
+    }
+    jobs
 }
 
 // ---- Context loading ----

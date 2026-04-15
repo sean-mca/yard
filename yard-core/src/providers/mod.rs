@@ -9,14 +9,54 @@ use std::future::Future;
 use std::pin::Pin;
 use yard_structs::{Resource, ResourceStatus, ValidationError};
 
-/// Build a standard AWS SDK config with region and retry policy.
-/// Shared by all providers and the S3 storage backend.
-pub async fn aws_config(region: &str) -> aws_config::SdkConfig {
-    aws_config::defaults(BehaviorVersion::latest())
-        .region(aws_config::Region::new(region.to_string()))
-        .retry_config(aws_config::retry::RetryConfig::standard().with_max_attempts(3))
-        .load()
-        .await
+/// Build a standard AWS SDK config with region, retry policy, and optional
+/// STS `AssumeRole` wrapped around the default credential provider chain.
+///
+/// Resolution of AssumeRole params (env vars beat yaml so CI can override):
+///   `YARD_AWS_ASSUME_ROLE`  → yaml `assume_role`
+///   `YARD_AWS_SESSION_NAME` → yaml `session_name` (default "yard")
+///   `YARD_AWS_EXTERNAL_ID`  → yaml `external_id`
+///
+/// When no role is configured, falls through to the default provider chain
+/// (env vars, shared config, IMDS/ECS task role, SSO). This preserves the
+/// current behavior for users who don't set an `aws:` block.
+pub async fn aws_config(region: &str, aws_cfg: Option<&Value>) -> aws_config::SdkConfig {
+    let region_obj = aws_config::Region::new(region.to_string());
+    let base = aws_config::defaults(BehaviorVersion::latest())
+        .region(region_obj.clone())
+        .retry_config(aws_config::retry::RetryConfig::standard().with_max_attempts(3));
+
+    let yaml_str = |key: &str| {
+        aws_cfg
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    };
+
+    let assume_role = std::env::var("YARD_AWS_ASSUME_ROLE")
+        .ok()
+        .or_else(|| yaml_str("assume_role"));
+
+    if let Some(role_arn) = assume_role {
+        let session_name = std::env::var("YARD_AWS_SESSION_NAME")
+            .ok()
+            .or_else(|| yaml_str("session_name"))
+            .unwrap_or_else(|| "yard".to_string());
+        let external_id = std::env::var("YARD_AWS_EXTERNAL_ID")
+            .ok()
+            .or_else(|| yaml_str("external_id"));
+
+        let mut builder = aws_config::sts::AssumeRoleProvider::builder(role_arn)
+            .session_name(session_name)
+            .region(region_obj);
+        if let Some(eid) = external_id {
+            builder = builder.external_id(eid);
+        }
+        let provider = builder.build().await;
+        return base.credentials_provider(provider).load().await;
+    }
+
+    base.load().await
 }
 
 /// Shared S3 script operations used by all providers that upload

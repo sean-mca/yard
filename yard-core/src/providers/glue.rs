@@ -99,9 +99,10 @@ impl GlueProvider {
             })
             .unwrap_or_default();
 
-        let config = aws_config(region).await;
-        let glue_client = GlueClient::new(&config);
-        let s3_client = S3Client::new(&config);
+        let aws_cfg = config.get("_aws");
+        let sdk_config = aws_config(region, aws_cfg).await;
+        let glue_client = GlueClient::new(&sdk_config);
+        let s3_client = S3Client::new(&sdk_config);
 
         Ok(Self {
             glue_client,
@@ -124,6 +125,11 @@ impl GlueProvider {
 
     fn build_default_arguments(&self) -> HashMap<String, String> {
         let mut args = self.default_arguments.clone();
+
+        // Enable Iceberg libraries on every Glue job — yard is Iceberg-first.
+        // User-supplied default_arguments may still override this explicitly.
+        args.entry("--datalake-formats".to_string())
+            .or_insert_with(|| "iceberg".to_string());
 
         // Wire bookmark setting into default arguments
         if let Some(ref bookmark) = self.bookmark {

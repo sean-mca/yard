@@ -24,77 +24,213 @@ fn render_imports(imports: &[Import]) -> String {
 
 // --- Source rendering (now named: produces df_<name>) ---
 
-fn render_source(source: &Source) -> Result<String> {
-    let var = format!("df_{}", source.name);
+/// Render a serde_json::Value as a Python literal. Strings, numbers, bools,
+/// and null map directly; arrays and objects recurse. Used for opaque
+/// `options:` passthrough.
+fn python_literal(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "None".to_string(),
+        serde_json::Value::Bool(b) => if *b { "True" } else { "False" }.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
+        serde_json::Value::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(python_literal).collect();
+            format!("[{}]", items.join(", "))
+        }
+        serde_json::Value::Object(obj) => {
+            let mut keys: Vec<&String> = obj.keys().collect();
+            keys.sort();
+            let items: Vec<String> = keys
+                .iter()
+                .map(|k| format!("\"{}\": {}", k, python_literal(&obj[*k])))
+                .collect();
+            format!("{{{}}}", items.join(", "))
+        }
+    }
+}
+
+fn effective_engine(source: &Source, default_engine: &str) -> String {
+    source
+        .engine
+        .clone()
+        .unwrap_or_else(|| default_engine.to_string())
+}
+
+fn require_str<'a>(value: Option<&'a str>, source_name: &str, field: &str) -> Result<&'a str> {
+    value.ok_or_else(|| anyhow!("source '{source_name}': '{field}' is required"))
+}
+
+/// Build a Python dict literal from a seed of ordered (key, value) pairs,
+/// merging in arbitrary user-supplied options afterward.
+fn build_options_dict(
+    seed: &[(&str, serde_json::Value)],
+    user_opts: &std::collections::HashMap<String, serde_json::Value>,
+) -> String {
+    let mut opts = serde_json::Map::new();
+    for (k, v) in seed {
+        opts.insert((*k).to_string(), v.clone());
+    }
+    for (k, v) in user_opts {
+        opts.insert(k.clone(), v.clone());
+    }
+    python_literal(&serde_json::Value::Object(opts))
+}
+
+/// Append `.option(k, v)` calls onto a Spark reader chain. `seed` pairs are
+/// emitted as literal strings; `extra` entries use `python_literal`.
+fn append_spark_options(
+    chain: &mut String,
+    seed: &[(&str, &str)],
+    extra: &std::collections::HashMap<String, serde_json::Value>,
+) {
+    for (k, v) in seed {
+        chain.push_str(&format!(".option(\"{k}\", \"{v}\")"));
+    }
+    for (k, v) in extra {
+        chain.push_str(&format!(".option(\"{}\", {})", k, python_literal(v)));
+    }
+}
+
+/// Render a `glueContext.create_dynamic_frame.from_options(...).toDF()` call.
+/// `options_expr` may be a literal dict or a variable name.
+fn glue_from_options(
+    var: &str,
+    connection_type: &str,
+    options_expr: &str,
+    ctx: &str,
+    format: Option<&str>,
+) -> String {
+    let format_arg = format
+        .map(|f| format!("format=\"{f}\", "))
+        .unwrap_or_default();
+    format!(
+        "    {var} = glueContext.create_dynamic_frame.from_options(\
+             connection_type=\"{connection_type}\", \
+             {format_arg}connection_options={options_expr}, \
+             transformation_ctx=\"{ctx}\").toDF()"
+    )
+}
+
+fn render_source(source: &Source, default_engine: &str) -> Result<String> {
+    let name = &source.name;
+    let var = format!("df_{name}");
+    let ctx = format!("{name}_ctx");
+    let engine = effective_engine(source, default_engine);
+    let secret_var = format!("{name}_source_secret");
     let mut lines = Vec::new();
 
     if let Some(secret_id) = &source.secret_id {
-        lines.push(render_secret_fetch(
-            secret_id,
-            &format!("{}_source", source.name),
-        ));
+        lines.push(render_secret_fetch(secret_id, &format!("{name}_source")));
     }
-
-    let secret_var = format!("{}_source_secret", source.name);
 
     match source.source_type.as_str() {
         "s3" => {
             let format = source.format.as_deref().unwrap_or("parquet");
-            let path = source
-                .path
-                .as_deref()
-                .ok_or_else(|| anyhow!("source '{}': 'path' is required for s3 source", source.name))?;
-            lines.push(format!(
-                "    {var} = spark.read.format(\"{format}\").load(\"{path}\")"
-            ));
+            let path = require_str(source.path.as_deref(), name, "path")?;
+            if engine == "glue" {
+                let opts = build_options_dict(
+                    &[(
+                        "paths",
+                        serde_json::Value::Array(vec![serde_json::Value::String(path.into())]),
+                    )],
+                    &source.options,
+                );
+                lines.push(glue_from_options(&var, "s3", &opts, &ctx, Some(format)));
+            } else {
+                let mut chain = format!("spark.read.format(\"{format}\")");
+                append_spark_options(&mut chain, &[], &source.options);
+                chain.push_str(&format!(".load(\"{path}\")"));
+                lines.push(format!("    {var} = {chain}"));
+            }
         }
         "jdbc" => {
-            let url = source
-                .connection_url
-                .as_deref()
-                .ok_or_else(|| anyhow!("source '{}': 'connection_url' is required for jdbc source", source.name))?;
-            let table = source
-                .table
-                .as_deref()
-                .ok_or_else(|| anyhow!("source '{}': 'table' is required for jdbc source", source.name))?;
-            lines.push(format!(
-                "    {var} = spark.read.format(\"jdbc\").option(\"url\", \"{url}\").option(\"dbtable\", \"{table}\")\\"
-            ));
-            if source.secret_id.is_some() {
-                lines.push(format!(
-                    "        .option(\"user\", {secret_var}[\"username\"]).option(\"password\", {secret_var}[\"password\"])\\"
-                ));
+            let url = require_str(source.connection_url.as_deref(), name, "connection_url")?;
+            let table = require_str(source.table.as_deref(), name, "table")?;
+            if engine == "glue" {
+                let connection_type = source.connection_type.as_deref().ok_or_else(|| {
+                    anyhow!(
+                        "source '{name}': 'connection_type' is required for jdbc+glue (mysql, postgresql, sqlserver, oracle, redshift)"
+                    )
+                })?;
+                let base_opts = build_options_dict(
+                    &[
+                        ("url", serde_json::Value::String(url.into())),
+                        ("dbtable", serde_json::Value::String(table.into())),
+                    ],
+                    &source.options,
+                );
+                let options_expr = if source.secret_id.is_some() {
+                    let opts_var = format!("_opts_{name}");
+                    lines.push(format!(
+                        "    {opts_var} = {{**{base_opts}, \"user\": {secret_var}[\"username\"], \"password\": {secret_var}[\"password\"]}}"
+                    ));
+                    opts_var
+                } else {
+                    base_opts
+                };
+                lines.push(glue_from_options(&var, connection_type, &options_expr, &ctx, None));
+            } else {
+                let mut chain = "spark.read.format(\"jdbc\")".to_string();
+                append_spark_options(
+                    &mut chain,
+                    &[("url", url), ("dbtable", table)],
+                    &source.options,
+                );
+                if source.secret_id.is_some() {
+                    chain.push_str(&format!(
+                        ".option(\"user\", {secret_var}[\"username\"]).option(\"password\", {secret_var}[\"password\"])"
+                    ));
+                }
+                chain.push_str(".load()");
+                lines.push(format!("    {var} = {chain}"));
             }
-            lines.push("        .load()".to_string());
         }
         "catalog" => {
-            let db = source
-                .database
-                .as_deref()
-                .ok_or_else(|| anyhow!("source '{}': 'database' is required for catalog source", source.name))?;
-            let table = source
-                .table
-                .as_deref()
-                .ok_or_else(|| anyhow!("source '{}': 'table' is required for catalog source", source.name))?;
+            let db = require_str(source.database.as_deref(), name, "database")?;
+            let table = require_str(source.table.as_deref(), name, "table")?;
             lines.push(format!(
-                "    {var} = glueContext.create_dynamic_frame.from_catalog(database=\"{db}\", table_name=\"{table}\").toDF()"
+                "    {var} = glueContext.create_dynamic_frame.from_catalog(database=\"{db}\", table_name=\"{table}\", transformation_ctx=\"{ctx}\").toDF()"
             ));
         }
-        _ => {
+        "kafka" => {
+            let servers = require_str(source.connection_url.as_deref(), name, "connection_url")?;
+            let topic = require_str(source.topic.as_deref(), name, "topic")?;
+            let mut chain = "spark.read.format(\"kafka\")".to_string();
+            append_spark_options(
+                &mut chain,
+                &[("kafka.bootstrap.servers", servers), ("subscribe", topic)],
+                &source.options,
+            );
+            chain.push_str(".load()");
+            lines.push(format!("    {var} = {chain}"));
+        }
+        "api" => {
+            let url = require_str(source.url.as_deref(), name, "url")?;
+            let headers_obj: serde_json::Map<String, serde_json::Value> = source
+                .headers
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect();
+            let headers_lit = python_literal(&serde_json::Value::Object(headers_obj));
+            let resp_var = format!("_resp_{name}");
             lines.push(format!(
-                "    # Unsupported source type: {}",
-                source.source_type
+                "    {resp_var} = requests.get(\"{url}\", headers={headers_lit})"
             ));
+            lines.push(format!("    {resp_var}.raise_for_status()"));
+            lines.push(format!("    {var} = spark.createDataFrame({resp_var}.json())"));
+        }
+        other => {
+            lines.push(format!("    # Unsupported source type: {other}"));
         }
     }
 
     Ok(lines.join("\n"))
 }
 
-fn render_sources(sources: &[Source]) -> Result<String> {
+fn render_sources(sources: &[Source], default_engine: &str) -> Result<String> {
     let rendered: Vec<String> = sources
         .iter()
-        .map(render_source)
+        .map(|s| render_source(s, default_engine))
         .collect::<Result<Vec<_>>>()?;
     Ok(rendered.join("\n"))
 }
@@ -151,23 +287,17 @@ fn render_transform(
         }
         "drop_columns" => {
             let (input, output) = resolve_df(transform, default_source);
-            let cols = transform
-                .columns
-                .iter()
-                .map(|c| format!("\"{}\"", c))
-                .collect::<Vec<_>>()
-                .join(", ");
-            Ok(format!("    {output} = {input}.drop({cols})"))
+            Ok(format!(
+                "    {output} = {input}.drop({})",
+                quoted_list(&transform.columns)
+            ))
         }
         "select" => {
             let (input, output) = resolve_df(transform, default_source);
-            let cols = transform
-                .columns
-                .iter()
-                .map(|c| format!("\"{}\"", c))
-                .collect::<Vec<_>>()
-                .join(", ");
-            Ok(format!("    {output} = {input}.select({cols})"))
+            Ok(format!(
+                "    {output} = {input}.select({})",
+                quoted_list(&transform.columns)
+            ))
         }
         "rename" => {
             let (input, output) = resolve_df(transform, default_source);
@@ -203,12 +333,7 @@ fn render_transform(
         }
         "aggregate" => {
             let (input, output) = resolve_df(transform, default_source);
-            let group_cols = transform
-                .group_by
-                .iter()
-                .map(|c| format!("\"{}\"", c))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let group_cols = quoted_list(&transform.group_by);
             let mut agg_entries: Vec<(&String, &String)> = transform.aggs.iter().collect();
             agg_entries.sort_by(|a, b| a.0.cmp(b.0));
             let agg_exprs = agg_entries
@@ -235,24 +360,18 @@ fn render_transform(
             let window_var = format!("_w_{col_name}");
             let mut spec = String::from("Window");
             if !transform.partition_by.is_empty() {
-                let parts = transform
-                    .partition_by
-                    .iter()
-                    .map(|c| format!("\"{}\"", c))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                spec.push_str(&format!(".partitionBy({parts})"));
+                spec.push_str(&format!(
+                    ".partitionBy({})",
+                    quoted_list(&transform.partition_by)
+                ));
             }
             if !transform.order_by.is_empty() {
                 let orders = transform
                     .order_by
                     .iter()
                     .map(|o| {
-                        if o.desc {
-                            format!("F.col(\"{}\").desc()", o.column)
-                        } else {
-                            format!("F.col(\"{}\").asc()", o.column)
-                        }
+                        let dir = if o.desc { "desc" } else { "asc" };
+                        format!("F.col(\"{}\").{dir}()", o.column)
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -285,6 +404,75 @@ fn render_transforms(
 
 // --- Sink rendering (now with named dataframe) ---
 
+fn require_sink_str<'a>(value: Option<&'a str>, sink_type: &str, field: &str) -> Result<&'a str> {
+    value.ok_or_else(|| anyhow!("sink: '{field}' is required for {sink_type} sink"))
+}
+
+fn quoted_list(cols: &[String]) -> String {
+    cols.iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Emitted inline at module scope when an iceberg sink is writing with
+/// `fill_nulls` enabled. Coerces null/void-typed columns (common in JSON
+/// ingestion) into type-appropriate defaults so Iceberg writes don't fail on
+/// void schemas or unresolvable nullable nested types. Opt-out via
+/// `fill_nulls: false` on the sink.
+const ICEBERG_FILL_NULLS_HELPERS: &str = r#"def _yard_default_struct(struct_type):
+    out = []
+    for f in struct_type.fields:
+        dt = f.dataType
+        if isinstance(dt, StructType):
+            out.append(_yard_default_struct(dt).alias(f.name))
+        elif isinstance(dt, (DoubleType, FloatType)):
+            out.append(F.lit(0.0).cast(dt).alias(f.name))
+        elif isinstance(dt, (IntegerType, LongType)):
+            out.append(F.lit(0).cast(dt).alias(f.name))
+        elif isinstance(dt, ArrayType):
+            out.append(F.array().cast(dt).alias(f.name))
+        elif isinstance(dt, (TimestampType, DateType)):
+            out.append(F.lit(None).cast(dt).alias(f.name))
+        elif isinstance(dt, BooleanType):
+            out.append(F.lit(False).alias(f.name))
+        else:
+            out.append(F.lit("").cast("string").alias(f.name))
+    return F.struct(*out)
+
+
+def _yard_fill_nulls(df):
+    for field in df.schema.fields:
+        dt, name = field.dataType, field.name
+        col = F.col(f"`{name}`")
+        if "void" in dt.simpleString():
+            df = df.withColumn(name, F.coalesce(col.cast("string"), F.lit("")))
+        elif isinstance(dt, StructType):
+            df = df.withColumn(name, F.when(col.isNull(), _yard_default_struct(dt)).otherwise(col))
+        elif isinstance(dt, ArrayType):
+            if isinstance(dt.elementType, StructType):
+                inner = _yard_default_struct(dt.elementType)
+                df = df.withColumn(name, F.when(col.isNull(), F.array().cast(dt))
+                    .otherwise(F.transform(col, lambda x: F.when(x.isNull(), inner).otherwise(x))))
+            else:
+                df = df.withColumn(name, F.when(col.isNull(), F.array().cast(dt)).otherwise(col))
+        elif isinstance(dt, (DoubleType, FloatType, IntegerType, LongType)):
+            df = df.withColumn(name, F.coalesce(col, F.lit(0).cast(dt)))
+        elif isinstance(dt, BooleanType):
+            df = df.withColumn(name, F.coalesce(col, F.lit(False)))
+        else:
+            df = df.withColumn(name, F.coalesce(col.cast("string"), F.lit("")))
+    return df
+"#;
+
+const ICEBERG_TABLE_PROPERTIES: &[(&str, &str)] = &[
+    ("format-version", "2"),
+    ("write.spark.accept-any-schema", "true"),
+    ("write.target-file-size-bytes", "536870912"),
+    ("write.parquet.compression-codec", "zstd"),
+    ("write.distribution-mode", "hash"),
+];
+
 fn render_sink(sink: &Sink, default_source: &str) -> Result<String> {
     let source_name = sink.source.as_deref().unwrap_or(default_source);
     let var = format!("df_{source_name}");
@@ -299,32 +487,17 @@ fn render_sink(sink: &Sink, default_source: &str) -> Result<String> {
     match sink.sink_type.as_str() {
         "s3" => {
             let format = sink.format.as_deref().unwrap_or("parquet");
-            let path = sink
-                .path
-                .as_deref()
-                .ok_or_else(|| anyhow!("sink: 'path' is required for s3 sink"))?;
+            let path = require_sink_str(sink.path.as_deref(), "s3", "path")?;
             let mut write = format!("    {var}.write.format(\"{format}\").mode(\"{mode}\")");
             if !sink.partition_by.is_empty() {
-                let parts = sink
-                    .partition_by
-                    .iter()
-                    .map(|c| format!("\"{}\"", c))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                write.push_str(&format!(".partitionBy({parts})"));
+                write.push_str(&format!(".partitionBy({})", quoted_list(&sink.partition_by)));
             }
             write.push_str(&format!(".save(\"{path}\")"));
             lines.push(write);
         }
         "jdbc" => {
-            let url = sink
-                .connection_url
-                .as_deref()
-                .ok_or_else(|| anyhow!("sink: 'connection_url' is required for jdbc sink"))?;
-            let table = sink
-                .table
-                .as_deref()
-                .ok_or_else(|| anyhow!("sink: 'table' is required for jdbc sink"))?;
+            let url = require_sink_str(sink.connection_url.as_deref(), "jdbc", "connection_url")?;
+            let table = require_sink_str(sink.table.as_deref(), "jdbc", "table")?;
             lines.push(format!(
                 "    {var}.write.format(\"jdbc\").option(\"url\", \"{url}\").option(\"dbtable\", \"{table}\")\\"
             ));
@@ -336,14 +509,8 @@ fn render_sink(sink: &Sink, default_source: &str) -> Result<String> {
             lines.push(format!("        .mode(\"{mode}\").save()"));
         }
         "catalog" => {
-            let db = sink
-                .database
-                .as_deref()
-                .ok_or_else(|| anyhow!("sink: 'database' is required for catalog sink"))?;
-            let table = sink
-                .table
-                .as_deref()
-                .ok_or_else(|| anyhow!("sink: 'table' is required for catalog sink"))?;
+            let db = require_sink_str(sink.database.as_deref(), "catalog", "database")?;
+            let table = require_sink_str(sink.table.as_deref(), "catalog", "table")?;
             lines.push(format!(
                 "    sink_frame = DynamicFrame.fromDF({var}, glueContext, \"sink_frame\")"
             ));
@@ -351,8 +518,45 @@ fn render_sink(sink: &Sink, default_source: &str) -> Result<String> {
                 "    glueContext.write_dynamic_frame.from_catalog(frame=sink_frame, database=\"{db}\", table_name=\"{table}\")"
             ));
         }
-        _ => {
-            lines.push(format!("    # Unsupported sink type: {}", sink.sink_type));
+        "iceberg" => {
+            let db = require_sink_str(sink.database.as_deref(), "iceberg", "database")?;
+            let table = require_sink_str(sink.table.as_deref(), "iceberg", "table")?;
+            // "overwrite" maps to dynamic partition overwrite; "append" is default.
+            let write_op = match mode {
+                "overwrite" => "overwritePartitions",
+                _ => "append",
+            };
+            let partition_clause = if sink.partition_by.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n            .partitionedBy({})",
+                    quoted_list(&sink.partition_by)
+                )
+            };
+            let tbl_props = ICEBERG_TABLE_PROPERTIES
+                .iter()
+                .map(|(k, v)| format!("\n            .tableProperty(\"{k}\", \"{v}\")"))
+                .collect::<String>();
+            lines.push(format!(
+                "    _glue = boto3.client(\"glue\")\n    \
+                 try:\n        \
+                     _glue.get_database(Name=\"{db}\")\n    \
+                 except _glue.exceptions.EntityNotFoundException:\n        \
+                     _glue.create_database(DatabaseInput={{\"Name\": \"{db}\"}})"
+            ));
+            lines.push(format!("    _tbl = \"glue_catalog.{db}.{table}\""));
+            lines.push(format!(
+                "    if not spark.catalog.tableExists(_tbl):\n        \
+                     ({var}.writeTo(_tbl)\n            \
+                         .using(\"iceberg\"){partition_clause}{tbl_props}\n            \
+                         .create())\n    \
+                 else:\n        \
+                     {var}.writeTo(_tbl).option(\"mergeSchema\", \"true\").{write_op}()"
+            ));
+        }
+        other => {
+            lines.push(format!("    # Unsupported sink type: {other}"));
         }
     }
 
@@ -377,6 +581,56 @@ fn needs_secrets_imports(job_def: &JobDefinition) -> bool {
     source_has || sink_has
 }
 
+fn has_iceberg_sink(job_def: &JobDefinition) -> bool {
+    job_def
+        .sink
+        .as_ref()
+        .is_some_and(|s| s.sink_type == "iceberg")
+}
+
+/// True when the iceberg sink should be preceded by a `_yard_fill_nulls` pass.
+/// Opt-in by default for iceberg sinks; `fill_nulls: false` opts out.
+fn should_fill_nulls(job_def: &JobDefinition) -> bool {
+    job_def
+        .sink
+        .as_ref()
+        .is_some_and(|s| s.sink_type == "iceberg" && s.fill_nulls != Some(false))
+}
+
+fn render_partition_derivation(job_def: &JobDefinition, sink_source: &str) -> Option<String> {
+    if job_def.partition_by.is_empty() {
+        return None;
+    }
+    let var = format!("df_{sink_source}");
+    let mut lines = Vec::new();
+    lines.push("    # --- Partition columns ---".to_string());
+    if job_def.create_timestamp {
+        lines.push(format!(
+            "    {var} = {var}.withColumn(\"ingestion_timestamp\", F.current_timestamp())"
+        ));
+        lines.push("    _ts = \"ingestion_timestamp\"".to_string());
+    } else {
+        let col = job_def
+            .partition_timestamp_column
+            .as_deref()
+            .unwrap_or("event_time");
+        lines.push(format!("    _ts = \"{col}\""));
+    }
+    for unit in &job_def.partition_by {
+        let func = match unit.as_str() {
+            "year" => "year",
+            "month" => "month",
+            "day" => "dayofmonth",
+            _ => continue,
+        };
+        lines.push(format!(
+            "    if \"{unit}\" not in {var}.columns:\n        \
+             {var} = {var}.withColumn(\"{unit}\", F.{func}(F.col(_ts)))"
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
 fn needs_functions_import(job_def: &JobDefinition) -> bool {
     job_def
         .transforms
@@ -391,12 +645,30 @@ fn needs_window_import(job_def: &JobDefinition) -> bool {
         .any(|t| t.transform_type == "window")
 }
 
-fn needs_dynamic_frame_import(job_def: &JobDefinition) -> bool {
+fn needs_dynamic_frame_import(job_def: &JobDefinition, default_engine: &str) -> bool {
     job_def
         .sink
         .as_ref()
         .is_some_and(|s| s.sink_type == "catalog")
-        || job_def.sources.iter().any(|s| s.source_type == "catalog")
+        || job_def.sources.iter().any(|s| {
+            s.source_type == "catalog"
+                || (matches!(s.source_type.as_str(), "s3" | "jdbc")
+                    && effective_engine(s, default_engine) == "glue")
+        })
+}
+
+fn needs_requests_import(job_def: &JobDefinition) -> bool {
+    job_def.sources.iter().any(|s| s.source_type == "api")
+}
+
+fn default_engine_for(job_def: &JobDefinition) -> String {
+    job_def
+        .config
+        .get(&job_def.job_type)
+        .and_then(|g| g.get("default_engine"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("spark")
+        .to_string()
 }
 
 fn indent_body(body: &str) -> String {
@@ -445,30 +717,53 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
 
     let all_source_names: Vec<String> = job_def.sources.iter().map(|s| s.name.clone()).collect();
 
+    let default_engine = default_engine_for(job_def);
+
     // Build extra imports needed by template features
     let mut extra_imports = Vec::new();
-    if needs_secrets_imports(job_def) {
+    let iceberg = has_iceberg_sink(job_def);
+    let partitioning = !job_def.partition_by.is_empty();
+    if needs_secrets_imports(job_def) || iceberg {
         extra_imports.push("import boto3".to_string());
-        extra_imports.push("import json".to_string());
+        if needs_secrets_imports(job_def) {
+            extra_imports.push("import json".to_string());
+        }
     }
-    if needs_dynamic_frame_import(job_def) {
+    if needs_requests_import(job_def) {
+        extra_imports.push("import requests".to_string());
+    }
+    if needs_dynamic_frame_import(job_def, &default_engine) {
         extra_imports.push("from awsglue.dynamicframe import DynamicFrame".to_string());
     }
-    if needs_functions_import(job_def) {
+    let fill_nulls = should_fill_nulls(job_def);
+    if needs_functions_import(job_def) || partitioning || fill_nulls {
         extra_imports.push("from pyspark.sql import functions as F".to_string());
+    }
+    if fill_nulls {
+        extra_imports.push(
+            "from pyspark.sql.types import (StructType, ArrayType, DoubleType, FloatType, \
+             IntegerType, LongType, TimestampType, DateType, BooleanType)"
+                .to_string(),
+        );
     }
     if needs_window_import(job_def) {
         extra_imports.push("from pyspark.sql.window import Window".to_string());
     }
 
     let user_imports = render_imports(&job_def.imports);
-    let all_imports = if extra_imports.is_empty() {
+    let mut all_imports = if extra_imports.is_empty() {
         user_imports
     } else if user_imports.is_empty() {
         extra_imports.join("\n")
     } else {
         format!("{}\n{}", user_imports, extra_imports.join("\n"))
     };
+    if fill_nulls {
+        // Append the helpers at module scope (after the imports block, before
+        // the Glue/Spark setup). The template inlines `imports_block` verbatim.
+        all_imports.push_str("\n\n\n");
+        all_imports.push_str(ICEBERG_FILL_NULLS_HELPERS);
+    }
 
     // Build the run() body
     let run_body = if let Some(body) = &job_def.body {
@@ -478,7 +773,7 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
         if !job_def.sources.is_empty() {
             parts.push(format!(
                 "    # --- Sources ---\n{}",
-                render_sources(&job_def.sources)?
+                render_sources(&job_def.sources, &default_engine)?
             ));
         }
         if !job_def.transforms.is_empty() {
@@ -488,9 +783,30 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
             ));
         }
         if let Some(sink) = &job_def.sink {
+            let sink_source = sink.source.as_deref().unwrap_or(default_source);
+            if let Some(deriv) = render_partition_derivation(job_def, sink_source) {
+                parts.push(deriv);
+            }
+            if fill_nulls {
+                let var = format!("df_{sink_source}");
+                parts.push(format!(
+                    "    # --- Null/void coercion for Iceberg ---\n    \
+                     {var} = _yard_fill_nulls({var})"
+                ));
+            }
+            // Mirror job-level partition_by onto the iceberg sink so writeTo
+            // emits `.partitionedBy(...)` on first table creation.
+            let effective_sink = if sink.sink_type == "iceberg" && !job_def.partition_by.is_empty()
+            {
+                let mut s = sink.clone();
+                s.partition_by = job_def.partition_by.clone();
+                std::borrow::Cow::Owned(s)
+            } else {
+                std::borrow::Cow::Borrowed(sink)
+            };
             parts.push(format!(
                 "    # --- Sink ---\n{}",
-                render_sink(sink, default_source)?
+                render_sink(&effective_sink, default_source)?
             ));
         }
         if parts.is_empty() {
@@ -505,6 +821,16 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
     context.insert("job_type", &job_def.job_type);
     context.insert("imports_block", &all_imports);
     context.insert("body", &run_body);
+
+    // Iceberg warehouse for the glue_catalog Spark catalog, read from merged
+    // provider config (`providers.glue.warehouse`, flowed into job.config.glue).
+    let warehouse = job_def
+        .config
+        .get("glue")
+        .and_then(|g| g.get("warehouse"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    context.insert("iceberg_warehouse", warehouse);
 
     let rendered = tera
         .render("script", &context)
@@ -537,6 +863,7 @@ mod tests {
             table: None,
             database: None,
             secret_id: None,
+            ..Default::default()
         }
     }
 
@@ -561,7 +888,8 @@ mod tests {
     fn glue_setup_and_teardown() {
         let script = generate_python_script("test_job", &base_job()).unwrap();
         assert!(script.contains("from awsglue.utils import getResolvedOptions"));
-        assert!(script.contains("SparkContext()"));
+        assert!(script.contains("SparkSession.builder"));
+        assert!(script.contains("spark.sparkContext"));
         assert!(script.contains("job.commit()"));
     }
 
@@ -743,6 +1071,7 @@ mod tests {
             secret_id: None,
             mode: Some("overwrite".to_string()),
             partition_by: vec![],
+            fill_nulls: None,
         });
         let script = generate_python_script("test_job", &job).unwrap();
         assert!(script.contains("df_events.write.format(\"parquet\")"));
@@ -785,6 +1114,7 @@ mod tests {
             secret_id: None,
             mode: Some("overwrite".to_string()),
             partition_by: vec![],
+            fill_nulls: None,
         });
         let script = generate_python_script("test_job", &job).unwrap();
         assert!(script.contains("df_enriched.write.format(\"parquet\")"));
@@ -816,6 +1146,7 @@ mod tests {
             table: Some("public.users".to_string()),
             database: None,
             secret_id: Some("my-rds-secret".to_string()),
+            ..Default::default()
         }];
         let script = generate_python_script("test_job", &job).unwrap();
         assert!(script.contains("import boto3"));
@@ -903,6 +1234,7 @@ mod tests {
             secret_id: None,
             mode: Some("overwrite".to_string()),
             partition_by: vec![],
+            fill_nulls: None,
         });
         let script = generate_python_script("test_job", &job).unwrap();
         assert!(script.contains("df_orders = spark.read"));
@@ -963,6 +1295,7 @@ mod tests {
             table: None,
             database: None,
             secret_id: None,
+            ..Default::default()
         }];
         let result = generate_python_script("test_job", &job);
         assert!(result.is_err());
@@ -982,6 +1315,7 @@ mod tests {
             table: Some("public.users".to_string()),
             database: None,
             secret_id: None,
+            ..Default::default()
         }];
         let result = generate_python_script("test_job", &job);
         assert!(result.is_err());
@@ -1001,6 +1335,7 @@ mod tests {
             table: None,
             database: None,
             secret_id: None,
+            ..Default::default()
         }];
         let result = generate_python_script("test_job", &job);
         assert!(result.is_err());
@@ -1020,6 +1355,7 @@ mod tests {
             table: Some("my_table".to_string()),
             database: None,
             secret_id: None,
+            ..Default::default()
         }];
         let result = generate_python_script("test_job", &job);
         assert!(result.is_err());
@@ -1039,6 +1375,7 @@ mod tests {
             table: None,
             database: Some("my_db".to_string()),
             secret_id: None,
+            ..Default::default()
         }];
         let result = generate_python_script("test_job", &job);
         assert!(result.is_err());
@@ -1148,6 +1485,7 @@ mod tests {
             secret_id: None,
             mode: None,
             partition_by: vec![],
+            fill_nulls: None,
         });
         let result = generate_python_script("test_job", &job);
         assert!(result.is_err());
@@ -1170,6 +1508,7 @@ mod tests {
             secret_id: None,
             mode: None,
             partition_by: vec![],
+            fill_nulls: None,
         });
         let result = generate_python_script("test_job", &job);
         assert!(result.is_err());
@@ -1192,6 +1531,7 @@ mod tests {
             secret_id: None,
             mode: None,
             partition_by: vec![],
+            fill_nulls: None,
         });
         let result = generate_python_script("test_job", &job);
         assert!(result.is_err());
@@ -1214,6 +1554,7 @@ mod tests {
             secret_id: None,
             mode: None,
             partition_by: vec![],
+            fill_nulls: None,
         });
         let result = generate_python_script("test_job", &job);
         assert!(result.is_err());
@@ -1236,6 +1577,7 @@ mod tests {
             secret_id: None,
             mode: None,
             partition_by: vec![],
+            fill_nulls: None,
         });
         let result = generate_python_script("test_job", &job);
         assert!(result.is_err());

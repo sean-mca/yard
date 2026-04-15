@@ -101,11 +101,77 @@ sink:
 
 | Type | Required fields | Description |
 |------|-----------------|-------------|
-| `s3` | `path` | Read from S3 (parquet, csv, json) |
+| `s3` | `path` | Read from S3 (parquet, csv, json, orc) |
 | `jdbc` | `connection_url`, `table` | Read from a database via JDBC |
 | `catalog` | `database`, `table` | Read from the Glue Data Catalog |
+| `kafka` | `connection_url` (bootstrap servers), `topic` | Batch read from a Kafka topic |
+| `api` | `url` | HTTP GET → JSON → DataFrame (JSON root must be a list) |
 
-JDBC sources support `secret_id` for automatic Secrets Manager credential fetching.
+JDBC sources support `secret_id` for automatic Secrets Manager credential fetching. API sources support `headers:` (string→string map).
+
+All sources support an opaque `options:` map that passes through to Spark's `.option(k, v)` chain (or to Glue's `connection_options` when using the glue engine).
+
+### Engine: Spark DataFrame vs Glue DynamicFrame
+
+For `s3` and `jdbc` sources you can pick the read engine. Default is Spark; set `engine: glue` to use `glueContext.create_dynamic_frame.from_options(...).toDF()` instead. A project-level default lives under `providers.glue.default_engine`.
+
+```yaml
+# events_ingest.yaml
+sources:
+  - name: events
+    type: s3
+    engine: glue
+    format: json
+    path: s3://bucket/raw/events/
+    options:
+      recurse: true
+      groupFiles: inPartition
+      compressionType: gzip
+```
+
+For `jdbc + engine: glue`, also set `connection_type:` to pick the Glue connector (`mysql`, `postgresql`, `sqlserver`, `oracle`, `redshift`). `catalog` sources are always DynamicFrame-backed. `kafka` and `api` have a single renderer each.
+
+## Sink types
+
+| Type | Required fields | Description |
+|------|-----------------|-------------|
+| `s3` | `path` | Write parquet/csv/json/orc to S3 |
+| `jdbc` | `connection_url`, `table` | Write via JDBC |
+| `catalog` | `database`, `table` | Write through the Glue Data Catalog |
+| `iceberg` | `database`, `table` | Write to an Iceberg table registered in the Glue Catalog |
+
+### Iceberg sinks
+
+```yaml
+sink:
+  type: iceberg
+  database: analytics
+  table: events
+  mode: append           # append | overwrite (dynamic partition overwrite)
+  fill_nulls: true       # default; set false to skip null/void coercion
+```
+
+**What yard emits for you:**
+
+- A SparkSession with `glue_catalog` pre-configured against `providers.glue.warehouse`.
+- A boto3 check for the Glue database — creates it if missing.
+- `CREATE TABLE IF NOT EXISTS glue_catalog.<db>.<table>` via `writeTo(...).using("iceberg")`, with partitioning (if set) and sensible table properties: `format-version=2`, `write.spark.accept-any-schema=true`, `write.target-file-size-bytes=512MB`, `write.parquet.compression-codec=zstd`, `write.distribution-mode=hash`.
+- Subsequent writes use `option("mergeSchema", "true")` so new source columns append automatically.
+
+**Null/void coercion (`fill_nulls`, default `true`):** JSON ingestion can produce `void`-typed columns and all-null nested structs that fail Iceberg writes. Yard inlines a `_yard_fill_nulls(df)` pass that coerces those into type-appropriate defaults (empty string, `0`, `false`, empty struct, empty array) before writing. Opt-out with `fill_nulls: false` when you've pre-cleaned the data.
+
+### Job-level partitioning (Iceberg only)
+
+Set partitions at the top of the job file; yard derives them from a timestamp column and passes them through to `writeTo(...).partitionedBy(...)` on first create.
+
+```yaml
+partition_by: [year, month, day]      # subset of {year, month, day}
+create_timestamp: true                 # adds ingestion_timestamp column + derives from it
+# or, to derive from an existing column:
+# partition_timestamp_column: event_time
+```
+
+Exactly one of `create_timestamp: true` or `partition_timestamp_column:` must be set. The column derivations are idempotent — if `year` already exists on the DataFrame, yard leaves it alone.
 
 ## Transforms
 
