@@ -537,6 +537,12 @@ fn render_sink(sink: &Sink, default_source: &str) -> Result<String> {
             let tbl_props = ICEBERG_TABLE_PROPERTIES
                 .iter()
                 .map(|(k, v)| format!("\n            .tableProperty(\"{k}\", \"{v}\")"))
+                .chain(
+                    sink.path
+                        .as_deref()
+                        .filter(|p| !p.is_empty())
+                        .map(|p| format!("\n            .tableProperty(\"location\", \"{p}\")")),
+                )
                 .collect::<String>();
             lines.push(format!(
                 "    _glue = boto3.client(\"glue\")\n    \
@@ -1118,6 +1124,56 @@ mod tests {
         });
         let script = generate_python_script("test_job", &job).unwrap();
         assert!(script.contains("df_enriched.write.format(\"parquet\")"));
+    }
+
+    // --- Iceberg sink ---
+
+    fn iceberg_sink(database: &str, table: &str, path: Option<&str>) -> Sink {
+        Sink {
+            source: None,
+            sink_type: "iceberg".to_string(),
+            database: Some(database.to_string()),
+            table: Some(table.to_string()),
+            path: path.map(str::to_string),
+            mode: Some("append".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn iceberg_sink_without_path_omits_location() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(script.contains("\"glue_catalog.analytics.events\""));
+        assert!(!script.contains(".tableProperty(\"location\""));
+    }
+
+    #[test]
+    fn iceberg_sink_with_path_emits_location_property() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink(
+            "analytics",
+            "events",
+            Some("s3://my-warehouse/analytics/events/"),
+        ));
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(script.contains(
+            ".tableProperty(\"location\", \"s3://my-warehouse/analytics/events/\")"
+        ));
+        // Location only applies on create; unchanged for non-create branch.
+        assert!(script.contains(".writeTo(_tbl).option(\"mergeSchema\", \"true\").append()"));
+    }
+
+    #[test]
+    fn iceberg_sink_empty_path_omits_location() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", Some("")));
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(!script.contains(".tableProperty(\"location\""));
     }
 
     // --- Body override still works ---
