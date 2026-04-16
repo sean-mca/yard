@@ -55,17 +55,99 @@ Distinct from per-job execution roles (e.g. the Glue `role:` field). This block 
 2. If an `assume_role` is resolved, yard calls STS `AssumeRole` on top of the default AWS provider chain.
 3. Otherwise, yard uses the default chain directly (env vars → profiles → IMDS/ECS task role → SSO).
 
-**Account-level overrides** in `account.yaml` shallow-merge over the root `aws:` block:
+## Config cascade (deep merge)
 
-```yaml
-# aws/prod/account.yaml
-aws:
-  assume_role: arn:aws:iam::999988887777:role/YardProdDeployRole
+Every configuration layer is deep-merged using a four-layer precedence chain. Later layers win on conflict; unrelated sibling keys at every nesting depth are preserved.
+
+```
+yard.yaml  →  account.yaml  →  region.yaml  →  job.yaml
 ```
 
-All jobs and DAGs under `aws/prod/` use the prod role; jobs elsewhere keep the root role. Env vars still win over both.
+This applies to both `aws:` and provider blocks (e.g. `glue:`, `airflow:`).
 
-**`external_id`** is only required when the target role's trust policy has an `sts:ExternalId` condition (typical for third-party SaaS or strict cross-account setups). Leave it out otherwise.
+### How deep merge works
+
+Deep merge recurses into nested objects so you can override a single key of a nested map without wiping its siblings. Arrays and scalars are replaced wholesale.
+
+**Example:** override one `default_arguments` key per job while keeping provider defaults:
+
+```yaml
+# yard.yaml
+providers:
+  glue:
+    default_arguments:
+      --enable-metrics: "true"
+      --job-language: python
+      --TempDir: s3://temp/
+```
+
+```yaml
+# my-job.yaml
+type: glue
+glue:
+  default_arguments:
+    --job-language: scala    # only this key changes
+```
+
+**Result:** `{--enable-metrics: "true", --job-language: "scala", --TempDir: "s3://temp/"}`. The provider defaults for `--enable-metrics` and `--TempDir` are preserved.
+
+### account.yaml and region.yaml overrides
+
+Place an `account.yaml` or `region.yaml` file at any level in your directory tree. Jobs discover the nearest ancestor file and deep-merge its contents between the root and per-job layers.
+
+**`account.yaml`** — override `aws:` and/or provider settings per account:
+
+```yaml
+# accounts/prod/account.yaml
+account:
+  id: "999988887777"
+
+aws:
+  assume_role: arn:aws:iam::999988887777:role/YardProdDeployRole
+
+glue:
+  script_bucket: prod-glue-scripts
+  warehouse: s3://prod-warehouse/iceberg/
+```
+
+**`region.yaml`** — override settings per region:
+
+```yaml
+# accounts/prod/eu-west-1/region.yaml
+region:
+  id: eu-west-1
+
+glue:
+  region: eu-west-1
+  warehouse: s3://eu-warehouse/iceberg/
+
+airflow:
+  dags_bucket: mwaa-eu-dags
+```
+
+All jobs under `accounts/prod/eu-west-1/` inherit these overrides. A job can still override further via its own `glue:` block.
+
+### Inline AWS overrides on jobs
+
+You can set `aws.assume_role` directly on a job file without requiring an `account.yaml` folder:
+
+```yaml
+# jobs/orders.yaml
+type: glue
+role: arn:aws:iam::222222222222:role/OrdersGlueExecution
+aws:
+  assume_role: arn:aws:iam::222222222222:role/YardGlueDeploy
+
+source:
+  type: s3
+  path: s3://landing/orders/
+sink:
+  type: iceberg
+  database: sales
+  table: orders
+```
+
+The job's `aws:` block is deep-merged as the final layer: `yard.yaml → account.yaml → region.yaml → job-inline`. This is useful for cross-account deployments where a few jobs target a different AWS account than the project root.
 
 ## State backends
 

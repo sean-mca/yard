@@ -147,9 +147,12 @@ sink:
   type: iceberg
   database: analytics
   table: events
+  path: s3://warehouse/analytics/events/   # optional: custom table location
   mode: append           # append | overwrite (dynamic partition overwrite)
   fill_nulls: true       # default; set false to skip null/void coercion
 ```
+
+When `path` is set, it becomes the Iceberg table's physical storage location via `.tableProperty("location", "...")` at table creation time. If omitted, Iceberg uses the default warehouse path from `providers.glue.warehouse`. The `path` only applies on first create — existing tables are not relocated.
 
 **What yard emits for you:**
 
