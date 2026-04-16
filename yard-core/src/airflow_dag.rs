@@ -6,10 +6,23 @@
 //! apply/plan wiring lands in PR 1c.
 
 use anyhow::{Context as AnyhowContext, Result, anyhow};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tera::{Context, Tera};
 use yard_structs::{AirflowSection, JobDefinition, ProjectManifest};
+
+/// Airflow connection required by a DAG so a task can invoke AWS APIs under a
+/// cross-account role. The DAG-codegen layer does not manage connections —
+/// this struct is emitted alongside the rendered DAG so operators can set them
+/// up in MWAA.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RequiredConnection {
+    pub conn_id: String,
+    pub role_arn: String,
+}
+
+const DEFAULT_AWS_CONN_ID: &str = "aws_default";
 
 use crate::{is_task_only, merge_airflow_sections, parse_airflow_section};
 
@@ -186,9 +199,22 @@ pub fn generate_dag(manifest: &ProjectManifest, dag: &ResolvedDag) -> Result<Str
     // Task definitions, one per line, indented one level for inside `with DAG:`.
     let mut task_lines = Vec::new();
     for (task_id, job_type, job) in &task_types {
-        task_lines.push(render_task(task_id, job_type, job)?);
+        task_lines.push(render_task(task_id, job_type, job, manifest)?);
     }
     let tasks_block = task_lines.join("\n");
+
+    // Cross-account connection docstring. Empty for single-account DAGs so we
+    // don't clutter the header.
+    let required = required_connections_for_dag(manifest, dag)?;
+    let required_connections_block = if required.is_empty() {
+        String::new()
+    } else {
+        let mut out = String::from("# Required Airflow connections (create in MWAA before running):\n");
+        for rc in &required {
+            out.push_str(&format!("#   - {}  ->  {}\n", rc.conn_id, rc.role_arn));
+        }
+        out
+    };
 
     // Dependency wiring at module level (outside the `with` block), one edge
     // per line: `t_up >> t_down`. Simple and easy to read; richer grouping
@@ -218,6 +244,7 @@ pub fn generate_dag(manifest: &ProjectManifest, dag: &ResolvedDag) -> Result<Str
     ctx.insert("schedule", &schedule);
     ctx.insert("tasks_block", &tasks_block);
     ctx.insert("deps_block", &deps_block);
+    ctx.insert("required_connections_block", &required_connections_block);
 
     tera.render("airflow_dag", &ctx)
         .context("Failed to render Airflow DAG template")
@@ -465,7 +492,12 @@ fn render_default_args(cfg: &AirflowSection) -> String {
     }
 }
 
-fn render_task(task_id: &str, job_type: &str, job: &JobDefinition) -> Result<String> {
+fn render_task(
+    task_id: &str,
+    job_type: &str,
+    job: &JobDefinition,
+    manifest: &ProjectManifest,
+) -> Result<String> {
     let var = python_var_name(task_id);
     let tid = python_string_literal(task_id);
     match job_type {
@@ -482,12 +514,17 @@ fn render_task(task_id: &str, job_type: &str, job: &JobDefinition) -> Result<Str
                 cmd_lit = python_string_literal(cmd),
             ))
         }
-        "glue" => Ok(format!(
-            "    {var} = GlueJobOperator(\n        task_id={tid},\n        job_name={jn},\n        aws_conn_id=\"aws_default\",\n    )",
-            var = var,
-            tid = tid,
-            jn = python_string_literal(task_id),
-        )),
+        "glue" => {
+            let conn_id = resolve_task_aws_conn_id(job, manifest)
+                .with_context(|| format!("task '{task_id}'"))?;
+            Ok(format!(
+                "    {var} = GlueJobOperator(\n        task_id={tid},\n        job_name={jn},\n        aws_conn_id={cn},\n    )",
+                var = var,
+                tid = tid,
+                jn = python_string_literal(task_id),
+                cn = python_string_literal(&conn_id),
+            ))
+        }
         other if is_task_only(other) => Err(anyhow!(
             "task-only job type '{other}' is not yet supported in Airflow codegen"
         )),
@@ -495,6 +532,84 @@ fn render_task(task_id: &str, job_type: &str, job: &JobDefinition) -> Result<Str
             "job type '{other}' is not supported in Airflow codegen yet"
         )),
     }
+}
+
+/// Derive the Airflow connection id a task should use. Returns
+/// `DEFAULT_AWS_CONN_ID` when the task's assume-role matches the project root
+/// (same-account case, no per-task override needed) or when no assume-role is
+/// set. Otherwise returns a deterministic id derived from the role ARN.
+fn resolve_task_aws_conn_id(job: &JobDefinition, manifest: &ProjectManifest) -> Result<String> {
+    let task_role = job_assume_role(job);
+    let root_role = assume_role_of(&manifest.aws);
+    match (task_role, root_role) {
+        (Some(task), Some(root)) if task == root => Ok(DEFAULT_AWS_CONN_ID.to_string()),
+        (Some(task), _) => derive_aws_conn_id(task),
+        (None, _) => Ok(DEFAULT_AWS_CONN_ID.to_string()),
+    }
+}
+
+fn job_assume_role(job: &JobDefinition) -> Option<&str> {
+    // `_aws` is the merged view (root ⊕ account.yaml ⊕ job-inline) produced by
+    // `cascade_provider_defaults`; it's authoritative, no fallbacks needed.
+    job.config.get("_aws").and_then(assume_role_of)
+}
+
+fn assume_role_of(v: &Value) -> Option<&str> {
+    v.get("assume_role").and_then(|r| r.as_str()).filter(|s| !s.is_empty())
+}
+
+/// Parse a role ARN and produce a stable Airflow connection id of the form
+/// `yard_<account>_<role_name_sanitized>`. Returns an error on malformed or
+/// non-IAM-role ARNs so invalid config fails at plan/apply rather than at
+/// DAG runtime.
+pub fn derive_aws_conn_id(role_arn: &str) -> Result<String> {
+    let rest = role_arn
+        .strip_prefix("arn:aws:iam::")
+        .ok_or_else(|| anyhow!("malformed role ARN '{role_arn}': expected 'arn:aws:iam::...'"))?;
+    let (account, tail) = rest
+        .split_once(':')
+        .ok_or_else(|| anyhow!("malformed role ARN '{role_arn}': missing account/resource separator"))?;
+    if account.len() != 12 || !account.chars().all(|c| c.is_ascii_digit()) {
+        return Err(anyhow!(
+            "malformed role ARN '{role_arn}': account id must be 12 digits"
+        ));
+    }
+    let name = tail
+        .strip_prefix("role/")
+        .ok_or_else(|| anyhow!("malformed role ARN '{role_arn}': expected resource type 'role/'"))?;
+    if name.is_empty() {
+        return Err(anyhow!("malformed role ARN '{role_arn}': empty role name"));
+    }
+    let sanitized = sanitize_identifier(name);
+    Ok(format!("yard_{account}_{sanitized}"))
+}
+
+/// Distinct Airflow connections the DAG's Glue tasks need, in deterministic
+/// order. Empty when every task uses `aws_default`.
+pub fn required_connections_for_dag(
+    manifest: &ProjectManifest,
+    dag: &ResolvedDag,
+) -> Result<Vec<RequiredConnection>> {
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    for task_id in &dag.tasks {
+        let Some(job) = manifest.jobs.get(task_id) else {
+            continue;
+        };
+        if job.job_type != "glue" {
+            continue;
+        }
+        let conn_id = resolve_task_aws_conn_id(job, manifest)?;
+        if conn_id == DEFAULT_AWS_CONN_ID {
+            continue;
+        }
+        if let Some(arn) = job_assume_role(job) {
+            seen.entry(conn_id).or_insert_with(|| arn.to_string());
+        }
+    }
+    Ok(seen
+        .into_iter()
+        .map(|(conn_id, role_arn)| RequiredConnection { conn_id, role_arn })
+        .collect())
 }
 
 /// Sanitize a string into a Python identifier fragment: keep `[A-Za-z0-9_]`,
@@ -999,6 +1114,197 @@ mod tests {
         let errors = validate_orphan_airflow_blocks(&manifest, &dags);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].0, "orphan_job");
+    }
+
+    // ---- Cross-account: derive_aws_conn_id ----
+
+    #[test]
+    fn derive_aws_conn_id_happy_path() {
+        let got =
+            derive_aws_conn_id("arn:aws:iam::222222222222:role/GlueInvoker").unwrap();
+        assert_eq!(got, "yard_222222222222_GlueInvoker");
+    }
+
+    #[test]
+    fn derive_aws_conn_id_sanitizes_role_path() {
+        // IAM role paths (slashes) are allowed; we sanitize them for
+        // Airflow-friendly conn ids.
+        let got =
+            derive_aws_conn_id("arn:aws:iam::111111111111:role/path/to/MyRole").unwrap();
+        assert_eq!(got, "yard_111111111111_path_to_MyRole");
+    }
+
+    #[test]
+    fn derive_aws_conn_id_rejects_non_iam() {
+        assert!(derive_aws_conn_id("arn:aws:s3:::my-bucket").is_err());
+    }
+
+    #[test]
+    fn derive_aws_conn_id_rejects_bad_account() {
+        // Short account, non-digit account.
+        assert!(derive_aws_conn_id("arn:aws:iam::12345:role/R").is_err());
+        assert!(derive_aws_conn_id("arn:aws:iam::abcdefghijkl:role/R").is_err());
+    }
+
+    #[test]
+    fn derive_aws_conn_id_rejects_missing_role_prefix() {
+        assert!(
+            derive_aws_conn_id("arn:aws:iam::222222222222:user/Alice").is_err()
+        );
+    }
+
+    #[test]
+    fn derive_aws_conn_id_rejects_empty_role_name() {
+        assert!(derive_aws_conn_id("arn:aws:iam::222222222222:role/").is_err());
+    }
+
+    #[test]
+    fn derive_aws_conn_id_rejects_garbage() {
+        assert!(derive_aws_conn_id("not-an-arn").is_err());
+        assert!(derive_aws_conn_id("").is_err());
+    }
+
+    // ---- Cross-account: render_task picks aws_conn_id per job ----
+
+    fn glue_job_with_assume_role(dir: &Path, role_arn: &str) -> JobDefinition {
+        JobDefinition {
+            job_type: "glue".to_string(),
+            config: json!({
+                "type": "glue",
+                "role": "arn:aws:iam::123456789:role/TestGlueRole",
+                "_aws": { "assume_role": role_arn },
+            }),
+            dir: dir.to_path_buf(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn render_task_glue_no_assume_role_uses_default_conn() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        manifest.jobs.insert("orders".into(), glue_job(&dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        assert!(script.contains("aws_conn_id=\"aws_default\""));
+        assert!(!script.contains("Required Airflow connections"));
+    }
+
+    #[test]
+    fn render_task_glue_cross_account_uses_derived_conn() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        manifest.aws = json!({"assume_role": "arn:aws:iam::111111111111:role/OperatorA"});
+        manifest.jobs.insert(
+            "orders".into(),
+            glue_job_with_assume_role(
+                &dag_dir,
+                "arn:aws:iam::222222222222:role/GlueInvoker",
+            ),
+        );
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        assert!(script.contains("aws_conn_id=\"yard_222222222222_GlueInvoker\""));
+        assert!(script.contains("Required Airflow connections"));
+        assert!(script.contains("yard_222222222222_GlueInvoker  ->  arn:aws:iam::222222222222:role/GlueInvoker"));
+    }
+
+    #[test]
+    fn render_task_glue_same_account_role_uses_default_conn() {
+        // Job declares an assume_role that matches the project root — no
+        // cross-account boundary, so no derived conn_id and no docstring.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let root_arn = "arn:aws:iam::111111111111:role/OperatorA";
+        let mut manifest = empty_manifest("test");
+        manifest.aws = json!({"assume_role": root_arn});
+        manifest
+            .jobs
+            .insert("orders".into(), glue_job_with_assume_role(&dag_dir, root_arn));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        assert!(script.contains("aws_conn_id=\"aws_default\""));
+        assert!(!script.contains("Required Airflow connections"));
+    }
+
+    #[test]
+    fn required_connections_deduplicates_across_tasks() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let role_b = "arn:aws:iam::222222222222:role/GlueInvoker";
+        let role_c = "arn:aws:iam::333333333333:role/GlueInvoker";
+        let mut manifest = empty_manifest("test");
+        manifest.aws = json!({"assume_role": "arn:aws:iam::111111111111:role/OperatorA"});
+        manifest
+            .jobs
+            .insert("orders".into(), glue_job_with_assume_role(&dag_dir, role_b));
+        manifest
+            .jobs
+            .insert("shipments".into(), glue_job_with_assume_role(&dag_dir, role_b));
+        manifest
+            .jobs
+            .insert("billing".into(), glue_job_with_assume_role(&dag_dir, role_c));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let conns = required_connections_for_dag(&manifest, &dags[0]).unwrap();
+        assert_eq!(conns.len(), 2);
+        // Deterministic (BTreeMap ordering).
+        assert_eq!(conns[0].conn_id, "yard_222222222222_GlueInvoker");
+        assert_eq!(conns[0].role_arn, role_b);
+        assert_eq!(conns[1].conn_id, "yard_333333333333_GlueInvoker");
+        assert_eq!(conns[1].role_arn, role_c);
+    }
+
+    #[test]
+    fn required_connections_ignores_bash_tasks() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        manifest.jobs.insert("run".into(), bash_job("echo hi", &dag_dir));
+        let dags = collect_dags(root, &manifest).unwrap();
+        assert!(
+            required_connections_for_dag(&manifest, &dags[0])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn generate_dag_fails_on_malformed_assume_role() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("orders".into(), glue_job_with_assume_role(&dag_dir, "garbage"));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let err = generate_dag(&manifest, &dags[0]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("malformed role ARN"), "error was: {msg}");
     }
 
     #[test]

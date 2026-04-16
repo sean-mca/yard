@@ -144,6 +144,13 @@ pub async fn execute(
         println!("{}", color_delete(&format!("  - Deleted DAG: {}", name)));
     }
 
+    if !result.dag_required_connections.is_empty() {
+        println!("\nRequired Airflow connections (create in MWAA before the DAG runs):");
+        for rc in &result.dag_required_connections {
+            println!("  - {}  ->  {}", rc.conn_id, rc.role_arn);
+        }
+    }
+
     println!("\nState updated successfully.");
 
     Ok(())

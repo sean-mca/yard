@@ -221,36 +221,73 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
     Ok(all_jobs)
 }
 
+/// Extract a field from the nearest ancestor context file (account.yaml or
+/// region.yaml) by walking up from `dir`. Returns `Value::Null` when the
+/// file doesn't exist or the field is absent.
+fn context_field(dir: &Path, filename: &str, field: &str) -> Value {
+    find_and_parse_context(dir, filename, false)
+        .ok()
+        .and_then(|v| v.get(field).cloned())
+        .unwrap_or(Value::Null)
+}
+
+/// Deep-merge cascade applied to every job:
+///
+///     root (yard.yaml)  →  account.yaml  →  region.yaml  →  job-inline
+///
+/// Each layer wins over the one before it via `merge_provider_config` (recursive
+/// deep-merge). Both `providers.<type>` and `aws:` follow the same four-layer
+/// precedence chain.
 fn cascade_provider_defaults(
     mut jobs: HashMap<String, JobDefinition>,
     providers: &HashMap<String, Value>,
     root_aws: &Value,
 ) -> HashMap<String, JobDefinition> {
     for job in jobs.values_mut() {
-        if let Some(defaults) = providers.get(&job.job_type) {
-            let overrides = job
-                .config
-                .get(&job.job_type)
-                .cloned()
-                .unwrap_or(Value::Null);
-            let merged = crate::merge_provider_config(defaults, &overrides);
-            if let Some(obj) = job.config.as_object_mut() {
-                obj.insert(job.job_type.clone(), merged);
-            }
+        // --- providers.<type> cascade ---
+        let root_provider = providers
+            .get(&job.job_type)
+            .cloned()
+            .unwrap_or(Value::Null);
+        let account_provider = context_field(&job.dir, "account.yaml", &job.job_type);
+        let region_provider = context_field(&job.dir, "region.yaml", &job.job_type);
+        let job_inline_provider = job
+            .config
+            .get(&job.job_type)
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        let merged = cascade_merge(&[
+            &root_provider,
+            &account_provider,
+            &region_provider,
+            &job_inline_provider,
+        ]);
+        if let Some(obj) = job.config.as_object_mut() {
+            obj.insert(job.job_type.clone(), merged);
         }
 
-        // Merge root aws with the job's nearest-ancestor account.yaml `aws:`
-        // block and stash under `config._aws` for providers to read.
-        let account_aws = find_and_parse_context(&job.dir, "account.yaml", false)
-            .ok()
-            .and_then(|v| v.get("aws").cloned())
-            .unwrap_or(Value::Null);
-        let merged_aws = crate::merge_provider_config(root_aws, &account_aws);
+        // --- aws cascade ---
+        let account_aws = context_field(&job.dir, "account.yaml", "aws");
+        let region_aws = context_field(&job.dir, "region.yaml", "aws");
+        let job_inline_aws = job.config.get("aws").cloned().unwrap_or(Value::Null);
+
+        let merged_aws = cascade_merge(&[root_aws, &account_aws, &region_aws, &job_inline_aws]);
         if let Some(obj) = job.config.as_object_mut() {
             obj.insert("_aws".to_string(), merged_aws);
         }
     }
     jobs
+}
+
+/// Fold N layers left-to-right via deep-merge; later layers win.
+fn cascade_merge(layers: &[&Value]) -> Value {
+    layers
+        .iter()
+        .copied()
+        .fold(Value::Null, |acc, layer| {
+            crate::merge_provider_config(&acc, layer)
+        })
 }
 
 // ---- Context loading ----
@@ -333,5 +370,351 @@ pub fn yaml_to_json(yaml: &yaml_rust2::Yaml) -> Value {
         }
         yaml_rust2::Yaml::Null => Value::Null,
         _ => Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let p = std::env::temp_dir()
+                .join(format!("yard_resolve_{}_{}", std::process::id(), n));
+            let _ = fs::remove_dir_all(&p);
+            fs::create_dir_all(&p).unwrap();
+            TempDir(p)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn glue_job(dir: &Path, inline_aws: Option<Value>) -> JobDefinition {
+        let mut cfg = json!({"type": "glue"});
+        if let Some(aws) = inline_aws {
+            cfg.as_object_mut().unwrap().insert("aws".into(), aws);
+        }
+        JobDefinition {
+            job_type: "glue".to_string(),
+            config: cfg,
+            dir: dir.to_path_buf(),
+            ..Default::default()
+        }
+    }
+
+    fn run_cascade(
+        jobs: Vec<(String, JobDefinition)>,
+        root_aws: Value,
+    ) -> HashMap<String, JobDefinition> {
+        run_cascade_with_providers(jobs, root_aws, HashMap::new())
+    }
+
+    fn run_cascade_with_providers(
+        jobs: Vec<(String, JobDefinition)>,
+        root_aws: Value,
+        providers: HashMap<String, Value>,
+    ) -> HashMap<String, JobDefinition> {
+        let map: HashMap<String, JobDefinition> = jobs.into_iter().collect();
+        cascade_provider_defaults(map, &providers, &root_aws)
+    }
+
+    fn aws_field<'a>(job: &'a JobDefinition, key: &str) -> Option<&'a str> {
+        job.config.get("_aws")?.get(key)?.as_str()
+    }
+
+    fn provider_field<'a>(job: &'a JobDefinition, provider: &str, key: &str) -> Option<&'a str> {
+        job.config.get(provider)?.get(key)?.as_str()
+    }
+
+    // --- aws cascade: root → account → region → job ---
+
+    #[test]
+    fn inline_aws_overrides_root() {
+        let tmp = TempDir::new();
+        let job = glue_job(
+            &tmp.0,
+            Some(json!({"assume_role": "arn:aws:iam::222222222222:role/Deploy"})),
+        );
+        let out = run_cascade(
+            vec![("j".into(), job)],
+            json!({"assume_role": "arn:aws:iam::111111111111:role/Root"}),
+        );
+        assert_eq!(
+            aws_field(&out["j"], "assume_role"),
+            Some("arn:aws:iam::222222222222:role/Deploy")
+        );
+    }
+
+    #[test]
+    fn inline_aws_overrides_account_yaml() {
+        let tmp = TempDir::new();
+        fs::write(
+            tmp.0.join("account.yaml"),
+            "aws:\n  assume_role: arn:aws:iam::222222222222:role/Account\n",
+        )
+        .unwrap();
+        let job = glue_job(
+            &tmp.0,
+            Some(json!({"assume_role": "arn:aws:iam::333333333333:role/Inline"})),
+        );
+        let out = run_cascade(
+            vec![("j".into(), job)],
+            json!({"assume_role": "arn:aws:iam::111111111111:role/Root"}),
+        );
+        assert_eq!(
+            aws_field(&out["j"], "assume_role"),
+            Some("arn:aws:iam::333333333333:role/Inline")
+        );
+    }
+
+    #[test]
+    fn inline_aws_deep_merges_with_account_yaml_siblings() {
+        let tmp = TempDir::new();
+        fs::write(
+            tmp.0.join("account.yaml"),
+            "aws:\n  assume_role: arn:aws:iam::222222222222:role/Account\n  region: eu-west-1\n",
+        )
+        .unwrap();
+        let job = glue_job(
+            &tmp.0,
+            Some(json!({"assume_role": "arn:aws:iam::333333333333:role/Inline"})),
+        );
+        let out = run_cascade(vec![("j".into(), job)], Value::Null);
+        assert_eq!(
+            aws_field(&out["j"], "assume_role"),
+            Some("arn:aws:iam::333333333333:role/Inline")
+        );
+        assert_eq!(aws_field(&out["j"], "region"), Some("eu-west-1"));
+    }
+
+    #[test]
+    fn no_inline_falls_back_to_account_yaml() {
+        let tmp = TempDir::new();
+        fs::write(
+            tmp.0.join("account.yaml"),
+            "aws:\n  assume_role: arn:aws:iam::222222222222:role/Account\n",
+        )
+        .unwrap();
+        let job = glue_job(&tmp.0, None);
+        let out = run_cascade(
+            vec![("j".into(), job)],
+            json!({"assume_role": "arn:aws:iam::111111111111:role/Root"}),
+        );
+        assert_eq!(
+            aws_field(&out["j"], "assume_role"),
+            Some("arn:aws:iam::222222222222:role/Account")
+        );
+    }
+
+    #[test]
+    fn no_inline_no_account_uses_root() {
+        let tmp = TempDir::new();
+        let job = glue_job(&tmp.0, None);
+        let out = run_cascade(
+            vec![("j".into(), job)],
+            json!({"assume_role": "arn:aws:iam::111111111111:role/Root"}),
+        );
+        assert_eq!(
+            aws_field(&out["j"], "assume_role"),
+            Some("arn:aws:iam::111111111111:role/Root")
+        );
+    }
+
+    #[test]
+    fn region_yaml_aws_overrides_account_yaml() {
+        let tmp = TempDir::new();
+        fs::write(
+            tmp.0.join("account.yaml"),
+            "aws:\n  assume_role: arn:aws:iam::222222222222:role/Account\n  region: us-east-1\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.0.join("region.yaml"),
+            "aws:\n  region: eu-west-1\n",
+        )
+        .unwrap();
+        let job = glue_job(&tmp.0, None);
+        let out = run_cascade(vec![("j".into(), job)], Value::Null);
+        // region.yaml wins for region
+        assert_eq!(aws_field(&out["j"], "region"), Some("eu-west-1"));
+        // account.yaml preserved for assume_role (region.yaml didn't set it)
+        assert_eq!(
+            aws_field(&out["j"], "assume_role"),
+            Some("arn:aws:iam::222222222222:role/Account")
+        );
+    }
+
+    #[test]
+    fn full_four_layer_aws_cascade() {
+        let tmp = TempDir::new();
+        fs::write(
+            tmp.0.join("account.yaml"),
+            "aws:\n  from_account: account\n  from_region: will_be_overridden\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.0.join("region.yaml"),
+            "aws:\n  from_region: region\n  from_job: will_be_overridden\n",
+        )
+        .unwrap();
+        let job = glue_job(&tmp.0, Some(json!({"from_job": "job"})));
+        let out = run_cascade(
+            vec![("j".into(), job)],
+            json!({"from_root": "root", "from_account": "will_be_overridden"}),
+        );
+        assert_eq!(aws_field(&out["j"], "from_root"), Some("root"));
+        assert_eq!(aws_field(&out["j"], "from_account"), Some("account"));
+        assert_eq!(aws_field(&out["j"], "from_region"), Some("region"));
+        assert_eq!(aws_field(&out["j"], "from_job"), Some("job"));
+    }
+
+    // --- provider cascade: root → account → region → job ---
+
+    #[test]
+    fn provider_root_flows_through_when_no_overrides() {
+        let tmp = TempDir::new();
+        let job = glue_job(&tmp.0, None);
+        let providers = HashMap::from([(
+            "glue".to_string(),
+            json!({"script_bucket": "root-bucket", "warehouse": "s3://root/"}),
+        )]);
+        let out = run_cascade_with_providers(vec![("j".into(), job)], Value::Null, providers);
+        assert_eq!(
+            provider_field(&out["j"], "glue", "script_bucket"),
+            Some("root-bucket")
+        );
+        assert_eq!(
+            provider_field(&out["j"], "glue", "warehouse"),
+            Some("s3://root/")
+        );
+    }
+
+    #[test]
+    fn provider_account_yaml_overrides_root() {
+        let tmp = TempDir::new();
+        fs::write(
+            tmp.0.join("account.yaml"),
+            "glue:\n  script_bucket: account-bucket\n",
+        )
+        .unwrap();
+        let job = glue_job(&tmp.0, None);
+        let providers = HashMap::from([(
+            "glue".to_string(),
+            json!({"script_bucket": "root-bucket", "warehouse": "s3://root/"}),
+        )]);
+        let out = run_cascade_with_providers(vec![("j".into(), job)], Value::Null, providers);
+        assert_eq!(
+            provider_field(&out["j"], "glue", "script_bucket"),
+            Some("account-bucket")
+        );
+        // Unset fields preserved from root
+        assert_eq!(
+            provider_field(&out["j"], "glue", "warehouse"),
+            Some("s3://root/")
+        );
+    }
+
+    #[test]
+    fn provider_region_yaml_overrides_account() {
+        let tmp = TempDir::new();
+        fs::write(
+            tmp.0.join("account.yaml"),
+            "glue:\n  script_bucket: account-bucket\n  warehouse: s3://account/\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.0.join("region.yaml"),
+            "glue:\n  warehouse: s3://region/\n",
+        )
+        .unwrap();
+        let job = glue_job(&tmp.0, None);
+        let providers = HashMap::from([(
+            "glue".to_string(),
+            json!({"script_bucket": "root-bucket", "warehouse": "s3://root/"}),
+        )]);
+        let out = run_cascade_with_providers(vec![("j".into(), job)], Value::Null, providers);
+        // account wins over root for script_bucket
+        assert_eq!(
+            provider_field(&out["j"], "glue", "script_bucket"),
+            Some("account-bucket")
+        );
+        // region wins over account for warehouse
+        assert_eq!(
+            provider_field(&out["j"], "glue", "warehouse"),
+            Some("s3://region/")
+        );
+    }
+
+    #[test]
+    fn provider_job_inline_overrides_all_layers() {
+        let tmp = TempDir::new();
+        fs::write(
+            tmp.0.join("account.yaml"),
+            "glue:\n  script_bucket: account-bucket\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.0.join("region.yaml"),
+            "glue:\n  warehouse: s3://region/\n",
+        )
+        .unwrap();
+        let mut job = glue_job(&tmp.0, None);
+        job.config
+            .as_object_mut()
+            .unwrap()
+            .insert("glue".into(), json!({"script_bucket": "job-bucket"}));
+        let providers = HashMap::from([(
+            "glue".to_string(),
+            json!({"script_bucket": "root-bucket", "warehouse": "s3://root/"}),
+        )]);
+        let out = run_cascade_with_providers(vec![("j".into(), job)], Value::Null, providers);
+        // Job wins for script_bucket
+        assert_eq!(
+            provider_field(&out["j"], "glue", "script_bucket"),
+            Some("job-bucket")
+        );
+        // Region still wins for warehouse (job didn't override it)
+        assert_eq!(
+            provider_field(&out["j"], "glue", "warehouse"),
+            Some("s3://region/")
+        );
+    }
+
+    #[test]
+    fn full_four_layer_provider_cascade() {
+        let tmp = TempDir::new();
+        fs::write(
+            tmp.0.join("account.yaml"),
+            "glue:\n  from_account: account\n  from_region: will_be_overridden\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.0.join("region.yaml"),
+            "glue:\n  from_region: region\n  from_job: will_be_overridden\n",
+        )
+        .unwrap();
+        let mut job = glue_job(&tmp.0, None);
+        job.config
+            .as_object_mut()
+            .unwrap()
+            .insert("glue".into(), json!({"from_job": "job"}));
+        let providers = HashMap::from([(
+            "glue".to_string(),
+            json!({"from_root": "root", "from_account": "will_be_overridden"}),
+        )]);
+        let out = run_cascade_with_providers(vec![("j".into(), job)], Value::Null, providers);
+        assert_eq!(provider_field(&out["j"], "glue", "from_root"), Some("root"));
+        assert_eq!(provider_field(&out["j"], "glue", "from_account"), Some("account"));
+        assert_eq!(provider_field(&out["j"], "glue", "from_region"), Some("region"));
+        assert_eq!(provider_field(&out["j"], "glue", "from_job"), Some("job"));
     }
 }
