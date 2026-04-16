@@ -197,6 +197,9 @@ pub struct ApplyResult {
     pub dag_created: Vec<String>,
     pub dag_modified: Vec<String>,
     pub dag_deleted: Vec<String>,
+    /// Distinct cross-account Airflow connections required by created/modified
+    /// DAGs. Operators must configure these in MWAA before the DAG runs.
+    pub dag_required_connections: Vec<airflow_dag::RequiredConnection>,
 }
 
 /// Apply changes: generate scripts, deploy via provider, update state.
@@ -278,6 +281,7 @@ pub async fn apply(
             dag_created: Vec::new(),
             dag_modified: Vec::new(),
             dag_deleted: Vec::new(),
+            dag_required_connections: Vec::new(),
         };
 
         for diff in &diffs {
@@ -401,6 +405,7 @@ pub async fn apply(
             result.dag_created = dag_result.created;
             result.dag_modified = dag_result.modified;
             result.dag_deleted = dag_result.deleted;
+            result.dag_required_connections = dag_result.required_connections;
         } else {
             // No DAG dirs in the project — clean up any orphaned DAG state
             let dag_names = storage.list_dags().await?;
@@ -568,6 +573,7 @@ pub struct DagApplyResult {
     pub created: Vec<String>,
     pub modified: Vec<String>,
     pub deleted: Vec<String>,
+    pub required_connections: Vec<airflow_dag::RequiredConnection>,
 }
 
 /// Load the current DAG deployment state from the state backend.
@@ -677,6 +683,7 @@ async fn apply_dags(
         created: Vec::new(),
         modified: Vec::new(),
         deleted: Vec::new(),
+        required_connections: Vec::new(),
     };
 
     if diffs.is_empty() {
@@ -755,6 +762,19 @@ async fn apply_dags(
             }
         }
     }
+
+    let mut conn_set: std::collections::BTreeMap<String, airflow_dag::RequiredConnection> =
+        std::collections::BTreeMap::new();
+    for diff in &diffs {
+        if matches!(diff.diff_type, DiffType::Create | DiffType::Modify { .. })
+            && let Some(dag) = dags.iter().find(|d| d.name == diff.name)
+        {
+            for rc in airflow_dag::required_connections_for_dag(manifest, dag)? {
+                conn_set.entry(rc.conn_id.clone()).or_insert(rc);
+            }
+        }
+    }
+    result.required_connections = conn_set.into_values().collect();
 
     Ok(result)
 }
@@ -1265,6 +1285,44 @@ mod tests {
     use super::*;
     use serde_json::json;
     use yard_structs::{JobDefinition, StateBackend};
+
+    /// Locks the invariant flagged when scoping cross-account DAGs:
+    /// DAG-upload credentials come strictly from root + nearest `account.yaml`.
+    /// Per-job `_aws` must never be consulted for DAG artifact upload,
+    /// otherwise a cross-account job would hijack the upload target from the
+    /// MWAA home account. `resolve_aws_for_dir` takes no job context, which
+    /// is the structural guarantee; this test also verifies the runtime
+    /// cascade (root ← account.yaml) behaves as expected.
+    #[test]
+    fn dag_upload_credentials_ignore_job_aws() {
+        let tmp = std::env::temp_dir().join(format!(
+            "yard_dag_upload_invariant_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let dag_dir = tmp.join("pipeline");
+        std::fs::create_dir_all(&dag_dir).unwrap();
+        std::fs::write(
+            tmp.join("account.yaml"),
+            "aws:\n  assume_role: arn:aws:iam::111111111111:role/AccountA\n",
+        )
+        .unwrap();
+
+        let root_aws = json!({"assume_role": "arn:aws:iam::999999999999:role/Root"});
+        let resolved = resolve_aws_for_dir(&root_aws, &dag_dir);
+        // account.yaml wins, proving the cascade uses account context only.
+        assert_eq!(
+            resolved
+                .get("assume_role")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "arn:aws:iam::111111111111:role/AccountA"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     fn make_job(job_type: &str, config: serde_json::Value) -> JobDefinition {
         let imports = parse_imports(&config);
