@@ -186,6 +186,11 @@ pub struct AirflowSection {
     pub retries: Option<i32>,
     pub dags_bucket: Option<String>,
     pub dags_prefix: Option<String>,
+    /// Dataset URIs that trigger this DAG. When set, the DAG's schedule
+    /// becomes `[Dataset("uri"), ...]` instead of a cron string. Mutually
+    /// exclusive with `schedule`.
+    #[serde(default)]
+    pub triggered_by: Vec<String>,
 }
 
 /// Per-job Airflow metadata lifted out of the `airflow:` block on a job file.
@@ -194,6 +199,10 @@ pub struct AirflowSection {
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 pub struct AirflowJobBlock {
     pub depends_on: Vec<String>,
+    /// Dataset URIs this task produces. Emitted as `outlets=[Dataset(...)]`
+    /// on the Airflow operator so downstream DAGs are triggered on completion.
+    #[serde(default)]
+    pub produces: Vec<String>,
     #[serde(flatten, default)]
     pub overrides: AirflowSection,
 }

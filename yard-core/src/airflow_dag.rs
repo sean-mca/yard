@@ -176,6 +176,16 @@ pub fn generate_dag(manifest: &ProjectManifest, dag: &ResolvedDag) -> Result<Str
             }
         }
     }
+    // Determine if any task produces datasets, or if the DAG is dataset-triggered.
+    let has_datasets = !dag.config.triggered_by.is_empty()
+        || task_types
+            .iter()
+            .any(|(_, _, j)| j.airflow.as_ref().is_some_and(|a| !a.produces.is_empty()));
+
+    // `triggered_by` takes precedence over an inherited `schedule` — a
+    // dataset-triggered DAG doesn't use a cron schedule even if one was
+    // inherited from the project or account level.
+
     let mut import_lines = Vec::new();
     if needs_bash {
         import_lines.push("from airflow.operators.bash import BashOperator".to_string());
@@ -185,15 +195,30 @@ pub fn generate_dag(manifest: &ProjectManifest, dag: &ResolvedDag) -> Result<Str
             "from airflow.providers.amazon.aws.operators.glue import GlueJobOperator".to_string(),
         );
     }
+    if has_datasets {
+        import_lines.push("from airflow.datasets import Dataset".to_string());
+    }
     let imports_block = import_lines.join("\n");
 
     // default_args dict. Only include fields we actually have.
     let default_args = render_default_args(&dag.config);
 
-    // schedule expression as a Python literal.
-    let schedule = match &dag.config.schedule {
-        Some(s) => python_string_literal(s),
-        None => "None".to_string(),
+    // schedule: dataset-triggered DAGs get `[Dataset(...), ...]`;
+    // cron DAGs get a quoted string; unscheduled DAGs get None.
+    let schedule = if !dag.config.triggered_by.is_empty() {
+        let datasets = dag
+            .config
+            .triggered_by
+            .iter()
+            .map(|uri| format!("Dataset({})", python_string_literal(uri)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("[{datasets}]")
+    } else {
+        match &dag.config.schedule {
+            Some(s) => python_string_literal(s),
+            None => "None".to_string(),
+        }
     };
 
     // Task definitions, one per line, indented one level for inside `with DAG:`.
@@ -574,6 +599,7 @@ fn render_task(
 ) -> Result<String> {
     let var = python_var_name(task_id);
     let tid = python_string_literal(task_id);
+    let outlets = render_outlets(job);
     match job_type {
         "bash" => {
             let cmd = job
@@ -582,21 +608,23 @@ fn render_task(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("bash task '{task_id}' is missing 'command'"))?;
             Ok(format!(
-                "    {var} = BashOperator(\n        task_id={tid},\n        bash_command={cmd_lit},\n    )",
+                "    {var} = BashOperator(\n        task_id={tid},\n        bash_command={cmd_lit},{outlets}\n    )",
                 var = var,
                 tid = tid,
                 cmd_lit = python_string_literal(cmd),
+                outlets = outlets,
             ))
         }
         "glue" => {
             let conn_id = resolve_task_aws_conn_id(job, manifest)
                 .with_context(|| format!("task '{task_id}'"))?;
             Ok(format!(
-                "    {var} = GlueJobOperator(\n        task_id={tid},\n        job_name={jn},\n        aws_conn_id={cn},\n    )",
+                "    {var} = GlueJobOperator(\n        task_id={tid},\n        job_name={jn},\n        aws_conn_id={cn},{outlets}\n    )",
                 var = var,
                 tid = tid,
                 jn = python_string_literal(task_id),
                 cn = python_string_literal(&conn_id),
+                outlets = outlets,
             ))
         }
         other if is_task_only(other) => Err(anyhow!(
@@ -605,6 +633,25 @@ fn render_task(
         other => Err(anyhow!(
             "job type '{other}' is not supported in Airflow codegen yet"
         )),
+    }
+}
+
+fn render_outlets(job: &JobDefinition) -> String {
+    let produces = job
+        .airflow
+        .as_ref()
+        .map(|a| &a.produces)
+        .filter(|p| !p.is_empty());
+    match produces {
+        Some(uris) => {
+            let items = uris
+                .iter()
+                .map(|u| format!("Dataset({})", python_string_literal(u)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("\n        outlets=[{items}],")
+        }
+        None => String::new(),
     }
 }
 
@@ -892,11 +939,11 @@ mod tests {
         a.airflow = None;
         b.airflow = Some(AirflowJobBlock {
             depends_on: vec!["a".to_string()],
-            overrides: Default::default(),
+            ..Default::default()
         });
         c.airflow = Some(AirflowJobBlock {
             depends_on: vec!["b".to_string()],
-            overrides: Default::default(),
+            ..Default::default()
         });
         manifest.jobs.insert("a".to_string(), a);
         manifest.jobs.insert("b".to_string(), b);
@@ -924,11 +971,11 @@ mod tests {
         let mut c = bash_job("echo c", &dag_dir);
         b.airflow = Some(AirflowJobBlock {
             depends_on: vec!["a".to_string()],
-            overrides: Default::default(),
+            ..Default::default()
         });
         c.airflow = Some(AirflowJobBlock {
             depends_on: vec!["a".to_string()],
-            overrides: Default::default(),
+            ..Default::default()
         });
         manifest.jobs.insert("a".to_string(), a);
         manifest.jobs.insert("b".to_string(), b);
@@ -954,11 +1001,11 @@ mod tests {
         let mut b = bash_job("echo b", &dag_dir);
         a.airflow = Some(AirflowJobBlock {
             depends_on: vec!["b".to_string()],
-            overrides: Default::default(),
+            ..Default::default()
         });
         b.airflow = Some(AirflowJobBlock {
             depends_on: vec!["a".to_string()],
-            overrides: Default::default(),
+            ..Default::default()
         });
         manifest.jobs.insert("a".to_string(), a);
         manifest.jobs.insert("b".to_string(), b);
@@ -978,7 +1025,7 @@ mod tests {
         let mut a = bash_job("echo a", &dag_dir);
         a.airflow = Some(AirflowJobBlock {
             depends_on: vec!["ghost".to_string()],
-            overrides: Default::default(),
+            ..Default::default()
         });
         manifest.jobs.insert("a".to_string(), a);
 
@@ -1002,7 +1049,7 @@ mod tests {
         let mut b = bash_job("echo b", &dag_two);
         b.airflow = Some(AirflowJobBlock {
             depends_on: vec!["a".to_string()],
-            overrides: Default::default(),
+            ..Default::default()
         });
         manifest.jobs.insert("b".to_string(), b);
 
@@ -1063,6 +1110,7 @@ mod tests {
         let mut b = bash_job("echo b", &dag_dir);
         a.airflow = Some(AirflowJobBlock {
             depends_on: vec![],
+            produces: vec![],
             overrides: AirflowSection {
                 schedule: Some("@hourly".to_string()),
                 ..Default::default()
@@ -1070,6 +1118,7 @@ mod tests {
         });
         b.airflow = Some(AirflowJobBlock {
             depends_on: vec![],
+            produces: vec![],
             overrides: AirflowSection {
                 retries: Some(3),
                 ..Default::default()
@@ -1096,7 +1145,7 @@ mod tests {
         let mut notify = bash_job("echo done", &dag_dir);
         notify.airflow = Some(AirflowJobBlock {
             depends_on: vec!["orders".to_string()],
-            overrides: Default::default(),
+            ..Default::default()
         });
         manifest.jobs.insert("notify".to_string(), notify);
 
@@ -1129,7 +1178,7 @@ mod tests {
         let mut a = bash_job("echo a", &dag_dir);
         a.airflow = Some(AirflowJobBlock {
             depends_on: vec!["a".to_string()],
-            overrides: Default::default(),
+            ..Default::default()
         });
         manifest.jobs.insert("a".to_string(), a);
 
@@ -1162,7 +1211,7 @@ mod tests {
         let mut b = prefixed_bash_job("shipments", "echo b", &dag_dir);
         b.airflow = Some(AirflowJobBlock {
             depends_on: vec!["orders".to_string()],
-            overrides: Default::default(),
+            ..Default::default()
         });
         manifest
             .jobs
@@ -1189,7 +1238,7 @@ mod tests {
         let mut b = prefixed_bash_job("shipments", "echo b", &dag_dir);
         b.airflow = Some(AirflowJobBlock {
             depends_on: vec!["sales-orders".to_string()],
-            overrides: Default::default(),
+            ..Default::default()
         });
         manifest
             .jobs
@@ -1216,7 +1265,7 @@ mod tests {
         let mut c = prefixed_bash_job("notify", "echo c", &dag_dir);
         c.airflow = Some(AirflowJobBlock {
             depends_on: vec!["orders".to_string()],
-            overrides: Default::default(),
+            ..Default::default()
         });
         manifest
             .jobs
@@ -1243,7 +1292,7 @@ mod tests {
         let mut a = prefixed_bash_job("orders", "echo a", &dag_dir);
         a.airflow = Some(AirflowJobBlock {
             depends_on: vec!["orders".to_string()],
-            overrides: Default::default(),
+            ..Default::default()
         });
         manifest
             .jobs
@@ -1516,5 +1565,114 @@ mod tests {
         let dags = collect_dags(root, &manifest).unwrap();
         let errors = validate_orphan_airflow_blocks(&manifest, &dags);
         assert!(errors.is_empty());
+    }
+
+    // ---- Airflow Datasets ----
+
+    #[test]
+    fn task_with_produces_emits_outlets() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        let mut job = glue_job(&dag_dir);
+        job.airflow = Some(AirflowJobBlock {
+            produces: vec!["s3://warehouse/sales/orders".to_string()],
+            ..Default::default()
+        });
+        manifest.jobs.insert("orders".into(), job);
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        assert!(script.contains("from airflow.datasets import Dataset"));
+        assert!(script.contains("outlets=[Dataset(\"s3://warehouse/sales/orders\")]"));
+        assert!(validate_python_syntax(&script).is_none(), "{script}");
+    }
+
+    #[test]
+    fn task_without_produces_omits_outlets() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        manifest.jobs.insert("orders".into(), glue_job(&dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        assert!(!script.contains("outlets"));
+        assert!(!script.contains("Dataset"));
+    }
+
+    #[test]
+    fn dag_triggered_by_datasets_emits_schedule_list() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "triggered_by:\n  - s3://warehouse/sales/orders\n  - s3://warehouse/sales/shipments\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest.jobs.insert("agg".into(), bash_job("echo agg", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        assert!(script.contains("from airflow.datasets import Dataset"));
+        assert!(script.contains(
+            "schedule=[Dataset(\"s3://warehouse/sales/orders\"), Dataset(\"s3://warehouse/sales/shipments\")]"
+        ));
+        assert!(!script.contains("@daily"));
+        assert!(validate_python_syntax(&script).is_none(), "{script}");
+    }
+
+    #[test]
+    fn triggered_by_overrides_inherited_schedule() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "schedule: \"@daily\"\ntriggered_by:\n  - s3://warehouse/foo\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest.jobs.insert("task".into(), bash_job("echo hi", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        assert!(script.contains("schedule=[Dataset(\"s3://warehouse/foo\")]"));
+        assert!(!script.contains("@daily"));
+        assert!(validate_python_syntax(&script).is_none(), "{script}");
+    }
+
+    #[test]
+    fn multiple_produces_on_one_task() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        let mut job = bash_job("echo done", &dag_dir);
+        job.airflow = Some(AirflowJobBlock {
+            produces: vec![
+                "s3://warehouse/a".to_string(),
+                "s3://warehouse/b".to_string(),
+            ],
+            ..Default::default()
+        });
+        manifest.jobs.insert("multi".into(), job);
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        assert!(script.contains(
+            "outlets=[Dataset(\"s3://warehouse/a\"), Dataset(\"s3://warehouse/b\")]"
+        ));
+        assert!(validate_python_syntax(&script).is_none(), "{script}");
     }
 }

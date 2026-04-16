@@ -1036,6 +1036,7 @@ pub fn parse_airflow_section(value: &Value) -> AirflowSection {
             .get("dags_prefix")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+        triggered_by: str_array_field(value, "triggered_by"),
     }
 }
 
@@ -1046,6 +1047,7 @@ pub fn parse_airflow_job_block(config: &Value) -> Option<AirflowJobBlock> {
     let block = config.get("airflow")?;
     Some(AirflowJobBlock {
         depends_on: str_array_field(block, "depends_on"),
+        produces: str_array_field(block, "produces"),
         overrides: parse_airflow_section(block),
     })
 }
@@ -1067,6 +1069,11 @@ pub fn merge_airflow_sections(base: &AirflowSection, overlay: &AirflowSection) -
             .dags_prefix
             .clone()
             .or_else(|| base.dags_prefix.clone()),
+        triggered_by: if overlay.triggered_by.is_empty() {
+            base.triggered_by.clone()
+        } else {
+            overlay.triggered_by.clone()
+        },
     }
 }
 

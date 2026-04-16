@@ -10,7 +10,7 @@ default_args = {{ default_args }}
 with DAG(
     dag_id="{{ dag_name }}",
     default_args=default_args,
-    schedule_interval={{ schedule }},
+    schedule={{ schedule }},
     start_date=datetime(2024, 1, 1),
     catchup=False,
 ) as dag:
