@@ -166,7 +166,7 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
                 .position(|p| p == "envs")
                 .and_then(|i| parts.get(i + 1).cloned())
         };
-        let job_name = [env, folder, Some(base_name)]
+        let job_name = [env, folder, Some(base_name.clone())]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>()
@@ -214,6 +214,7 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
                 create_timestamp,
                 config,
                 dir: job_dir.clone(),
+                base_name,
             },
         );
     }

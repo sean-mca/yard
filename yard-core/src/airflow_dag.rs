@@ -7,7 +7,7 @@
 
 use anyhow::{Context as AnyhowContext, Result, anyhow};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use tera::{Context, Tera};
 use yard_structs::{AirflowSection, JobDefinition, ProjectManifest};
@@ -113,11 +113,11 @@ pub fn collect_dags(root_dir: &Path, manifest: &ProjectManifest) -> Result<Vec<R
 
         let task_ids: BTreeSet<String> = jobs.iter().map(|(n, _)| n.clone()).collect();
 
-        validate_depends_on(&jobs, &task_ids, manifest, dag_dir)?;
+        let resolved_deps = resolve_all_depends_on(&jobs, &task_ids, manifest, dag_dir)?;
         enforce_single_dag_level_override(&jobs, dag_dir)?;
 
         let dag_config = resolve_dag_airflow_config(manifest, dag_dir, &jobs)?;
-        let (sorted_tasks, deps_map) = topo_sort(&jobs)?;
+        let (sorted_tasks, deps_map) = topo_sort(&jobs, &resolved_deps)?;
 
         let dir_name = dag_dir
             .file_name()
@@ -288,45 +288,125 @@ fn nearest_ancestor_in(start: &Path, set: &BTreeSet<PathBuf>) -> Option<PathBuf>
     }
 }
 
-fn validate_depends_on(
+/// Build a lookup from short name (base_name) to full job name for all tasks
+/// in this DAG. Returns entries only where base_name differs from the full name.
+fn build_short_name_index(
+    jobs: &[(String, &JobDefinition)],
+) -> HashMap<String, Vec<String>> {
+    let mut index: HashMap<String, Vec<String>> = HashMap::new();
+    for (full_name, job) in jobs {
+        if !job.base_name.is_empty() && job.base_name != *full_name {
+            index
+                .entry(job.base_name.clone())
+                .or_default()
+                .push(full_name.clone());
+        }
+    }
+    index
+}
+
+/// Resolve a single depends_on reference to a full task name.
+fn resolve_dep(
+    dep: &str,
+    task_name: &str,
+    task_ids: &BTreeSet<String>,
+    short_index: &HashMap<String, Vec<String>>,
+    manifest: &ProjectManifest,
+    dag_dir: &Path,
+) -> Result<String> {
+    if dep == task_name {
+        return Err(anyhow!(
+            "task '{}' in DAG at '{}' depends on itself",
+            task_name,
+            dag_dir.display()
+        ));
+    }
+    if task_ids.contains(dep) {
+        return Ok(dep.to_string());
+    }
+    if let Some(matches) = short_index.get(dep) {
+        let filtered: Vec<&String> = matches
+            .iter()
+            .filter(|m| task_ids.contains(m.as_str()))
+            .collect();
+        return match filtered.len() {
+            1 => {
+                let resolved = filtered[0];
+                if resolved == task_name {
+                    return Err(anyhow!(
+                        "task '{}' in DAG at '{}' depends on itself (via short name '{}')",
+                        task_name,
+                        dag_dir.display(),
+                        dep
+                    ));
+                }
+                Ok(resolved.clone())
+            }
+            0 => Err(anyhow!(
+                "task '{}' in DAG at '{}' depends_on '{}', which is not a task in this DAG",
+                task_name,
+                dag_dir.display(),
+                dep
+            )),
+            _ => Err(anyhow!(
+                "task '{}' in DAG at '{}' depends_on '{}' which is ambiguous — matches: {}. \
+                 Use the full name to disambiguate.",
+                task_name,
+                dag_dir.display(),
+                dep,
+                filtered.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            )),
+        };
+    }
+    if manifest.jobs.contains_key(dep) {
+        Err(anyhow!(
+            "task '{}' in DAG at '{}' has cross-DAG depends_on '{}' — \
+             cross-DAG dependencies are not supported",
+            task_name,
+            dag_dir.display(),
+            dep
+        ))
+    } else {
+        Err(anyhow!(
+            "task '{}' in DAG at '{}' depends_on '{}', which is not a task in this DAG",
+            task_name,
+            dag_dir.display(),
+            dep
+        ))
+    }
+}
+
+/// Resolve and validate all depends_on references, returning a map of
+/// full_name → resolved upstream full names.
+fn resolve_all_depends_on(
     jobs: &[(String, &JobDefinition)],
     task_ids: &BTreeSet<String>,
     manifest: &ProjectManifest,
     dag_dir: &Path,
-) -> Result<()> {
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let short_index = build_short_name_index(jobs);
+    let mut resolved: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (name, job) in jobs {
         let Some(block) = &job.airflow else {
+            resolved.insert(name.clone(), Vec::new());
             continue;
         };
+        let mut deps = Vec::new();
         for dep in &block.depends_on {
-            if dep == name {
-                return Err(anyhow!(
-                    "task '{}' in DAG at '{}' depends on itself",
-                    name,
-                    dag_dir.display()
-                ));
-            }
-            if !task_ids.contains(dep) {
-                return if manifest.jobs.contains_key(dep) {
-                    Err(anyhow!(
-                        "task '{}' in DAG at '{}' has cross-DAG depends_on '{}' — \
-                         cross-DAG dependencies are not supported",
-                        name,
-                        dag_dir.display(),
-                        dep
-                    ))
-                } else {
-                    Err(anyhow!(
-                        "task '{}' in DAG at '{}' depends_on '{}', which is not a task in this DAG",
-                        name,
-                        dag_dir.display(),
-                        dep
-                    ))
-                };
-            }
+            deps.push(resolve_dep(
+                dep,
+                name,
+                task_ids,
+                &short_index,
+                manifest,
+                dag_dir,
+            )?);
         }
+        deps.sort();
+        deps.dedup();
+        resolved.insert(name.clone(), deps);
     }
-    Ok(())
+    Ok(resolved)
 }
 
 fn section_has_dag_level_fields(s: &AirflowSection) -> bool {
@@ -406,20 +486,11 @@ fn resolve_dag_airflow_config(
 /// output. Returns the sorted task list and a per-task upstream map.
 type TopoResult = (Vec<String>, BTreeMap<String, Vec<String>>);
 
-fn topo_sort(jobs: &[(String, &JobDefinition)]) -> Result<TopoResult> {
+fn topo_sort(
+    jobs: &[(String, &JobDefinition)],
+    deps: &BTreeMap<String, Vec<String>>,
+) -> Result<TopoResult> {
     let all_tasks: BTreeSet<String> = jobs.iter().map(|(n, _)| n.clone()).collect();
-
-    let mut deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (name, job) in jobs {
-        let mut d: Vec<String> = job
-            .airflow
-            .as_ref()
-            .map(|a| a.depends_on.clone())
-            .unwrap_or_default();
-        d.sort();
-        d.dedup();
-        deps.insert(name.clone(), d);
-    }
 
     let mut in_degree: BTreeMap<String, usize> = BTreeMap::new();
     for name in &all_tasks {
@@ -427,9 +498,12 @@ fn topo_sort(jobs: &[(String, &JobDefinition)]) -> Result<TopoResult> {
     }
 
     let mut downstream: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (name, ds) in &deps {
+    for (name, ds) in deps.iter() {
         for d in ds {
-            downstream.entry(d.clone()).or_default().push(name.clone());
+            downstream
+                .entry(d.clone())
+                .or_default()
+                .push(name.clone());
         }
     }
     for v in downstream.values_mut() {
@@ -474,7 +548,7 @@ fn topo_sort(jobs: &[(String, &JobDefinition)]) -> Result<TopoResult> {
         ));
     }
 
-    Ok((sorted, deps))
+    Ok((sorted, deps.clone()))
 }
 
 fn render_default_args(cfg: &AirflowSection) -> String {
@@ -1058,6 +1132,122 @@ mod tests {
             overrides: Default::default(),
         });
         manifest.jobs.insert("a".to_string(), a);
+
+        let err = collect_dags(root, &manifest).unwrap_err().to_string();
+        assert!(err.contains("depends on itself"), "got: {err}");
+    }
+
+    // ---- Short-name resolution in depends_on ----
+
+    fn prefixed_bash_job(base_name: &str, command: &str, dir: &Path) -> JobDefinition {
+        JobDefinition {
+            job_type: "bash".to_string(),
+            config: json!({"type": "bash", "command": command}),
+            dir: dir.to_path_buf(),
+            base_name: base_name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn depends_on_resolves_short_name_to_full() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        let mut a = prefixed_bash_job("orders", "echo a", &dag_dir);
+        a.airflow = None;
+        let mut b = prefixed_bash_job("shipments", "echo b", &dag_dir);
+        b.airflow = Some(AirflowJobBlock {
+            depends_on: vec!["orders".to_string()],
+            overrides: Default::default(),
+        });
+        manifest
+            .jobs
+            .insert("sales-orders".to_string(), a);
+        manifest
+            .jobs
+            .insert("sales-shipments".to_string(), b);
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        assert_eq!(dags[0].tasks, vec!["sales-orders", "sales-shipments"]);
+        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        assert!(script.contains("t_sales_orders >> t_sales_shipments"));
+    }
+
+    #[test]
+    fn depends_on_full_name_still_works() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        let a = prefixed_bash_job("orders", "echo a", &dag_dir);
+        let mut b = prefixed_bash_job("shipments", "echo b", &dag_dir);
+        b.airflow = Some(AirflowJobBlock {
+            depends_on: vec!["sales-orders".to_string()],
+            overrides: Default::default(),
+        });
+        manifest
+            .jobs
+            .insert("sales-orders".to_string(), a);
+        manifest
+            .jobs
+            .insert("sales-shipments".to_string(), b);
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        assert!(script.contains("t_sales_orders >> t_sales_shipments"));
+    }
+
+    #[test]
+    fn depends_on_ambiguous_short_name_errors() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        let a = prefixed_bash_job("orders", "echo a", &dag_dir);
+        let b = prefixed_bash_job("orders", "echo b", &dag_dir);
+        let mut c = prefixed_bash_job("notify", "echo c", &dag_dir);
+        c.airflow = Some(AirflowJobBlock {
+            depends_on: vec!["orders".to_string()],
+            overrides: Default::default(),
+        });
+        manifest
+            .jobs
+            .insert("sales-orders".to_string(), a);
+        manifest
+            .jobs
+            .insert("billing-orders".to_string(), b);
+        manifest
+            .jobs
+            .insert("pipeline-notify".to_string(), c);
+
+        let err = collect_dags(root, &manifest).unwrap_err().to_string();
+        assert!(err.contains("ambiguous"), "got: {err}");
+    }
+
+    #[test]
+    fn depends_on_self_via_short_name_errors() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        let mut a = prefixed_bash_job("orders", "echo a", &dag_dir);
+        a.airflow = Some(AirflowJobBlock {
+            depends_on: vec!["orders".to_string()],
+            overrides: Default::default(),
+        });
+        manifest
+            .jobs
+            .insert("sales-orders".to_string(), a);
 
         let err = collect_dags(root, &manifest).unwrap_err().to_string();
         assert!(err.contains("depends on itself"), "got: {err}");

@@ -158,6 +158,11 @@ pub struct JobDefinition {
     /// when grouping jobs into DAGs.
     #[serde(skip, default = "default_path_buf")]
     pub dir: PathBuf,
+    /// Filename-derived base name (e.g. `orders` from `orders.yaml`).
+    /// Populated during discovery; used for short-name resolution in
+    /// `depends_on`.
+    #[serde(skip, default)]
+    pub base_name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]

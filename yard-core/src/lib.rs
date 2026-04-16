@@ -1363,6 +1363,7 @@ mod tests {
             create_timestamp: false,
             config,
             dir: std::path::PathBuf::new(),
+            base_name: String::new(),
         }
     }
 
