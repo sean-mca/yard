@@ -12,10 +12,10 @@ This milestone hardens yard-core by fixing a silent S3 pagination bug and decomp
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: S3 Pagination** - Fix silent truncation of state listings beyond 1,000 objects
-- [ ] **Phase 2: lib.rs Facade Extraction** - Split lib.rs into focused sub-modules with lib.rs as re-export facade
-- [ ] **Phase 3: codegen.rs Decomposition** - Split codegen.rs into directory module with per-concern sub-modules
-- [ ] **Phase 4: airflow_dag.rs Decomposition** - Split airflow_dag.rs into directory module with collection/generation/connections sub-modules
+- [x] **Phase 1: S3 Pagination** - Fix silent truncation of state listings beyond 1,000 objects
+- [x] **Phase 2: lib.rs Facade Extraction** - Split lib.rs into focused sub-modules with lib.rs as re-export facade
+- [x] **Phase 3: codegen.rs Decomposition** - Split codegen.rs into directory module with per-concern sub-modules
+- [x] **Phase 4: airflow_dag.rs Decomposition** - Split airflow_dag.rs into directory module with collection/generation/connections sub-modules
 - [ ] **Phase 5: validation.rs Decomposition** - Split validation.rs into directory module and verify all quality gates across full codebase
 
 ## Phase Details
@@ -58,11 +58,10 @@ Plans:
   2. No file in `codegen/` exceeds 400 lines
   3. `yard-cli` and `yard-server` compile without any source changes
   4. All existing tests pass without changes to test logic
-**Plans**: TBD
+**Plans**: 1 plan
 
 Plans:
-- [ ] 03-01: TBD
-- [ ] 03-02: TBD
+- [x] 03-01-PLAN.md -- Split codegen.rs into codegen/ directory module (helpers, source, sink, transform, mod)
 
 ### Phase 4: airflow_dag.rs Decomposition
 **Goal**: airflow_dag.rs is replaced by a directory module with sub-modules split by DAG pipeline stage
@@ -73,11 +72,10 @@ Plans:
   2. No file in `airflow_dag/` exceeds 400 lines
   3. `yard-cli` and `yard-server` compile without any source changes
   4. All existing tests pass without changes to test logic
-**Plans**: TBD
+**Plans**: 1 plan
 
 Plans:
-- [ ] 04-01: TBD
-- [ ] 04-02: TBD
+- [x] 04-01-PLAN.md — Split airflow_dag.rs into airflow_dag/ directory module (helpers, connections, resolve, generation, collection, mod)
 
 ### Phase 5: validation.rs Decomposition
 **Goal**: validation.rs is replaced by a directory module, and all cross-cutting quality gates are verified across the full codebase
@@ -104,7 +102,7 @@ Note: Phases 3 and 4 depend only on Phase 2 (not each other) and could theoretic
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. S3 Pagination | 1/1 | Complete | 2026-04-18 |
-| 2. lib.rs Facade Extraction | 0/3 | Not started | - |
-| 3. codegen.rs Decomposition | 0/2 | Not started | - |
-| 4. airflow_dag.rs Decomposition | 0/2 | Not started | - |
+| 2. lib.rs Facade Extraction | 3/3 | Complete | 2026-04-18 |
+| 3. codegen.rs Decomposition | 1/1 | Complete | 2026-04-18 |
+| 4. airflow_dag.rs Decomposition | 1/1 | Complete | 2026-04-18 |
 | 5. validation.rs Decomposition | 0/2 | Not started | - |
