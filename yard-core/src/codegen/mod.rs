@@ -1,419 +1,21 @@
+mod helpers;
+mod sink;
+mod source;
+mod transform;
+
 use anyhow::{Context as AnyhowContext, Result, anyhow};
 use tera::{Context, Tera};
-use yard_structs::{Import, JobDefinition, Sink, Source, Transform};
+use yard_structs::JobDefinition;
 
-const GLUE_TEMPLATE: &str = include_str!("templates/glue.py.tera");
-const EMR_TEMPLATE: &str = include_str!("templates/emr.py.tera");
+// Re-import sub-module items so they are in scope for generate_python_script
+// and for `use super::*` in the test module
+use helpers::*;
+use sink::render_sink;
+use source::render_sources;
+use transform::render_transforms;
 
-// --- Import rendering ---
-
-fn render_import(import: &Import) -> String {
-    match &import.from {
-        Some(module) => format!("from {} import {}", module, import.name),
-        None => format!("import {}", import.name),
-    }
-}
-
-fn render_imports(imports: &[Import]) -> String {
-    imports
-        .iter()
-        .map(render_import)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-// --- Source rendering (now named: produces df_<name>) ---
-
-/// Render a serde_json::Value as a Python literal. Strings, numbers, bools,
-/// and null map directly; arrays and objects recurse. Used for opaque
-/// `options:` passthrough.
-fn python_literal(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::Null => "None".to_string(),
-        serde_json::Value::Bool(b) => if *b { "True" } else { "False" }.to_string(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::String(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
-        serde_json::Value::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(python_literal).collect();
-            format!("[{}]", items.join(", "))
-        }
-        serde_json::Value::Object(obj) => {
-            let mut keys: Vec<&String> = obj.keys().collect();
-            keys.sort();
-            let items: Vec<String> = keys
-                .iter()
-                .map(|k| format!("\"{}\": {}", k, python_literal(&obj[*k])))
-                .collect();
-            format!("{{{}}}", items.join(", "))
-        }
-    }
-}
-
-fn effective_engine(source: &Source, default_engine: &str) -> String {
-    source
-        .engine
-        .clone()
-        .unwrap_or_else(|| default_engine.to_string())
-}
-
-fn require_str<'a>(value: Option<&'a str>, source_name: &str, field: &str) -> Result<&'a str> {
-    value.ok_or_else(|| anyhow!("source '{source_name}': '{field}' is required"))
-}
-
-/// Build a Python dict literal from a seed of ordered (key, value) pairs,
-/// merging in arbitrary user-supplied options afterward.
-fn build_options_dict(
-    seed: &[(&str, serde_json::Value)],
-    user_opts: &std::collections::HashMap<String, serde_json::Value>,
-) -> String {
-    let mut opts = serde_json::Map::new();
-    for (k, v) in seed {
-        opts.insert((*k).to_string(), v.clone());
-    }
-    for (k, v) in user_opts {
-        opts.insert(k.clone(), v.clone());
-    }
-    python_literal(&serde_json::Value::Object(opts))
-}
-
-/// Append `.option(k, v)` calls onto a Spark reader chain. `seed` pairs are
-/// emitted as literal strings; `extra` entries use `python_literal`.
-fn append_spark_options(
-    chain: &mut String,
-    seed: &[(&str, &str)],
-    extra: &std::collections::HashMap<String, serde_json::Value>,
-) {
-    for (k, v) in seed {
-        chain.push_str(&format!(".option(\"{k}\", \"{v}\")"));
-    }
-    for (k, v) in extra {
-        chain.push_str(&format!(".option(\"{}\", {})", k, python_literal(v)));
-    }
-}
-
-/// Render a `glueContext.create_dynamic_frame.from_options(...).toDF()` call.
-/// `options_expr` may be a literal dict or a variable name.
-fn glue_from_options(
-    var: &str,
-    connection_type: &str,
-    options_expr: &str,
-    ctx: &str,
-    format: Option<&str>,
-) -> String {
-    let format_arg = format
-        .map(|f| format!("format=\"{f}\", "))
-        .unwrap_or_default();
-    format!(
-        "    {var} = glueContext.create_dynamic_frame.from_options(\
-             connection_type=\"{connection_type}\", \
-             {format_arg}connection_options={options_expr}, \
-             transformation_ctx=\"{ctx}\").toDF()"
-    )
-}
-
-fn render_source(source: &Source, default_engine: &str) -> Result<String> {
-    let name = &source.name;
-    let var = format!("df_{name}");
-    let ctx = format!("{name}_ctx");
-    let engine = effective_engine(source, default_engine);
-    let secret_var = format!("{name}_source_secret");
-    let mut lines = Vec::new();
-
-    if let Some(secret_id) = &source.secret_id {
-        lines.push(render_secret_fetch(secret_id, &format!("{name}_source")));
-    }
-
-    match source.source_type.as_str() {
-        "s3" => {
-            let format = source.format.as_deref().unwrap_or("parquet");
-            let path = require_str(source.path.as_deref(), name, "path")?;
-            if engine == "glue" {
-                let opts = build_options_dict(
-                    &[(
-                        "paths",
-                        serde_json::Value::Array(vec![serde_json::Value::String(path.into())]),
-                    )],
-                    &source.options,
-                );
-                lines.push(glue_from_options(&var, "s3", &opts, &ctx, Some(format)));
-            } else {
-                let mut chain = format!("spark.read.format(\"{format}\")");
-                append_spark_options(&mut chain, &[], &source.options);
-                chain.push_str(&format!(".load(\"{path}\")"));
-                lines.push(format!("    {var} = {chain}"));
-            }
-        }
-        "jdbc" => {
-            let url = require_str(source.connection_url.as_deref(), name, "connection_url")?;
-            let table = require_str(source.table.as_deref(), name, "table")?;
-            if engine == "glue" {
-                let connection_type = source.connection_type.as_deref().ok_or_else(|| {
-                    anyhow!(
-                        "source '{name}': 'connection_type' is required for jdbc+glue (mysql, postgresql, sqlserver, oracle, redshift)"
-                    )
-                })?;
-                let base_opts = build_options_dict(
-                    &[
-                        ("url", serde_json::Value::String(url.into())),
-                        ("dbtable", serde_json::Value::String(table.into())),
-                    ],
-                    &source.options,
-                );
-                let options_expr = if source.secret_id.is_some() {
-                    let opts_var = format!("_opts_{name}");
-                    lines.push(format!(
-                        "    {opts_var} = {{**{base_opts}, \"user\": {secret_var}[\"username\"], \"password\": {secret_var}[\"password\"]}}"
-                    ));
-                    opts_var
-                } else {
-                    base_opts
-                };
-                lines.push(glue_from_options(&var, connection_type, &options_expr, &ctx, None));
-            } else {
-                let mut chain = "spark.read.format(\"jdbc\")".to_string();
-                append_spark_options(
-                    &mut chain,
-                    &[("url", url), ("dbtable", table)],
-                    &source.options,
-                );
-                if source.secret_id.is_some() {
-                    chain.push_str(&format!(
-                        ".option(\"user\", {secret_var}[\"username\"]).option(\"password\", {secret_var}[\"password\"])"
-                    ));
-                }
-                chain.push_str(".load()");
-                lines.push(format!("    {var} = {chain}"));
-            }
-        }
-        "catalog" => {
-            let db = require_str(source.database.as_deref(), name, "database")?;
-            let table = require_str(source.table.as_deref(), name, "table")?;
-            lines.push(format!(
-                "    {var} = glueContext.create_dynamic_frame.from_catalog(database=\"{db}\", table_name=\"{table}\", transformation_ctx=\"{ctx}\").toDF()"
-            ));
-        }
-        "kafka" => {
-            let servers = require_str(source.connection_url.as_deref(), name, "connection_url")?;
-            let topic = require_str(source.topic.as_deref(), name, "topic")?;
-            let mut chain = "spark.read.format(\"kafka\")".to_string();
-            append_spark_options(
-                &mut chain,
-                &[("kafka.bootstrap.servers", servers), ("subscribe", topic)],
-                &source.options,
-            );
-            chain.push_str(".load()");
-            lines.push(format!("    {var} = {chain}"));
-        }
-        "api" => {
-            let url = require_str(source.url.as_deref(), name, "url")?;
-            let headers_obj: serde_json::Map<String, serde_json::Value> = source
-                .headers
-                .iter()
-                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                .collect();
-            let headers_lit = python_literal(&serde_json::Value::Object(headers_obj));
-            let resp_var = format!("_resp_{name}");
-            lines.push(format!(
-                "    {resp_var} = requests.get(\"{url}\", headers={headers_lit})"
-            ));
-            lines.push(format!("    {resp_var}.raise_for_status()"));
-            lines.push(format!("    {var} = spark.createDataFrame({resp_var}.json())"));
-        }
-        other => {
-            lines.push(format!("    # Unsupported source type: {other}"));
-        }
-    }
-
-    Ok(lines.join("\n"))
-}
-
-fn render_sources(sources: &[Source], default_engine: &str) -> Result<String> {
-    let rendered: Vec<String> = sources
-        .iter()
-        .map(|s| render_source(s, default_engine))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(rendered.join("\n"))
-}
-
-// --- Transform rendering (now with named dataframes) ---
-
-fn resolve_df(transform: &Transform, default_source: &str) -> (String, String) {
-    let input = transform.source.as_deref().unwrap_or(default_source);
-    let output = transform.output.as_deref().unwrap_or(input);
-    (format!("df_{input}"), format!("df_{output}"))
-}
-
-fn render_transform(
-    transform: &Transform,
-    default_source: &str,
-    all_source_names: &[String],
-) -> Result<String> {
-    match transform.transform_type.as_str() {
-        "filter" => {
-            let (input, output) = resolve_df(transform, default_source);
-            let condition = transform.condition.as_deref().unwrap_or("True").trim();
-            Ok(format!("    {output} = {input}.filter({condition})"))
-        }
-        "sql" => {
-            let output_name = transform.output.as_deref().unwrap_or(default_source);
-            let output_var = format!("df_{output_name}");
-            let query = transform
-                .query
-                .as_deref()
-                .unwrap_or("SELECT * FROM source")
-                .trim();
-            let mut lines = Vec::new();
-            // Register all named sources as temp views
-            for name in all_source_names {
-                lines.push(format!("    df_{name}.createOrReplaceTempView(\"{name}\")"));
-            }
-            lines.push(format!("    {output_var} = spark.sql(\"{query}\")"));
-            Ok(lines.join("\n"))
-        }
-        "join" => {
-            let left = transform.left.as_deref().unwrap_or(default_source);
-            let right = transform
-                .right
-                .as_deref()
-                .ok_or_else(|| anyhow!("join transform: 'right' is required"))?;
-            let on_col = transform
-                .on
-                .as_deref()
-                .ok_or_else(|| anyhow!("join transform: 'on' is required"))?;
-            let how = transform.how.as_deref().unwrap_or("inner");
-            let output_name = transform.output.as_deref().unwrap_or(left);
-            let output_var = format!("df_{output_name}");
-            Ok(format!("    {output_var} = df_{left}.join(df_{right}, on=\"{on_col}\", how=\"{how}\")"))
-        }
-        "drop_columns" => {
-            let (input, output) = resolve_df(transform, default_source);
-            Ok(format!(
-                "    {output} = {input}.drop({})",
-                quoted_list(&transform.columns)
-            ))
-        }
-        "select" => {
-            let (input, output) = resolve_df(transform, default_source);
-            Ok(format!(
-                "    {output} = {input}.select({})",
-                quoted_list(&transform.columns)
-            ))
-        }
-        "rename" => {
-            let (input, output) = resolve_df(transform, default_source);
-            let mut lines: Vec<String> = Vec::new();
-            let mut first = true;
-            for (old, new) in &transform.mapping {
-                if first {
-                    lines.push(format!(
-                        "    {output} = {input}.withColumnRenamed(\"{old}\", \"{new}\")"
-                    ));
-                    first = false;
-                } else {
-                    lines.push(format!(
-                        "    {output} = {output}.withColumnRenamed(\"{old}\", \"{new}\")"
-                    ));
-                }
-            }
-            Ok(lines.join("\n"))
-        }
-        "add_column" => {
-            let (input, output) = resolve_df(transform, default_source);
-            let name = transform
-                .name
-                .as_deref()
-                .ok_or_else(|| anyhow!("add_column transform: 'name' is required"))?
-                .trim();
-            let expr = transform
-                .expression
-                .as_deref()
-                .unwrap_or("lit(None)")
-                .trim();
-            Ok(format!("    {output} = {input}.withColumn(\"{name}\", {expr})"))
-        }
-        "aggregate" => {
-            let (input, output) = resolve_df(transform, default_source);
-            let group_cols = quoted_list(&transform.group_by);
-            let mut agg_entries: Vec<(&String, &String)> = transform.aggs.iter().collect();
-            agg_entries.sort_by(|a, b| a.0.cmp(b.0));
-            let agg_exprs = agg_entries
-                .iter()
-                .map(|(alias, expr)| format!("F.expr(\"{}\").alias(\"{}\")", expr.trim(), alias))
-                .collect::<Vec<_>>()
-                .join(", ");
-            Ok(format!(
-                "    {output} = {input}.groupBy({group_cols}).agg({agg_exprs})"
-            ))
-        }
-        "window" => {
-            let (input, output) = resolve_df(transform, default_source);
-            let col_name = transform
-                .name
-                .as_deref()
-                .ok_or_else(|| anyhow!("window transform: 'name' is required"))?
-                .trim();
-            let expr = transform
-                .expression
-                .as_deref()
-                .ok_or_else(|| anyhow!("window transform: 'expression' is required"))?
-                .trim();
-            let window_var = format!("_w_{col_name}");
-            let mut spec = String::from("Window");
-            if !transform.partition_by.is_empty() {
-                spec.push_str(&format!(
-                    ".partitionBy({})",
-                    quoted_list(&transform.partition_by)
-                ));
-            }
-            if !transform.order_by.is_empty() {
-                let orders = transform
-                    .order_by
-                    .iter()
-                    .map(|o| {
-                        let dir = if o.desc { "desc" } else { "asc" };
-                        format!("F.col(\"{}\").{dir}()", o.column)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                spec.push_str(&format!(".orderBy({orders})"));
-            }
-            let line1 = format!("    {window_var} = {spec}");
-            let line2 = format!(
-                "    {output} = {input}.withColumn(\"{col_name}\", F.expr(\"{expr}\").over({window_var}))"
-            );
-            Ok(format!("{line1}\n{line2}"))
-        }
-        _ => Ok(format!(
-            "    # Unsupported transform type: {}",
-            transform.transform_type
-        )),
-    }
-}
-
-fn render_transforms(
-    transforms: &[Transform],
-    default_source: &str,
-    all_source_names: &[String],
-) -> Result<String> {
-    let rendered: Vec<String> = transforms
-        .iter()
-        .map(|t| render_transform(t, default_source, all_source_names))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(rendered.join("\n"))
-}
-
-// --- Sink rendering (now with named dataframe) ---
-
-fn require_sink_str<'a>(value: Option<&'a str>, sink_type: &str, field: &str) -> Result<&'a str> {
-    value.ok_or_else(|| anyhow!("sink: '{field}' is required for {sink_type} sink"))
-}
-
-fn quoted_list(cols: &[String]) -> String {
-    cols.iter()
-        .map(|c| format!("\"{c}\""))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
+const GLUE_TEMPLATE: &str = include_str!("../templates/glue.py.tera");
+const EMR_TEMPLATE: &str = include_str!("../templates/emr.py.tera");
 
 /// Emitted inline at module scope when an iceberg sink is writing with
 /// `fill_nulls` enabled. Coerces null/void-typed columns (common in JSON
@@ -465,235 +67,10 @@ def _yard_fill_nulls(df):
     return df
 "#;
 
-const ICEBERG_TABLE_PROPERTIES: &[(&str, &str)] = &[
-    ("format-version", "2"),
-    ("write.spark.accept-any-schema", "true"),
-    ("write.target-file-size-bytes", "536870912"),
-    ("write.parquet.compression-codec", "zstd"),
-    ("write.distribution-mode", "hash"),
-];
-
-fn render_sink(sink: &Sink, default_source: &str) -> Result<String> {
-    let source_name = sink.source.as_deref().unwrap_or(default_source);
-    let var = format!("df_{source_name}");
-    let mut lines = Vec::new();
-
-    if let Some(secret_id) = &sink.secret_id {
-        lines.push(render_secret_fetch(secret_id, "sink"));
-    }
-
-    let mode = sink.mode.as_deref().unwrap_or("overwrite");
-
-    match sink.sink_type.as_str() {
-        "s3" => {
-            let format = sink.format.as_deref().unwrap_or("parquet");
-            let path = require_sink_str(sink.path.as_deref(), "s3", "path")?;
-            let mut write = format!("    {var}.write.format(\"{format}\").mode(\"{mode}\")");
-            if !sink.partition_by.is_empty() {
-                write.push_str(&format!(".partitionBy({})", quoted_list(&sink.partition_by)));
-            }
-            write.push_str(&format!(".save(\"{path}\")"));
-            lines.push(write);
-        }
-        "jdbc" => {
-            let url = require_sink_str(sink.connection_url.as_deref(), "jdbc", "connection_url")?;
-            let table = require_sink_str(sink.table.as_deref(), "jdbc", "table")?;
-            lines.push(format!(
-                "    {var}.write.format(\"jdbc\").option(\"url\", \"{url}\").option(\"dbtable\", \"{table}\")\\"
-            ));
-            if sink.secret_id.is_some() {
-                lines.push(
-                    "        .option(\"user\", sink_secret[\"username\"]).option(\"password\", sink_secret[\"password\"])\\".to_string()
-                );
-            }
-            lines.push(format!("        .mode(\"{mode}\").save()"));
-        }
-        "catalog" => {
-            let db = require_sink_str(sink.database.as_deref(), "catalog", "database")?;
-            let table = require_sink_str(sink.table.as_deref(), "catalog", "table")?;
-            lines.push(format!(
-                "    sink_frame = DynamicFrame.fromDF({var}, glueContext, \"sink_frame\")"
-            ));
-            lines.push(format!(
-                "    glueContext.write_dynamic_frame.from_catalog(frame=sink_frame, database=\"{db}\", table_name=\"{table}\")"
-            ));
-        }
-        "iceberg" => {
-            let db = require_sink_str(sink.database.as_deref(), "iceberg", "database")?;
-            let table = require_sink_str(sink.table.as_deref(), "iceberg", "table")?;
-            // "overwrite" maps to dynamic partition overwrite; "append" is default.
-            let write_op = match mode {
-                "overwrite" => "overwritePartitions",
-                _ => "append",
-            };
-            let partition_clause = if sink.partition_by.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "\n            .partitionedBy({})",
-                    quoted_list(&sink.partition_by)
-                )
-            };
-            let tbl_props = ICEBERG_TABLE_PROPERTIES
-                .iter()
-                .map(|(k, v)| format!("\n            .tableProperty(\"{k}\", \"{v}\")"))
-                .chain(
-                    sink.path
-                        .as_deref()
-                        .filter(|p| !p.is_empty())
-                        .map(|p| format!("\n            .tableProperty(\"location\", \"{p}\")")),
-                )
-                .collect::<String>();
-            lines.push(format!(
-                "    _glue = boto3.client(\"glue\")\n    \
-                 try:\n        \
-                     _glue.get_database(Name=\"{db}\")\n    \
-                 except _glue.exceptions.EntityNotFoundException:\n        \
-                     _glue.create_database(DatabaseInput={{\"Name\": \"{db}\"}})"
-            ));
-            lines.push(format!("    _tbl = \"glue_catalog.{db}.{table}\""));
-            lines.push(format!(
-                "    if not spark.catalog.tableExists(_tbl):\n        \
-                     ({var}.writeTo(_tbl)\n            \
-                         .using(\"iceberg\"){partition_clause}{tbl_props}\n            \
-                         .create())\n    \
-                 else:\n        \
-                     {var}.writeTo(_tbl).option(\"mergeSchema\", \"true\").{write_op}()"
-            ));
-        }
-        other => {
-            lines.push(format!("    # Unsupported sink type: {other}"));
-        }
-    }
-
-    Ok(lines.join("\n"))
-}
-
-// --- Secrets Manager helper ---
-
-fn render_secret_fetch(secret_id: &str, prefix: &str) -> String {
-    let var = format!("{prefix}_secret");
-    [
-        format!("    {var}_client = boto3.client(\"secretsmanager\")"),
-        format!("    {var}_resp = {var}_client.get_secret_value(SecretId=\"{secret_id}\")"),
-        format!("    {var} = json.loads({var}_resp[\"SecretString\"])"),
-    ]
-    .join("\n")
-}
-
-fn needs_secrets_imports(job_def: &JobDefinition) -> bool {
-    let source_has = job_def.sources.iter().any(|s| s.secret_id.is_some());
-    let sink_has = job_def.sink.as_ref().is_some_and(|s| s.secret_id.is_some());
-    source_has || sink_has
-}
-
-fn has_iceberg_sink(job_def: &JobDefinition) -> bool {
-    job_def
-        .sink
-        .as_ref()
-        .is_some_and(|s| s.sink_type == "iceberg")
-}
-
-/// True when the iceberg sink should be preceded by a `_yard_fill_nulls` pass.
-/// Opt-in by default for iceberg sinks; `fill_nulls: false` opts out.
-fn should_fill_nulls(job_def: &JobDefinition) -> bool {
-    job_def
-        .sink
-        .as_ref()
-        .is_some_and(|s| s.sink_type == "iceberg" && s.fill_nulls != Some(false))
-}
-
-fn render_partition_derivation(job_def: &JobDefinition, sink_source: &str) -> Option<String> {
-    if job_def.partition_by.is_empty() {
-        return None;
-    }
-    let var = format!("df_{sink_source}");
-    let mut lines = Vec::new();
-    lines.push("    # --- Partition columns ---".to_string());
-    if job_def.create_timestamp {
-        lines.push(format!(
-            "    {var} = {var}.withColumn(\"ingestion_timestamp\", F.current_timestamp())"
-        ));
-        lines.push("    _ts = \"ingestion_timestamp\"".to_string());
-    } else {
-        let col = job_def
-            .partition_timestamp_column
-            .as_deref()
-            .unwrap_or("event_time");
-        lines.push(format!("    _ts = \"{col}\""));
-    }
-    for unit in &job_def.partition_by {
-        let func = match unit.as_str() {
-            "year" => "year",
-            "month" => "month",
-            "day" => "dayofmonth",
-            _ => continue,
-        };
-        lines.push(format!(
-            "    if \"{unit}\" not in {var}.columns:\n        \
-             {var} = {var}.withColumn(\"{unit}\", F.{func}(F.col(_ts)))"
-        ));
-    }
-    Some(lines.join("\n"))
-}
-
-fn needs_functions_import(job_def: &JobDefinition) -> bool {
-    job_def
-        .transforms
-        .iter()
-        .any(|t| matches!(t.transform_type.as_str(), "aggregate" | "window"))
-}
-
-fn needs_window_import(job_def: &JobDefinition) -> bool {
-    job_def
-        .transforms
-        .iter()
-        .any(|t| t.transform_type == "window")
-}
-
-fn needs_dynamic_frame_import(job_def: &JobDefinition, default_engine: &str) -> bool {
-    job_def
-        .sink
-        .as_ref()
-        .is_some_and(|s| s.sink_type == "catalog")
-        || job_def.sources.iter().any(|s| {
-            s.source_type == "catalog"
-                || (matches!(s.source_type.as_str(), "s3" | "jdbc")
-                    && effective_engine(s, default_engine) == "glue")
-        })
-}
-
-fn needs_requests_import(job_def: &JobDefinition) -> bool {
-    job_def.sources.iter().any(|s| s.source_type == "api")
-}
-
-fn default_engine_for(job_def: &JobDefinition) -> String {
-    job_def
-        .config
-        .get(&job_def.job_type)
-        .and_then(|g| g.get("default_engine"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("spark")
-        .to_string()
-}
-
-fn indent_body(body: &str) -> String {
-    body.lines()
-        .map(|line| {
-            if line.trim().is_empty() {
-                String::new()
-            } else {
-                format!("    {}", line)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result<String> {
     // Task-only job types (bash, ...) don't produce a standalone PySpark script;
     // they participate in Airflow DAG codegen instead. Return an empty string so
-    // callers that blindly hash/write the script output continue to work — the
+    // callers that blindly hash/write the script output continue to work -- the
     // apply path skips deploy for these types via `is_task_only`.
     if crate::is_task_only(&job_def.job_type) {
         return Ok(String::new());
@@ -859,8 +236,8 @@ mod tests {
         }
     }
 
-    fn s3_source(name: &str, path: &str) -> Source {
-        Source {
+    fn s3_source(name: &str, path: &str) -> yard_structs::Source {
+        yard_structs::Source {
             name: name.to_string(),
             source_type: "s3".to_string(),
             format: Some("parquet".to_string()),
@@ -937,7 +314,7 @@ mod tests {
     fn transform_defaults_to_first_source() {
         let mut job = base_job();
         job.sources = vec![s3_source("events", "s3://b/in")];
-        job.transforms = vec![Transform {
+        job.transforms = vec![yard_structs::Transform {
             transform_type: "filter".to_string(),
             source: None,
             output: None,
@@ -967,7 +344,7 @@ mod tests {
             s3_source("orders", "s3://b/orders"),
             s3_source("customers", "s3://b/customers"),
         ];
-        job.transforms = vec![Transform {
+        job.transforms = vec![yard_structs::Transform {
             transform_type: "filter".to_string(),
             source: Some("customers".to_string()),
             output: Some("active_customers".to_string()),
@@ -999,7 +376,7 @@ mod tests {
             s3_source("orders", "s3://b/orders"),
             s3_source("customers", "s3://b/customers"),
         ];
-        job.transforms = vec![Transform {
+        job.transforms = vec![yard_structs::Transform {
             transform_type: "join".to_string(),
             source: None,
             output: Some("enriched".to_string()),
@@ -1033,7 +410,7 @@ mod tests {
             s3_source("orders", "s3://b/orders"),
             s3_source("customers", "s3://b/customers"),
         ];
-        job.transforms = vec![Transform {
+        job.transforms = vec![yard_structs::Transform {
             transform_type: "sql".to_string(),
             source: None,
             output: Some("enriched".to_string()),
@@ -1066,7 +443,7 @@ mod tests {
     fn sink_defaults_to_first_source() {
         let mut job = base_job();
         job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(Sink {
+        job.sink = Some(yard_structs::Sink {
             source: None,
             sink_type: "s3".to_string(),
             format: Some("parquet".to_string()),
@@ -1090,7 +467,7 @@ mod tests {
             s3_source("orders", "s3://b/orders"),
             s3_source("customers", "s3://b/customers"),
         ];
-        job.transforms = vec![Transform {
+        job.transforms = vec![yard_structs::Transform {
             transform_type: "join".to_string(),
             source: None,
             output: Some("enriched".to_string()),
@@ -1109,7 +486,7 @@ mod tests {
             partition_by: vec![],
             order_by: vec![],
         }];
-        job.sink = Some(Sink {
+        job.sink = Some(yard_structs::Sink {
             source: Some("enriched".to_string()),
             sink_type: "s3".to_string(),
             format: Some("parquet".to_string()),
@@ -1128,8 +505,8 @@ mod tests {
 
     // --- Iceberg sink ---
 
-    fn iceberg_sink(database: &str, table: &str, path: Option<&str>) -> Sink {
-        Sink {
+    fn iceberg_sink(database: &str, table: &str, path: Option<&str>) -> yard_structs::Sink {
+        yard_structs::Sink {
             source: None,
             sink_type: "iceberg".to_string(),
             database: Some(database.to_string()),
@@ -1193,7 +570,7 @@ mod tests {
     #[test]
     fn jdbc_source_secret_named() {
         let mut job = base_job();
-        job.sources = vec![Source {
+        job.sources = vec![yard_structs::Source {
             name: "users".to_string(),
             source_type: "jdbc".to_string(),
             format: None,
@@ -1221,7 +598,7 @@ mod tests {
             s3_source("customers", "s3://raw/customers/"),
         ];
         job.transforms = vec![
-            Transform {
+            yard_structs::Transform {
                 transform_type: "filter".to_string(),
                 source: Some("orders".to_string()),
                 output: None,
@@ -1240,7 +617,7 @@ mod tests {
                 partition_by: vec![],
                 order_by: vec![],
             },
-            Transform {
+            yard_structs::Transform {
                 transform_type: "join".to_string(),
                 source: None,
                 output: Some("enriched".to_string()),
@@ -1259,7 +636,7 @@ mod tests {
                 partition_by: vec![],
                 order_by: vec![],
             },
-            Transform {
+            yard_structs::Transform {
                 transform_type: "drop_columns".to_string(),
                 source: Some("enriched".to_string()),
                 output: None,
@@ -1279,7 +656,7 @@ mod tests {
                 order_by: vec![],
             },
         ];
-        job.sink = Some(Sink {
+        job.sink = Some(yard_structs::Sink {
             source: Some("enriched".to_string()),
             sink_type: "s3".to_string(),
             format: Some("parquet".to_string()),
@@ -1342,7 +719,7 @@ mod tests {
     #[test]
     fn s3_source_missing_path_errors() {
         let mut job = base_job();
-        job.sources = vec![Source {
+        job.sources = vec![yard_structs::Source {
             name: "events".to_string(),
             source_type: "s3".to_string(),
             format: Some("parquet".to_string()),
@@ -1362,7 +739,7 @@ mod tests {
     #[test]
     fn jdbc_source_missing_connection_url_errors() {
         let mut job = base_job();
-        job.sources = vec![Source {
+        job.sources = vec![yard_structs::Source {
             name: "users".to_string(),
             source_type: "jdbc".to_string(),
             format: None,
@@ -1382,7 +759,7 @@ mod tests {
     #[test]
     fn jdbc_source_missing_table_errors() {
         let mut job = base_job();
-        job.sources = vec![Source {
+        job.sources = vec![yard_structs::Source {
             name: "users".to_string(),
             source_type: "jdbc".to_string(),
             format: None,
@@ -1402,7 +779,7 @@ mod tests {
     #[test]
     fn catalog_source_missing_database_errors() {
         let mut job = base_job();
-        job.sources = vec![Source {
+        job.sources = vec![yard_structs::Source {
             name: "catalog_src".to_string(),
             source_type: "catalog".to_string(),
             format: None,
@@ -1422,7 +799,7 @@ mod tests {
     #[test]
     fn catalog_source_missing_table_errors() {
         let mut job = base_job();
-        job.sources = vec![Source {
+        job.sources = vec![yard_structs::Source {
             name: "catalog_src".to_string(),
             source_type: "catalog".to_string(),
             format: None,
@@ -1443,7 +820,7 @@ mod tests {
     fn join_missing_right_errors() {
         let mut job = base_job();
         job.sources = vec![s3_source("orders", "s3://b/orders")];
-        job.transforms = vec![Transform {
+        job.transforms = vec![yard_structs::Transform {
             transform_type: "join".to_string(),
             source: None,
             output: None,
@@ -1472,7 +849,7 @@ mod tests {
     fn join_missing_on_errors() {
         let mut job = base_job();
         job.sources = vec![s3_source("orders", "s3://b/orders")];
-        job.transforms = vec![Transform {
+        job.transforms = vec![yard_structs::Transform {
             transform_type: "join".to_string(),
             source: None,
             output: None,
@@ -1501,7 +878,7 @@ mod tests {
     fn add_column_missing_name_errors() {
         let mut job = base_job();
         job.sources = vec![s3_source("events", "s3://b/in")];
-        job.transforms = vec![Transform {
+        job.transforms = vec![yard_structs::Transform {
             transform_type: "add_column".to_string(),
             source: None,
             output: None,
@@ -1530,7 +907,7 @@ mod tests {
     fn s3_sink_missing_path_errors() {
         let mut job = base_job();
         job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(Sink {
+        job.sink = Some(yard_structs::Sink {
             source: None,
             sink_type: "s3".to_string(),
             format: Some("parquet".to_string()),
@@ -1553,7 +930,7 @@ mod tests {
     fn jdbc_sink_missing_connection_url_errors() {
         let mut job = base_job();
         job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(Sink {
+        job.sink = Some(yard_structs::Sink {
             source: None,
             sink_type: "jdbc".to_string(),
             format: None,
@@ -1576,7 +953,7 @@ mod tests {
     fn jdbc_sink_missing_table_errors() {
         let mut job = base_job();
         job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(Sink {
+        job.sink = Some(yard_structs::Sink {
             source: None,
             sink_type: "jdbc".to_string(),
             format: None,
@@ -1599,7 +976,7 @@ mod tests {
     fn catalog_sink_missing_database_errors() {
         let mut job = base_job();
         job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(Sink {
+        job.sink = Some(yard_structs::Sink {
             source: None,
             sink_type: "catalog".to_string(),
             format: None,
@@ -1622,7 +999,7 @@ mod tests {
     fn catalog_sink_missing_table_errors() {
         let mut job = base_job();
         job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(Sink {
+        job.sink = Some(yard_structs::Sink {
             source: None,
             sink_type: "catalog".to_string(),
             format: None,
@@ -1650,7 +1027,7 @@ mod tests {
         let mut aggs = HashMap::new();
         aggs.insert("total".to_string(), "sum(amount)".to_string());
         aggs.insert("n".to_string(), "count(*)".to_string());
-        job.transforms = vec![Transform {
+        job.transforms = vec![yard_structs::Transform {
             transform_type: "aggregate".to_string(),
             source: Some("orders".to_string()),
             output: Some("daily".to_string()),
@@ -1671,7 +1048,7 @@ mod tests {
         job.sources = vec![s3_source("events", "s3://b/events")];
         let mut aggs = HashMap::new();
         aggs.insert("n".to_string(), "count(*)".to_string());
-        job.transforms = vec![Transform {
+        job.transforms = vec![yard_structs::Transform {
             transform_type: "aggregate".to_string(),
             group_by: vec!["user".to_string()],
             aggs,
@@ -1689,7 +1066,7 @@ mod tests {
     fn window_transform_partition_and_order() {
         let mut job = base_job();
         job.sources = vec![s3_source("orders", "s3://b/orders")];
-        job.transforms = vec![Transform {
+        job.transforms = vec![yard_structs::Transform {
             transform_type: "window".to_string(),
             source: Some("orders".to_string()),
             output: Some("ranked".to_string()),
@@ -1723,7 +1100,7 @@ mod tests {
     fn window_transform_partition_only() {
         let mut job = base_job();
         job.sources = vec![s3_source("events", "s3://b/events")];
-        job.transforms = vec![Transform {
+        job.transforms = vec![yard_structs::Transform {
             transform_type: "window".to_string(),
             name: Some("cnt".to_string()),
             expression: Some("count(*)".to_string()),
@@ -1756,14 +1133,14 @@ mod tests {
         let mut aggs = HashMap::new();
         aggs.insert("total".to_string(), "sum(amount)".to_string());
         job.transforms = vec![
-            Transform {
+            yard_structs::Transform {
                 transform_type: "aggregate".to_string(),
                 output: Some("totals".to_string()),
                 group_by: vec!["region".to_string()],
                 aggs,
                 ..Default::default()
             },
-            Transform {
+            yard_structs::Transform {
                 transform_type: "window".to_string(),
                 source: Some("totals".to_string()),
                 output: Some("ranked".to_string()),
