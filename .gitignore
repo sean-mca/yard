@@ -11,3 +11,8 @@ yard.yaml
 .env.local
 .claude
 nexttime.txt
+
+.planning/**
+
+.planning
+CLAUDE.md
