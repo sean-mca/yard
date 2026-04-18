@@ -1,0 +1,504 @@
+use std::collections::HashSet;
+use yard_structs::{JobDefinition, ValidationError};
+
+const SUPPORTED_JOB_TYPES: &[&str] = &["glue", "emr", "bash"];
+const SUPPORTED_SOURCE_TYPES: &[&str] = &["s3", "jdbc", "catalog", "kafka", "api"];
+const VALID_ENGINES: &[&str] = &["spark", "glue"];
+const SUPPORTED_SINK_TYPES: &[&str] = &["s3", "jdbc", "catalog", "iceberg"];
+const VALID_PARTITION_UNITS: &[&str] = &["year", "month", "day"];
+const VALID_ICEBERG_MODES: &[&str] = &["append", "overwrite"];
+const SUPPORTED_TRANSFORM_TYPES: &[&str] = &[
+    "filter",
+    "sql",
+    "join",
+    "drop_columns",
+    "select",
+    "rename",
+    "add_column",
+    "aggregate",
+    "window",
+];
+
+pub fn err(field: &str, message: &str) -> ValidationError {
+    ValidationError {
+        field: field.to_string(),
+        message: message.to_string(),
+    }
+}
+
+pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+
+    // Job type
+    if !SUPPORTED_JOB_TYPES.contains(&job.job_type.as_str()) {
+        errors.push(err(
+            "type",
+            &format!(
+                "\"{}\" is not a supported job type (expected: {})",
+                job.job_type,
+                SUPPORTED_JOB_TYPES.join(", ")
+            ),
+        ));
+    }
+
+    // Task-only job types (bash, ...) take a separate path — they don't have
+    // sources/sinks/transforms and don't deploy anywhere. Validate them here
+    // and skip the Spark-job checks below.
+    if crate::is_task_only(&job.job_type) {
+        validate_task_only_job(job, &mut errors);
+        return errors;
+    }
+
+    // body and job_file are mutually exclusive (only relevant for Spark jobs)
+    if job.body.is_some() && job.job_file.is_some() {
+        errors.push(err(
+            "job_file",
+            "cannot specify both \"body\" and \"job_file\"",
+        ));
+    }
+
+    // Track known df names for reference checking
+    let mut known_names: HashSet<String> = HashSet::new();
+
+    // Sources
+    for (i, source) in job.sources.iter().enumerate() {
+        let prefix = format!("sources[{}]", i);
+
+        if !SUPPORTED_SOURCE_TYPES.contains(&source.source_type.as_str()) {
+            errors.push(err(
+                &format!("{prefix}.type"),
+                &format!(
+                    "\"{}\" is not a supported source type (expected: {})",
+                    source.source_type,
+                    SUPPORTED_SOURCE_TYPES.join(", ")
+                ),
+            ));
+        }
+
+        match source.source_type.as_str() {
+            "s3" => {
+                if source.path.is_none() {
+                    errors.push(err(&prefix.to_string(), "type \"s3\" requires \"path\""));
+                }
+            }
+            "jdbc" => {
+                if source.connection_url.is_none() {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        "type \"jdbc\" requires \"connection_url\"",
+                    ));
+                }
+                if source.table.is_none() {
+                    errors.push(err(&prefix.to_string(), "type \"jdbc\" requires \"table\""));
+                }
+                if source.engine.as_deref() == Some("glue")
+                    && source.connection_type.is_none()
+                {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        "type \"jdbc\" with engine \"glue\" requires \"connection_type\" (mysql, postgresql, sqlserver, oracle, redshift)",
+                    ));
+                }
+            }
+            "kafka" => {
+                if source.connection_url.is_none() {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        "type \"kafka\" requires \"connection_url\" (bootstrap servers)",
+                    ));
+                }
+                if source.topic.is_none() {
+                    errors.push(err(&prefix.to_string(), "type \"kafka\" requires \"topic\""));
+                }
+            }
+            "api" => {
+                if source.url.is_none() {
+                    errors.push(err(&prefix.to_string(), "type \"api\" requires \"url\""));
+                }
+            }
+            "catalog" => {
+                if source.database.is_none() {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        "type \"catalog\" requires \"database\"",
+                    ));
+                }
+                if source.table.is_none() {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        "type \"catalog\" requires \"table\"",
+                    ));
+                }
+            }
+            _ => {}
+        }
+
+        if let Some(engine) = source.engine.as_deref()
+            && !VALID_ENGINES.contains(&engine)
+        {
+            errors.push(err(
+                &format!("{prefix}.engine"),
+                &format!(
+                    "\"{}\" is not a valid engine (expected: {})",
+                    engine,
+                    VALID_ENGINES.join(", ")
+                ),
+            ));
+        }
+
+        known_names.insert(source.name.clone());
+    }
+
+    // Transforms
+    for (i, transform) in job.transforms.iter().enumerate() {
+        let prefix = format!("transforms[{}]", i);
+
+        if !SUPPORTED_TRANSFORM_TYPES.contains(&transform.transform_type.as_str()) {
+            errors.push(err(
+                &format!("{prefix}.type"),
+                &format!(
+                    "\"{}\" is not a supported transform type (expected: {})",
+                    transform.transform_type,
+                    SUPPORTED_TRANSFORM_TYPES.join(", ")
+                ),
+            ));
+        }
+
+        // Reference checks
+        if let Some(ref src) = transform.source
+            && !known_names.contains(src)
+        {
+            errors.push(err(
+                &format!("{prefix}.source"),
+                &format!(
+                    "\"{}\" does not reference a known source or transform output",
+                    src
+                ),
+            ));
+        }
+
+        match transform.transform_type.as_str() {
+            "filter" => {
+                if transform.condition.is_none() {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        "type \"filter\" requires \"condition\"",
+                    ));
+                }
+            }
+            "sql" => {
+                if transform.query.is_none() {
+                    errors.push(err(&prefix.to_string(), "type \"sql\" requires \"query\""));
+                }
+            }
+            "join" => {
+                if let Some(left) = &transform.left {
+                    if !known_names.contains(left) {
+                        errors.push(err(
+                            &format!("{prefix}.left"),
+                            &format!(
+                                "\"{}\" does not reference a known source or transform output",
+                                left
+                            ),
+                        ));
+                    }
+                } else {
+                    errors.push(err(&prefix.to_string(), "type \"join\" requires \"left\""));
+                }
+                if let Some(right) = &transform.right {
+                    if !known_names.contains(right) {
+                        errors.push(err(
+                            &format!("{prefix}.right"),
+                            &format!(
+                                "\"{}\" does not reference a known source or transform output",
+                                right
+                            ),
+                        ));
+                    }
+                } else {
+                    errors.push(err(&prefix.to_string(), "type \"join\" requires \"right\""));
+                }
+                if transform.on.is_none() {
+                    errors.push(err(&prefix.to_string(), "type \"join\" requires \"on\""));
+                }
+            }
+            "drop_columns" | "select" => {
+                if transform.columns.is_empty() {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        &format!(
+                            "type \"{}\" requires non-empty \"columns\"",
+                            transform.transform_type
+                        ),
+                    ));
+                }
+            }
+            "rename" => {
+                if transform.mapping.is_empty() {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        "type \"rename\" requires non-empty \"mapping\"",
+                    ));
+                }
+            }
+            "add_column" => {
+                if transform.name.is_none() {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        "type \"add_column\" requires \"name\"",
+                    ));
+                }
+                if transform.expression.is_none() {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        "type \"add_column\" requires \"expression\"",
+                    ));
+                }
+            }
+            "aggregate" => {
+                if transform.group_by.is_empty() {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        "type \"aggregate\" requires non-empty \"group_by\"",
+                    ));
+                }
+                if transform.aggs.is_empty() {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        "type \"aggregate\" requires non-empty \"aggs\"",
+                    ));
+                }
+            }
+            "window" => {
+                if transform.name.is_none() {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        "type \"window\" requires \"name\" (new column name)",
+                    ));
+                }
+                if transform.expression.is_none() {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        "type \"window\" requires \"expression\"",
+                    ));
+                }
+                if transform.partition_by.is_empty() && transform.order_by.is_empty() {
+                    errors.push(err(
+                        &prefix.to_string(),
+                        "type \"window\" requires at least one of \"partition_by\" or \"order_by\"",
+                    ));
+                }
+            }
+            _ => {}
+        }
+
+        // Register output name for downstream reference checking
+        if let Some(ref output) = transform.output {
+            known_names.insert(output.clone());
+        } else if let Some(ref src) = transform.source {
+            // If no output, the transform overwrites its source — already known
+            known_names.insert(src.clone());
+        }
+    }
+
+    // Sink
+    if let Some(ref sink) = job.sink {
+        if !SUPPORTED_SINK_TYPES.contains(&sink.sink_type.as_str()) {
+            errors.push(err(
+                "sink.type",
+                &format!(
+                    "\"{}\" is not a supported sink type (expected: {})",
+                    sink.sink_type,
+                    SUPPORTED_SINK_TYPES.join(", ")
+                ),
+            ));
+        }
+
+        if let Some(ref src) = sink.source
+            && !known_names.contains(src)
+        {
+            errors.push(err(
+                "sink.source",
+                &format!(
+                    "\"{}\" does not reference a known source or transform output",
+                    src
+                ),
+            ));
+        }
+
+        match sink.sink_type.as_str() {
+            "s3" => {
+                if sink.path.is_none() {
+                    errors.push(err("sink", "type \"s3\" requires \"path\""));
+                }
+            }
+            "jdbc" => {
+                if sink.connection_url.is_none() {
+                    errors.push(err("sink", "type \"jdbc\" requires \"connection_url\""));
+                }
+                if sink.table.is_none() {
+                    errors.push(err("sink", "type \"jdbc\" requires \"table\""));
+                }
+            }
+            "catalog" => {
+                if sink.database.is_none() {
+                    errors.push(err("sink", "type \"catalog\" requires \"database\""));
+                }
+                if sink.table.is_none() {
+                    errors.push(err("sink", "type \"catalog\" requires \"table\""));
+                }
+            }
+            "iceberg" => {
+                if sink.database.is_none() {
+                    errors.push(err("sink", "type \"iceberg\" requires \"database\""));
+                }
+                if sink.table.is_none() {
+                    errors.push(err("sink", "type \"iceberg\" requires \"table\""));
+                }
+                if let Some(mode) = sink.mode.as_deref()
+                    && !VALID_ICEBERG_MODES.contains(&mode)
+                {
+                    errors.push(err(
+                        "sink.mode",
+                        &format!(
+                            "\"{}\" is not valid for iceberg (expected: {})",
+                            mode,
+                            VALID_ICEBERG_MODES.join(", ")
+                        ),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Job-level partition_by (Iceberg only)
+    if !job.partition_by.is_empty() {
+        for p in &job.partition_by {
+            if !VALID_PARTITION_UNITS.contains(&p.as_str()) {
+                errors.push(err(
+                    "partition_by",
+                    &format!(
+                        "\"{}\" is not a valid partition unit (expected: {})",
+                        p,
+                        VALID_PARTITION_UNITS.join(", ")
+                    ),
+                ));
+            }
+        }
+
+        let sink_is_iceberg = job
+            .sink
+            .as_ref()
+            .is_some_and(|s| s.sink_type == "iceberg");
+        if !sink_is_iceberg {
+            errors.push(err(
+                "partition_by",
+                "job-level \"partition_by\" requires an iceberg sink",
+            ));
+        }
+
+        match (job.create_timestamp, &job.partition_timestamp_column) {
+            (true, Some(_)) => errors.push(err(
+                "create_timestamp",
+                "cannot set both \"create_timestamp\" and \"partition_timestamp_column\"",
+            )),
+            (false, None) => errors.push(err(
+                "partition_by",
+                "requires one of \"create_timestamp: true\" or \"partition_timestamp_column\"",
+            )),
+            _ => {}
+        }
+    } else if job.create_timestamp || job.partition_timestamp_column.is_some() {
+        errors.push(err(
+            "partition_by",
+            "\"create_timestamp\" / \"partition_timestamp_column\" require non-empty \"partition_by\"",
+        ));
+    }
+
+    // Provider-specific config validation — dispatched to provider modules
+    match job.job_type.as_str() {
+        "glue" => {
+            let has_role = job
+                .config
+                .get("role")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty());
+            if !has_role {
+                errors.push(err(
+                    "role",
+                    "Glue jobs require a \"role\" (execution role ARN)",
+                ));
+            }
+
+            if let Some(config) = job.config.get("glue") {
+                crate::providers::glue::validate_config(config, &mut errors);
+            }
+        }
+        "emr" => {
+            if let Some(config) = job.config.get("emr") {
+                crate::providers::emr::validate_config(config, &mut errors);
+            }
+        }
+        _ => {}
+    }
+
+    errors
+}
+
+/// Validate a task-only job (bash, ... future: python, sensor, dbt).
+/// These jobs must not carry Spark-job fields (sources/sink/transforms/body/job_file)
+/// and must carry their task-type-specific required fields.
+fn validate_task_only_job(job: &JobDefinition, errors: &mut Vec<ValidationError>) {
+    // Reject Spark-shaped fields on task-only jobs — they're meaningless here.
+    if !job.sources.is_empty() {
+        errors.push(err(
+            "sources",
+            &format!(
+                "task-only job type \"{}\" cannot declare sources",
+                job.job_type
+            ),
+        ));
+    }
+    if job.sink.is_some() {
+        errors.push(err(
+            "sink",
+            &format!(
+                "task-only job type \"{}\" cannot declare a sink",
+                job.job_type
+            ),
+        ));
+    }
+    if !job.transforms.is_empty() {
+        errors.push(err(
+            "transforms",
+            &format!(
+                "task-only job type \"{}\" cannot declare transforms",
+                job.job_type
+            ),
+        ));
+    }
+    if job.body.is_some() || job.job_file.is_some() {
+        errors.push(err(
+            "body",
+            &format!(
+                "task-only job type \"{}\" cannot declare body or job_file",
+                job.job_type
+            ),
+        ));
+    }
+
+    if job.job_type == "bash" {
+        let has_command = job
+            .config
+            .get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty());
+        if !has_command {
+            errors.push(err(
+                "command",
+                "bash jobs require a non-empty \"command\" field",
+            ));
+        }
+    }
+}
