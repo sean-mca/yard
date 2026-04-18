@@ -37,6 +37,38 @@ fn lock_info() -> LockInfo {
     }
 }
 
+/// Lists S3 objects under `prefix`, applies `filter_map` to each key's
+/// prefix-relative path, and collects the non-None results.
+async fn list_s3_filtered<F>(
+    client: &Client,
+    bucket: &str,
+    prefix: &str,
+    filter_map: F,
+) -> Result<Vec<String>>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut results = Vec::new();
+    let mut stream = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(prefix)
+        .into_paginator()
+        .send();
+
+    while let Some(page) = stream.try_next().await? {
+        for obj in page.contents() {
+            if let Some(key) = obj.key() {
+                let relative = key.strip_prefix(prefix).unwrap_or(key);
+                if let Some(name) = filter_map(relative) {
+                    results.push(name);
+                }
+            }
+        }
+    }
+    Ok(results)
+}
+
 impl Storage {
     // --- Per-job state operations ---
 
@@ -152,28 +184,17 @@ impl Storage {
                 Ok(jobs)
             }
             Storage::S3(s) => {
-                let mut jobs = Vec::new();
-                let resp = s
-                    .client
-                    .list_objects_v2()
-                    .bucket(&s.bucket)
-                    .prefix(&s.prefix)
-                    .send()
-                    .await?;
-
-                for obj in resp.contents() {
-                    if let Some(key) = obj.key() {
-                        let relative = key.strip_prefix(&s.prefix).unwrap_or(key);
-                        if let Some(job_name) = relative.strip_suffix(".json")
-                            && !job_name.ends_with(".lock")
-                            && !job_name.starts_with(DAG_STATE_PREFIX)
-                            && !job_name.contains('/')
-                        {
-                            jobs.push(job_name.to_string());
-                        }
+                list_s3_filtered(&s.client, &s.bucket, &s.prefix, |relative| {
+                    let job_name = relative.strip_suffix(".json")?;
+                    if job_name.ends_with(".lock")
+                        || job_name.starts_with(DAG_STATE_PREFIX)
+                        || job_name.contains('/')
+                    {
+                        return None;
                     }
-                }
-                Ok(jobs)
+                    Some(job_name.to_string())
+                })
+                .await
             }
         }
     }
@@ -295,28 +316,15 @@ impl Storage {
                 Ok(dags)
             }
             Storage::S3(s) => {
-                let mut dags = Vec::new();
-                let resp = s
-                    .client
-                    .list_objects_v2()
-                    .bucket(&s.bucket)
-                    .prefix(&s.prefix)
-                    .send()
-                    .await?;
-
-                for obj in resp.contents() {
-                    if let Some(key) = obj.key() {
-                        let relative = key.strip_prefix(&s.prefix).unwrap_or(key);
-                        if let Some(base) = relative.strip_suffix(".json")
-                            && !base.ends_with(".lock")
-                            && !base.contains('/')
-                            && let Some(dag_name) = base.strip_prefix(DAG_STATE_PREFIX)
-                        {
-                            dags.push(dag_name.to_string());
-                        }
+                list_s3_filtered(&s.client, &s.bucket, &s.prefix, |relative| {
+                    let base = relative.strip_suffix(".json")?;
+                    if base.ends_with(".lock") || base.contains('/') {
+                        return None;
                     }
-                }
-                Ok(dags)
+                    let dag_name = base.strip_prefix(DAG_STATE_PREFIX)?;
+                    Some(dag_name.to_string())
+                })
+                .await
             }
         }
     }
