@@ -45,7 +45,7 @@ Plans:
 **Plans:** 3 plans
 
 Plans:
-- [ ] 02-01-PLAN.md — Extract leaf modules (parsing.rs, config_merge.rs) from lib.rs
+- [x] 02-01-PLAN.md — Extract leaf modules (parsing.rs, config_merge.rs) from lib.rs
 - [ ] 02-02-PLAN.md — Extract independent modules (diff.rs, show.rs) from lib.rs
 - [ ] 02-03-PLAN.md — Extract orchestrate.rs, dag_lifecycle.rs and finalize lib.rs facade
 
