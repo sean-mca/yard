@@ -15,7 +15,7 @@ use crate::validation;
 
 use crate::config_merge::{build_provider_config, is_task_only};
 use crate::diff::calculate_diff;
-use crate::{apply_dags, destroy_all_dags};
+use crate::dag_lifecycle::{apply_dags, destroy_all_dags};
 
 /// Load the current project state by reading all per-job state files.
 /// Errors (permissions, network, corrupt files) are propagated — only
