@@ -36,7 +36,7 @@ fn assume_role_of(v: &Value) -> Option<&str> {
 /// `yard_<account>_<role_name_sanitized>`. Returns an error on malformed or
 /// non-IAM-role ARNs so invalid config fails at plan/apply rather than at
 /// DAG runtime.
-pub(super) fn derive_aws_conn_id(role_arn: &str) -> Result<String> {
+pub fn derive_aws_conn_id(role_arn: &str) -> Result<String> {
     let rest = role_arn
         .strip_prefix("arn:aws:iam::")
         .ok_or_else(|| anyhow!("malformed role ARN '{role_arn}': expected 'arn:aws:iam::...'"))?;
@@ -60,7 +60,7 @@ pub(super) fn derive_aws_conn_id(role_arn: &str) -> Result<String> {
 
 /// Distinct Airflow connections the DAG's Glue tasks need, in deterministic
 /// order. Empty when every task uses `aws_default`.
-pub(super) fn required_connections_for_dag(
+pub fn required_connections_for_dag(
     manifest: &ProjectManifest,
     dag: &ResolvedDag,
 ) -> Result<Vec<RequiredConnection>> {

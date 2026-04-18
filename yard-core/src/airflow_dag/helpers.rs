@@ -1,4 +1,3 @@
-use anyhow::Result;
 use std::collections::BTreeSet;
 use yard_structs::ProjectManifest;
 
@@ -34,7 +33,7 @@ pub(super) fn python_string_literal(s: &str) -> String {
 
 /// Validate that no job has an `airflow:` block while living outside any DAG
 /// directory. Such blocks are meaningless without a DAG context.
-pub(super) fn validate_orphan_airflow_blocks(
+pub fn validate_orphan_airflow_blocks(
     manifest: &ProjectManifest,
     dags: &[ResolvedDag],
 ) -> Vec<(String, String)> {

@@ -10,7 +10,7 @@ use super::AIRFLOW_DAG_TEMPLATE;
 use crate::is_task_only;
 
 /// Render a resolved DAG into an Airflow Python file.
-pub(super) fn generate_dag(manifest: &ProjectManifest, dag: &ResolvedDag) -> Result<String> {
+pub fn generate_dag(manifest: &ProjectManifest, dag: &ResolvedDag) -> Result<String> {
     let mut tera = Tera::default();
     tera.add_raw_template("airflow_dag", AIRFLOW_DAG_TEMPLATE)?;
 

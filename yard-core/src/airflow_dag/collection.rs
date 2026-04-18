@@ -19,7 +19,7 @@ use crate::{merge_airflow_sections, parse_airflow_section};
 /// - DAG-level override fields (schedule/retries/etc.) declared on more than
 ///   one task in the same DAG
 /// - Dependency cycles
-pub(super) fn collect_dags(root_dir: &Path, manifest: &ProjectManifest) -> Result<Vec<ResolvedDag>> {
+pub fn collect_dags(root_dir: &Path, manifest: &ProjectManifest) -> Result<Vec<ResolvedDag>> {
     let mut dag_dirs = find_dag_marker_dirs(root_dir)?;
     dag_dirs.sort();
 
