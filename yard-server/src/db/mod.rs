@@ -1,5 +1,6 @@
 pub mod dynamo;
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -71,6 +72,30 @@ pub struct Setting {
     pub value: String,
 }
 
+// ---- Database Trait ----
+
+#[async_trait]
+pub trait Database: Send + Sync {
+    // Webhooks
+    async fn insert_webhook_event(&self, event: &WebhookEvent) -> anyhow::Result<()>;
+    async fn list_webhook_events(&self, pr_number: u64, limit: u32) -> anyhow::Result<Vec<WebhookEvent>>;
+    // Plans
+    async fn insert_plan_result(&self, result: &PlanResultRow) -> anyhow::Result<()>;
+    async fn get_latest_plan_result(&self, pr_number: u64) -> anyhow::Result<Option<PlanResultRow>>;
+    async fn list_plan_results(&self, limit: u32) -> anyhow::Result<Vec<PlanResultRow>>;
+    // Drift
+    async fn insert_drift_snapshot(&self, snapshot: &DriftSnapshot) -> anyhow::Result<()>;
+    async fn get_latest_drift_snapshot(&self, job_name: &str) -> anyhow::Result<Option<DriftSnapshot>>;
+    async fn list_drift_snapshots(&self, drifted_only: bool, limit: u32) -> anyhow::Result<Vec<DriftSnapshot>>;
+    // Settings
+    async fn get_setting(&self, key: &str) -> anyhow::Result<Option<String>>;
+    async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()>;
+    async fn list_settings(&self) -> anyhow::Result<Vec<Setting>>;
+    // Cache
+    async fn set_cache(&self, key: &str, data: &str) -> anyhow::Result<()>;
+    async fn get_cache(&self, key: &str) -> anyhow::Result<Option<String>>;
+}
+
 // ---- Configuration ----
 
 pub struct DbConfig {
@@ -98,12 +123,111 @@ impl DbConfig {
 
 // ---- Factory ----
 
-pub async fn connect(config: &DbConfig) -> anyhow::Result<Arc<DynamoDatabase>> {
+pub async fn connect(config: &DbConfig) -> anyhow::Result<Arc<dyn Database>> {
     let db = DynamoDatabase::connect(
         &config.table_name,
         &config.region,
         config.endpoint_url.as_deref(),
     )
     .await?;
-    Ok(Arc::new(db))
+    Ok(Arc::new(db) as Arc<dyn Database>)
+}
+
+// ---- Test Support ----
+
+#[cfg(test)]
+pub mod test_support {
+    use super::*;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
+
+    pub struct InMemoryDb {
+        webhooks: Mutex<Vec<WebhookEvent>>,
+        plans: Mutex<Vec<PlanResultRow>>,
+        drift: Mutex<Vec<DriftSnapshot>>,
+        settings: Mutex<HashMap<String, String>>,
+        cache: Mutex<HashMap<String, String>>,
+    }
+
+    impl InMemoryDb {
+        pub fn new() -> Self {
+            Self {
+                webhooks: Mutex::new(Vec::new()),
+                plans: Mutex::new(Vec::new()),
+                drift: Mutex::new(Vec::new()),
+                settings: Mutex::new(HashMap::new()),
+                cache: Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Database for InMemoryDb {
+        async fn insert_webhook_event(&self, event: &WebhookEvent) -> anyhow::Result<()> {
+            self.webhooks.lock().await.push(event.clone());
+            Ok(())
+        }
+        async fn list_webhook_events(&self, pr_number: u64, limit: u32) -> anyhow::Result<Vec<WebhookEvent>> {
+            let events = self.webhooks.lock().await;
+            Ok(events.iter()
+                .filter(|e| e.pr_number == pr_number)
+                .take(limit as usize)
+                .cloned()
+                .collect())
+        }
+        async fn insert_plan_result(&self, result: &PlanResultRow) -> anyhow::Result<()> {
+            self.plans.lock().await.push(result.clone());
+            Ok(())
+        }
+        async fn get_latest_plan_result(&self, pr_number: u64) -> anyhow::Result<Option<PlanResultRow>> {
+            let plans = self.plans.lock().await;
+            Ok(plans.iter()
+                .filter(|p| p.pr_number == pr_number)
+                .last()
+                .cloned())
+        }
+        async fn list_plan_results(&self, limit: u32) -> anyhow::Result<Vec<PlanResultRow>> {
+            let plans = self.plans.lock().await;
+            Ok(plans.iter().rev().take(limit as usize).cloned().collect())
+        }
+        async fn insert_drift_snapshot(&self, snapshot: &DriftSnapshot) -> anyhow::Result<()> {
+            self.drift.lock().await.push(snapshot.clone());
+            Ok(())
+        }
+        async fn get_latest_drift_snapshot(&self, job_name: &str) -> anyhow::Result<Option<DriftSnapshot>> {
+            let drift = self.drift.lock().await;
+            Ok(drift.iter()
+                .filter(|d| d.job_name == job_name)
+                .last()
+                .cloned())
+        }
+        async fn list_drift_snapshots(&self, drifted_only: bool, limit: u32) -> anyhow::Result<Vec<DriftSnapshot>> {
+            let drift = self.drift.lock().await;
+            Ok(drift.iter()
+                .rev()
+                .filter(|d| !drifted_only || d.drifted)
+                .take(limit as usize)
+                .cloned()
+                .collect())
+        }
+        async fn get_setting(&self, key: &str) -> anyhow::Result<Option<String>> {
+            Ok(self.settings.lock().await.get(key).cloned())
+        }
+        async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
+            self.settings.lock().await.insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+        async fn list_settings(&self) -> anyhow::Result<Vec<Setting>> {
+            Ok(self.settings.lock().await.iter()
+                .map(|(k, v)| Setting { key: k.clone(), value: v.clone() })
+                .collect())
+        }
+        async fn set_cache(&self, key: &str, data: &str) -> anyhow::Result<()> {
+            self.cache.lock().await.insert(key.to_string(), data.to_string());
+            Ok(())
+        }
+        async fn get_cache(&self, key: &str) -> anyhow::Result<Option<String>> {
+            Ok(self.cache.lock().await.get(key).cloned())
+        }
+    }
 }
