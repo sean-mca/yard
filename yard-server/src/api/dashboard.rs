@@ -9,7 +9,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use crate::db::{DynamoDatabase, PlanStatus};
+use crate::db::{Database, PlanStatus};
 use crate::types::*;
 
 const MAX_CACHED_PRS: u8 = 50;
@@ -18,7 +18,7 @@ pub struct ApiState {
     pub github_token: String,
     pub repo_owner: String,
     pub repo_name: String,
-    pub db: Arc<DynamoDatabase>,
+    pub db: Arc<dyn Database>,
 }
 
 pub fn dashboard_router(state: Arc<ApiState>) -> Router {
@@ -92,7 +92,7 @@ async fn fetch_dashboard_data(
 
     let has_more = all_prs.items.len() == per_page as usize;
 
-    let rows = build_pr_rows(&state.db, &all_prs.items).await;
+    let rows = build_pr_rows(state.db.as_ref(), &all_prs.items).await;
 
     let jobs_tracked = count_job_files(&octo, owner, repo).await.unwrap_or(0);
 
@@ -150,7 +150,7 @@ pub async fn refresh_dashboard_cache(state: &ApiState) -> Result<DashboardCache,
         .await
         .map_err(|e| format!("Failed to fetch PRs: {e}"))?;
 
-    let rows = build_pr_rows(&state.db, &all_prs.items).await;
+    let rows = build_pr_rows(state.db.as_ref(), &all_prs.items).await;
 
     let jobs_tracked = count_job_files(&octo, owner, repo).await.unwrap_or(0);
 
@@ -213,7 +213,7 @@ async fn get_dashboard_cached(
 // ---- Shared helpers ----
 
 async fn build_pr_rows(
-    db: &DynamoDatabase,
+    db: &dyn Database,
     prs: &[octocrab::models::pulls::PullRequest],
 ) -> Vec<PrRow> {
     let mut rows = Vec::new();

@@ -1,11 +1,41 @@
+use async_trait::async_trait;
 use octocrab::Octocrab;
+
+/// Trait for GitHub API operations, enabling mock implementations in tests.
+#[allow(dead_code)]
+#[async_trait]
+pub trait GitHubApi: Send + Sync {
+    /// Post a plan comment on a pull request.
+    async fn post_plan_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        plan_output: &str,
+    ) -> Result<(), octocrab::Error>;
+
+    /// List files changed in a pull request.
+    async fn get_pr_changed_files(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<Vec<String>, octocrab::Error>;
+
+    /// Get the head SHA of a pull request.
+    async fn get_pr_head_sha(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<String, octocrab::Error>;
+}
 
 /// Wrapper around octocrab for yard-specific GitHub operations.
 pub struct GitHubClient {
     octo: Octocrab,
 }
 
-#[allow(dead_code)]
 impl GitHubClient {
     pub fn new(token: &str) -> Result<Self, octocrab::Error> {
         let octo = Octocrab::builder()
@@ -13,9 +43,11 @@ impl GitHubClient {
             .build()?;
         Ok(Self { octo })
     }
+}
 
-    /// Post a plan comment on a pull request.
-    pub async fn post_plan_comment(
+#[async_trait]
+impl GitHubApi for GitHubClient {
+    async fn post_plan_comment(
         &self,
         owner: &str,
         repo: &str,
@@ -39,8 +71,7 @@ impl GitHubClient {
         Ok(())
     }
 
-    /// List files changed in a pull request.
-    pub async fn get_pr_changed_files(
+    async fn get_pr_changed_files(
         &self,
         owner: &str,
         repo: &str,
@@ -59,8 +90,7 @@ impl GitHubClient {
         Ok(paths)
     }
 
-    /// Get the head SHA of a pull request.
-    pub async fn get_pr_head_sha(
+    async fn get_pr_head_sha(
         &self,
         owner: &str,
         repo: &str,
@@ -72,5 +102,85 @@ impl GitHubClient {
             .await?;
 
         Ok(pr.head.sha)
+    }
+}
+
+#[cfg(test)]
+pub mod test_support {
+    use super::*;
+    use tokio::sync::Mutex;
+
+    #[derive(Debug, Clone)]
+    pub struct RecordedCall {
+        pub method: String,
+        pub args: Vec<String>,
+    }
+
+    pub struct MockGitHubClient {
+        pub calls: Mutex<Vec<RecordedCall>>,
+    }
+
+    impl MockGitHubClient {
+        pub fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl GitHubApi for MockGitHubClient {
+        async fn post_plan_comment(
+            &self,
+            owner: &str,
+            repo: &str,
+            pr_number: u64,
+            plan_output: &str,
+        ) -> Result<(), octocrab::Error> {
+            self.calls.lock().await.push(RecordedCall {
+                method: "post_plan_comment".to_string(),
+                args: vec![
+                    owner.to_string(),
+                    repo.to_string(),
+                    pr_number.to_string(),
+                    plan_output.to_string(),
+                ],
+            });
+            Ok(())
+        }
+
+        async fn get_pr_changed_files(
+            &self,
+            owner: &str,
+            repo: &str,
+            pr_number: u64,
+        ) -> Result<Vec<String>, octocrab::Error> {
+            self.calls.lock().await.push(RecordedCall {
+                method: "get_pr_changed_files".to_string(),
+                args: vec![
+                    owner.to_string(),
+                    repo.to_string(),
+                    pr_number.to_string(),
+                ],
+            });
+            Ok(vec![])
+        }
+
+        async fn get_pr_head_sha(
+            &self,
+            owner: &str,
+            repo: &str,
+            pr_number: u64,
+        ) -> Result<String, octocrab::Error> {
+            self.calls.lock().await.push(RecordedCall {
+                method: "get_pr_head_sha".to_string(),
+                args: vec![
+                    owner.to_string(),
+                    repo.to_string(),
+                    pr_number.to_string(),
+                ],
+            });
+            Ok("mock-sha-abc123".to_string())
+        }
     }
 }

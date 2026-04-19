@@ -74,6 +74,7 @@ pub struct Setting {
 
 // ---- Database Trait ----
 
+#[allow(dead_code)]
 #[async_trait]
 pub trait Database: Send + Sync {
     // Webhooks
@@ -123,6 +124,7 @@ impl DbConfig {
 
 // ---- Factory ----
 
+#[allow(dead_code)]
 pub async fn connect(config: &DbConfig) -> anyhow::Result<Arc<dyn Database>> {
     let db = DynamoDatabase::connect(
         &config.table_name,

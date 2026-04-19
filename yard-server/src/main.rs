@@ -48,7 +48,7 @@ fn start_api_server() {
     use api::jobs::jobs_router;
     use api::settings::settings_router;
     use db::DbConfig;
-    use github::{client::GitHubClient, router::AppState, router::github_router};
+    use github::{client::{GitHubApi, GitHubClient}, router::AppState, router::github_router};
     use std::sync::Arc;
     use tower_governor::GovernorLayer;
     use tower_governor::governor::GovernorConfigBuilder;
@@ -76,15 +76,22 @@ fn start_api_server() {
 
             // Initialize DynamoDB persistence
             let db_config = DbConfig::from_env();
-            let db = db::connect(&db_config)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to connect to DynamoDB: {e}"))?;
-            db.migrate()
+            let dynamo_db = db::DynamoDatabase::connect(
+                &db_config.table_name,
+                &db_config.region,
+                db_config.endpoint_url.as_deref(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to connect to DynamoDB: {e}"))?;
+            dynamo_db.migrate()
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to run DynamoDB migrations: {e}"))?;
+            let db: std::sync::Arc<dyn db::Database> = std::sync::Arc::new(dynamo_db);
 
-            let github_client = GitHubClient::new(&github_token)
-                .map_err(|e| anyhow::anyhow!("Failed to create GitHub client: {e}"))?;
+            let github_client: std::sync::Arc<dyn GitHubApi> = std::sync::Arc::new(
+                GitHubClient::new(&github_token)
+                    .map_err(|e| anyhow::anyhow!("Failed to create GitHub client: {e}"))?,
+            );
 
             let api_state = Arc::new(ApiState {
                 github_token,
