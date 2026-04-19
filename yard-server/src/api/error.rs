@@ -56,3 +56,60 @@ impl IntoResponse for ApiError {
         (status, Json(body)).into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    async fn error_response(err: ApiError) -> (StatusCode, serde_json::Value) {
+        let resp = err.into_response();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn test_database_error_returns_500() {
+        let (status, body) = error_response(ApiError::DatabaseError("db down".into())).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["status"], 500);
+        assert_eq!(body["error"], "db down");
+    }
+
+    #[tokio::test]
+    async fn test_github_error_returns_502() {
+        let (status, body) = error_response(ApiError::GitHubError("rate limited".into())).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["status"], 502);
+    }
+
+    #[tokio::test]
+    async fn test_not_found_returns_404() {
+        let (status, body) = error_response(ApiError::NotFound("no such item".into())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["status"], 404);
+    }
+
+    #[tokio::test]
+    async fn test_bad_request_returns_400() {
+        let (status, body) = error_response(ApiError::BadRequest("invalid input".into())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], 400);
+    }
+
+    #[tokio::test]
+    async fn test_cache_unavailable_returns_503() {
+        let (status, body) = error_response(ApiError::CacheUnavailable("not populated".into())).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], 503);
+    }
+
+    #[tokio::test]
+    async fn test_internal_error_returns_500() {
+        let (status, body) = error_response(ApiError::Internal("unexpected".into())).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["status"], 500);
+    }
+}

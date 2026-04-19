@@ -233,3 +233,185 @@ pub mod test_support {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_support::InMemoryDb;
+    use chrono::Utc;
+    use serde_json::json;
+
+    fn make_webhook(pr: u64, action: &str) -> WebhookEvent {
+        WebhookEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            pr_number: pr,
+            action: action.to_string(),
+            sha: "abc123".to_string(),
+            payload: json!({"test": true}),
+            received_at: Utc::now(),
+        }
+    }
+
+    fn make_plan(pr: u64, status: PlanStatus) -> PlanResultRow {
+        PlanResultRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            pr_number: pr,
+            sha: "abc123".to_string(),
+            status,
+            raw_output: "test output".to_string(),
+            diff_summary: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn make_drift(job: &str, drifted: bool) -> DriftSnapshot {
+        DriftSnapshot {
+            id: uuid::Uuid::new_v4().to_string(),
+            job_name: job.to_string(),
+            repo_hash: "abc".to_string(),
+            state_hash: "def".to_string(),
+            drifted,
+            checked_at: Utc::now(),
+        }
+    }
+
+    // Webhook tests
+
+    #[tokio::test]
+    async fn test_insert_and_list_webhook_events() {
+        let db = InMemoryDb::new();
+        let e1 = make_webhook(42, "opened");
+        let e2 = make_webhook(42, "synchronize");
+        db.insert_webhook_event(&e1).await.unwrap();
+        db.insert_webhook_event(&e2).await.unwrap();
+        let events = db.list_webhook_events(42, 10).await.unwrap();
+        assert_eq!(events.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_list_webhook_events_filters_by_pr() {
+        let db = InMemoryDb::new();
+        db.insert_webhook_event(&make_webhook(1, "opened")).await.unwrap();
+        db.insert_webhook_event(&make_webhook(2, "opened")).await.unwrap();
+        db.insert_webhook_event(&make_webhook(1, "synchronize")).await.unwrap();
+        let events = db.list_webhook_events(1, 10).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|e| e.pr_number == 1));
+    }
+
+    #[tokio::test]
+    async fn test_list_webhook_events_respects_limit() {
+        let db = InMemoryDb::new();
+        for i in 0..5 {
+            db.insert_webhook_event(&make_webhook(1, &format!("action-{i}"))).await.unwrap();
+        }
+        let events = db.list_webhook_events(1, 2).await.unwrap();
+        assert_eq!(events.len(), 2);
+    }
+
+    // Plan tests
+
+    #[tokio::test]
+    async fn test_insert_and_get_latest_plan_result() {
+        let db = InMemoryDb::new();
+        let p1 = make_plan(10, PlanStatus::Pending);
+        let p2 = make_plan(10, PlanStatus::Success);
+        db.insert_plan_result(&p1).await.unwrap();
+        db.insert_plan_result(&p2).await.unwrap();
+        let latest = db.get_latest_plan_result(10).await.unwrap().unwrap();
+        assert_eq!(latest.id, p2.id);
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_plan_result_none() {
+        let db = InMemoryDb::new();
+        let result = db.get_latest_plan_result(999).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_plan_results() {
+        let db = InMemoryDb::new();
+        db.insert_plan_result(&make_plan(1, PlanStatus::Success)).await.unwrap();
+        db.insert_plan_result(&make_plan(2, PlanStatus::Failure)).await.unwrap();
+        db.insert_plan_result(&make_plan(3, PlanStatus::Pending)).await.unwrap();
+        let plans = db.list_plan_results(10).await.unwrap();
+        assert_eq!(plans.len(), 3);
+    }
+
+    // Drift tests
+
+    #[tokio::test]
+    async fn test_insert_and_get_latest_drift_snapshot() {
+        let db = InMemoryDb::new();
+        let snap = make_drift("job-a", true);
+        db.insert_drift_snapshot(&snap).await.unwrap();
+        let latest = db.get_latest_drift_snapshot("job-a").await.unwrap().unwrap();
+        assert_eq!(latest.job_name, "job-a");
+        assert!(latest.drifted);
+    }
+
+    #[tokio::test]
+    async fn test_list_drift_snapshots_all() {
+        let db = InMemoryDb::new();
+        db.insert_drift_snapshot(&make_drift("a", true)).await.unwrap();
+        db.insert_drift_snapshot(&make_drift("b", true)).await.unwrap();
+        db.insert_drift_snapshot(&make_drift("c", false)).await.unwrap();
+        let all = db.list_drift_snapshots(false, 10).await.unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_list_drift_snapshots_drifted_only() {
+        let db = InMemoryDb::new();
+        db.insert_drift_snapshot(&make_drift("a", true)).await.unwrap();
+        db.insert_drift_snapshot(&make_drift("b", true)).await.unwrap();
+        db.insert_drift_snapshot(&make_drift("c", false)).await.unwrap();
+        let drifted = db.list_drift_snapshots(true, 10).await.unwrap();
+        assert_eq!(drifted.len(), 2);
+        assert!(drifted.iter().all(|d| d.drifted));
+    }
+
+    // Settings tests
+
+    #[tokio::test]
+    async fn test_set_and_get_setting() {
+        let db = InMemoryDb::new();
+        db.set_setting("theme", "dark").await.unwrap();
+        let val = db.get_setting("theme").await.unwrap().unwrap();
+        assert_eq!(val, "dark");
+    }
+
+    #[tokio::test]
+    async fn test_get_setting_missing() {
+        let db = InMemoryDb::new();
+        let result = db.get_setting("nonexistent").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_settings() {
+        let db = InMemoryDb::new();
+        db.set_setting("theme", "dark").await.unwrap();
+        db.set_setting("drift_interval", "5").await.unwrap();
+        let settings = db.list_settings().await.unwrap();
+        assert_eq!(settings.len(), 2);
+    }
+
+    // Cache tests
+
+    #[tokio::test]
+    async fn test_set_and_get_cache() {
+        let db = InMemoryDb::new();
+        db.set_cache("drift", "{}").await.unwrap();
+        let val = db.get_cache("drift").await.unwrap().unwrap();
+        assert_eq!(val, "{}");
+    }
+
+    #[tokio::test]
+    async fn test_get_cache_missing() {
+        let db = InMemoryDb::new();
+        let result = db.get_cache("nonexistent").await.unwrap();
+        assert!(result.is_none());
+    }
+}
