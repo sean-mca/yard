@@ -311,6 +311,68 @@ fn walk_for_jobs(dir: &Path, workdir: &Path, jobs: &mut HashMap<String, JobFileI
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{Database, test_support::InMemoryDb};
+    use crate::types::DriftData;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    fn test_state() -> Arc<ApiState> {
+        let db = Arc::new(InMemoryDb::new());
+        Arc::new(ApiState {
+            github_token: "t".into(),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            db: db as Arc<dyn Database>,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_get_drift_cached_empty_returns_503() {
+        let state = test_state();
+        let result = get_drift_cached(State(state)).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_get_drift_cached_with_data_returns_200() {
+        let state = test_state();
+        let drift_data = DriftData { items: vec![], in_sync: 5, drifted: 0 };
+        let cached = serde_json::to_string(&drift_data).unwrap();
+        state.db.set_cache("drift", &cached).await.unwrap();
+
+        let result = get_drift_cached(State(state)).await.unwrap();
+        assert_eq!(result.0.in_sync, 5);
+        assert_eq!(result.0.drifted, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_drift_cached_corrupt_returns_503() {
+        let state = test_state();
+        state.db.set_cache("drift", "not valid json{{{").await.unwrap();
+
+        let result = get_drift_cached(State(state)).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_get_drift_summary_empty() {
+        let state = test_state();
+        let result = get_drift_summary(State(state)).await.unwrap();
+        assert_eq!(result.0.drifted, 0);
+        assert_eq!(result.0.in_sync, 0);
+    }
+}
+
 fn extract_env_region(job_path: &Path, workdir: &Path) -> (String, String) {
     let relative = job_path.strip_prefix(workdir).unwrap_or(job_path);
 

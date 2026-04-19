@@ -102,6 +102,68 @@ async fn post_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{Database, test_support::InMemoryDb};
+    use crate::api::dashboard::ApiState;
+    use axum::extract::State;
+    use axum::response::IntoResponse;
+
+    fn test_api_state() -> Arc<ApiState> {
+        let db = Arc::new(InMemoryDb::new());
+        Arc::new(ApiState {
+            github_token: "t".into(),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            db: db as Arc<dyn Database>,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_get_settings_empty() {
+        let state = test_api_state();
+        let result = get_settings(State(state)).await.unwrap();
+        assert!(result.0.settings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_post_settings_valid() {
+        let state = test_api_state();
+        let payload = SettingsPayload {
+            settings: [("theme".to_string(), "dark".to_string())].into_iter().collect(),
+        };
+        let result = post_settings(State(state), Json(payload)).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_post_settings_invalid_returns_400() {
+        let state = test_api_state();
+        let payload = SettingsPayload {
+            settings: [("theme".to_string(), "neon".to_string())].into_iter().collect(),
+        };
+        let result = post_settings(State(state), Json(payload)).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_post_then_get_settings_roundtrip() {
+        let state = test_api_state();
+        // POST
+        let payload = SettingsPayload {
+            settings: [
+                ("theme".to_string(), "dark".to_string()),
+                ("drift_interval".to_string(), "5".to_string()),
+            ].into_iter().collect(),
+        };
+        post_settings(State(state.clone()), Json(payload)).await.unwrap();
+        // GET
+        let result = get_settings(State(state)).await.unwrap();
+        assert_eq!(result.0.settings.get("theme").unwrap(), "dark");
+        assert_eq!(result.0.settings.get("drift_interval").unwrap(), "5");
+    }
 
     #[test]
     fn rejects_unknown_key() {

@@ -288,6 +288,48 @@ async fn count_job_files(
     Ok(0)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{Database, test_support::InMemoryDb};
+    use crate::types::DashboardCache;
+    use axum::extract::{Query, State};
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    fn test_state() -> Arc<ApiState> {
+        let db = Arc::new(InMemoryDb::new());
+        Arc::new(ApiState {
+            github_token: "t".into(),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            db: db as Arc<dyn Database>,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_get_dashboard_cached_empty_returns_503() {
+        let state = test_state();
+        let params = Query(PaginationParams { page: None, per_page: None });
+        let result = get_dashboard_cached(State(state), params).await;
+        assert!(result.is_err());
+        let resp = result.unwrap_err().into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_get_dashboard_cached_with_data_returns_200() {
+        let state = test_state();
+        let cache = DashboardCache { prs: vec![], open_prs: 0, jobs_tracked: 0 };
+        let cached = serde_json::to_string(&cache).unwrap();
+        state.db.set_cache("dashboard", &cached).await.unwrap();
+
+        let params = Query(PaginationParams { page: None, per_page: None });
+        let result = get_dashboard_cached(State(state), params).await.unwrap();
+        assert_eq!(result.0.open_prs, 0);
+    }
+}
+
 fn format_relative_time(dt: chrono::DateTime<chrono::Utc>) -> String {
     let now = chrono::Utc::now();
     let duration = now.signed_duration_since(dt);
