@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, KeySchemaElement,
     KeyType, Projection, ProjectionType, ScalarAttributeType,
@@ -9,7 +10,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use tracing::info;
 
-use super::{DriftSnapshot, PlanResultRow, PlanStatus, Setting, WebhookEvent};
+use super::{Database, DriftSnapshot, PlanResultRow, PlanStatus, Setting, WebhookEvent};
 
 pub struct DynamoDatabase {
     client: Client,
@@ -150,10 +151,13 @@ impl DynamoDatabase {
 
         anyhow::bail!("Timed out waiting for table to become active")
     }
+}
 
+#[async_trait]
+impl Database for DynamoDatabase {
     // ---- Webhook Events ----
 
-    pub async fn insert_webhook_event(&self, event: &WebhookEvent) -> Result<()> {
+    async fn insert_webhook_event(&self, event: &WebhookEvent) -> Result<()> {
         let pk = format!("PR#{}", event.pr_number);
         let sk = format!("WEBHOOK#{}#{}", event.received_at.to_rfc3339(), event.id);
         let payload_str =
@@ -188,7 +192,7 @@ impl DynamoDatabase {
         Ok(())
     }
 
-    pub async fn list_webhook_events(
+    async fn list_webhook_events(
         &self,
         pr_number: u64,
         limit: u32,
@@ -214,7 +218,7 @@ impl DynamoDatabase {
 
     // ---- Plan Results ----
 
-    pub async fn insert_plan_result(&self, result: &PlanResultRow) -> Result<()> {
+    async fn insert_plan_result(&self, result: &PlanResultRow) -> Result<()> {
         let pk = format!("PR#{}", result.pr_number);
         let sk = format!("PLAN#{}#{}", result.created_at.to_rfc3339(), result.id);
 
@@ -255,7 +259,7 @@ impl DynamoDatabase {
         Ok(())
     }
 
-    pub async fn get_latest_plan_result(&self, pr_number: u64) -> Result<Option<PlanResultRow>> {
+    async fn get_latest_plan_result(&self, pr_number: u64) -> Result<Option<PlanResultRow>> {
         let pk = format!("PR#{pr_number}");
 
         let resp = self
@@ -274,7 +278,7 @@ impl DynamoDatabase {
         Ok(resp.items().first().and_then(parse_plan_result))
     }
 
-    pub async fn list_plan_results(&self, limit: u32) -> Result<Vec<PlanResultRow>> {
+    async fn list_plan_results(&self, limit: u32) -> Result<Vec<PlanResultRow>> {
         let resp = self
             .client
             .query()
@@ -293,7 +297,7 @@ impl DynamoDatabase {
 
     // ---- Drift Snapshots ----
 
-    pub async fn insert_drift_snapshot(&self, snapshot: &DriftSnapshot) -> Result<()> {
+    async fn insert_drift_snapshot(&self, snapshot: &DriftSnapshot) -> Result<()> {
         let pk = format!("JOB#{}", snapshot.job_name);
         let sk = format!(
             "DRIFT#{}#{}",
@@ -333,7 +337,7 @@ impl DynamoDatabase {
         Ok(())
     }
 
-    pub async fn get_latest_drift_snapshot(
+    async fn get_latest_drift_snapshot(
         &self,
         job_name: &str,
     ) -> Result<Option<DriftSnapshot>> {
@@ -355,7 +359,7 @@ impl DynamoDatabase {
         Ok(resp.items().first().and_then(parse_drift_snapshot))
     }
 
-    pub async fn list_drift_snapshots(
+    async fn list_drift_snapshots(
         &self,
         drifted_only: bool,
         limit: u32,
@@ -387,7 +391,7 @@ impl DynamoDatabase {
 
     // ---- Settings ----
 
-    pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
+    async fn get_setting(&self, key: &str) -> Result<Option<String>> {
         let pk = format!("SETTING#{key}");
 
         let resp = self
@@ -407,7 +411,7 @@ impl DynamoDatabase {
             .map(|s| s.to_string()))
     }
 
-    pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+    async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         let pk = format!("SETTING#{key}");
 
         self.client
@@ -426,7 +430,7 @@ impl DynamoDatabase {
         Ok(())
     }
 
-    pub async fn list_settings(&self) -> Result<Vec<Setting>> {
+    async fn list_settings(&self) -> Result<Vec<Setting>> {
         let resp = self
             .client
             .query()
@@ -448,9 +452,10 @@ impl DynamoDatabase {
             })
             .collect())
     }
+
     // ---- Cache ----
 
-    pub async fn set_cache(&self, key: &str, data: &str) -> Result<()> {
+    async fn set_cache(&self, key: &str, data: &str) -> Result<()> {
         let pk = format!("CACHE#{key}");
 
         self.client
@@ -468,7 +473,7 @@ impl DynamoDatabase {
         Ok(())
     }
 
-    pub async fn get_cache(&self, key: &str) -> Result<Option<String>> {
+    async fn get_cache(&self, key: &str) -> Result<Option<String>> {
         let pk = format!("CACHE#{key}");
 
         let resp = self

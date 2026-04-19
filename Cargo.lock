@@ -6003,6 +6003,7 @@ name = "yard-server"
 version = "0.2.2"
 dependencies = [
  "anyhow",
+ "async-trait",
  "aws-config",
  "aws-sdk-dynamodb",
  "axum",

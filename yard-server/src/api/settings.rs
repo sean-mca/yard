@@ -1,14 +1,15 @@
 use axum::{
     extract::State,
     http::StatusCode,
-    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::info;
+
+use super::error::ApiError;
 
 use super::dashboard::ApiState;
 
@@ -56,19 +57,18 @@ struct SettingsResponse {
     settings: HashMap<String, String>,
 }
 
-async fn get_settings(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
-    match state.db.list_settings().await {
-        Ok(items) => {
-            let settings: HashMap<String, String> =
-                items.into_iter().map(|s| (s.key, s.value)).collect();
-            info!(count = settings.len(), "Fetched settings");
-            (StatusCode::OK, Json(SettingsResponse { settings })).into_response()
-        }
-        Err(e) => {
-            error!("Failed to fetch settings: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
-    }
+async fn get_settings(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let items = state
+        .db
+        .list_settings()
+        .await
+        .map_err(|e| ApiError::DatabaseError(format!("Failed to fetch settings: {e}")))?;
+    let settings: HashMap<String, String> =
+        items.into_iter().map(|s| (s.key, s.value)).collect();
+    info!(count = settings.len(), "Fetched settings");
+    Ok(Json(SettingsResponse { settings }))
 }
 
 #[derive(Deserialize)]
@@ -79,28 +79,91 @@ struct SettingsPayload {
 async fn post_settings(
     State(state): State<Arc<ApiState>>,
     Json(payload): Json<SettingsPayload>,
-) -> impl IntoResponse {
+) -> Result<StatusCode, ApiError> {
     // Validate all settings before writing any
     for (key, value) in &payload.settings {
         if let Err(msg) = validate_setting(key, value) {
-            return (StatusCode::BAD_REQUEST, msg).into_response();
+            return Err(ApiError::BadRequest(msg));
         }
     }
 
     for (key, value) in &payload.settings {
-        if let Err(e) = state.db.set_setting(key, value).await {
-            error!(key = %key, "Failed to save setting: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
+        state
+            .db
+            .set_setting(key, value)
+            .await
+            .map_err(|e| ApiError::DatabaseError(format!("Failed to save setting '{key}': {e}")))?;
     }
 
     info!(count = payload.settings.len(), "Saved settings");
-    StatusCode::OK.into_response()
+    Ok(StatusCode::OK)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{Database, test_support::InMemoryDb};
+    use crate::api::dashboard::ApiState;
+    use axum::extract::State;
+    use axum::response::IntoResponse;
+
+    fn test_api_state() -> Arc<ApiState> {
+        let db = Arc::new(InMemoryDb::new());
+        Arc::new(ApiState {
+            github_token: "t".into(),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            db: db as Arc<dyn Database>,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_get_settings_empty() {
+        let state = test_api_state();
+        let result = get_settings(State(state)).await.unwrap();
+        assert!(result.0.settings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_post_settings_valid() {
+        let state = test_api_state();
+        let payload = SettingsPayload {
+            settings: [("theme".to_string(), "dark".to_string())].into_iter().collect(),
+        };
+        let result = post_settings(State(state), Json(payload)).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_post_settings_invalid_returns_400() {
+        let state = test_api_state();
+        let payload = SettingsPayload {
+            settings: [("theme".to_string(), "neon".to_string())].into_iter().collect(),
+        };
+        let result = post_settings(State(state), Json(payload)).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_post_then_get_settings_roundtrip() {
+        let state = test_api_state();
+        // POST
+        let payload = SettingsPayload {
+            settings: [
+                ("theme".to_string(), "dark".to_string()),
+                ("drift_interval".to_string(), "5".to_string()),
+            ].into_iter().collect(),
+        };
+        post_settings(State(state.clone()), Json(payload)).await.unwrap();
+        // GET
+        let result = get_settings(State(state)).await.unwrap();
+        assert_eq!(result.0.settings.get("theme").unwrap(), "dark");
+        assert_eq!(result.0.settings.get("drift_interval").unwrap(), "5");
+    }
 
     #[test]
     fn rejects_unknown_key() {

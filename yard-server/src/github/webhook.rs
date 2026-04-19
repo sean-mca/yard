@@ -200,6 +200,120 @@ fn parse_issue_comment_event(body: &Bytes) -> Result<WebhookAction, StatusCode> 
 mod tests {
     use super::*;
 
+    fn sign(secret: &str, payload: &[u8]) -> String {
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(payload);
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    fn webhook_headers(event_type: &str, signature: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", event_type.parse().unwrap());
+        headers.insert("x-hub-signature-256", signature.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn test_pr_opened_routes_to_plan() {
+        let secret = "test-secret";
+        let payload = serde_json::json!({
+            "action": "opened",
+            "number": 42,
+            "pull_request": {
+                "head": {"ref": "feature", "sha": "abc123"},
+                "base": {"ref": "main", "sha": "def456"}
+            },
+            "repository": {
+                "full_name": "owner/repo",
+                "clone_url": "https://github.com/owner/repo.git"
+            }
+        });
+        let body_bytes = serde_json::to_vec(&payload).unwrap();
+        let sig = sign(secret, &body_bytes);
+        let headers = webhook_headers("pull_request", &sig);
+
+        let result = parse_webhook(&headers, &body_bytes.into(), secret);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            WebhookAction::Plan { pr_number, head_sha, .. } => {
+                assert_eq!(pr_number, 42);
+                assert_eq!(head_sha, "abc123");
+            }
+            other => panic!("Expected Plan, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pr_closed_routes_to_ignore() {
+        let secret = "s";
+        let payload = serde_json::json!({
+            "action": "closed",
+            "number": 1,
+            "pull_request": {
+                "head": {"ref": "f", "sha": "a"},
+                "base": {"ref": "m", "sha": "b"}
+            },
+            "repository": {"full_name": "o/r", "clone_url": "https://x.com"}
+        });
+        let body_bytes = serde_json::to_vec(&payload).unwrap();
+        let sig = sign(secret, &body_bytes);
+        let headers = webhook_headers("pull_request", &sig);
+        let result = parse_webhook(&headers, &body_bytes.into(), secret).unwrap();
+        assert!(matches!(result, WebhookAction::Ignore));
+    }
+
+    #[test]
+    fn test_issue_comment_yard_apply_routes_to_apply() {
+        let secret = "s";
+        let payload = serde_json::json!({
+            "action": "created",
+            "comment": {"body": "yard apply"},
+            "issue": {"number": 10, "pull_request": {"url": "https://api.github.com/pulls/10"}},
+            "repository": {"full_name": "o/r", "clone_url": "https://x.com"}
+        });
+        let body_bytes = serde_json::to_vec(&payload).unwrap();
+        let sig = sign(secret, &body_bytes);
+        let headers = webhook_headers("issue_comment", &sig);
+        let result = parse_webhook(&headers, &body_bytes.into(), secret).unwrap();
+        match result {
+            WebhookAction::Apply { pr_number, .. } => assert_eq!(pr_number, 10),
+            other => panic!("Expected Apply, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_issue_comment_unrelated_routes_to_ignore() {
+        let secret = "s";
+        let payload = serde_json::json!({
+            "action": "created",
+            "comment": {"body": "looks good to me"},
+            "issue": {"number": 10, "pull_request": {"url": "https://api.github.com/pulls/10"}},
+            "repository": {"full_name": "o/r", "clone_url": "https://x.com"}
+        });
+        let body_bytes = serde_json::to_vec(&payload).unwrap();
+        let sig = sign(secret, &body_bytes);
+        let headers = webhook_headers("issue_comment", &sig);
+        let result = parse_webhook(&headers, &body_bytes.into(), secret).unwrap();
+        assert!(matches!(result, WebhookAction::Ignore));
+    }
+
+    #[test]
+    fn test_unknown_event_type_routes_to_ignore() {
+        let secret = "s";
+        let payload = b"{}";
+        let sig = sign(secret, payload);
+        let headers = webhook_headers("ping", &sig);
+        let result = parse_webhook(&headers, &payload.to_vec().into(), secret).unwrap();
+        assert!(matches!(result, WebhookAction::Ignore));
+    }
+
+    #[test]
+    fn test_invalid_signature_rejected() {
+        let headers = webhook_headers("pull_request", "sha256=invalid");
+        let result = parse_webhook(&headers, &b"{}".to_vec().into(), "secret");
+        assert!(result.is_err());
+    }
+
     #[test]
     fn test_verify_signature_valid() {
         let secret = "test-secret";

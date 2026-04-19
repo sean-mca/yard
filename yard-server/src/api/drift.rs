@@ -1,7 +1,5 @@
 use axum::{
     extract::State,
-    http::StatusCode,
-    response::IntoResponse,
     routing::get,
     Json, Router,
 };
@@ -10,7 +8,9 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
+
+use super::error::ApiError;
 
 use super::dashboard::ApiState;
 use crate::db::DriftSnapshot;
@@ -27,14 +27,11 @@ pub fn drift_router(state: Arc<ApiState>) -> Router {
 
 // ---- Full drift check ----
 
-async fn get_drift(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
-    match run_drift_check(&state).await {
-        Ok(data) => (StatusCode::OK, Json(data)).into_response(),
-        Err(e) => {
-            error!("Drift check failed: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
-        }
-    }
+async fn get_drift(State(state): State<Arc<ApiState>>) -> Result<Json<DriftData>, ApiError> {
+    let data = run_drift_check(&state)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(data))
 }
 
 pub async fn run_drift_check(state: &ApiState) -> Result<DriftData, String> {
@@ -211,30 +208,18 @@ async fn get_head_sha(state: &ApiState) -> Result<String, String> {
 
 // ---- Cached drift data (populated by background task or full check) ----
 
-async fn get_drift_cached(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
-    match state.db.get_cache("drift").await {
-        Ok(Some(cached)) => match serde_json::from_str::<DriftData>(&cached) {
-            Ok(data) => (StatusCode::OK, Json(data)).into_response(),
-            Err(_) => (
-                StatusCode::OK,
-                Json(DriftData {
-                    items: vec![],
-                    in_sync: 0,
-                    drifted: 0,
-                }),
-            )
-                .into_response(),
-        },
-        _ => (
-            StatusCode::OK,
-            Json(DriftData {
-                items: vec![],
-                in_sync: 0,
-                drifted: 0,
-            }),
-        )
-            .into_response(),
-    }
+async fn get_drift_cached(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<DriftData>, ApiError> {
+    let cached = state
+        .db
+        .get_cache("drift")
+        .await
+        .map_err(|e| ApiError::DatabaseError(format!("Cache read failed: {e}")))?
+        .ok_or_else(|| ApiError::CacheUnavailable("Drift cache not yet populated".into()))?;
+    let data: DriftData = serde_json::from_str(&cached)
+        .map_err(|_| ApiError::CacheUnavailable("Drift cache data is corrupt".into()))?;
+    Ok(Json(data))
 }
 
 // ---- Lightweight summary from DynamoDB ----
@@ -245,21 +230,14 @@ struct DriftSummary {
     in_sync: u32,
 }
 
-async fn get_drift_summary(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
-    let all = match state.db.list_drift_snapshots(false, 500).await {
-        Ok(items) => items,
-        Err(e) => {
-            error!("Failed to fetch drift snapshots: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(DriftSummary {
-                    drifted: 0,
-                    in_sync: 0,
-                }),
-            )
-                .into_response();
-        }
-    };
+async fn get_drift_summary(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<DriftSummary>, ApiError> {
+    let all = state
+        .db
+        .list_drift_snapshots(false, 500)
+        .await
+        .map_err(|e| ApiError::DatabaseError(format!("Failed to fetch drift snapshots: {e}")))?;
 
     // Deduplicate: keep latest per job (list is sorted by time desc from GSI)
     let mut seen = std::collections::HashSet::new();
@@ -275,7 +253,7 @@ async fn get_drift_summary(State(state): State<Arc<ApiState>>) -> impl IntoRespo
         }
     }
 
-    (StatusCode::OK, Json(DriftSummary { drifted, in_sync })).into_response()
+    Ok(Json(DriftSummary { drifted, in_sync }))
 }
 
 // ---- Job file discovery from cloned repo ----
@@ -330,6 +308,68 @@ fn walk_for_jobs(dir: &Path, workdir: &Path, jobs: &mut HashMap<String, JobFileI
                 },
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{Database, test_support::InMemoryDb};
+    use crate::types::DriftData;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    fn test_state() -> Arc<ApiState> {
+        let db = Arc::new(InMemoryDb::new());
+        Arc::new(ApiState {
+            github_token: "t".into(),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            db: db as Arc<dyn Database>,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_get_drift_cached_empty_returns_503() {
+        let state = test_state();
+        let result = get_drift_cached(State(state)).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_get_drift_cached_with_data_returns_200() {
+        let state = test_state();
+        let drift_data = DriftData { items: vec![], in_sync: 5, drifted: 0 };
+        let cached = serde_json::to_string(&drift_data).unwrap();
+        state.db.set_cache("drift", &cached).await.unwrap();
+
+        let result = get_drift_cached(State(state)).await.unwrap();
+        assert_eq!(result.0.in_sync, 5);
+        assert_eq!(result.0.drifted, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_drift_cached_corrupt_returns_503() {
+        let state = test_state();
+        state.db.set_cache("drift", "not valid json{{{").await.unwrap();
+
+        let result = get_drift_cached(State(state)).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_get_drift_summary_empty() {
+        let state = test_state();
+        let result = get_drift_summary(State(state)).await.unwrap();
+        assert_eq!(result.0.drifted, 0);
+        assert_eq!(result.0.in_sync, 0);
     }
 }
 

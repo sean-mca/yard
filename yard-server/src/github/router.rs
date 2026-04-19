@@ -10,17 +10,17 @@ use chrono::Utc;
 use std::sync::Arc;
 use tracing::{info, warn, error};
 
-use super::client::GitHubClient;
+use super::client::GitHubApi;
 use super::git_ops::{clone_at_sha, WorkdirGuard};
 use super::webhook::{parse_webhook, WebhookAction};
 use crate::api::dashboard::ApiState;
-use crate::db::{DynamoDatabase, PlanResultRow, PlanStatus, WebhookEvent};
+use crate::db::{Database, PlanResultRow, PlanStatus, WebhookEvent};
 
 /// Shared state for the webhook handler.
 pub struct AppState {
-    pub github_client: GitHubClient,
+    pub github_client: Arc<dyn GitHubApi>,
     pub webhook_secret: String,
-    pub db: Arc<DynamoDatabase>,
+    pub db: Arc<dyn Database>,
     pub api_state: Arc<ApiState>,
 }
 

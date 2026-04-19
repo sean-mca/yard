@@ -1,15 +1,15 @@
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
-    response::IntoResponse,
     routing::get,
     Json, Router,
 };
 use serde::Deserialize;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
-use crate::db::{DynamoDatabase, PlanStatus};
+use super::error::ApiError;
+
+use crate::db::{Database, PlanStatus};
 use crate::types::*;
 
 const MAX_CACHED_PRS: u8 = 50;
@@ -18,7 +18,7 @@ pub struct ApiState {
     pub github_token: String,
     pub repo_owner: String,
     pub repo_name: String,
-    pub db: Arc<DynamoDatabase>,
+    pub db: Arc<dyn Database>,
 }
 
 pub fn dashboard_router(state: Arc<ApiState>) -> Router {
@@ -39,17 +39,13 @@ struct PaginationParams {
 async fn get_dashboard(
     State(state): State<Arc<ApiState>>,
     Query(params): Query<PaginationParams>,
-) -> impl IntoResponse {
+) -> Result<Json<DashboardData>, ApiError> {
     let page = params.page.unwrap_or(1).max(1);
     let per_page = params.per_page.unwrap_or(15).min(50);
-
-    match fetch_dashboard_data(&state, page, per_page).await {
-        Ok(data) => (StatusCode::OK, Json(data)).into_response(),
-        Err(e) => {
-            error!("Failed to fetch dashboard data: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
-        }
-    }
+    let data = fetch_dashboard_data(&state, page, per_page)
+        .await
+        .map_err(ApiError::GitHubError)?;
+    Ok(Json(data))
 }
 
 async fn fetch_dashboard_data(
@@ -92,7 +88,7 @@ async fn fetch_dashboard_data(
 
     let has_more = all_prs.items.len() == per_page as usize;
 
-    let rows = build_pr_rows(&state.db, &all_prs.items).await;
+    let rows = build_pr_rows(state.db.as_ref(), &all_prs.items).await;
 
     let jobs_tracked = count_job_files(&octo, owner, repo).await.unwrap_or(0);
 
@@ -150,7 +146,7 @@ pub async fn refresh_dashboard_cache(state: &ApiState) -> Result<DashboardCache,
         .await
         .map_err(|e| format!("Failed to fetch PRs: {e}"))?;
 
-    let rows = build_pr_rows(&state.db, &all_prs.items).await;
+    let rows = build_pr_rows(state.db.as_ref(), &all_prs.items).await;
 
     let jobs_tracked = count_job_files(&octo, owner, repo).await.unwrap_or(0);
 
@@ -182,38 +178,26 @@ pub async fn refresh_dashboard_cache(state: &ApiState) -> Result<DashboardCache,
 async fn get_dashboard_cached(
     State(state): State<Arc<ApiState>>,
     Query(params): Query<PaginationParams>,
-) -> impl IntoResponse {
+) -> Result<Json<DashboardData>, ApiError> {
     let page = params.page.unwrap_or(1).max(1);
     let per_page = params.per_page.unwrap_or(15).min(50);
 
-    match state.db.get_cache("dashboard").await {
-        Ok(Some(cached)) => match serde_json::from_str::<DashboardCache>(&cached) {
-            Ok(cache) => {
-                let data = cache.paginate(page, per_page);
-                (StatusCode::OK, Json(data)).into_response()
-            }
-            Err(_) => {
-                // Cache corrupt — fall through to GitHub
-                match fetch_dashboard_data(&state, page, per_page).await {
-                    Ok(data) => (StatusCode::OK, Json(data)).into_response(),
-                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-                }
-            }
-        },
-        _ => {
-            // No cache yet — fall through to GitHub
-            match fetch_dashboard_data(&state, page, per_page).await {
-                Ok(data) => (StatusCode::OK, Json(data)).into_response(),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-            }
-        }
-    }
+    let cached = state
+        .db
+        .get_cache("dashboard")
+        .await
+        .map_err(|e| ApiError::DatabaseError(format!("Cache read failed: {e}")))?
+        .ok_or_else(|| ApiError::CacheUnavailable("Dashboard cache not yet populated".into()))?;
+    let cache: DashboardCache = serde_json::from_str(&cached)
+        .map_err(|_| ApiError::CacheUnavailable("Dashboard cache data is corrupt".into()))?;
+    let data = cache.paginate(page, per_page);
+    Ok(Json(data))
 }
 
 // ---- Shared helpers ----
 
 async fn build_pr_rows(
-    db: &DynamoDatabase,
+    db: &dyn Database,
     prs: &[octocrab::models::pulls::PullRequest],
 ) -> Vec<PrRow> {
     let mut rows = Vec::new();
@@ -302,6 +286,48 @@ async fn count_job_files(
     }
 
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{Database, test_support::InMemoryDb};
+    use crate::types::DashboardCache;
+    use axum::extract::{Query, State};
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    fn test_state() -> Arc<ApiState> {
+        let db = Arc::new(InMemoryDb::new());
+        Arc::new(ApiState {
+            github_token: "t".into(),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            db: db as Arc<dyn Database>,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_get_dashboard_cached_empty_returns_503() {
+        let state = test_state();
+        let params = Query(PaginationParams { page: None, per_page: None });
+        let result = get_dashboard_cached(State(state), params).await;
+        assert!(result.is_err());
+        let resp = result.unwrap_err().into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_get_dashboard_cached_with_data_returns_200() {
+        let state = test_state();
+        let cache = DashboardCache { prs: vec![], open_prs: 0, jobs_tracked: 0 };
+        let cached = serde_json::to_string(&cache).unwrap();
+        state.db.set_cache("dashboard", &cached).await.unwrap();
+
+        let params = Query(PaginationParams { page: None, per_page: None });
+        let result = get_dashboard_cached(State(state), params).await.unwrap();
+        assert_eq!(result.0.open_prs, 0);
+    }
 }
 
 fn format_relative_time(dt: chrono::DateTime<chrono::Utc>) -> String {
