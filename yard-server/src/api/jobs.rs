@@ -1,13 +1,13 @@
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
-    response::IntoResponse,
     routing::get,
     Json, Router,
 };
 use serde::Deserialize;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::info;
+
+use super::error::ApiError;
 
 use super::dashboard::ApiState;
 use crate::types::*;
@@ -19,14 +19,11 @@ pub fn jobs_router(state: Arc<ApiState>) -> Router {
         .with_state(state)
 }
 
-async fn get_jobs(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
-    match fetch_jobs(&state).await {
-        Ok(data) => (StatusCode::OK, Json(data)).into_response(),
-        Err(e) => {
-            error!("Failed to fetch jobs: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
-        }
-    }
+async fn get_jobs(State(state): State<Arc<ApiState>>) -> Result<Json<JobsData>, ApiError> {
+    let data = fetch_jobs(&state)
+        .await
+        .map_err(ApiError::GitHubError)?;
+    Ok(Json(data))
 }
 
 async fn fetch_jobs(state: &ApiState) -> Result<JobsData, String> {
@@ -109,14 +106,10 @@ struct FileParams {
 async fn get_job_file(
     State(state): State<Arc<ApiState>>,
     Query(params): Query<FileParams>,
-) -> impl IntoResponse {
-    match fetch_file_content(&state, &params.path).await {
-        Ok(content) => (StatusCode::OK, content).into_response(),
-        Err(e) => {
-            error!("Failed to fetch file: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
-        }
-    }
+) -> Result<String, ApiError> {
+    fetch_file_content(&state, &params.path)
+        .await
+        .map_err(ApiError::GitHubError)
 }
 
 async fn fetch_file_content(state: &ApiState, path: &str) -> Result<String, String> {

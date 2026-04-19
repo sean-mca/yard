@@ -1,14 +1,15 @@
 use axum::{
     extract::State,
     http::StatusCode,
-    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::info;
+
+use super::error::ApiError;
 
 use super::dashboard::ApiState;
 
@@ -56,19 +57,18 @@ struct SettingsResponse {
     settings: HashMap<String, String>,
 }
 
-async fn get_settings(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
-    match state.db.list_settings().await {
-        Ok(items) => {
-            let settings: HashMap<String, String> =
-                items.into_iter().map(|s| (s.key, s.value)).collect();
-            info!(count = settings.len(), "Fetched settings");
-            (StatusCode::OK, Json(SettingsResponse { settings })).into_response()
-        }
-        Err(e) => {
-            error!("Failed to fetch settings: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
-    }
+async fn get_settings(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let items = state
+        .db
+        .list_settings()
+        .await
+        .map_err(|e| ApiError::DatabaseError(format!("Failed to fetch settings: {e}")))?;
+    let settings: HashMap<String, String> =
+        items.into_iter().map(|s| (s.key, s.value)).collect();
+    info!(count = settings.len(), "Fetched settings");
+    Ok(Json(SettingsResponse { settings }))
 }
 
 #[derive(Deserialize)]
@@ -79,23 +79,24 @@ struct SettingsPayload {
 async fn post_settings(
     State(state): State<Arc<ApiState>>,
     Json(payload): Json<SettingsPayload>,
-) -> impl IntoResponse {
+) -> Result<StatusCode, ApiError> {
     // Validate all settings before writing any
     for (key, value) in &payload.settings {
         if let Err(msg) = validate_setting(key, value) {
-            return (StatusCode::BAD_REQUEST, msg).into_response();
+            return Err(ApiError::BadRequest(msg));
         }
     }
 
     for (key, value) in &payload.settings {
-        if let Err(e) = state.db.set_setting(key, value).await {
-            error!(key = %key, "Failed to save setting: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
+        state
+            .db
+            .set_setting(key, value)
+            .await
+            .map_err(|e| ApiError::DatabaseError(format!("Failed to save setting '{key}': {e}")))?;
     }
 
     info!(count = payload.settings.len(), "Saved settings");
-    StatusCode::OK.into_response()
+    Ok(StatusCode::OK)
 }
 
 #[cfg(test)]

@@ -1,13 +1,13 @@
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
-    response::IntoResponse,
     routing::get,
     Json, Router,
 };
 use serde::Deserialize;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
+
+use super::error::ApiError;
 
 use crate::db::{Database, PlanStatus};
 use crate::types::*;
@@ -39,17 +39,13 @@ struct PaginationParams {
 async fn get_dashboard(
     State(state): State<Arc<ApiState>>,
     Query(params): Query<PaginationParams>,
-) -> impl IntoResponse {
+) -> Result<Json<DashboardData>, ApiError> {
     let page = params.page.unwrap_or(1).max(1);
     let per_page = params.per_page.unwrap_or(15).min(50);
-
-    match fetch_dashboard_data(&state, page, per_page).await {
-        Ok(data) => (StatusCode::OK, Json(data)).into_response(),
-        Err(e) => {
-            error!("Failed to fetch dashboard data: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
-        }
-    }
+    let data = fetch_dashboard_data(&state, page, per_page)
+        .await
+        .map_err(ApiError::GitHubError)?;
+    Ok(Json(data))
 }
 
 async fn fetch_dashboard_data(
@@ -182,32 +178,20 @@ pub async fn refresh_dashboard_cache(state: &ApiState) -> Result<DashboardCache,
 async fn get_dashboard_cached(
     State(state): State<Arc<ApiState>>,
     Query(params): Query<PaginationParams>,
-) -> impl IntoResponse {
+) -> Result<Json<DashboardData>, ApiError> {
     let page = params.page.unwrap_or(1).max(1);
     let per_page = params.per_page.unwrap_or(15).min(50);
 
-    match state.db.get_cache("dashboard").await {
-        Ok(Some(cached)) => match serde_json::from_str::<DashboardCache>(&cached) {
-            Ok(cache) => {
-                let data = cache.paginate(page, per_page);
-                (StatusCode::OK, Json(data)).into_response()
-            }
-            Err(_) => {
-                // Cache corrupt — fall through to GitHub
-                match fetch_dashboard_data(&state, page, per_page).await {
-                    Ok(data) => (StatusCode::OK, Json(data)).into_response(),
-                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-                }
-            }
-        },
-        _ => {
-            // No cache yet — fall through to GitHub
-            match fetch_dashboard_data(&state, page, per_page).await {
-                Ok(data) => (StatusCode::OK, Json(data)).into_response(),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-            }
-        }
-    }
+    let cached = state
+        .db
+        .get_cache("dashboard")
+        .await
+        .map_err(|e| ApiError::DatabaseError(format!("Cache read failed: {e}")))?
+        .ok_or_else(|| ApiError::CacheUnavailable("Dashboard cache not yet populated".into()))?;
+    let cache: DashboardCache = serde_json::from_str(&cached)
+        .map_err(|_| ApiError::CacheUnavailable("Dashboard cache data is corrupt".into()))?;
+    let data = cache.paginate(page, per_page);
+    Ok(Json(data))
 }
 
 // ---- Shared helpers ----

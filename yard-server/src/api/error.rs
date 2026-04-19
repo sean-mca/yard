@@ -9,6 +9,7 @@ use serde_json::json;
 pub enum ApiError {
     DatabaseError(String),
     GitHubError(String),
+    #[allow(dead_code)]
     NotFound(String),
     BadRequest(String),
     CacheUnavailable(String),

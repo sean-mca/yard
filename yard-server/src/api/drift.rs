@@ -1,7 +1,5 @@
 use axum::{
     extract::State,
-    http::StatusCode,
-    response::IntoResponse,
     routing::get,
     Json, Router,
 };
@@ -10,7 +8,9 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
+
+use super::error::ApiError;
 
 use super::dashboard::ApiState;
 use crate::db::DriftSnapshot;
@@ -27,14 +27,11 @@ pub fn drift_router(state: Arc<ApiState>) -> Router {
 
 // ---- Full drift check ----
 
-async fn get_drift(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
-    match run_drift_check(&state).await {
-        Ok(data) => (StatusCode::OK, Json(data)).into_response(),
-        Err(e) => {
-            error!("Drift check failed: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
-        }
-    }
+async fn get_drift(State(state): State<Arc<ApiState>>) -> Result<Json<DriftData>, ApiError> {
+    let data = run_drift_check(&state)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(data))
 }
 
 pub async fn run_drift_check(state: &ApiState) -> Result<DriftData, String> {
@@ -211,30 +208,18 @@ async fn get_head_sha(state: &ApiState) -> Result<String, String> {
 
 // ---- Cached drift data (populated by background task or full check) ----
 
-async fn get_drift_cached(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
-    match state.db.get_cache("drift").await {
-        Ok(Some(cached)) => match serde_json::from_str::<DriftData>(&cached) {
-            Ok(data) => (StatusCode::OK, Json(data)).into_response(),
-            Err(_) => (
-                StatusCode::OK,
-                Json(DriftData {
-                    items: vec![],
-                    in_sync: 0,
-                    drifted: 0,
-                }),
-            )
-                .into_response(),
-        },
-        _ => (
-            StatusCode::OK,
-            Json(DriftData {
-                items: vec![],
-                in_sync: 0,
-                drifted: 0,
-            }),
-        )
-            .into_response(),
-    }
+async fn get_drift_cached(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<DriftData>, ApiError> {
+    let cached = state
+        .db
+        .get_cache("drift")
+        .await
+        .map_err(|e| ApiError::DatabaseError(format!("Cache read failed: {e}")))?
+        .ok_or_else(|| ApiError::CacheUnavailable("Drift cache not yet populated".into()))?;
+    let data: DriftData = serde_json::from_str(&cached)
+        .map_err(|_| ApiError::CacheUnavailable("Drift cache data is corrupt".into()))?;
+    Ok(Json(data))
 }
 
 // ---- Lightweight summary from DynamoDB ----
@@ -245,21 +230,14 @@ struct DriftSummary {
     in_sync: u32,
 }
 
-async fn get_drift_summary(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
-    let all = match state.db.list_drift_snapshots(false, 500).await {
-        Ok(items) => items,
-        Err(e) => {
-            error!("Failed to fetch drift snapshots: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(DriftSummary {
-                    drifted: 0,
-                    in_sync: 0,
-                }),
-            )
-                .into_response();
-        }
-    };
+async fn get_drift_summary(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<DriftSummary>, ApiError> {
+    let all = state
+        .db
+        .list_drift_snapshots(false, 500)
+        .await
+        .map_err(|e| ApiError::DatabaseError(format!("Failed to fetch drift snapshots: {e}")))?;
 
     // Deduplicate: keep latest per job (list is sorted by time desc from GSI)
     let mut seen = std::collections::HashSet::new();
@@ -275,7 +253,7 @@ async fn get_drift_summary(State(state): State<Arc<ApiState>>) -> impl IntoRespo
         }
     }
 
-    (StatusCode::OK, Json(DriftSummary { drifted, in_sync })).into_response()
+    Ok(Json(DriftSummary { drifted, in_sync }))
 }
 
 // ---- Job file discovery from cloned repo ----
