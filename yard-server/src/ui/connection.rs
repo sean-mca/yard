@@ -64,6 +64,10 @@ pub enum Event {
         reason: String,
     },
     WebhookReceived,
+    AlertSent {
+        #[allow(dead_code)]
+        drifted_count: u32,
+    },
 }
 
 /// Build the WebSocket URL for the events endpoint.
