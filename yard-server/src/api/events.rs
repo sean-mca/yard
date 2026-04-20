@@ -38,6 +38,7 @@ pub enum Event {
     DashboardRefreshed,
     DashboardFailed { reason: String },
     WebhookReceived,
+    AlertSent { drifted_count: u32 },
 }
 
 /// Truncate a failure-reason string to at most `REASON_MAX_CHARS` characters,
