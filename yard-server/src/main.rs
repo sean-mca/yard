@@ -93,11 +93,14 @@ fn start_api_server() {
                     .map_err(|e| anyhow::anyhow!("Failed to create GitHub client: {e}"))?,
             );
 
+            let (event_tx, _seed_rx) = api::events::new_event_channel();
+
             let api_state = Arc::new(ApiState {
                 github_token,
                 repo_owner,
                 repo_name,
                 db: db.clone(),
+                event_tx,
             });
 
             let webhook_state = Arc::new(AppState {
@@ -125,6 +128,7 @@ fn start_api_server() {
                 .merge(jobs_router(api_state.clone()))
                 .merge(drift_router(api_state.clone()))
                 .merge(settings_router(api_state.clone()))
+                .merge(api::events::events_router(api_state.clone()))
                 .layer(rate_limit)
                 .layer(cors)
                 .layer(TraceLayer::new_for_http());
@@ -182,9 +186,13 @@ async fn drift_poll_loop(state: std::sync::Arc<api::dashboard::ApiState>) {
                     in_sync = data.in_sync,
                     "Scheduled drift check complete"
                 );
+                let _ = state.event_tx.send(api::events::Event::DriftRefreshed);
             }
             Err(e) => {
                 warn!("Scheduled drift check failed: {e}");
+                let _ = state.event_tx.send(api::events::Event::DriftFailed {
+                    reason: api::events::sanitize_reason(&e),
+                });
             }
         }
 
@@ -211,9 +219,13 @@ async fn dashboard_poll_loop(state: std::sync::Arc<api::dashboard::ApiState>) {
                     open_prs = cache.open_prs,
                     "Dashboard cache refreshed"
                 );
+                let _ = state.event_tx.send(api::events::Event::DashboardRefreshed);
             }
             Err(e) => {
                 warn!("Dashboard cache refresh failed: {e}");
+                let _ = state.event_tx.send(api::events::Event::DashboardFailed {
+                    reason: api::events::sanitize_reason(&e),
+                });
             }
         }
 
@@ -251,6 +263,43 @@ fn Shell() -> Element {
         Route::Settings {} => "Settings",
     };
 
+    // Phase 7: provide ConnectionCtx + spawn the WS task (wasm32 only).
+    // On native, ConnectionIndicator falls back to Connecting (Plan 04).
+    #[cfg(target_arch = "wasm32")]
+    {
+        let ctx = ui::connection::ConnectionCtx {
+            state: use_signal(|| ui::connection::ConnectionState::Connecting),
+            dashboard_tick: use_signal(|| 0u64),
+            drift_tick: use_signal(|| 0u64),
+        };
+        use_context_provider(|| ctx);
+
+        // Spawn the WS task exactly once per mount. `use_hook` runs its closure
+        // only on first render; the captured Signal handles are stable across
+        // re-renders, so no duplicate connections are created.
+        use_hook(|| {
+            let dashboard_tick = ctx.dashboard_tick;
+            let drift_tick = ctx.drift_tick;
+            ui::connection::spawn_ws_task(ctx.state, move |event| {
+                use ui::connection::Event::*;
+                // `write_unchecked(&self)` permits updates from an `Fn` closure;
+                // Signals use interior mutability, borrow-checked at runtime.
+                match event {
+                    DashboardRefreshed
+                    | DashboardFailed { .. }
+                    | WebhookReceived => {
+                        let mut w = dashboard_tick.write_unchecked();
+                        *w = w.wrapping_add(1);
+                    }
+                    DriftRefreshed | DriftFailed { .. } => {
+                        let mut w = drift_tick.write_unchecked();
+                        *w = w.wrapping_add(1);
+                    }
+                }
+            });
+        });
+    }
+
     rsx! {
         div {
             class: format!(
@@ -259,8 +308,9 @@ fn Shell() -> Element {
             ),
             ui::sidebar::Sidebar { open: sidebar_open, route }
             main { class: "flex-1 min-h-screen",
-                div { class: "h-14 flex items-center px-6 border-b border-zinc-200 dark:border-zinc-800",
+                div { class: "h-14 flex items-center justify-between px-6 border-b border-zinc-200 dark:border-zinc-800",
                     h1 { class: "text-sm font-semibold", "{title}" }
+                    ui::connection_indicator::ConnectionIndicator {}
                 }
                 Outlet::<Route> {}
             }

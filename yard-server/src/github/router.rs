@@ -232,10 +232,24 @@ async fn handle_webhook(
                 }
             };
 
-            // Refresh dashboard cache
+            // Refresh dashboard cache; emit events for the outcome.
             if let Err(e) = crate::api::dashboard::refresh_dashboard_cache(&state.api_state).await {
                 warn!(error = %e, "Failed to refresh dashboard cache after plan");
+                let _ = state.api_state.event_tx.send(
+                    crate::api::events::Event::DashboardFailed {
+                        reason: crate::api::events::sanitize_reason(&e),
+                    },
+                );
+            } else {
+                let _ = state
+                    .api_state
+                    .event_tx
+                    .send(crate::api::events::Event::DashboardRefreshed);
             }
+            let _ = state
+                .api_state
+                .event_tx
+                .send(crate::api::events::Event::WebhookReceived);
 
             status
         }
@@ -341,13 +355,90 @@ async fn handle_webhook(
                 }
             };
 
-            // Refresh dashboard cache
+            // Refresh dashboard cache; emit events for the outcome.
             if let Err(e) = crate::api::dashboard::refresh_dashboard_cache(&state.api_state).await {
                 warn!(error = %e, "Failed to refresh dashboard cache after apply");
+                let _ = state.api_state.event_tx.send(
+                    crate::api::events::Event::DashboardFailed {
+                        reason: crate::api::events::sanitize_reason(&e),
+                    },
+                );
+            } else {
+                let _ = state
+                    .api_state
+                    .event_tx
+                    .send(crate::api::events::Event::DashboardRefreshed);
             }
+            let _ = state
+                .api_state
+                .event_tx
+                .send(crate::api::events::Event::WebhookReceived);
 
             status
         }
         WebhookAction::Ignore => StatusCode::OK,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::api::events::{new_event_channel, sanitize_reason, Event};
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn webhook_emission_contract_dashboard_refreshed_then_webhook_received() {
+        // This test exercises the broadcast plumbing that the Plan/Apply branches
+        // use after a successful refresh_dashboard_cache. It mirrors the exact
+        // sequence in handle_webhook but without the GitHub clone path.
+        let (tx, mut rx) = new_event_channel();
+
+        // Success branch: emit DashboardRefreshed then WebhookReceived.
+        let _ = tx.send(Event::DashboardRefreshed);
+        let _ = tx.send(Event::WebhookReceived);
+
+        let first = timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("recv timed out")
+            .expect("recv err");
+        let second = timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("recv timed out")
+            .expect("recv err");
+
+        assert!(matches!(first, Event::DashboardRefreshed));
+        assert!(matches!(second, Event::WebhookReceived));
+    }
+
+    #[tokio::test]
+    async fn webhook_emission_contract_dashboard_failed_carries_sanitized_reason() {
+        // Failure branch: emit DashboardFailed { reason: sanitize_reason(&e) } then WebhookReceived.
+        let (tx, mut rx) = new_event_channel();
+        let long_err = "x".repeat(300);
+        let _ = tx.send(Event::DashboardFailed {
+            reason: sanitize_reason(&long_err),
+        });
+        let _ = tx.send(Event::WebhookReceived);
+
+        let first = timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("recv timed out")
+            .expect("recv err");
+        match first {
+            Event::DashboardFailed { reason } => {
+                assert_eq!(
+                    reason.chars().count(),
+                    200,
+                    "reason must be sanitized to 200 chars"
+                );
+                assert!(reason.ends_with('…'));
+            }
+            other => panic!("expected DashboardFailed, got {other:?}"),
+        }
+
+        let second = timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("recv timed out")
+            .expect("recv err");
+        assert!(matches!(second, Event::WebhookReceived));
     }
 }

@@ -38,7 +38,11 @@ pub struct DashboardData {
 
 /// Cached dashboard data — full unpaginated PR list + metadata.
 /// Stored in DynamoDB, paginated on read to produce DashboardData.
+/// Only consumed by the native API layer; on wasm32 the struct is still
+/// reachable via `types::*` glob imports but no caller exists. Narrow
+/// `dead_code` allow keeps wasm32 clippy green without cfg-gating the type.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub struct DashboardCache {
     pub prs: Vec<PrRow>,
     pub open_prs: u32,
@@ -46,6 +50,7 @@ pub struct DashboardCache {
 }
 
 impl DashboardCache {
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub fn paginate(&self, page: u32, per_page: u32) -> DashboardData {
         let start = ((page - 1) * per_page) as usize;
         let end = (start + per_page as usize).min(self.prs.len());

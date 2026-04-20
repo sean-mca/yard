@@ -7,6 +7,9 @@ use crate::types::*;
 
 use super::api_base;
 
+#[cfg(target_arch = "wasm32")]
+use super::connection::{ConnectionCtx, ConnectionState};
+
 // ---- Query type ----
 
 #[derive(Clone, PartialEq, Hash, Eq)]
@@ -38,11 +41,34 @@ impl QueryCapability for DriftQuery {
 
 #[component]
 pub fn Drift() -> Element {
+    // Phase 7: compute polling interval from WS state. Pause when Live.
+    #[cfg(target_arch = "wasm32")]
+    let ctx: ConnectionCtx = use_context();
+    #[cfg(target_arch = "wasm32")]
+    let interval = if matches!(*ctx.state.read(), ConnectionState::Live) {
+        Duration::MAX
+    } else {
+        Duration::from_secs(15)
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let interval = Duration::from_secs(15);
+
     let data = use_query(
         Query::new((), DriftQuery)
             .stale_time(Duration::from_secs(30))
-            .interval_time(Duration::from_secs(15)),
+            .interval_time(interval),
     );
+
+    // Phase 7: invalidate drift query on WS drift events.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let data_handle = data;
+        use_effect(move || {
+            let _ = ctx.drift_tick.read();
+            data_handle.invalidate();
+        });
+    }
+
     let selected = use_signal(|| None::<DriftItem>);
 
     let data_state = data.read();
