@@ -6,6 +6,8 @@ mod api;
 mod db;
 #[cfg(not(target_arch = "wasm32"))]
 mod github;
+#[cfg(not(target_arch = "wasm32"))]
+mod alerting;
 mod types;
 mod ui;
 
@@ -187,6 +189,114 @@ async fn drift_poll_loop(state: std::sync::Arc<api::dashboard::ApiState>) {
                     "Scheduled drift check complete"
                 );
                 let _ = state.event_tx.send(api::events::Event::DriftRefreshed);
+
+                // ---- Phase 8: drift threshold alerting ----
+                // Disabled-by-default short-circuit (D-07): check cheap settings
+                // before reading cooldown state.
+                let slack_enabled = matches!(
+                    state
+                        .db
+                        .get_setting("slack_enabled")
+                        .await
+                        .ok()
+                        .flatten()
+                        .as_deref(),
+                    Some("true")
+                );
+                let webhook_url = state
+                    .db
+                    .get_setting("slack_webhook_url")
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let threshold_opt = state
+                    .db
+                    .get_setting("alert_drift_threshold")
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.parse::<u32>().ok());
+
+                if slack_enabled
+                    && !webhook_url.is_empty()
+                    && let Some(threshold) = threshold_opt
+                {
+                    let cooldown_mins = state
+                        .db
+                        .get_setting("alert_cooldown_minutes")
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(10);
+                    // Saturating multiply prevents overflow for attacker-set u64::MAX (T-08-03-01).
+                    let cooldown =
+                        std::time::Duration::from_secs(cooldown_mins.saturating_mul(60));
+
+                    let last_sent = state
+                        .db
+                        .get_setting("alert_last_sent_at")
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                        .map(|dt| dt.with_timezone(&chrono::Utc));
+
+                    let cfg = alerting::threshold::AlertConfig {
+                        threshold,
+                        cooldown,
+                        last_sent,
+                    };
+                    let now = chrono::Utc::now();
+                    match alerting::threshold::evaluate(&data, &cfg, now) {
+                        alerting::threshold::AlertDecision::Send => {
+                            match alerting::slack::post_slack_alert(
+                                &webhook_url,
+                                &data,
+                                threshold,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    let ts = now.to_rfc3339();
+                                    match state
+                                        .db
+                                        .set_setting("alert_last_sent_at", &ts)
+                                        .await
+                                    {
+                                        Ok(()) => {
+                                            info!(
+                                                drifted = data.drifted,
+                                                threshold = threshold,
+                                                "Drift alert sent"
+                                            );
+                                            let _ = state.event_tx.send(
+                                                api::events::Event::AlertSent {
+                                                    drifted_count: data.drifted,
+                                                },
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                error = %e,
+                                                "Failed to persist alert_last_sent_at after successful Slack POST"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Slack alert POST failed");
+                                }
+                            }
+                        }
+                        alerting::threshold::AlertDecision::Cooldown => {
+                            info!("Drift alert skipped (cooldown)");
+                        }
+                        alerting::threshold::AlertDecision::BelowThreshold => {}
+                    }
+                }
+                // ---- End Phase 8 alert block ----
             }
             Err(e) => {
                 warn!("Scheduled drift check failed: {e}");
@@ -291,7 +401,7 @@ fn Shell() -> Element {
                         let mut w = dashboard_tick.write_unchecked();
                         *w = w.wrapping_add(1);
                     }
-                    DriftRefreshed | DriftFailed { .. } => {
+                    DriftRefreshed | DriftFailed { .. } | AlertSent { .. } => {
                         let mut w = drift_tick.write_unchecked();
                         *w = w.wrapping_add(1);
                     }

@@ -41,6 +41,19 @@ fn validate_setting(key: &str, value: &str) -> Result<(), String> {
             )),
         },
         "slack_webhook_url" => Ok(()),
+        "alert_drift_threshold" => match value.parse::<u32>() {
+            Ok(n) if n >= 1 => Ok(()),
+            _ => Err(format!(
+                "invalid alert_drift_threshold '{value}': must be a positive integer >= 1"
+            )),
+        },
+        "alert_cooldown_minutes" => match value.parse::<u64>() {
+            Ok(n) if n >= 1 => Ok(()),
+            _ => Err(format!(
+                "invalid alert_cooldown_minutes '{value}': must be a positive integer >= 1"
+            )),
+        },
+        "alert_last_sent_at" => Ok(()),
         _ => Err(format!("unknown setting '{key}'")),
     }
 }
@@ -226,5 +239,57 @@ mod tests {
     fn accepts_any_slack_webhook_url() {
         assert!(validate_setting("slack_webhook_url", "https://hooks.slack.com/services/foo").is_ok());
         assert!(validate_setting("slack_webhook_url", "").is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_alert_drift_threshold() {
+        assert!(validate_setting("alert_drift_threshold", "0").is_err());
+        assert!(validate_setting("alert_drift_threshold", "-1").is_err());
+        assert!(validate_setting("alert_drift_threshold", "abc").is_err());
+    }
+
+    #[test]
+    fn accepts_valid_alert_drift_threshold() {
+        assert!(validate_setting("alert_drift_threshold", "1").is_ok());
+        assert!(validate_setting("alert_drift_threshold", "100").is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_alert_cooldown_minutes() {
+        assert!(validate_setting("alert_cooldown_minutes", "0").is_err());
+        assert!(validate_setting("alert_cooldown_minutes", "-5").is_err());
+        assert!(validate_setting("alert_cooldown_minutes", "abc").is_err());
+    }
+
+    #[test]
+    fn accepts_valid_alert_cooldown_minutes() {
+        assert!(validate_setting("alert_cooldown_minutes", "1").is_ok());
+        assert!(validate_setting("alert_cooldown_minutes", "10").is_ok());
+        assert!(validate_setting("alert_cooldown_minutes", "1440").is_ok());
+    }
+
+    #[test]
+    fn accepts_any_alert_last_sent_at() {
+        // Server-written key — lenient pass-through like slack_webhook_url.
+        assert!(validate_setting("alert_last_sent_at", "2026-04-20T12:00:00Z").is_ok());
+        assert!(validate_setting("alert_last_sent_at", "arbitrary-string").is_ok());
+        assert!(validate_setting("alert_last_sent_at", "").is_ok());
+    }
+
+    #[tokio::test]
+    async fn post_settings_rejects_invalid_alert_threshold_with_400() {
+        // End-to-end test: post_settings handler catches validate_setting's Err
+        // and wraps it in ApiError::BadRequest → HTTP 400 via IntoResponse.
+        let state = test_api_state();
+        let payload = SettingsPayload {
+            settings: [("alert_drift_threshold".to_string(), "0".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let result = post_settings(State(state), Json(payload)).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }
