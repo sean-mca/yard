@@ -9,7 +9,15 @@ use dioxus::prelude::*;
 /// Local mirror of `super::connection::ConnectionState`, compilable on native.
 /// The wasm-only `connection` module defines the authoritative enum; this copy
 /// ensures this file compiles on native too. Keep variants in lock-step.
+///
+/// `#[allow(dead_code)]` on the variants: `ConnectionIndicator` is not yet
+/// mounted in `Shell` on native — Plan 07-05 wires it in. Until then the
+/// `Live`/`Offline` arms of the internal match are unreachable from anywhere
+/// except the native `cfg` branch (which always assigns `Connecting`). Once
+/// Plan 07-05 lands, the wasm→native cross-target match reaches every arm and
+/// this attribute can be removed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)]
 pub enum ConnectionState {
     Live,
     Connecting,
