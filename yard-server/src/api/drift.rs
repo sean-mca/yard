@@ -322,11 +322,13 @@ mod tests {
 
     fn test_state() -> Arc<ApiState> {
         let db = Arc::new(InMemoryDb::new());
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
         Arc::new(ApiState {
             github_token: "t".into(),
             repo_owner: "o".into(),
             repo_name: "r".into(),
             db: db as Arc<dyn Database>,
+            event_tx,
         })
     }
 

@@ -19,6 +19,11 @@ pub struct ApiState {
     pub repo_owner: String,
     pub repo_name: String,
     pub db: Arc<dyn Database>,
+    // Subscribed by Plan 03's WS handler via `event_tx.subscribe()`; sent into by
+    // Plan 02's poll loops. Staged here so the channel type-contract and ApiState
+    // shape are locked before downstream waves land.
+    #[allow(dead_code)]
+    pub event_tx: tokio::sync::broadcast::Sender<crate::api::events::Event>,
 }
 
 pub fn dashboard_router(state: Arc<ApiState>) -> Router {
@@ -299,11 +304,13 @@ mod tests {
 
     fn test_state() -> Arc<ApiState> {
         let db = Arc::new(InMemoryDb::new());
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
         Arc::new(ApiState {
             github_token: "t".into(),
             repo_owner: "o".into(),
             repo_name: "r".into(),
             db: db as Arc<dyn Database>,
+            event_tx,
         })
     }
 

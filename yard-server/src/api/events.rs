@@ -9,6 +9,7 @@ use tokio::sync::broadcast;
 
 /// Max chars retained in a failure `reason` string before truncation with `…`.
 /// Prevents leaking long GitHub error bodies / stack traces over the WS wire.
+#[allow(dead_code)] // Consumed via `sanitize_reason` — flagged until Plan 02 wires emission sites.
 const REASON_MAX_CHARS: usize = 200;
 
 /// Broadcast channel capacity. Small on purpose (see CONTEXT.md D-05):
@@ -17,6 +18,7 @@ pub const EVENT_CHANNEL_CAPACITY: usize = 64;
 
 /// Server → client WebSocket event. Each variant is a "refresh now" signal
 /// (see CONTEXT.md D-01 / D-02). Serialised as `{"event":"<snake_case>", ...fields}`.
+#[allow(dead_code)] // Variants constructed by Plan 02 emission sites; staged here for the type contract.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
@@ -30,6 +32,7 @@ pub enum Event {
 /// Truncate a failure-reason string to at most `REASON_MAX_CHARS` characters,
 /// replacing the last char with `…` when truncation occurs. Counts chars
 /// (Unicode scalar values), not bytes, so multi-byte input behaves sensibly.
+#[allow(dead_code)] // Called by Plan 02 emission sites before constructing failed-event variants.
 pub fn sanitize_reason(s: &str) -> String {
     let char_count = s.chars().count();
     if char_count <= REASON_MAX_CHARS {

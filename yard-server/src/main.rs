@@ -93,11 +93,14 @@ fn start_api_server() {
                     .map_err(|e| anyhow::anyhow!("Failed to create GitHub client: {e}"))?,
             );
 
+            let (event_tx, _seed_rx) = api::events::new_event_channel();
+
             let api_state = Arc::new(ApiState {
                 github_token,
                 repo_owner,
                 repo_name,
                 db: db.clone(),
+                event_tx,
             });
 
             let webhook_state = Arc::new(AppState {
