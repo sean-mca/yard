@@ -7,6 +7,14 @@
 //! This module is gated at the module declaration site (`#[cfg(target_arch = "wasm32")] pub mod connection;` in `ui/mod.rs`)
 //! so the native test build ignores it entirely (it depends on `gloo-net`, `gloo-timers`,
 //! `futures-util`, which are WASM-only per Cargo.toml).
+//!
+//! `#[allow(dead_code)]` notes: Plan 07-05 is the consumer — it mounts
+//! `spawn_ws_task` from `Shell` (constructing `ConnectionCtx`, reading
+//! `ConnectionState`, decoding `Event`, calling `ws_url`). Until Plan 07-05
+//! lands the whole module is unreferenced on wasm32. The allow attributes
+//! below can be removed once Shell wires the task.
+
+#![allow(dead_code)]
 
 use std::time::Duration;
 
