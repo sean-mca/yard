@@ -128,6 +128,7 @@ fn start_api_server() {
                 .merge(jobs_router(api_state.clone()))
                 .merge(drift_router(api_state.clone()))
                 .merge(settings_router(api_state.clone()))
+                .merge(api::events::events_router(api_state.clone()))
                 .layer(rate_limit)
                 .layer(cors)
                 .layer(TraceLayer::new_for_http());

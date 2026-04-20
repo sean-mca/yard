@@ -65,7 +65,6 @@ pub fn new_event_channel() -> (broadcast::Sender<Event>, broadcast::Receiver<Eve
 /// Mounts `/api/ws/events`. Inherits CORS + rate-limit + tracing layers from the
 /// main router (see `main.rs::start_api_server`). The rate limiter applies to
 /// the upgrade *handshake* only; once upgraded, frames flow freely per D-09.
-#[allow(dead_code)] // Merged into the main router by Plan 07-03 Task 2.
 pub fn events_router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/api/ws/events", any(ws_handler))
@@ -74,7 +73,6 @@ pub fn events_router(state: Arc<ApiState>) -> Router {
 
 /// Upgrade extractor handler. Any HTTP verb that arrives with the WS upgrade
 /// header will hit this path — `axum::routing::any` is the idiomatic choice.
-#[allow(dead_code)] // Reached by `events_router` once it is merged into the main router (Task 2).
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<ApiState>>) -> Response {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
@@ -82,7 +80,6 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<ApiState>>) ->
 /// Per-connection event loop. Subscribes a fresh `broadcast::Receiver`,
 /// forwards events as JSON text frames, closes on lag, and ignores all
 /// inbound client payloads except Close (see T-07-03 threat model).
-#[allow(dead_code)] // Invoked by `ws_handler` once the router is mounted (Task 2).
 async fn handle_socket(mut socket: WebSocket, state: Arc<ApiState>) {
     let mut rx = state.event_tx.subscribe();
     info!("WebSocket client connected");
