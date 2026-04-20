@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use crate::types::DriftData;
 
 /// Operator-configured alert parameters + the last-sent checkpoint.
+#[allow(dead_code)] // Constructed by plan 08-05 drift_poll_loop alert block; staged here for the type contract.
 #[derive(Clone, Debug)]
 pub struct AlertConfig {
     /// Minimum drifted-job count that triggers an alert (inclusive, D-01).
@@ -23,6 +24,7 @@ pub struct AlertConfig {
 }
 
 /// Outcome of an evaluation — `Send` means the caller should POST to Slack.
+#[allow(dead_code)] // Constructed by plan 08-05 drift_poll_loop alert block; staged here for the type contract.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AlertDecision {
     /// Drifted count is under the threshold; no alert.
@@ -36,6 +38,7 @@ pub enum AlertDecision {
 /// Decide whether to send a drift alert given drift results, operator config,
 /// and the current wall-clock time. Pure — takes `now` as a parameter and does
 /// not observe `Utc::now()` internally (see CONTEXT.md D-05 and ALRT-02).
+#[allow(dead_code)] // Called by plan 08-05 drift_poll_loop alert block; staged here for the type contract.
 pub fn evaluate(drift: &DriftData, cfg: &AlertConfig, now: DateTime<Utc>) -> AlertDecision {
     if drift.drifted < cfg.threshold {
         return AlertDecision::BelowThreshold;
