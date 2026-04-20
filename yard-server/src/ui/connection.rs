@@ -114,7 +114,8 @@ pub fn spawn_ws_task(mut state: Signal<ConnectionState>, on_event: impl Fn(Event
                         }
                     }
                     // Ignore close errors — we're about to reconnect anyway.
-                    let _ = ws.close(None, None).await;
+                    // gloo-net's WebSocket::close is synchronous; no .await.
+                    let _ = ws.close(None, None);
                 }
                 Err(_) => {
                     // Fall through to the backoff sleep below.
