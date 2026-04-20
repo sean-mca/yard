@@ -185,9 +185,13 @@ async fn drift_poll_loop(state: std::sync::Arc<api::dashboard::ApiState>) {
                     in_sync = data.in_sync,
                     "Scheduled drift check complete"
                 );
+                let _ = state.event_tx.send(api::events::Event::DriftRefreshed);
             }
             Err(e) => {
                 warn!("Scheduled drift check failed: {e}");
+                let _ = state.event_tx.send(api::events::Event::DriftFailed {
+                    reason: api::events::sanitize_reason(&e),
+                });
             }
         }
 
@@ -214,9 +218,13 @@ async fn dashboard_poll_loop(state: std::sync::Arc<api::dashboard::ApiState>) {
                     open_prs = cache.open_prs,
                     "Dashboard cache refreshed"
                 );
+                let _ = state.event_tx.send(api::events::Event::DashboardRefreshed);
             }
             Err(e) => {
                 warn!("Dashboard cache refresh failed: {e}");
+                let _ = state.event_tx.send(api::events::Event::DashboardFailed {
+                    reason: api::events::sanitize_reason(&e),
+                });
             }
         }
 
