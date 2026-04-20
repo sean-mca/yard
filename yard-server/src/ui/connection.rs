@@ -8,13 +8,9 @@
 //! so the native test build ignores it entirely (it depends on `gloo-net`, `gloo-timers`,
 //! `futures-util`, which are WASM-only per Cargo.toml).
 //!
-//! `#[allow(dead_code)]` notes: Plan 07-05 is the consumer — it mounts
-//! `spawn_ws_task` from `Shell` (constructing `ConnectionCtx`, reading
-//! `ConnectionState`, decoding `Event`, calling `ws_url`). Until Plan 07-05
-//! lands the whole module is unreferenced on wasm32. The allow attributes
-//! below can be removed once Shell wires the task.
-
-#![allow(dead_code)]
+//! Plan 07-05 is the consumer — `Shell` mounts `spawn_ws_task` and constructs
+//! `ConnectionCtx`; dashboard/drift pages consume the ticks; `ConnectionIndicator`
+//! reads `ConnectionState`.
 
 use std::time::Duration;
 
@@ -49,13 +45,24 @@ pub struct ConnectionCtx {
 
 /// Client mirror of the server's `api::events::Event` enum. Keep variants in
 /// lock-step. Serialised shape (matches server): `{"event":"<snake_case>", ...}`.
+///
+/// The `reason` fields are deserialised for forward compatibility (the server
+/// sanitises and sends them) but are not currently rendered in the UI — Shell's
+/// event match uses `{ .. }` to ignore them. A future UI addition may display
+/// these reasons; the allow below silences dead-code until then.
 #[derive(serde::Deserialize, Clone, Debug)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
     DriftRefreshed,
-    DriftFailed { reason: String },
+    DriftFailed {
+        #[allow(dead_code)]
+        reason: String,
+    },
     DashboardRefreshed,
-    DashboardFailed { reason: String },
+    DashboardFailed {
+        #[allow(dead_code)]
+        reason: String,
+    },
     WebhookReceived,
 }
 

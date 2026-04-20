@@ -10,14 +10,13 @@ use dioxus::prelude::*;
 /// The wasm-only `connection` module defines the authoritative enum; this copy
 /// ensures this file compiles on native too. Keep variants in lock-step.
 ///
-/// `#[allow(dead_code)]` on the variants: `ConnectionIndicator` is not yet
-/// mounted in `Shell` on native — Plan 07-05 wires it in. Until then the
-/// `Live`/`Offline` arms of the internal match are unreachable from anywhere
-/// except the native `cfg` branch (which always assigns `Connecting`). Once
-/// Plan 07-05 lands, the wasm→native cross-target match reaches every arm and
-/// this attribute can be removed.
+/// On native, Shell does not provide a `ConnectionCtx` (the wasm-only types
+/// can't exist here), so the internal `let state = ...;` branch always
+/// resolves to `Connecting`. `Live` / `Offline` are only reached through the
+/// wasm32 `cfg` branch that matches against `super::connection::ConnectionState`.
+/// The narrow `dead_code` allow on native keeps clippy green without a cfg-gate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub enum ConnectionState {
     Live,
     Connecting,
