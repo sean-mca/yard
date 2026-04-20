@@ -144,4 +144,27 @@ mod tests {
     fn event_channel_capacity_matches_constant() {
         assert_eq!(EVENT_CHANNEL_CAPACITY, 64);
     }
+
+    #[test]
+    fn events_router_compiles_with_api_state() {
+        // Compile-check: constructing events_router() with a fake ApiState exercises
+        // the full type graph (WebSocketUpgrade, State<Arc<ApiState>>, broadcast::Sender).
+        // Deliberately minimal — we don't spin up a real Axum test server because
+        // CONTEXT.md D-20 scopes end-to-end WS integration out of this phase.
+        use crate::api::dashboard::ApiState;
+        use crate::db::Database;
+        use crate::db::test_support::InMemoryDb;
+        use std::sync::Arc;
+        let db: Arc<dyn Database> = Arc::new(InMemoryDb::new());
+        let (event_tx, _rx) = new_event_channel();
+        let state = Arc::new(ApiState {
+            github_token: "t".into(),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            db,
+            event_tx,
+        });
+        let _router: axum::Router = events_router(state);
+        // If we got here, the router typechecked; success.
+    }
 }
