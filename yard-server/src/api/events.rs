@@ -158,6 +158,21 @@ mod tests {
     }
 
     #[test]
+    fn event_alert_sent_serializes_with_count() {
+        let json = serde_json::to_string(&Event::AlertSent { drifted_count: 5 }).unwrap();
+        assert_eq!(json, r#"{"event":"alert_sent","drifted_count":5}"#);
+    }
+
+    #[test]
+    fn event_alert_sent_serializes_with_zero_count() {
+        // Edge case — the variant is constructed from drift_data.drifted (u32),
+        // which could theoretically be 0 if the evaluator were bypassed. Verify
+        // the shape is stable.
+        let json = serde_json::to_string(&Event::AlertSent { drifted_count: 0 }).unwrap();
+        assert_eq!(json, r#"{"event":"alert_sent","drifted_count":0}"#);
+    }
+
+    #[test]
     fn event_drift_failed_serializes_with_reason() {
         let json = serde_json::to_string(&Event::DriftFailed {
             reason: "boom".into(),
