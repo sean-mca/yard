@@ -6,6 +6,8 @@ mod api;
 mod db;
 #[cfg(not(target_arch = "wasm32"))]
 mod github;
+#[cfg(not(target_arch = "wasm32"))]
+mod alerting;
 mod types;
 mod ui;
 
