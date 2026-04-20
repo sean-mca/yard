@@ -38,6 +38,7 @@ pub enum Event {
     DashboardRefreshed,
     DashboardFailed { reason: String },
     WebhookReceived,
+    AlertSent { drifted_count: u32 },
 }
 
 /// Truncate a failure-reason string to at most `REASON_MAX_CHARS` characters,
@@ -155,6 +156,21 @@ mod tests {
     fn event_webhook_received_serializes_tagged() {
         let json = serde_json::to_string(&Event::WebhookReceived).unwrap();
         assert_eq!(json, r#"{"event":"webhook_received"}"#);
+    }
+
+    #[test]
+    fn event_alert_sent_serializes_with_count() {
+        let json = serde_json::to_string(&Event::AlertSent { drifted_count: 5 }).unwrap();
+        assert_eq!(json, r#"{"event":"alert_sent","drifted_count":5}"#);
+    }
+
+    #[test]
+    fn event_alert_sent_serializes_with_zero_count() {
+        // Edge case — the variant is constructed from drift_data.drifted (u32),
+        // which could theoretically be 0 if the evaluator were bypassed. Verify
+        // the shape is stable.
+        let json = serde_json::to_string(&Event::AlertSent { drifted_count: 0 }).unwrap();
+        assert_eq!(json, r#"{"event":"alert_sent","drifted_count":0}"#);
     }
 
     #[test]
