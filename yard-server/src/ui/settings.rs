@@ -72,6 +72,8 @@ pub fn Settings(theme: Signal<Theme>) -> Element {
     let mut drift_interval = use_signal(|| "3".to_string());
     let mut slack_url = use_signal(String::new);
     let mut slack_enabled = use_signal(|| false);
+    let mut alert_threshold = use_signal(String::new);
+    let mut alert_cooldown = use_signal(String::new);
     let mut loaded = use_signal(|| false);
 
     // Load settings from API on mount
@@ -89,6 +91,12 @@ pub fn Settings(theme: Signal<Theme>) -> Element {
                 }
                 if let Some(v) = settings.get("slack_enabled") {
                     slack_enabled.set(v == "true");
+                }
+                if let Some(v) = settings.get("alert_drift_threshold") {
+                    alert_threshold.set(v.clone());
+                }
+                if let Some(v) = settings.get("alert_cooldown_minutes") {
+                    alert_cooldown.set(v.clone());
                 }
             }
             loaded.set(true);
@@ -132,6 +140,50 @@ pub fn Settings(theme: Signal<Theme>) -> Element {
                     field_placeholder: "https://hooks.slack.com/services/...",
                     field_value: slack_url,
                     loaded,
+                }
+
+                // Alert threshold + cooldown (always visible per D-09)
+                div { class: "rounded-lg border border-zinc-200 dark:border-zinc-700 p-4 mt-3",
+                    div { class: "space-y-3",
+                        div {
+                            label { class: "text-xs font-medium text-zinc-500 block mb-1.5", "Alert threshold (jobs)" }
+                            input {
+                                r#type: "number",
+                                min: "1",
+                                placeholder: "1",
+                                class: "w-full px-3 py-1.5 text-sm rounded-md border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-zinc-300 dark:focus:ring-zinc-600",
+                                value: "{alert_threshold}",
+                                oninput: move |e| alert_threshold.set(e.value()),
+                                onchange: move |e| {
+                                    let val = e.value();
+                                    if loaded() {
+                                        spawn(async move {
+                                            let _ = save_setting("alert_drift_threshold", &val).await;
+                                        });
+                                    }
+                                },
+                            }
+                        }
+                        div {
+                            label { class: "text-xs font-medium text-zinc-500 block mb-1.5", "Cooldown (minutes)" }
+                            input {
+                                r#type: "number",
+                                min: "1",
+                                placeholder: "10",
+                                class: "w-full px-3 py-1.5 text-sm rounded-md border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-zinc-300 dark:focus:ring-zinc-600",
+                                value: "{alert_cooldown}",
+                                oninput: move |e| alert_cooldown.set(e.value()),
+                                onchange: move |e| {
+                                    let val = e.value();
+                                    if loaded() {
+                                        spawn(async move {
+                                            let _ = save_setting("alert_cooldown_minutes", &val).await;
+                                        });
+                                    }
+                                },
+                            }
+                        }
+                    }
                 }
 
             }
