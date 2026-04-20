@@ -41,6 +41,19 @@ fn validate_setting(key: &str, value: &str) -> Result<(), String> {
             )),
         },
         "slack_webhook_url" => Ok(()),
+        "alert_drift_threshold" => match value.parse::<u32>() {
+            Ok(n) if n >= 1 => Ok(()),
+            _ => Err(format!(
+                "invalid alert_drift_threshold '{value}': must be a positive integer >= 1"
+            )),
+        },
+        "alert_cooldown_minutes" => match value.parse::<u64>() {
+            Ok(n) if n >= 1 => Ok(()),
+            _ => Err(format!(
+                "invalid alert_cooldown_minutes '{value}': must be a positive integer >= 1"
+            )),
+        },
+        "alert_last_sent_at" => Ok(()),
         _ => Err(format!("unknown setting '{key}'")),
     }
 }
