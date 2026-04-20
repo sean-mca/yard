@@ -8,6 +8,9 @@ use crate::types::*;
 
 use super::api_base;
 
+#[cfg(target_arch = "wasm32")]
+use super::connection::{ConnectionCtx, ConnectionState};
+
 // ---- Query types ----
 
 #[derive(Clone, PartialEq, Hash, Eq)]
@@ -75,17 +78,48 @@ impl QueryCapability for DriftSummaryQuery {
 pub fn Dashboard() -> Element {
     let mut page = use_signal(|| 1u32);
 
+    // Phase 7: compute polling interval based on WS connection state.
+    // When Live, pause polling (Duration::MAX); otherwise, 15s.
+    // Per RESEARCH.md: Query::interval_time is NOT hashed, so swapping it
+    // does not drop cached data.
+    #[cfg(target_arch = "wasm32")]
+    let ctx: ConnectionCtx = use_context();
+    #[cfg(target_arch = "wasm32")]
+    let interval = if matches!(*ctx.state.read(), ConnectionState::Live) {
+        Duration::MAX
+    } else {
+        Duration::from_secs(15)
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let interval = Duration::from_secs(15);
+
     let data = use_query(
         Query::new(page(), DashboardQuery)
             .stale_time(Duration::from_secs(30))
-            .interval_time(Duration::from_secs(15)),
+            .interval_time(interval),
     );
 
     let drift_data = use_query(
         Query::new((), DriftSummaryQuery)
             .stale_time(Duration::from_secs(30))
-            .interval_time(Duration::from_secs(15)),
+            .interval_time(interval),
     );
+
+    // Phase 7: invalidate queries on WS push events.
+    // dashboard_tick drives dashboard data refresh; drift_tick drives drift summary.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let data_handle = data;
+        use_effect(move || {
+            let _ = ctx.dashboard_tick.read();
+            data_handle.invalidate();
+        });
+        let drift_handle = drift_data;
+        use_effect(move || {
+            let _ = ctx.drift_tick.read();
+            drift_handle.invalidate();
+        });
+    }
 
     let drift_state = drift_data.read();
     let drift_status = match &*drift_state.state() {
