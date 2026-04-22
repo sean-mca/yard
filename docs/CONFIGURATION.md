@@ -188,10 +188,161 @@ Defined by `JobDefinition` in `yard-structs/src/config.rs`.
 
 #### `transforms[]` fields (`Transform` struct)
 
-`transform_type` selects one of: `filter`, `sql`, `drop_columns`, `rename`,
-`select`, `add_column`, `join`, `aggregate`, `window`. Each type uses a
-subset of the available fields — see `yard-structs/src/config.rs` for the
-full list.
+Transforms run in the order declared. Each entry's `transform_type`
+selects one of nine operations, and every transform may set `source`
+(the input DataFrame) and `output` (the result DataFrame name).
+
+**Common fields (all transform types):**
+
+| Field | Applies to | Description |
+|-------|------------|-------------|
+| `source` | all | Name of the DataFrame to operate on. Defaults to the first/only source, or the previous transform's output. |
+| `output` | all | Name for the result DataFrame. Defaults to the same value as `source` (overwrites it in place). |
+
+Per-type field reference follows. See `yard-core/src/codegen/transform.rs`
+for the exact dispatch logic and `yard-structs/src/config.rs` (struct
+`Transform`) for the full list of fields parsed from YAML.
+
+##### `filter`
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `condition` | Yes | PySpark Column expression string (inlined into `.filter(...)`). Defaults to `True` if omitted. |
+
+```yaml
+transforms:
+  - transform_type: filter
+    source: orders
+    output: big_orders
+    condition: F.col("amount") > 100
+```
+
+##### `sql`
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `query` | Yes | Full SQL `SELECT` against registered temp views (all named sources are registered as views with their `name`). Defaults to `SELECT * FROM source` if omitted. |
+
+```yaml
+transforms:
+  - transform_type: sql
+    output: joined
+    query: SELECT o.*, c.name FROM orders o JOIN customers c ON o.customer_id = c.id
+```
+
+##### `drop_columns`
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `columns` | Yes | Array of column names to drop. |
+
+```yaml
+transforms:
+  - transform_type: drop_columns
+    source: orders
+    columns: [internal_id, debug_flag]
+```
+
+##### `select`
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `columns` | Yes | Array of columns to keep (dropped columns are everything else). |
+
+```yaml
+transforms:
+  - transform_type: select
+    source: orders
+    columns: [order_id, customer_id, amount]
+```
+
+##### `rename`
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `mapping` | Yes | `HashMap<String, String>` of old → new column names. Applied as successive `withColumnRenamed` calls. |
+
+```yaml
+transforms:
+  - transform_type: rename
+    source: orders
+    mapping:
+      cust_id: customer_id
+      amt: amount
+```
+
+##### `add_column`
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | Name of the new column. |
+| `expression` | No | PySpark expression to compute the column. Defaults to `lit(None)` if omitted. |
+
+```yaml
+transforms:
+  - transform_type: add_column
+    source: orders
+    name: total_with_tax
+    expression: F.col("amount") * 1.08
+```
+
+##### `join`
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `left` | No | Left-side DataFrame name. Defaults to the first/only source. |
+| `right` | Yes | Right-side DataFrame name. |
+| `on` | Yes | Column name to join on. |
+| `how` | No | Join type: `inner`, `left`, `right`, `outer`. Defaults to `inner`. |
+
+```yaml
+transforms:
+  - transform_type: join
+    left: orders
+    right: customers
+    on: customer_id
+    how: inner
+    output: orders_enriched
+```
+
+##### `aggregate`
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `group_by` | Yes | Array of grouping column names. |
+| `aggs` | Yes | `HashMap<alias, expression>`, e.g. `total: sum(amount)`. Each entry becomes `F.expr("<expression>").alias("<alias>")`. |
+
+```yaml
+transforms:
+  - transform_type: aggregate
+    source: orders
+    output: totals_by_customer
+    group_by: [customer_id]
+    aggs:
+      total: sum(amount)
+      order_count: count(*)
+```
+
+##### `window`
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | Name of the new column populated by the window expression. |
+| `expression` | Yes | Window function call (e.g. `row_number()`, `rank()`, `lag(amount, 1)`) wrapped by `F.expr(...)` and applied `.over(window_spec)`. |
+| `partition_by` | No | Array of columns passed to `Window.partitionBy(...)`. Omit for an unpartitioned window. |
+| `order_by` | No | Array of `{column, desc}` records passed to `Window.orderBy(...)`. `desc: true` emits `F.col("col").desc()`; otherwise `.asc()`. |
+
+```yaml
+transforms:
+  - transform_type: window
+    source: orders
+    name: order_rank
+    expression: row_number()
+    partition_by: [customer_id]
+    order_by:
+      - column: created_at
+        desc: true
+```
 
 ### `dag.yaml` (DAG marker)
 
@@ -211,6 +362,10 @@ The file contents are parsed as an `AirflowSection`:
 The same `AirflowSection` shape may also appear under an `airflow:` block
 in `yard.yaml`, `account.yaml`, `region.yaml`, and per-job files. Later
 layers shallow-override earlier layers.
+
+For the full Airflow reference — how DAGs are discovered and generated,
+the operator mapping, dataset-based triggering, and per-job Airflow
+metadata — see [docs/AIRFLOW.md](./AIRFLOW.md).
 
 ---
 
