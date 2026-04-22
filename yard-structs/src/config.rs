@@ -16,6 +16,15 @@ pub enum StateBackend {
         bucket: String,
         region: String,
         key: String,
+        /// Optional per-state-backend `aws:` sub-block. Shape parallels the
+        /// root `aws:` on `ProjectManifest` — untyped `serde_json::Value`
+        /// whose readers use `.get("assume_role").and_then(|v| v.as_str())`,
+        /// `.get("session_name")`, `.get("external_id")`. `Value::Null` means
+        /// "fall through to `YARD_STATE_AWS_*` envs, then the default AWS
+        /// credential provider chain" — keeps today's behavior unchanged
+        /// when unset (Phase 9 strictly-additive guarantee).
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        aws: serde_json::Value,
     },
 }
 
@@ -179,7 +188,7 @@ pub struct YARDContext {
 /// Airflow config shared across inheritance layers (yard.yaml, region.yaml,
 /// account.yaml, dag.yaml, and the per-job `airflow:` block). Every layer has
 /// the same shape; later layers override earlier ones via shallow merge.
-#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
 pub struct AirflowSection {
     pub schedule: Option<String>,
     pub owner: Option<String>,
@@ -191,12 +200,19 @@ pub struct AirflowSection {
     /// exclusive with `schedule`.
     #[serde(default)]
     pub triggered_by: Vec<String>,
+    /// Optional per-airflow-provider `aws:` sub-block for the DAG upload bucket.
+    /// When set, takes priority over the root `aws:` + nearest `account.yaml`
+    /// cascade used elsewhere in codegen. Same untyped-`Value` shape as
+    /// `StateBackend::S3::aws` and `ProjectManifest::aws`. `Value::Null`
+    /// preserves today's account.yaml-cascade behavior.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub aws: serde_json::Value,
 }
 
 /// Per-job Airflow metadata lifted out of the `airflow:` block on a job file.
 /// Includes the shared [`AirflowSection`] overrides plus job-specific fields
 /// like `depends_on`.
-#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
 pub struct AirflowJobBlock {
     pub depends_on: Vec<String>,
     /// Dataset URIs this task produces. Emitted as `outlets=[Dataset(...)]`
