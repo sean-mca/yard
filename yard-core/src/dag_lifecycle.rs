@@ -115,14 +115,21 @@ pub async fn apply_dags(
     dry_run: bool,
     storage: &storage::Storage,
 ) -> Result<DagApplyResult> {
-    // Load current DAG state
-    let mut dag_deployments = HashMap::new();
+    // Load full DagState (not just .deployment) so the Delete branch below
+    // can re-authenticate using the persisted `aws:` per D-05.
+    let mut dag_states: HashMap<String, DagState> = HashMap::new();
     let dag_names = storage.list_dags().await?;
     for name in &dag_names {
         if let Some(state) = storage.read_dag(name).await? {
-            dag_deployments.insert(name.clone(), state.deployment);
+            dag_states.insert(name.clone(), state);
         }
     }
+    // `calculate_dag_diffs` still wants a deployment-only map — build it from
+    // the full states without re-reading storage.
+    let dag_deployments: HashMap<String, DagDeployment> = dag_states
+        .iter()
+        .map(|(k, v)| (k.clone(), v.deployment.clone()))
+        .collect();
 
     let diffs = calculate_dag_diffs(manifest, dags, &dag_deployments)?;
     let mut result = DagApplyResult {
@@ -196,12 +203,16 @@ pub async fn apply_dags(
                 }
             }
             DiffType::Delete => {
-                // Delete S3 file if it was deployed
+                // Delete S3 file if it was deployed. Re-auth uses the
+                // persisted `DagState.aws` when present (D-05); otherwise
+                // fall back to `manifest.aws` for pre-Phase-9 state files.
                 if !dry_run
-                    && let Some(existing) = dag_deployments.get(&diff.name)
-                    && let Some(ref uri) = existing.s3_uri
+                    && let Some(existing_state) = dag_states.get(&diff.name)
+                    && let Some(ref uri) = existing_state.deployment.s3_uri
                 {
-                    delete_dag_from_s3(manifest, &diff.name, uri).await?;
+                    let destroy_aws =
+                        resolve_destroy_dag_aws(&existing_state.aws, &manifest.aws);
+                    delete_dag_from_s3(manifest, destroy_aws, &diff.name, uri).await?;
                 }
 
                 storage.delete_dag(&diff.name).await?;
@@ -253,6 +264,22 @@ fn resolve_effective_dag_aws(manifest: &ProjectManifest, dag: &airflow_dag::Reso
     resolve_aws_for_dir(&manifest.aws, &dag.dir)
 }
 
+/// Resolve the `aws:` block to use at destroy time.
+///
+/// Preference:
+///   1. `dag_state_aws` — persisted at apply time by `apply_dags` (D-05).
+///   2. `fallback` — today's behavior for state files written before Phase 9,
+///      where `DagState.aws` is `Value::Null`. Callers should pass the
+///      project-root `manifest.aws` (or whatever they already had) as this
+///      fallback to preserve existing semantics.
+fn resolve_destroy_dag_aws<'a>(dag_state_aws: &'a Value, fallback: &'a Value) -> &'a Value {
+    if dag_state_aws.is_null() {
+        fallback
+    } else {
+        dag_state_aws
+    }
+}
+
 /// Upload a generated DAG file to S3 using the resolved dags_bucket/dags_prefix.
 /// Returns `Ok(Some((s3_uri, effective_aws)))` on success — the `effective_aws`
 /// must be persisted on `DagState.aws` so the destroy path can re-authenticate
@@ -297,9 +324,14 @@ fn resolve_aws_for_dir(root_aws: &Value, dir: &Path) -> Value {
     merge_provider_config(root_aws, &account_aws)
 }
 
-/// Delete a DAG file from S3.
+/// Delete a DAG file from S3. Uses the caller-supplied `dag_state_aws`
+/// (typically `DagState.aws` persisted at apply time — see D-05). The
+/// previous signature took only `&ProjectManifest` and read `manifest.aws`,
+/// which authenticated destroy against the project root even when the DAG
+/// had been uploaded to a different account.
 async fn delete_dag_from_s3(
     manifest: &ProjectManifest,
+    dag_state_aws: &Value,
     dag_name: &str,
     _s3_uri: &str,
 ) -> Result<()> {
@@ -317,12 +349,17 @@ async fn delete_dag_from_s3(
     let region = extract_airflow_region(manifest)?;
     let prefix = section.dags_prefix.as_deref().unwrap_or("dags/");
 
-    // Destroy path runs without the DAG's source dir (state-only), so
-    // account.yaml overrides can't be re-resolved here — root `aws:` applies.
+    // Destroy re-authenticates using `DagState.aws` persisted at apply time
+    // (D-05). Pre-Phase-9 state files have `aws: Null`; callers pass the
+    // project-root `manifest.aws` as a fallback so today's behavior is
+    // preserved for legacy state.
+    let aws_cfg_opt = if dag_state_aws.is_null() {
+        None
+    } else {
+        Some(dag_state_aws)
+    };
     let s3_ops = providers::S3ScriptOps {
-        s3_client: aws_sdk_s3::Client::new(
-            &providers::aws_config(&region, Some(&manifest.aws)).await,
-        ),
+        s3_client: aws_sdk_s3::Client::new(&providers::aws_config(&region, aws_cfg_opt).await),
         script_bucket: bucket.clone(),
         script_prefix: prefix.to_string(),
     };
