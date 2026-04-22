@@ -52,6 +52,9 @@ pub fn parse_airflow_section(value: &Value) -> AirflowSection {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         triggered_by: str_array_field(value, "triggered_by"),
+        // Optional per-DAG-bucket AWS creds sub-block (Phase 9 D-05).
+        // Passed through unchanged to dag_lifecycle where precedence is resolved.
+        aws: value.get("aws").cloned().unwrap_or(Value::Null),
     }
 }
 
@@ -88,6 +91,12 @@ pub fn merge_airflow_sections(base: &AirflowSection, overlay: &AirflowSection) -
             base.triggered_by.clone()
         } else {
             overlay.triggered_by.clone()
+        },
+        // Overlay wins when non-null; Null means "not set" so fall back to base.
+        aws: if overlay.aws.is_null() {
+            base.aws.clone()
+        } else {
+            overlay.aws.clone()
         },
     }
 }

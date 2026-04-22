@@ -2,9 +2,7 @@ use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
-use yard_structs::{
-    DagDeployment, DagDiff, DagState, DiffType, ProjectManifest,
-};
+use yard_structs::{DagDeployment, DagDiff, DagState, DiffType, ProjectManifest};
 
 use crate::airflow_dag;
 use crate::providers;
@@ -117,14 +115,21 @@ pub async fn apply_dags(
     dry_run: bool,
     storage: &storage::Storage,
 ) -> Result<DagApplyResult> {
-    // Load current DAG state
-    let mut dag_deployments = HashMap::new();
+    // Load full DagState (not just .deployment) so the Delete branch below
+    // can re-authenticate using the persisted `aws:` per D-05.
+    let mut dag_states: HashMap<String, DagState> = HashMap::new();
     let dag_names = storage.list_dags().await?;
     for name in &dag_names {
         if let Some(state) = storage.read_dag(name).await? {
-            dag_deployments.insert(name.clone(), state.deployment);
+            dag_states.insert(name.clone(), state);
         }
     }
+    // `calculate_dag_diffs` still wants a deployment-only map — build it from
+    // the full states without re-reading storage.
+    let dag_deployments: HashMap<String, DagDeployment> = dag_states
+        .iter()
+        .map(|(k, v)| (k.clone(), v.deployment.clone()))
+        .collect();
 
     let diffs = calculate_dag_diffs(manifest, dags, &dag_deployments)?;
     let mut result = DagApplyResult {
@@ -156,11 +161,17 @@ pub async fn apply_dags(
                 let dag_path = dag_gen_dir.join(format!("{}.py", diff.name));
                 std::fs::write(&dag_path, &content)?;
 
-                // Upload to S3 if dags_bucket is configured and not dry-run
-                let s3_uri = if !dry_run {
+                // Upload to S3 if dags_bucket is configured and not dry-run.
+                // Returns (s3_uri, effective_aws) — persist aws on DagState so
+                // the destroy path can re-auth without the DAG's source dir (D-05).
+                let upload_result = if !dry_run {
                     upload_dag_to_s3(manifest, dag, &content).await?
                 } else {
                     None
+                };
+                let (s3_uri, effective_aws) = match upload_result {
+                    Some((uri, aws)) => (Some(uri), aws),
+                    None => (None, Value::Null),
                 };
 
                 let status = if s3_uri.is_some() {
@@ -180,6 +191,7 @@ pub async fn apply_dags(
                         applied_at: chrono::Utc::now().to_rfc3339(),
                         s3_uri,
                     },
+                    aws: effective_aws,
                 };
 
                 storage.write_dag(&diff.name, &dag_state).await?;
@@ -191,12 +203,16 @@ pub async fn apply_dags(
                 }
             }
             DiffType::Delete => {
-                // Delete S3 file if it was deployed
+                // Delete S3 file if it was deployed. Re-auth uses the
+                // persisted `DagState.aws` when present (D-05); otherwise
+                // fall back to `manifest.aws` for pre-Phase-9 state files.
                 if !dry_run
-                    && let Some(existing) = dag_deployments.get(&diff.name)
-                    && let Some(ref uri) = existing.s3_uri
+                    && let Some(existing_state) = dag_states.get(&diff.name)
+                    && let Some(ref uri) = existing_state.deployment.s3_uri
                 {
-                    delete_dag_from_s3(manifest, &diff.name, uri).await?;
+                    let destroy_aws =
+                        resolve_destroy_dag_aws(&existing_state.aws, &manifest.aws);
+                    delete_dag_from_s3(manifest, destroy_aws, &diff.name, uri).await?;
                 }
 
                 storage.delete_dag(&diff.name).await?;
@@ -227,35 +243,74 @@ pub async fn apply_dags(
     Ok(result)
 }
 
+/// Resolve the effective `aws:` block for a DAG's upload bucket.
+///
+/// Precedence (highest first):
+///   1. `dag.config.aws` — the `AirflowSection.aws` field (D-05).
+///   2. Root `aws:` shallow-merged with nearest `account.yaml` `aws:` via
+///      `resolve_aws_for_dir` — today's cascade, preserved when the new
+///      `AirflowSection.aws` is Null (D-02 strictly additive).
+///
+/// Per-job `_aws` is intentionally ignored; see the
+/// `dag_upload_credentials_ignore_job_aws` test for the invariant.
+///
+/// Returns `Value::Null` if neither source produces a value; callers pass
+/// `None` to `providers::aws_config` in that case (default chain).
+fn resolve_effective_dag_aws(manifest: &ProjectManifest, dag: &airflow_dag::ResolvedDag) -> Value {
+    if !dag.config.aws.is_null() {
+        // Explicit config on the AirflowSection — use verbatim, no merge.
+        return dag.config.aws.clone();
+    }
+    resolve_aws_for_dir(&manifest.aws, &dag.dir)
+}
+
+/// Resolve the `aws:` block to use at destroy time.
+///
+/// Preference:
+///   1. `dag_state_aws` — persisted at apply time by `apply_dags` (D-05).
+///   2. `fallback` — today's behavior for state files written before Phase 9,
+///      where `DagState.aws` is `Value::Null`. Callers should pass the
+///      project-root `manifest.aws` (or whatever they already had) as this
+///      fallback to preserve existing semantics.
+fn resolve_destroy_dag_aws<'a>(dag_state_aws: &'a Value, fallback: &'a Value) -> &'a Value {
+    if dag_state_aws.is_null() {
+        fallback
+    } else {
+        dag_state_aws
+    }
+}
+
 /// Upload a generated DAG file to S3 using the resolved dags_bucket/dags_prefix.
-/// Returns `Ok(Some(s3_uri))` on success, `Ok(None)` if no dags_bucket is configured.
+/// Returns `Ok(Some((s3_uri, effective_aws)))` on success — the `effective_aws`
+/// must be persisted on `DagState.aws` so the destroy path can re-authenticate
+/// to the same account without needing the DAG's source dir (D-05).
+/// Returns `Ok(None)` if no `dags_bucket` is configured.
 async fn upload_dag_to_s3(
     manifest: &ProjectManifest,
     dag: &airflow_dag::ResolvedDag,
     content: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, Value)>> {
     let Some(ref bucket) = dag.config.dags_bucket else {
         return Ok(None);
     };
 
     let region = extract_airflow_region(manifest)?;
-    let prefix = dag
-        .config
-        .dags_prefix
-        .as_deref()
-        .unwrap_or("dags/");
+    let prefix = dag.config.dags_prefix.as_deref().unwrap_or("dags/");
 
-    let aws_cfg = resolve_aws_for_dir(&manifest.aws, &dag.dir);
+    let effective_aws = resolve_effective_dag_aws(manifest, dag);
+    let aws_cfg_opt = if effective_aws.is_null() {
+        None
+    } else {
+        Some(&effective_aws)
+    };
     let s3_ops = providers::S3ScriptOps {
-        s3_client: aws_sdk_s3::Client::new(
-            &providers::aws_config(&region, Some(&aws_cfg)).await,
-        ),
+        s3_client: aws_sdk_s3::Client::new(&providers::aws_config(&region, aws_cfg_opt).await),
         script_bucket: bucket.clone(),
         script_prefix: prefix.to_string(),
     };
 
     let uri = s3_ops.upload_script(&dag.name, content).await?;
-    Ok(Some(uri))
+    Ok(Some((uri, effective_aws)))
 }
 
 /// Merge the root `aws:` block with the nearest-ancestor `account.yaml` `aws:`
@@ -269,9 +324,14 @@ fn resolve_aws_for_dir(root_aws: &Value, dir: &Path) -> Value {
     merge_provider_config(root_aws, &account_aws)
 }
 
-/// Delete a DAG file from S3.
+/// Delete a DAG file from S3. Uses the caller-supplied `dag_state_aws`
+/// (typically `DagState.aws` persisted at apply time — see D-05). The
+/// previous signature took only `&ProjectManifest` and read `manifest.aws`,
+/// which authenticated destroy against the project root even when the DAG
+/// had been uploaded to a different account.
 async fn delete_dag_from_s3(
     manifest: &ProjectManifest,
+    dag_state_aws: &Value,
     dag_name: &str,
     _s3_uri: &str,
 ) -> Result<()> {
@@ -289,12 +349,17 @@ async fn delete_dag_from_s3(
     let region = extract_airflow_region(manifest)?;
     let prefix = section.dags_prefix.as_deref().unwrap_or("dags/");
 
-    // Destroy path runs without the DAG's source dir (state-only), so
-    // account.yaml overrides can't be re-resolved here — root `aws:` applies.
+    // Destroy re-authenticates using `DagState.aws` persisted at apply time
+    // (D-05). Pre-Phase-9 state files have `aws: Null`; callers pass the
+    // project-root `manifest.aws` as a fallback so today's behavior is
+    // preserved for legacy state.
+    let aws_cfg_opt = if dag_state_aws.is_null() {
+        None
+    } else {
+        Some(dag_state_aws)
+    };
     let s3_ops = providers::S3ScriptOps {
-        s3_client: aws_sdk_s3::Client::new(
-            &providers::aws_config(&region, Some(&manifest.aws)).await,
-        ),
+        s3_client: aws_sdk_s3::Client::new(&providers::aws_config(&region, aws_cfg_opt).await),
         script_bucket: bucket.clone(),
         script_prefix: prefix.to_string(),
     };
@@ -345,7 +410,9 @@ pub async fn destroy_dag(
     let lock = storage.lock(&lock_key).await?;
 
     let result: Result<()> = async {
-        // Delete S3 file if deployed
+        // Delete S3 file if deployed. Re-auth prefers the persisted
+        // `DagState.aws` (D-05); the caller-supplied `aws` is the fallback
+        // for pre-Phase-9 state files where `DagState.aws` is `Null`.
         if !dry_run
             && dag_state.deployment.s3_uri.is_some()
             && let Some(airflow_config) = provider_configs.get("airflow")
@@ -358,9 +425,15 @@ pub async fn destroy_dag(
                     .unwrap_or("us-east-1");
                 let prefix = section.dags_prefix.as_deref().unwrap_or("dags/");
 
+                let destroy_aws = resolve_destroy_dag_aws(&dag_state.aws, aws);
+                let aws_cfg_opt = if destroy_aws.is_null() {
+                    None
+                } else {
+                    Some(destroy_aws)
+                };
                 let s3_ops = providers::S3ScriptOps {
                     s3_client: aws_sdk_s3::Client::new(
-                        &providers::aws_config(region, Some(aws)).await,
+                        &providers::aws_config(region, aws_cfg_opt).await,
                     ),
                     script_bucket: bucket.clone(),
                     script_prefix: prefix.to_string(),
@@ -430,10 +503,8 @@ mod tests {
     /// cascade (root <- account.yaml) behaves as expected.
     #[test]
     fn dag_upload_credentials_ignore_job_aws() {
-        let tmp = std::env::temp_dir().join(format!(
-            "yard_dag_upload_invariant_{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("yard_dag_upload_invariant_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -516,10 +587,7 @@ mod tests {
         }
     }
 
-    fn make_dag_deployment(
-        content_hash: &str,
-        tasks: Vec<&str>,
-    ) -> DagDeployment {
+    fn make_dag_deployment(content_hash: &str, tasks: Vec<&str>) -> DagDeployment {
         DagDeployment {
             content_hash: content_hash.to_string(),
             config: json!({"schedule": "@daily"}),
@@ -630,5 +698,172 @@ mod tests {
         let diffs = calculate_dag_diffs(&manifest, &[dag], &dag_deployments).unwrap();
         assert_eq!(diffs.len(), 1);
         assert!(matches!(diffs[0].diff_type, DiffType::Modify { .. }));
+    }
+
+    // --- Phase 9 Plan 03 Task 1: apply-path credential resolution ---
+
+    #[test]
+    fn resolve_effective_dag_aws_prefers_dag_config_aws() {
+        let tmp =
+            std::env::temp_dir().join(format!("yard_dag_aws_priority_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // account.yaml that WOULD apply via the cascade if dag.config.aws were Null.
+        std::fs::write(
+            tmp.join("account.yaml"),
+            "aws:\n  assume_role: arn:aws:iam::111111111111:role/Account\n",
+        )
+        .unwrap();
+
+        let manifest = ProjectManifest {
+            project: "test".to_string(),
+            state: yard_structs::StateBackend::Local {
+                path: ".yard/state".into(),
+            },
+            providers: HashMap::new(),
+            jobs: HashMap::new(),
+            aws: json!({"assume_role": "arn:aws:iam::999999999999:role/Root"}),
+        };
+        let dag = airflow_dag::ResolvedDag {
+            name: "test_dag".to_string(),
+            dir: tmp.clone(),
+            config: yard_structs::AirflowSection {
+                schedule: Some("@daily".to_string()),
+                aws: json!({"assume_role": "arn:aws:iam::222222222222:role/DagExplicit"}),
+                ..Default::default()
+            },
+            tasks: Vec::new(),
+            depends_on: std::collections::BTreeMap::new(),
+        };
+
+        let effective = resolve_effective_dag_aws(&manifest, &dag);
+        // dag.config.aws wins OUTRIGHT — no merge with account.yaml.
+        assert_eq!(
+            effective.get("assume_role").and_then(|v| v.as_str()),
+            Some("arn:aws:iam::222222222222:role/DagExplicit")
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_effective_dag_aws_falls_back_to_cascade() {
+        let tmp =
+            std::env::temp_dir().join(format!("yard_dag_aws_fallback_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        std::fs::write(
+            tmp.join("account.yaml"),
+            "aws:\n  assume_role: arn:aws:iam::111111111111:role/Account\n",
+        )
+        .unwrap();
+
+        let manifest = ProjectManifest {
+            project: "test".to_string(),
+            state: yard_structs::StateBackend::Local {
+                path: ".yard/state".into(),
+            },
+            providers: HashMap::new(),
+            jobs: HashMap::new(),
+            aws: json!({"assume_role": "arn:aws:iam::999999999999:role/Root"}),
+        };
+        let dag = airflow_dag::ResolvedDag {
+            name: "test_dag".to_string(),
+            dir: tmp.clone(),
+            config: yard_structs::AirflowSection {
+                schedule: Some("@daily".to_string()),
+                aws: Value::Null, // unset; cascade should apply
+                ..Default::default()
+            },
+            tasks: Vec::new(),
+            depends_on: std::collections::BTreeMap::new(),
+        };
+
+        let effective = resolve_effective_dag_aws(&manifest, &dag);
+        // account.yaml wins per the existing cascade (nearest ancestor).
+        assert_eq!(
+            effective.get("assume_role").and_then(|v| v.as_str()),
+            Some("arn:aws:iam::111111111111:role/Account")
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_effective_dag_aws_all_null_returns_null() {
+        let tmp = std::env::temp_dir().join(format!("yard_dag_aws_null_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let manifest = ProjectManifest {
+            project: "test".to_string(),
+            state: yard_structs::StateBackend::Local {
+                path: ".yard/state".into(),
+            },
+            providers: HashMap::new(),
+            jobs: HashMap::new(),
+            aws: Value::Null,
+        };
+        let dag = airflow_dag::ResolvedDag {
+            name: "test_dag".to_string(),
+            dir: tmp.clone(),
+            config: yard_structs::AirflowSection {
+                schedule: Some("@daily".to_string()),
+                aws: Value::Null,
+                ..Default::default()
+            },
+            tasks: Vec::new(),
+            depends_on: std::collections::BTreeMap::new(),
+        };
+
+        let effective = resolve_effective_dag_aws(&manifest, &dag);
+        assert!(
+            effective.is_null(),
+            "absent everywhere → Null → caller passes None to aws_config (D-02)"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // --- Phase 9 Plan 03 Task 2: destroy-path credential resolution ---
+
+    #[test]
+    fn resolve_destroy_dag_aws_prefers_state() {
+        // When DagState.aws is populated, it wins over the caller-supplied
+        // fallback (today's manifest.aws) — this closes D-05's destroy gap.
+        let state_aws = json!({"assume_role": "arn:aws:iam::111111111111:role/FromState"});
+        let fallback = json!({"assume_role": "arn:aws:iam::999999999999:role/Fallback"});
+        let picked = resolve_destroy_dag_aws(&state_aws, &fallback);
+        assert_eq!(
+            picked.get("assume_role").and_then(|v| v.as_str()),
+            Some("arn:aws:iam::111111111111:role/FromState")
+        );
+    }
+
+    #[test]
+    fn resolve_destroy_dag_aws_falls_back_when_state_null() {
+        // Legacy pre-Phase-9 state files have DagState.aws == Null. In that
+        // case, fall back to the caller-supplied aws (typically manifest.aws)
+        // to preserve today's behavior byte-for-byte.
+        let state_aws = Value::Null;
+        let fallback = json!({"assume_role": "arn:aws:iam::999999999999:role/Fallback"});
+        let picked = resolve_destroy_dag_aws(&state_aws, &fallback);
+        assert_eq!(
+            picked.get("assume_role").and_then(|v| v.as_str()),
+            Some("arn:aws:iam::999999999999:role/Fallback")
+        );
+    }
+
+    #[test]
+    fn resolve_destroy_dag_aws_both_null_returns_null() {
+        let state_aws = Value::Null;
+        let fallback = Value::Null;
+        let picked = resolve_destroy_dag_aws(&state_aws, &fallback);
+        assert!(
+            picked.is_null(),
+            "both null → Null → caller passes None to aws_config → default chain (D-02)"
+        );
     }
 }

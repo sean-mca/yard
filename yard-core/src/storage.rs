@@ -507,6 +507,57 @@ impl Storage {
     }
 }
 
+/// Merge `YARD_STATE_AWS_*` env vars over a yaml `state.aws:` block
+/// (env beats yaml, mirroring `providers::aws_config`'s `YARD_AWS_*`
+/// precedence). Produces the `Value` that `providers::aws_config` will
+/// consume as its `aws_cfg` argument.
+///
+/// Resolution (highest precedence first):
+///   YARD_STATE_AWS_ASSUME_ROLE  → yaml `assume_role`
+///   YARD_STATE_AWS_SESSION_NAME → yaml `session_name`
+///   YARD_STATE_AWS_EXTERNAL_ID  → yaml `external_id`
+///
+/// Provider `YARD_AWS_*` env vars are NOT consulted — state creds scope
+/// is orthogonal to provider creds (D-03). If both yaml and envs are
+/// absent, returns `Value::Null` so the caller can pass `None` to
+/// `aws_config` and get the default credential provider chain —
+/// preserving today's behavior (D-02 strictly additive).
+fn merge_state_aws_with_env(state_aws: &serde_json::Value) -> serde_json::Value {
+    let yaml_str = |key: &str| {
+        state_aws
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    };
+
+    let assume_role = std::env::var("YARD_STATE_AWS_ASSUME_ROLE")
+        .ok()
+        .or_else(|| yaml_str("assume_role"));
+    let session_name = std::env::var("YARD_STATE_AWS_SESSION_NAME")
+        .ok()
+        .or_else(|| yaml_str("session_name"));
+    let external_id = std::env::var("YARD_STATE_AWS_EXTERNAL_ID")
+        .ok()
+        .or_else(|| yaml_str("external_id"));
+
+    let mut merged = serde_json::Map::new();
+    if let Some(v) = assume_role {
+        merged.insert("assume_role".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = session_name {
+        merged.insert("session_name".to_string(), serde_json::Value::String(v));
+    }
+    if let Some(v) = external_id {
+        merged.insert("external_id".to_string(), serde_json::Value::String(v));
+    }
+
+    if merged.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Object(merged)
+    }
+}
+
 // --- Factory ---
 
 pub async fn get_storage(backend: &StateBackend) -> Result<Storage> {
@@ -516,12 +567,26 @@ pub async fn get_storage(backend: &StateBackend) -> Result<Storage> {
             bucket,
             key,
             region,
+            aws,
         } => {
-            // State backend loads before yard.yaml is fully parsed, so no aws
-            // block is available here — fall through to the default provider
-            // chain. Users who need AssumeRole for state S3 can set
-            // AWS_PROFILE or rely on the Fargate/EC2 task role.
-            let config = crate::providers::aws_config(region, None).await;
+            // Resolve state credentials. Precedence (highest first):
+            //   1. `YARD_STATE_AWS_{ASSUME_ROLE,SESSION_NAME,EXTERNAL_ID}` envs
+            //   2. `state.aws:` yaml sub-block on yard.yaml
+            //   3. Default AWS credential provider chain (env vars, shared
+            //      config, IMDS/ECS task role, SSO) via `aws_config(region, None)`
+            //
+            // Provider `YARD_AWS_*` envs are intentionally NOT consulted here —
+            // state cred scope is orthogonal to provider cred scope (D-03).
+            // When neither yaml nor envs are set, `merge_state_aws_with_env`
+            // returns `Value::Null` and we pass `None` to `aws_config`,
+            // preserving today's default-chain behavior (D-02 strictly additive).
+            let merged = merge_state_aws_with_env(aws);
+            let aws_cfg_opt = if merged.is_null() {
+                None
+            } else {
+                Some(&merged)
+            };
+            let config = crate::providers::aws_config(region, aws_cfg_opt).await;
             let client = Client::new(&config);
 
             // Ensure prefix ends with `/` so job files are nested under it
@@ -783,6 +848,7 @@ mod tests {
                 applied_at: "2025-01-01T00:00:00Z".to_string(),
                 s3_uri: None,
             },
+            aws: serde_json::Value::Null,
         }
     }
 
@@ -873,5 +939,208 @@ mod tests {
         let storage = temp_storage("dag_empty");
         let dags = storage.list_dags().await.unwrap();
         assert!(dags.is_empty());
+    }
+
+    // --- Phase 9 · Plan 02: state credential resolution ---
+
+    /// Snapshot→set→run→restore for env vars. `std::env::set_var`/`remove_var`
+    /// require `unsafe` under Rust 2024 because concurrent env mutation is UB.
+    /// Used here only inside `#[cfg(test)]` and serialized through a
+    /// module-local Mutex — CLAUDE.md "no unsafe {}" exception per
+    /// Phase 9 Plan 02 (option a in the Task 1 checkpoint).
+    fn scoped_env<F: FnOnce()>(pairs: &[(&str, Option<&str>)], f: F) {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let prev: Vec<(String, Option<String>)> = pairs
+            .iter()
+            .map(|(k, _)| ((*k).to_string(), std::env::var(k).ok()))
+            .collect();
+        for (k, v) in pairs {
+            match v {
+                // #[cfg(test)] only — Rust 2024 env-mutation gate; CLAUDE.md exception per Phase 9 Plan 02 note
+                Some(val) => unsafe { std::env::set_var(k, val) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        f();
+        for (k, v) in prev {
+            match v {
+                Some(val) => unsafe { std::env::set_var(&k, val) },
+                None => unsafe { std::env::remove_var(&k) },
+            }
+        }
+    }
+
+    #[test]
+    fn merge_state_aws_env_beats_yaml() {
+        scoped_env(
+            &[
+                (
+                    "YARD_STATE_AWS_ASSUME_ROLE",
+                    Some("arn:aws:iam::999999999999:role/Env"),
+                ),
+                ("YARD_STATE_AWS_SESSION_NAME", Some("env-sess")),
+                ("YARD_STATE_AWS_EXTERNAL_ID", None),
+            ],
+            || {
+                let yaml = serde_json::json!({
+                    "assume_role": "arn:aws:iam::111111111111:role/Yaml",
+                    "session_name": "yaml-sess",
+                });
+                let merged = merge_state_aws_with_env(&yaml);
+                assert_eq!(
+                    merged.get("assume_role").and_then(|v| v.as_str()),
+                    Some("arn:aws:iam::999999999999:role/Env")
+                );
+                assert_eq!(
+                    merged.get("session_name").and_then(|v| v.as_str()),
+                    Some("env-sess")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn merge_state_aws_yaml_only() {
+        scoped_env(
+            &[
+                ("YARD_STATE_AWS_ASSUME_ROLE", None),
+                ("YARD_STATE_AWS_SESSION_NAME", None),
+                ("YARD_STATE_AWS_EXTERNAL_ID", None),
+            ],
+            || {
+                let yaml =
+                    serde_json::json!({"assume_role": "arn:aws:iam::111111111111:role/Yaml"});
+                let merged = merge_state_aws_with_env(&yaml);
+                assert_eq!(
+                    merged.get("assume_role").and_then(|v| v.as_str()),
+                    Some("arn:aws:iam::111111111111:role/Yaml")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn merge_state_aws_env_only() {
+        scoped_env(
+            &[
+                (
+                    "YARD_STATE_AWS_ASSUME_ROLE",
+                    Some("arn:aws:iam::222222222222:role/Env"),
+                ),
+                ("YARD_STATE_AWS_SESSION_NAME", None),
+                ("YARD_STATE_AWS_EXTERNAL_ID", None),
+            ],
+            || {
+                let merged = merge_state_aws_with_env(&serde_json::Value::Null);
+                assert_eq!(
+                    merged.get("assume_role").and_then(|v| v.as_str()),
+                    Some("arn:aws:iam::222222222222:role/Env")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn merge_state_aws_all_absent_returns_null() {
+        scoped_env(
+            &[
+                ("YARD_STATE_AWS_ASSUME_ROLE", None),
+                ("YARD_STATE_AWS_SESSION_NAME", None),
+                ("YARD_STATE_AWS_EXTERNAL_ID", None),
+            ],
+            || {
+                let merged = merge_state_aws_with_env(&serde_json::Value::Null);
+                assert!(
+                    merged.is_null(),
+                    "absent yaml + absent envs must return Null so aws_config gets None (default chain)"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn merge_state_aws_external_id_env_beats_yaml() {
+        scoped_env(
+            &[
+                ("YARD_STATE_AWS_ASSUME_ROLE", None),
+                ("YARD_STATE_AWS_SESSION_NAME", None),
+                ("YARD_STATE_AWS_EXTERNAL_ID", Some("xid-env")),
+            ],
+            || {
+                let yaml = serde_json::json!({"external_id": "xid-yaml"});
+                let merged = merge_state_aws_with_env(&yaml);
+                assert_eq!(
+                    merged.get("external_id").and_then(|v| v.as_str()),
+                    Some("xid-env")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn merge_state_aws_provider_env_ignored() {
+        // YARD_AWS_ASSUME_ROLE is for providers; must NOT feed into state.
+        scoped_env(
+            &[
+                (
+                    "YARD_AWS_ASSUME_ROLE",
+                    Some("arn:aws:iam::888888888888:role/Providers"),
+                ),
+                ("YARD_STATE_AWS_ASSUME_ROLE", None),
+                ("YARD_STATE_AWS_SESSION_NAME", None),
+                ("YARD_STATE_AWS_EXTERNAL_ID", None),
+            ],
+            || {
+                let merged = merge_state_aws_with_env(&serde_json::Value::Null);
+                assert!(
+                    merged.is_null(),
+                    "provider YARD_AWS_* must NOT leak into state creds (D-03)"
+                );
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn get_storage_s3_null_aws_matches_today() {
+        let backend = StateBackend::S3 {
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            key: "state/".to_string(),
+            aws: serde_json::Value::Null,
+        };
+        let result = get_storage(&backend).await;
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), Storage::S3(_)));
+    }
+
+    #[tokio::test]
+    async fn get_storage_s3_with_aws_wires() {
+        let backend = StateBackend::S3 {
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            key: "state/".to_string(),
+            aws: serde_json::json!({
+                "assume_role": "arn:aws:iam::111111111111:role/FakeState"
+            }),
+        };
+        let result = get_storage(&backend).await;
+        assert!(
+            result.is_ok(),
+            "construction must not error; STS errors only surface on first S3 call"
+        );
+        assert!(matches!(result.unwrap(), Storage::S3(_)));
+    }
+
+    #[tokio::test]
+    async fn get_storage_local_still_works() {
+        let backend = StateBackend::Local {
+            path: std::path::PathBuf::from("/tmp/yard-test-state"),
+        };
+        let result = get_storage(&backend).await;
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), Storage::Local(_)));
     }
 }

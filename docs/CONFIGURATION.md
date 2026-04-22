@@ -75,6 +75,51 @@ state:
 
 All three S3 fields (`bucket`, `region`, `key`) are required when `type: s3`.
 
+##### Cross-account state backend credentials
+
+When your S3 state bucket lives in a different AWS account than the
+identity running `yard`, add an optional `aws:` sub-block to the
+`state:` config (Phase 9 addition):
+
+```yaml
+state:
+  type: s3
+  bucket: my-org-yard-state
+  region: us-east-1
+  key: my-project/state/
+  aws:
+    assume_role: arn:aws:iam::111111111111:role/YardStateAccess
+    session_name: yard-ci        # optional; default "yard"
+    external_id: xid-abc-123     # optional
+```
+
+Resolution order for state credentials (highest precedence first):
+
+1. `YARD_STATE_AWS_ASSUME_ROLE` / `YARD_STATE_AWS_SESSION_NAME` /
+   `YARD_STATE_AWS_EXTERNAL_ID` environment variables.
+2. The `state.aws:` sub-block above.
+3. The default AWS credential provider chain (env vars, shared config,
+   IMDS / ECS task role, SSO).
+
+**Strictly-additive guarantee.** A `yard.yaml` with NO `state.aws:`
+block and NO `YARD_STATE_AWS_*` envs set resolves state credentials
+exactly as before Phase 9 — the default chain. Existing configs
+continue to work unchanged.
+
+**State creds are orthogonal to provider creds.** The provider
+`YARD_AWS_*` environment variables (`YARD_AWS_ASSUME_ROLE`, etc.) do
+NOT affect state backend credentials. This lets CI scope state and
+provider credentials independently: you can set
+`YARD_STATE_AWS_ASSUME_ROLE` for the state bucket without changing
+provider cred resolution.
+
+**Local state backend has no creds.** The `aws:` sub-block only
+applies to `type: s3`. A `type: local` state backend has no
+credential concept.
+
+Implementation: `yard-core/src/storage.rs::get_storage` and
+`yard-core/src/storage.rs::merge_state_aws_with_env`.
+
 #### `providers.glue` — AWS Glue provider defaults
 
 Consumed by `GlueProvider::new` in `yard-core/src/providers/glue.rs`.
@@ -384,6 +429,9 @@ Discovered by greping `std::env::var` across `yard-cli/src/` and
 | `YARD_AWS_ASSUME_ROLE` | No | — | Overrides the `aws.assume_role` field in YAML. When set, STS AssumeRole wraps the default credential chain. |
 | `YARD_AWS_SESSION_NAME` | No | `yard` | STS session name. |
 | `YARD_AWS_EXTERNAL_ID` | No | — | STS external id for cross-account roles. |
+| `YARD_STATE_AWS_ASSUME_ROLE` | No | — | Overrides `state.aws.assume_role`. Applies ONLY to the S3 state backend — provider credentials are controlled by `YARD_AWS_ASSUME_ROLE` (separate scope). |
+| `YARD_STATE_AWS_SESSION_NAME` | No | `yard` | STS session name for the state backend AssumeRole. |
+| `YARD_STATE_AWS_EXTERNAL_ID` | No | — | STS external id for cross-account state access. |
 | `NO_COLOR` | No | — | Disables ANSI colors in CLI output (https://no-color.org). The `--no-color` CLI flag has the same effect. |
 | `USER` / `USERNAME` | No | `unknown` | Used as the lock owner in state lock files. |
 
@@ -506,7 +554,11 @@ following per-environment patterns are discoverable from the repo:
 - **CI / AssumeRole overrides.** The `YARD_AWS_ASSUME_ROLE`,
   `YARD_AWS_SESSION_NAME`, and `YARD_AWS_EXTERNAL_ID` env vars exist
   specifically so CI can override any YAML-declared `aws:` block without
-  editing config.
+  editing config. For state-bucket credential overrides scoped
+  separately from provider creds (e.g. state in Account A, providers in
+  Account B), use `YARD_STATE_AWS_ASSUME_ROLE`,
+  `YARD_STATE_AWS_SESSION_NAME`, and `YARD_STATE_AWS_EXTERNAL_ID`. See
+  the state backend section above for the full cascade.
 - **UI API base URL.** `YARD_API_BASE` is resolved at compile time via
   `option_env!`, so a production build of the server is typically
   compiled with `YARD_API_BASE=""` (so the UI derives its host from
