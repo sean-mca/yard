@@ -410,7 +410,9 @@ pub async fn destroy_dag(
     let lock = storage.lock(&lock_key).await?;
 
     let result: Result<()> = async {
-        // Delete S3 file if deployed
+        // Delete S3 file if deployed. Re-auth prefers the persisted
+        // `DagState.aws` (D-05); the caller-supplied `aws` is the fallback
+        // for pre-Phase-9 state files where `DagState.aws` is `Null`.
         if !dry_run
             && dag_state.deployment.s3_uri.is_some()
             && let Some(airflow_config) = provider_configs.get("airflow")
@@ -423,9 +425,15 @@ pub async fn destroy_dag(
                     .unwrap_or("us-east-1");
                 let prefix = section.dags_prefix.as_deref().unwrap_or("dags/");
 
+                let destroy_aws = resolve_destroy_dag_aws(&dag_state.aws, aws);
+                let aws_cfg_opt = if destroy_aws.is_null() {
+                    None
+                } else {
+                    Some(destroy_aws)
+                };
                 let s3_ops = providers::S3ScriptOps {
                     s3_client: aws_sdk_s3::Client::new(
-                        &providers::aws_config(region, Some(aws)).await,
+                        &providers::aws_config(region, aws_cfg_opt).await,
                     ),
                     script_bucket: bucket.clone(),
                     script_prefix: prefix.to_string(),
