@@ -71,6 +71,14 @@ pub struct DagState {
     pub dag_name: String,
     pub project: String,
     pub deployment: DagDeployment,
+    /// AWS credential config resolved at apply time for this DAG's upload
+    /// bucket. Persisted so the destroy path (which runs without the DAG's
+    /// source dir) can re-authenticate to the same account the upload used.
+    /// `Value::Null` when the DAG's apply used the default AWS credential
+    /// chain (preserves today's behavior for existing state files via
+    /// `#[serde(default)]`).
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub aws: serde_json::Value,
 }
 
 #[cfg(test)]
