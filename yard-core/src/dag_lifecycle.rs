@@ -631,4 +631,138 @@ mod tests {
         assert_eq!(diffs.len(), 1);
         assert!(matches!(diffs[0].diff_type, DiffType::Modify { .. }));
     }
+
+    // --- Phase 9 Plan 03 Task 1: apply-path credential resolution ---
+
+    #[test]
+    fn resolve_effective_dag_aws_prefers_dag_config_aws() {
+        let tmp = std::env::temp_dir().join(format!(
+            "yard_dag_aws_priority_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // account.yaml that WOULD apply via the cascade if dag.config.aws were Null.
+        std::fs::write(
+            tmp.join("account.yaml"),
+            "aws:\n  assume_role: arn:aws:iam::111111111111:role/Account\n",
+        )
+        .unwrap();
+
+        let manifest = ProjectManifest {
+            project: "test".to_string(),
+            state: yard_structs::StateBackend::Local {
+                path: ".yard/state".into(),
+            },
+            providers: HashMap::new(),
+            jobs: HashMap::new(),
+            aws: json!({"assume_role": "arn:aws:iam::999999999999:role/Root"}),
+        };
+        let dag = airflow_dag::ResolvedDag {
+            name: "test_dag".to_string(),
+            dir: tmp.clone(),
+            config: yard_structs::AirflowSection {
+                schedule: Some("@daily".to_string()),
+                aws: json!({"assume_role": "arn:aws:iam::222222222222:role/DagExplicit"}),
+                ..Default::default()
+            },
+            tasks: Vec::new(),
+            depends_on: std::collections::BTreeMap::new(),
+        };
+
+        let effective = resolve_effective_dag_aws(&manifest, &dag);
+        // dag.config.aws wins OUTRIGHT — no merge with account.yaml.
+        assert_eq!(
+            effective.get("assume_role").and_then(|v| v.as_str()),
+            Some("arn:aws:iam::222222222222:role/DagExplicit")
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_effective_dag_aws_falls_back_to_cascade() {
+        let tmp = std::env::temp_dir().join(format!(
+            "yard_dag_aws_fallback_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        std::fs::write(
+            tmp.join("account.yaml"),
+            "aws:\n  assume_role: arn:aws:iam::111111111111:role/Account\n",
+        )
+        .unwrap();
+
+        let manifest = ProjectManifest {
+            project: "test".to_string(),
+            state: yard_structs::StateBackend::Local {
+                path: ".yard/state".into(),
+            },
+            providers: HashMap::new(),
+            jobs: HashMap::new(),
+            aws: json!({"assume_role": "arn:aws:iam::999999999999:role/Root"}),
+        };
+        let dag = airflow_dag::ResolvedDag {
+            name: "test_dag".to_string(),
+            dir: tmp.clone(),
+            config: yard_structs::AirflowSection {
+                schedule: Some("@daily".to_string()),
+                aws: Value::Null, // unset; cascade should apply
+                ..Default::default()
+            },
+            tasks: Vec::new(),
+            depends_on: std::collections::BTreeMap::new(),
+        };
+
+        let effective = resolve_effective_dag_aws(&manifest, &dag);
+        // account.yaml wins per the existing cascade (nearest ancestor).
+        assert_eq!(
+            effective.get("assume_role").and_then(|v| v.as_str()),
+            Some("arn:aws:iam::111111111111:role/Account")
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_effective_dag_aws_all_null_returns_null() {
+        let tmp = std::env::temp_dir().join(format!(
+            "yard_dag_aws_null_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let manifest = ProjectManifest {
+            project: "test".to_string(),
+            state: yard_structs::StateBackend::Local {
+                path: ".yard/state".into(),
+            },
+            providers: HashMap::new(),
+            jobs: HashMap::new(),
+            aws: Value::Null,
+        };
+        let dag = airflow_dag::ResolvedDag {
+            name: "test_dag".to_string(),
+            dir: tmp.clone(),
+            config: yard_structs::AirflowSection {
+                schedule: Some("@daily".to_string()),
+                aws: Value::Null,
+                ..Default::default()
+            },
+            tasks: Vec::new(),
+            depends_on: std::collections::BTreeMap::new(),
+        };
+
+        let effective = resolve_effective_dag_aws(&manifest, &dag);
+        assert!(
+            effective.is_null(),
+            "absent everywhere → Null → caller passes None to aws_config (D-02)"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
