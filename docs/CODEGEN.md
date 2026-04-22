@@ -1,0 +1,966 @@
+<!-- generated-by: gsd-doc-writer -->
+# Codegen
+
+yard turns a declarative `<job>.yaml` into an executable PySpark script at
+`plan`/`apply`/`show` time. This document is the authoritative reference for
+that pipeline: the Tera templates that hold the provider scaffolding, the
+Rust renderers that emit the dataframe body, the escape hatches that let
+users sidestep codegen entirely, and how Glue vs. EMR differ in the
+generated output.
+
+For the `transforms[]`, `sources[]`, and `sink:` field reference, see
+[CONFIGURATION.md](./CONFIGURATION.md). For Airflow DAG generation (a
+separate codegen path sharing nothing with this one besides the Tera
+engine), see [AIRFLOW.md](./AIRFLOW.md). This doc is the deep dive that
+[ARCHITECTURE.md](./ARCHITECTURE.md) links to when it mentions codegen at
+a high level.
+
+- [Overview](#overview)
+- [Template system](#template-system)
+- [Source generation](#source-generation)
+- [Transform generation](#transform-generation)
+- [Sink generation](#sink-generation)
+- [Provider specifics](#provider-specifics)
+- [Escape hatches](#escape-hatches)
+- [Helpers and utilities](#helpers-and-utilities)
+- [Adding a new provider, source, transform, or sink](#adding-a-new-provider-source-transform-or-sink)
+- [Debugging generated output](#debugging-generated-output)
+- [End-to-end example](#end-to-end-example)
+
+---
+
+## Overview
+
+### What codegen does
+
+Codegen takes a parsed `JobDefinition` (from `yard-structs/src/config.rs`)
+plus provider context (merged from `providers.<type>:` in `yard.yaml` and
+the per-job `<job_type>:` block) and produces a single Python/PySpark
+script as a `String`. The string is then either:
+
+- written to stdout by `yard show <job>`; or
+- uploaded to S3 by the provider's `deploy` method (as `text/x-python`)
+  and pointed at by the Glue job definition or EMR step that yard
+  creates/updates.
+
+No code runs locally — yard only emits the script, uploads it, and wires
+up the cloud resource that will execute it.
+
+### Where it fits in plan/apply
+
+From `yard-core/src/providers/glue.rs` and `yard-core/src/providers/emr.rs`:
+
+1. `generate_python_script(job_name, job_def)` produces the script string.
+2. `S3ScriptOps::upload_script(job_name, artifact)` uploads it to
+   `s3://{script_bucket}/{script_prefix}{job_name}.py`.
+3. The Glue provider calls `update_job` (falling back to `create_job` if
+   the Glue job doesn't exist yet) with `script_location` set to that S3
+   URI. The EMR provider submits a `spark-submit` step whose last arg is
+   the S3 URI.
+4. `deploy` returns a `Vec<Resource>` (one `s3_object`, one `glue_job` or
+   `emr_step`) that `yard-core` records in state for drift detection.
+
+### Entry points
+
+Defined in `yard-core/src/codegen/mod.rs` and re-exported via
+`yard-core/src/show.rs`:
+
+| Function | Caller | Purpose |
+|---|---|---|
+| `codegen::generate_python_script(job_name, job_def) -> Result<String>` | Providers, `show::show` | The only codegen entry point. Returns the full script text. |
+| `show::show(manifest, job_name) -> Result<String>` | `yard show <job>` CLI | Thin wrapper that looks up the job and calls `generate_python_script`. |
+| `show::show_dag(manifest, dags, dag_name)` | `yard show <dag>` CLI | Parallel DAG-codegen entry; see [AIRFLOW.md](./AIRFLOW.md). |
+
+Task-only job types (currently just `bash` — see
+`config_merge::is_task_only`) return an empty string from
+`generate_python_script`. Those jobs exist only as Airflow tasks; there is
+no PySpark artifact to generate or upload, and the apply path skips the
+deploy step for them.
+
+---
+
+## Template system
+
+yard uses the [Tera](https://keats.github.io/tera/) template engine. The
+templates are compiled into the binary at build time with
+`include_str!("../templates/<name>")` (see the two `const` declarations at
+the top of `yard-core/src/codegen/mod.rs`), so there is nothing to deploy
+alongside the CLI.
+
+### Template files
+
+All live under `yard-core/src/templates/`:
+
+| File | Used by | Purpose |
+|---|---|---|
+| `glue.py.tera` | `job_type: glue` | AWS Glue scaffold: `getResolvedOptions`, `SparkSession`, `GlueContext`, `Job.init` / `job.commit`. |
+| `emr.py.tera` | `job_type: emr` | EMR classic scaffold: `SparkSession.builder.appName(...)` + `spark.stop()` in `finally`. No Glue imports. |
+| `airflow_dag.py.tera` | DAG codegen | Airflow DAG scaffold. Rendered by a separate pipeline — see [AIRFLOW.md](./AIRFLOW.md). |
+
+### Render context
+
+Both the `glue.py.tera` and `emr.py.tera` templates receive a **flat**
+render context with pre-rendered string fragments rather than nested
+structures. The split — scaffolding in Tera, pipeline body generated in
+Rust — keeps the Tera templates short and predictable, and lets the Rust
+renderers emit arbitrary multiline strings without fighting Tera's
+whitespace rules.
+
+Keys inserted by `generate_python_script`:
+
+| Key | Type | Used in template | Produced by |
+|---|---|---|---|
+| `job_name` | string | `# Generated by YARD for job: {{ job_name }}` (both); `.appName("{{ job_name }}")` (EMR) | `generate_python_script` arg |
+| `job_type` | string | (inserted but not referenced by the current templates) | `job_def.job_type` |
+| `imports_block` | string | `{{ imports_block }}` inline at module scope (both) | `render_imports` + auto-injected imports; may have the Iceberg fill-nulls helpers appended |
+| `body` | string | `{{ body }}` inside `def run():` (both) | Rendered source/transform/sink pipeline, or indented user-supplied `body:`, or `"    pass"` |
+| `iceberg_warehouse` | string | `glue.py.tera` only — inside a `{%- if iceberg_warehouse %}` block that adds Iceberg Spark catalog configs | `job_def.config.glue.warehouse` (empty string if unset) |
+
+Nothing else is a template variable: there are no per-source, per-sink, or
+per-transform loops in the templates themselves. Everything under
+`def run():` is built in Rust and inlined as a single string.
+
+---
+
+## Source generation
+
+`yard-core/src/codegen/source.rs` iterates `job_def.sources` and emits a
+block of indented Python for each one, concatenated with newlines. The
+dispatch is a `match` on `source.source_type` inside `render_source`.
+
+### Variable naming
+
+Every source named `foo` produces a DataFrame bound to `df_foo`. The
+`name` field in `yard-structs::Source` is mandatory and is the only
+handle downstream transforms and the sink use to refer to the source —
+there is no implicit "primary source" at the Python level; there is only
+a convention (the first declared source) used for defaulting fields that
+are left out (see [Transform generation](#transform-generation) and
+[Sink generation](#sink-generation)).
+
+### Engine selector: Spark vs. Glue
+
+Sources where both a plain Spark reader and a Glue `DynamicFrame` reader
+exist (`s3`, `jdbc`) pick between them based on the `engine` field on the
+source. Resolution (in `helpers::effective_engine`):
+
+1. `source.engine` (`"spark"` or `"glue"`) wins if set.
+2. Otherwise, the provider-level `<job_type>.default_engine` is used —
+   read from `job_def.config[job_type].default_engine` by
+   `helpers::default_engine_for`.
+3. Otherwise, `"spark"`.
+
+When the engine is `glue`, the renderer emits
+`glueContext.create_dynamic_frame.from_options(...).toDF()` (helper
+`source::glue_from_options`). When it is `spark`, the renderer builds a
+`spark.read.format(...).option(...).load(...)` chain.
+
+### Supported source types
+
+Verified against the `match` in `source::render_source`:
+
+| `source_type` | Engine | Emits | Required fields |
+|---|---|---|---|
+| `s3` | spark | `df_<name> = spark.read.format("<format>")[.option(...)].load("<path>")` | `path` |
+| `s3` | glue | `df_<name> = glueContext.create_dynamic_frame.from_options(connection_type="s3", format="<format>", connection_options={...}, transformation_ctx="<name>_ctx").toDF()` | `path` |
+| `jdbc` | spark | `df_<name> = spark.read.format("jdbc").option("url", ...).option("dbtable", ...)[.option("user"/"password", ...secret)].load()` | `connection_url`, `table` |
+| `jdbc` | glue | `glueContext.create_dynamic_frame.from_options(connection_type="<connection_type>", connection_options=..., ...)` | `connection_url`, `table`, `connection_type` |
+| `catalog` | (glue only) | `df_<name> = glueContext.create_dynamic_frame.from_catalog(database="<db>", table_name="<table>", transformation_ctx="<name>_ctx").toDF()` | `database`, `table` |
+| `kafka` | spark | `spark.read.format("kafka").option("kafka.bootstrap.servers", <connection_url>).option("subscribe", <topic>)[.option(...)].load()` | `connection_url`, `topic` |
+| `api` | (plain Python) | `requests.get(<url>, headers=...).raise_for_status()` then `spark.createDataFrame(_resp_<name>.json())` | `url` |
+
+Unknown `source_type` values emit `# Unsupported source type: <other>` as
+a comment — the job still builds, which preserves forward compatibility
+when a newer yard introduces a type and the user is on an older CLI.
+Missing required fields are hard errors (`require_str` in
+`codegen/helpers.rs`).
+
+### Passthrough options
+
+The `options: { k: v }` map on a source is opaque. On the Spark engine
+each entry becomes a `.option(k, python_literal(v))` call
+(`helpers::append_spark_options`); on the Glue engine the entries are
+merged into the `connection_options` dict (`helpers::build_options_dict`)
+with the built-in seed keys applied first and user entries overwriting
+them.
+
+### Secrets Manager integration
+
+When `secret_id` is set on a source, the renderer emits a boto3 fetch
+block **before** the reader:
+
+```python
+    users_source_secret_client = boto3.client("secretsmanager")
+    users_source_secret_resp = users_source_secret_client.get_secret_value(SecretId="my-rds-secret")
+    users_source_secret = json.loads(users_source_secret_resp["SecretString"])
+```
+
+The secret dict is then referenced as
+`<name>_source_secret["username"]` / `["password"]` in the reader chain.
+This triggers `import boto3` and `import json` at module scope (see
+[Auto-injected imports](#auto-injected-imports)).
+
+### Before/after
+
+Given `orders.yaml`:
+
+```yaml
+sources:
+  - name: orders
+    source_type: s3
+    format: parquet
+    path: s3://raw/orders/
+```
+
+The generator emits into `run()`:
+
+```python
+    # --- Sources ---
+    df_orders = spark.read.format("parquet").load("s3://raw/orders/")
+```
+
+Switch to `engine: glue` and the same block becomes:
+
+```python
+    df_orders = glueContext.create_dynamic_frame.from_options(connection_type="s3", format="parquet", connection_options={"paths": ["s3://raw/orders/"]}, transformation_ctx="orders_ctx").toDF()
+```
+
+---
+
+## Transform generation
+
+`yard-core/src/codegen/transform.rs` handles the `transforms:` list. The
+full per-`transform_type` field reference lives in
+[CONFIGURATION.md](./CONFIGURATION.md); this section documents only how
+those fields translate into PySpark calls.
+
+### Execution model
+
+Transforms run in declared order. Each transform reads a **named
+DataFrame** and writes a **named DataFrame** (possibly the same one).
+Names in user YAML translate to Python variables with a `df_` prefix
+(the same convention used by sources).
+
+Defaulting rules, from `transform::resolve_df`:
+
+- `source:` unset → defaults to the first declared source's name
+  (passed in as `default_source`).
+- `output:` unset → defaults to `source` (so the transform rewrites its
+  input in place).
+
+The `sql` transform is special: its `source:` is ignored (all named
+sources are registered as temp views instead), `output:` still defaults
+to the first source, and the query is passed verbatim to `spark.sql()`.
+The `join` transform is also special: it uses `left:` / `right:` (both
+referencing existing named DataFrames) instead of `source:`, and
+`output:` defaults to `left`.
+
+### Supported transform types
+
+The dispatch in `transform::render_transform` covers the nine types
+listed in `Transform::transform_type` (see `yard-structs/src/config.rs`):
+`filter`, `sql`, `join`, `drop_columns`, `select`, `rename`, `add_column`,
+`aggregate`, `window`. Unknown values emit a `# Unsupported transform
+type: ...` comment. Full field → PySpark mappings are in
+[CONFIGURATION.md](./CONFIGURATION.md#transforms-fields-transform-struct).
+
+### Temp view registration for `sql`
+
+When a `sql` transform is present, **every** named source is registered
+as a temp view before the `spark.sql(...)` call, so the query can join
+any of them:
+
+```python
+    df_orders.createOrReplaceTempView("orders")
+    df_customers.createOrReplaceTempView("customers")
+    df_enriched = spark.sql("SELECT o.*, c.name FROM orders o JOIN customers c ON o.cid = c.id")
+```
+
+This happens once per `sql` transform — if you have multiple, each re-
+registers the views, which is a no-op after the first.
+
+### Chained transforms — illustrative snippet
+
+```yaml
+sources:
+  - name: orders
+    source_type: s3
+    format: parquet
+    path: s3://raw/orders/
+transforms:
+  - transform_type: filter
+    source: orders          # reads df_orders
+    condition: "col('status') != 'cancelled'"
+    # output: omitted → writes df_orders (in place)
+  - transform_type: add_column
+    # source: omitted → defaults to "orders"
+    output: orders_with_total
+    name: total
+    expression: "col('price') * col('qty')"
+```
+
+Renders to:
+
+```python
+    # --- Transforms ---
+    df_orders = df_orders.filter(col('status') != 'cancelled')
+    df_orders_with_total = df_orders.withColumn("total", col('price') * col('qty'))
+```
+
+Note that `filter`'s `condition` and `add_column`'s `expression` are
+inlined into the emitted Python **verbatim** (only trimmed of whitespace).
+That means PySpark helpers like `col(...)` and `lit(...)` must already be
+in scope — yard does **not** emit `from pyspark.sql.functions import col`
+for you. The escape-hatch `imports:` block (or a `from pyspark.sql import
+functions as F` reference in your expression, which triggers the
+automatic `F` import — see [Auto-injected imports](#auto-injected-imports))
+is how you bring those names in.
+
+---
+
+## Sink generation
+
+`yard-core/src/codegen/sink.rs` renders `job_def.sink` (an `Option<Sink>`
+— jobs without a sink produce no write). Dispatch is a `match` on
+`sink.sink_type` inside `render_sink`.
+
+### Defaulting and mode
+
+- `source:` on the sink selects which named DataFrame to write. Unset
+  → defaults to the first declared source's name.
+- `mode:` defaults to `"overwrite"`. The value is passed as-is to
+  `.mode(...)` for `s3` and `jdbc` sinks. For `iceberg`, `"overwrite"`
+  maps to `.overwritePartitions()` (dynamic partition overwrite) and
+  anything else (typically `"append"`) maps to `.append()`.
+
+### Supported sink types
+
+| `sink_type` | Emits | Required fields |
+|---|---|---|
+| `s3` | `df_<src>.write.format("<format>").mode("<mode>")[.partitionBy(...)].save("<path>")` | `path` |
+| `jdbc` | `df_<src>.write.format("jdbc").option("url", ...).option("dbtable", ...)[.option("user"/"password", ...)].mode("<mode>").save()` | `connection_url`, `table` |
+| `catalog` | Converts to DynamicFrame, then `glueContext.write_dynamic_frame.from_catalog(frame=sink_frame, database="<db>", table_name="<table>")` | `database`, `table` |
+| `iceberg` | Creates the Glue database if missing, then `writeTo("glue_catalog.<db>.<table>")` with create-or-append branching | `database`, `table` |
+
+Unknown `sink_type` emits `# Unsupported sink type: <other>`. Missing
+required fields are hard errors (`sink::require_sink_str`).
+
+`format:` defaults to `"parquet"` for `s3`. The `jdbc` sink honours the
+same Secrets Manager pattern as the `jdbc` source: when `secret_id` is
+set, a boto3 fetch block is rendered before the writer and
+`sink_secret["username"]` / `sink_secret["password"]` are woven into the
+`.option(...)` chain.
+
+### Iceberg specifics
+
+The `iceberg` sink is the most opinionated path in codegen:
+
+1. **Database ensure.** yard emits a `boto3.client("glue").get_database`
+   call wrapped in `try/except EntityNotFoundException`, creating the
+   database lazily if it doesn't exist. This is why `import boto3` is
+   auto-injected whenever an Iceberg sink is present (even without
+   secrets).
+2. **Table properties.** Every create path sets a fixed set of table
+   properties (from `ICEBERG_TABLE_PROPERTIES` in `codegen/sink.rs`):
+   `format-version=2`, `write.spark.accept-any-schema=true`,
+   `write.target-file-size-bytes=536870912`,
+   `write.parquet.compression-codec=zstd`,
+   `write.distribution-mode=hash`.
+3. **Optional location.** If `sink.path` is set and non-empty, an
+   additional `.tableProperty("location", "<path>")` is emitted. Empty
+   string or unset → location is omitted and Iceberg uses the catalog
+   warehouse default.
+4. **Create vs append branch.** The emitted Python calls
+   `spark.catalog.tableExists(_tbl)` at runtime. If absent, it emits a
+   full create (`.writeTo(_tbl).using("iceberg").partitionedBy(...)
+   .tableProperty(...).create()`). If present, it emits
+   `.writeTo(_tbl).option("mergeSchema", "true").<op>()` where `<op>` is
+   `overwritePartitions` or `append` per the mode rules above. Location
+   and table properties therefore only apply on first-time creation.
+5. **`fill_nulls`.** Defaults to `true` for `iceberg` sinks; explicit
+   `fill_nulls: false` opts out. When enabled, `generate_python_script`
+   injects the `_yard_fill_nulls` and `_yard_default_struct` helpers at
+   module scope (the `ICEBERG_FILL_NULLS_HELPERS` constant in
+   `codegen/mod.rs`) and adds a
+   `df_<src> = _yard_fill_nulls(df_<src>)` call immediately before the
+   writer. The helpers coerce `void`-typed and `NULL`-struct columns into
+   type-appropriate defaults so Iceberg writes don't fail on unresolved
+   schemas — a common issue when ingesting JSON with sparse objects.
+6. **Partition mirroring.** Job-level `partition_by` (top-level on the
+   `JobDefinition`) is mirrored onto the Iceberg sink's `partition_by`
+   so `.partitionedBy(...)` is emitted on first create. See
+   [Partition derivation](#partition-derivation) below.
+7. **`--datalake-formats: iceberg` default.** The Glue provider injects
+   `--datalake-formats: iceberg` into `default_arguments` so the Iceberg
+   runtime is on the classpath. Users can override it explicitly in
+   `providers.glue.default_arguments` if needed (see
+   `GlueProvider::build_default_arguments` in
+   `yard-core/src/providers/glue.rs`). The EMR provider has no
+   equivalent — EMR clusters are expected to have Iceberg configured at
+   the cluster level.
+
+### Partition derivation
+
+Job-level `partition_by` (only `year`, `month`, `day` are supported)
+triggers a small derivation block inserted **between** transforms and
+sink, generated by `helpers::render_partition_derivation`:
+
+- If `create_timestamp: true`, a new `ingestion_timestamp` column is
+  added via `F.current_timestamp()` and used as the timestamp source.
+- Otherwise, `partition_timestamp_column` names the existing column
+  (defaults to `"event_time"` if unset).
+- For each declared unit, the block emits an `if "<unit>" not in
+  df.columns: df = df.withColumn("<unit>", F.<fn>(F.col(_ts)))` guard,
+  where `<fn>` is `year`, `month`, or `dayofmonth`.
+
+---
+
+## Provider specifics
+
+### Glue (`glue.py.tera`)
+
+Glue scripts are structured for the Glue runtime's conventions:
+
+```python
+# Generated by YARD for job: <name>
+
+import sys
+import logging
+from awsglue.utils import getResolvedOptions
+from pyspark.sql import SparkSession
+from awsglue.context import GlueContext
+from awsglue.job import Job
+<imports_block>
+
+logger = logging.getLogger("yard")
+logger.setLevel(logging.INFO)
+
+# --- Glue Setup ---
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+
+spark = (
+    SparkSession.builder
+    # {% if iceberg_warehouse %} block adds:
+    # .config("spark.sql.extensions", "...IcebergSparkSessionExtensions")
+    # .config("spark.sql.catalog.glue_catalog", "...SparkCatalog")
+    # .config("spark.sql.catalog.glue_catalog.catalog-impl", "...GlueCatalog")
+    # .config("spark.sql.catalog.glue_catalog.io-impl", "...S3FileIO")
+    # .config("spark.sql.catalog.glue_catalog.warehouse", "<warehouse>")
+    .getOrCreate()
+)
+
+sc = spark.sparkContext
+glueContext = GlueContext(sc)
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+
+def run():
+    <body or "pass">
+
+
+if __name__ == "__main__":
+    try:
+        run()
+        job.commit()
+    except Exception as e:
+        logger.error(f"Job failed: {str(e)}")
+        raise
+```
+
+Things to note:
+
+- `JOB_NAME` is the only arg yard's generated scaffold reads via
+  `getResolvedOptions`. Additional args are wired in via
+  `providers.glue.default_arguments` (see
+  [CONFIGURATION.md](./CONFIGURATION.md)), which the Glue provider
+  applies to `CreateJob` / `UpdateJob` — those become available inside
+  the script via `getResolvedOptions(sys.argv, ['JOB_NAME', 'MY_ARG'])`
+  that **you** add to an `imports:` or `body:` block.
+- The Iceberg warehouse block is conditional: it only renders when
+  `providers.glue.warehouse` (flowed into `job_def.config.glue.warehouse`)
+  is non-empty. There is no warehouse validation in codegen itself —
+  specifying an Iceberg sink without setting `warehouse` will produce a
+  script that runs but fails at Iceberg write time with a configuration
+  error.
+- `job.commit()` is always the last call on the success path, and the
+  exception branch re-raises — the Glue console treats the step as
+  failed.
+- `DynamicFrame` is imported (via the auto-injected
+  `from awsglue.dynamicframe import DynamicFrame`) only when the job
+  actually uses it — a `catalog` source/sink, or a Glue-engine `s3` or
+  `jdbc` source. The rule is in `helpers::needs_dynamic_frame_import`.
+
+### EMR (`emr.py.tera`)
+
+EMR scripts are deliberately minimal — EMR clusters come pre-configured
+with Spark and don't need (or support) the Glue libraries:
+
+```python
+# Generated by YARD for job: <name>
+
+import logging
+from pyspark.sql import SparkSession
+<imports_block>
+
+logger = logging.getLogger("yard")
+logger.setLevel(logging.INFO)
+
+spark = SparkSession.builder.appName("<name>").getOrCreate()
+
+
+def run():
+    <body or "pass">
+
+
+if __name__ == "__main__":
+    try:
+        run()
+    except Exception as e:
+        logger.error(f"Job failed: {str(e)}")
+        raise
+    finally:
+        spark.stop()
+```
+
+How the EMR provider invokes it (`yard-core/src/providers/emr.rs`):
+
+- The script is uploaded to `s3://<script_bucket>/<script_prefix><job_name>.py`.
+- `add_job_flow_steps` is called against the configured `cluster_id`
+  with a `command-runner.jar` step whose args are literally
+  `spark-submit --deploy-mode <deploy_mode> <script_s3_uri>`. There is
+  no extra arg passing; anything the script needs must be baked in or
+  read from the environment/cluster config.
+- `deploy_mode` defaults to `"cluster"` (the alternative is `"client"`),
+  and `action_on_failure` defaults to `"CONTINUE"`. Both are validated in
+  `emr::validate_config`.
+- There is no Iceberg scaffolding: EMR clusters are expected to have
+  Iceberg configured at the cluster level, or to provide the JARs via
+  standard spark-submit args — yard does not attempt to inject them.
+
+### Side-by-side summary
+
+| Aspect | Glue | EMR |
+|---|---|---|
+| Scaffold imports | `awsglue.utils`, `awsglue.context`, `awsglue.job` + `pyspark` | `pyspark` only |
+| Session builder | `SparkSession.builder` with conditional Iceberg catalog configs | `SparkSession.builder.appName(...)` |
+| Context object | `GlueContext` + `Job.init(args['JOB_NAME'], args)` | None |
+| Entrypoint args | `getResolvedOptions(sys.argv, ['JOB_NAME'])` | None — pass via cluster/spark-submit |
+| Success finalizer | `job.commit()` | *(none)* |
+| Teardown | (none; Glue tears down the JVM) | `finally: spark.stop()` |
+| Iceberg runtime | `--datalake-formats: iceberg` default arg + Spark catalog configs | Cluster-level (not injected) |
+| Deploy mechanism | `CreateJob` / `UpdateJob` pointing at the uploaded script | `AddJobFlowSteps` with `spark-submit` |
+
+---
+
+## Escape hatches
+
+Three fields on a `<job>.yaml` let you bypass or extend codegen. Precedence
+is strict — `job_file` wins over `body`, which wins over the declarative
+source/transform/sink pipeline.
+
+### `imports:` — extra Python imports
+
+```yaml
+imports:
+  - name: col
+    from: pyspark.sql.functions
+  - name: datetime
+```
+
+Rendered by `helpers::render_import` as:
+
+```python
+from pyspark.sql.functions import col
+import datetime
+```
+
+and concatenated (with a newline separator) in front of the auto-injected
+imports yard computes from the pipeline. User imports come **first**, then
+auto-imports (`boto3`, `json`, `requests`, `from pyspark.sql import
+functions as F`, `from pyspark.sql.window import Window`, `from
+pyspark.sql.types import (...)`, `DynamicFrame`). The resulting block is
+substituted into `{{ imports_block }}` at module scope in the template.
+
+There is no de-duplication — if you hand-write `import boto3` and also
+declare an Iceberg sink, you will see `import boto3` twice. Harmless in
+Python but noisy in `yard show`.
+
+### `body:` — inline Python pipeline override
+
+```yaml
+body: |
+  df = spark.read.parquet("s3://custom/in/")
+  df.write.parquet("s3://custom/out/")
+```
+
+When `body:` is set, the entire declarative pipeline (sources, transforms,
+partition derivation, sink, fill-nulls) is **skipped**. The string you
+provide is indented 4 spaces per line (blank lines preserved, by
+`helpers::indent_body`) and dropped directly into `def run():`. You are
+responsible for everything, including reading and writing.
+
+Sources, transforms, and sink blocks in the same YAML are ignored when
+`body` is set — not merged, not prepended. This is covered by the
+`body_override_skips_source_sink` test in `codegen/mod.rs`.
+
+### `job_file:` — external script replacement
+
+```yaml
+job_file: ./scripts/custom_orders.py
+```
+
+When `job_file:` is set, `generate_python_script` short-circuits **before**
+the template is rendered. The referenced file is read verbatim with
+`std::fs::read_to_string` and returned as-is. None of the scaffolding
+(`GlueContext`, `SparkSession.builder`, `job.commit()`, imports block) is
+added — your script must contain everything the runtime needs.
+
+Caveats:
+
+- The path is resolved relative to the current working directory of the
+  `yard` process, not the YAML file. In practice, users either put the
+  script next to the YAML and run yard from the project root, or use
+  absolute paths.
+- Missing files are hard errors with the message `Failed to read
+  job_file: <path>`.
+- Any `imports:`, `body:`, `sources:`, `transforms:`, `sink:` in the same
+  YAML are ignored. Only `job_file:` is honoured.
+- The Glue provider still injects `--datalake-formats: iceberg` (and other
+  provider-level `default_arguments`) when deploying, regardless of what
+  your custom script does. If your script doesn't need them, override via
+  `providers.glue.default_arguments`.
+
+---
+
+## Helpers and utilities
+
+`yard-core/src/codegen/helpers.rs` holds the shared bits the source /
+transform / sink renderers all pull from. Read the file for signatures;
+here's a functional map.
+
+### Import and literal rendering
+
+- `render_import` / `render_imports` — turn `Import { name, from }` into
+  `from <from> import <name>` or `import <name>`.
+- `python_literal(&serde_json::Value)` — serialise a `serde_json::Value`
+  as a valid Python literal: `None`, `True`/`False`, numbers, quoted
+  strings (with `"` and `\` escaped), lists, and sorted-key dict
+  literals. Used for the opaque `options:` passthrough.
+
+### Spark/Glue option builders
+
+- `build_options_dict(seed, user_opts)` — emit a Python dict literal
+  from an ordered seed of `(k, v)` pairs plus arbitrary user-supplied
+  options (user keys overwrite seeds). Used on the Glue engine to build
+  `connection_options`.
+- `append_spark_options(chain, seed, extra)` — append `.option(k, v)`
+  calls to an existing reader chain. Seed entries are quoted as literal
+  strings; extras go through `python_literal`. Used on the Spark engine.
+
+### Required-field checks
+
+- `require_str(value, source_name, field)` — turns `Option<&str>` into
+  `Result<&str>` with an `anyhow` error `source '<name>': '<field>' is
+  required`. Sinks have a near-identical `sink::require_sink_str`.
+
+### Output shaping
+
+- `quoted_list(&[String])` — `["a", "b"]` → `"a", "b"` (used for
+  `.select`, `.drop`, `.groupBy`, `.partitionBy`, `.partitionedBy`).
+- `indent_body(&str)` — prefix each non-empty line with four spaces
+  (used for the `body:` escape hatch).
+
+### Secrets fetcher
+
+- `render_secret_fetch(secret_id, prefix)` — emit the three-line
+  `boto3.client("secretsmanager")` → `get_secret_value` →
+  `json.loads(...)` block with variable names prefixed by
+  `<prefix>_secret_...`.
+
+### Auto-injected imports
+
+A set of predicate helpers inspects the `JobDefinition` and decides which
+implicit imports to add (see the `if needs_*` checks in
+`generate_python_script`):
+
+| Predicate | Added import(s) |
+|---|---|
+| `needs_secrets_imports` (any source or the sink has `secret_id`) | `import boto3`, `import json` |
+| `has_iceberg_sink` | `import boto3` (for the Glue `get_database` / `create_database` calls) |
+| `needs_requests_import` (any `api` source) | `import requests` |
+| `needs_dynamic_frame_import` (any `catalog` source/sink, or any Glue-engine `s3`/`jdbc` source) | `from awsglue.dynamicframe import DynamicFrame` |
+| `needs_functions_import` (any `aggregate` or `window` transform) **or** `partition_by` non-empty **or** `should_fill_nulls` | `from pyspark.sql import functions as F` |
+| `should_fill_nulls` (Iceberg sink with `fill_nulls != Some(false)`) | `from pyspark.sql.types import (StructType, ArrayType, DoubleType, FloatType, IntegerType, LongType, TimestampType, DateType, BooleanType)` + the `_yard_fill_nulls` / `_yard_default_struct` helper block at module scope |
+| `needs_window_import` (any `window` transform) | `from pyspark.sql.window import Window` |
+
+### Partition derivation
+
+- `render_partition_derivation(job_def, sink_source)` — emits the
+  `ingestion_timestamp` + `year/month/day` derivation block described
+  under [Partition derivation](#partition-derivation). Returns `None`
+  when `partition_by` is empty.
+
+### Engine and provider config lookups
+
+- `effective_engine(source, default_engine)` — resolves the per-source
+  engine, falling back to the provider-level default.
+- `default_engine_for(job_def)` — reads the provider-level default engine
+  from `job_def.config[job_type].default_engine`, defaulting to
+  `"spark"`.
+
+---
+
+## Adding a new provider, source, transform, or sink
+
+Broader contributor setup (lint, format, test, branch) is covered in
+[DEVELOPMENT.md](./DEVELOPMENT.md). This section is codegen-specific.
+
+### New source type
+
+1. Add fields to `yard_structs::Source` in `yard-structs/src/config.rs`
+   if you need new optional attributes (e.g. `stream_name`, `api_key`).
+   All new fields should be `Option<T>` or `#[serde(default)]`.
+2. Add a match arm to `source::render_source` in
+   `yard-core/src/codegen/source.rs`. Use `helpers::require_str` for
+   mandatory fields, and `append_spark_options` / `build_options_dict`
+   for the `.option()` passthrough.
+3. If the new type needs a runtime library, add a new predicate (mirror
+   `needs_requests_import`) and plumb it through `generate_python_script`
+   in `codegen/mod.rs`.
+4. Add unit tests to the `#[cfg(test)]` module at the bottom of
+   `codegen/mod.rs` — prefer the pattern of constructing a minimal
+   `JobDefinition` and asserting the rendered string contains the key
+   emitted lines.
+
+### New transform type
+
+1. Add fields to `yard_structs::Transform` if the new type needs them.
+2. Add a match arm to `transform::render_transform` in
+   `yard-core/src/codegen/transform.rs`. Use `transform::resolve_df` to
+   get the `input`/`output` variable names; use `helpers::quoted_list`
+   for column-list arguments.
+3. If the transform requires `F` or `Window`, extend
+   `helpers::needs_functions_import` / `helpers::needs_window_import`.
+4. Add unit tests in `codegen/mod.rs` — the existing aggregate and
+   window tests are good templates.
+
+### New sink type
+
+1. Add fields to `yard_structs::Sink`.
+2. Add a match arm to `sink::render_sink` in
+   `yard-core/src/codegen/sink.rs`. Use `sink::require_sink_str` for
+   mandatory fields.
+3. If the new sink needs boto3 or other runtime libs, extend the
+   predicates in `helpers.rs`.
+4. Document fields in [CONFIGURATION.md](./CONFIGURATION.md) under the
+   sink reference.
+5. Add unit tests.
+
+### New provider
+
+Full steps are in
+[DEVELOPMENT.md → Adding a new provider](./DEVELOPMENT.md#adding-a-new-provider).
+The codegen-specific piece is:
+
+1. Add a new Tera template under `yard-core/src/templates/` (e.g.
+   `databricks.py.tera`). Mirror `glue.py.tera` or `emr.py.tera` —
+   it should accept `job_name`, `imports_block`, and `body` at minimum,
+   and reserve a `def run():` block that wraps `{{ body }}`.
+2. Add an `include_str!` constant at the top of
+   `yard-core/src/codegen/mod.rs` and a new match arm in the `template`
+   selector inside `generate_python_script`.
+3. If the new provider needs extra context keys, insert them on the
+   shared `Context` in `generate_python_script` and reference them in
+   your new template. Keep the keys flat and stringy so the Rust
+   renderers can pre-render everything.
+4. If the provider is task-only (no PySpark artifact), extend
+   `config_merge::is_task_only` instead — codegen will then return an
+   empty string and the provider's `deploy` will never be called with
+   an artifact.
+
+---
+
+## Debugging generated output
+
+### `yard show <job>` — dump the script
+
+From `yard-cli/src/commands/show.rs`: `yard show <name>` looks up `<name>`
+in the project manifest. If it matches a job, it calls
+`yard_core::show(manifest, job_name)` (which wraps
+`generate_python_script`) and prints the result to stdout. If it matches
+a DAG instead, it calls `yard_core::show_dag` — see
+[AIRFLOW.md](./AIRFLOW.md).
+
+```bash
+# From a project directory (or any descendant of it):
+yard show orders
+
+# From outside the project:
+yard show orders --directory ./path/to/project
+```
+
+`show` does **not** upload, deploy, or write state — it is the safest way
+to iterate on a job YAML. Redirect to a file if you want to diff versions:
+
+```bash
+yard show orders > /tmp/orders.after.py
+```
+
+### Where uploaded scripts land in S3
+
+When `yard apply` runs, each provider uses the shared `S3ScriptOps` helper
+(`yard-core/src/providers/mod.rs`) to upload:
+
+- **Bucket:** `providers.<type>.script_bucket` from the root `yard.yaml`.
+  Required; absence is a hard error at provider init.
+- **Prefix:** `providers.<type>.script_prefix`, default `yard-scripts/`.
+  Trailing slash is enforced by `S3ScriptOps::script_key`.
+- **Object key:** `<script_prefix><job_name>.py`.
+- **Content type:** `text/x-python`.
+
+So for `providers.glue.script_bucket: your-script-bucket` and a job named
+`orders`, the script lands at
+`s3://your-script-bucket/yard-scripts/orders.py`.
+
+Inspecting from the shell:
+
+```bash
+aws s3 cp s3://your-script-bucket/yard-scripts/orders.py -
+```
+
+This is the exact byte-for-byte output of `generate_python_script` — if
+`yard show orders` matches what's in S3, you know the deploy path didn't
+mangle anything.
+
+### Common pitfalls
+
+- **`NameError: name 'col' is not defined`** — `filter.condition` and
+  `add_column.expression` are inlined verbatim. If you use `col(...)`
+  without importing it, the Glue runtime fails at job start. Fix by
+  adding `{ name: col, from: pyspark.sql.functions }` to the job's
+  `imports:` block. `F.col(...)` works automatically if any `aggregate`
+  or `window` transform is present (because `from pyspark.sql import
+  functions as F` is auto-injected).
+- **`source '<x>': '<field>' is required`** — thrown by
+  `helpers::require_str` during codegen. The error message names the
+  offending source/field; check CONFIGURATION.md for what that
+  source_type needs.
+- **Iceberg `NoSuchTableException` on first run** — yard's emitted
+  script checks `spark.catalog.tableExists` and creates the table on
+  first write, but only inside the **Glue catalog** named
+  `glue_catalog`. If `providers.glue.warehouse` is unset, the Iceberg
+  Spark catalog configs are not added to `SparkSession.builder` and the
+  catalog isn't registered. Symptom: the script runs but fails with a
+  catalog-not-found error. Fix: set `providers.glue.warehouse` in
+  `yard.yaml`.
+- **Void-typed columns when writing Iceberg from JSON** — this is why
+  `fill_nulls` defaults to `true`. If you turned it off with
+  `fill_nulls: false` and are seeing `cannot write void type`, turn it
+  back on or cast the columns yourself in a `sql` transform.
+- **`yard show` output doesn't match what Glue ran** — usually means
+  the state has the old script's URI pinned (providers re-upload on
+  every `apply`, so this is rare), or you ran `yard show` from the
+  wrong directory and resolved a different job with the same name from
+  a different folder. Confirm with `aws s3 ls` against the configured
+  `script_bucket`.
+
+---
+
+## End-to-end example
+
+A minimal Glue job that reads orders from S3 (parquet), drops an internal
+column, and writes the result back to S3 (parquet, partitioned by
+region).
+
+### Input: `orders.yaml`
+
+```yaml
+job_type: glue
+role: arn:aws:iam::123456789012:role/YardGlueRole
+sources:
+  - name: orders
+    source_type: s3
+    format: parquet
+    path: s3://your-raw-bucket/orders/
+transforms:
+  - transform_type: filter
+    source: orders
+    condition: "col('status') != 'cancelled'"
+  - transform_type: drop_columns
+    source: orders
+    output: orders_cleaned
+    columns:
+      - _debug_flag
+sink:
+  source: orders_cleaned
+  sink_type: s3
+  format: parquet
+  path: s3://your-curated-bucket/orders/
+  mode: overwrite
+  partition_by:
+    - region
+imports:
+  - name: col
+    from: pyspark.sql.functions
+```
+
+### Output: generated PySpark (Glue)
+
+Running `yard show orders` emits (formatted with comments preserved):
+
+```python
+# Generated by YARD for job: orders
+
+import sys
+import logging
+from awsglue.utils import getResolvedOptions
+from pyspark.sql import SparkSession
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.functions import col
+
+logger = logging.getLogger("yard")
+logger.setLevel(logging.INFO)
+
+# --- Glue Setup ---
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+
+spark = (
+    SparkSession.builder
+    .getOrCreate()
+)
+
+sc = spark.sparkContext
+glueContext = GlueContext(sc)
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+
+def run():
+
+    # --- Sources ---
+    df_orders = spark.read.format("parquet").load("s3://your-raw-bucket/orders/")
+
+    # --- Transforms ---
+    df_orders = df_orders.filter(col('status') != 'cancelled')
+    df_orders_cleaned = df_orders.drop("_debug_flag")
+
+    # --- Sink ---
+    df_orders_cleaned.write.format("parquet").mode("overwrite").partitionBy("region").save("s3://your-curated-bucket/orders/")
+
+
+if __name__ == "__main__":
+    try:
+        run()
+        job.commit()
+    except Exception as e:
+        logger.error(f"Job failed: {str(e)}")
+        raise
+```
+
+On `yard apply`, the `GlueProvider` uploads this to
+`s3://your-script-bucket/yard-scripts/orders.py` and points a
+`glueetl` Glue job named `orders` at it, with `--datalake-formats: iceberg`
+default-injected even though this job doesn't use Iceberg (harmless — the
+classpath simply includes the Iceberg libraries).

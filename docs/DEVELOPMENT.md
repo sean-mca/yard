@@ -364,6 +364,10 @@ If the provider doesn't need codegen (task-only types like Airflow's
 for the new type — the provider's `deploy` method won't receive an
 artifact to upload.
 
+See [docs/CODEGEN.md](./CODEGEN.md) for the full codegen reference —
+template context variables, how source/transform/sink dispatch works,
+and where to wire a new source/sink/transform type.
+
 ### 5. Document and test
 
 - Add provider-defaults docs to `docs/CONFIGURATION.md` under the

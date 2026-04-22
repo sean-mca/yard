@@ -139,6 +139,8 @@ Entry point for PySpark codegen. Dispatches on `job_type`:
 
 Source, transform, and sink rendering is split across `codegen/source.rs`, `codegen/transform.rs`, `codegen/sink.rs`, with shared helpers in `codegen/helpers.rs`. Iceberg sinks get additional null-coercion helpers inlined via the `ICEBERG_FILL_NULLS_HELPERS` constant.
 
+For the full PySpark codegen reference — template system, per-source/transform/sink dispatch, provider differences, escape hatches, and an end-to-end rendered example — see [docs/CODEGEN.md](./CODEGEN.md).
+
 ### Airflow DAG codegen — `yard-core/src/airflow_dag/`
 
 - `collection.rs::collect_dags` groups jobs by their nearest `dag.yaml` marker file.
