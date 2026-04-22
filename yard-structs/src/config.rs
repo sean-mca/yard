@@ -206,3 +206,101 @@ pub struct AirflowJobBlock {
     #[serde(flatten, default)]
     pub overrides: AirflowSection,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn state_backend_s3_no_aws_roundtrip() {
+        // Today's yard.yaml (no `aws:` on state) must still parse and
+        // serialize back to the same JSON shape. D-02 strictly additive.
+        let input = json!({
+            "type": "s3",
+            "bucket": "my-bucket",
+            "region": "us-east-1",
+            "key": "state/"
+        });
+        let parsed: StateBackend = serde_json::from_value(input.clone()).unwrap();
+        let reserialized = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(reserialized, input, "aws:null must be skipped on serialize");
+    }
+
+    #[test]
+    fn state_backend_s3_with_aws() {
+        let input = json!({
+            "type": "s3",
+            "bucket": "my-bucket",
+            "region": "us-east-1",
+            "key": "state/",
+            "aws": {
+                "assume_role": "arn:aws:iam::111111111111:role/StateAccess",
+                "external_id": "xid-1"
+            }
+        });
+        let parsed: StateBackend = serde_json::from_value(input.clone()).unwrap();
+        if let StateBackend::S3 { aws, .. } = &parsed {
+            assert_eq!(
+                aws.get("assume_role").and_then(|v| v.as_str()),
+                Some("arn:aws:iam::111111111111:role/StateAccess")
+            );
+            assert_eq!(
+                aws.get("external_id").and_then(|v| v.as_str()),
+                Some("xid-1")
+            );
+        } else {
+            panic!("expected StateBackend::S3");
+        }
+        let reserialized = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(reserialized, input);
+    }
+
+    #[test]
+    fn state_backend_local_unchanged() {
+        let input = json!({ "type": "local", "path": ".yard/state" });
+        let parsed: StateBackend = serde_json::from_value(input.clone()).unwrap();
+        assert!(matches!(parsed, StateBackend::Local { .. }));
+        let reserialized = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(reserialized, input, "Local variant has no aws field");
+    }
+
+    #[test]
+    fn airflow_section_no_aws_roundtrip() {
+        let input = json!({
+            "schedule": "@daily",
+            "owner": "data-eng",
+            "retries": 2,
+            "dags_bucket": null,
+            "dags_prefix": null,
+            "triggered_by": []
+        });
+        let parsed: AirflowSection = serde_json::from_value(input).unwrap();
+        let reserialized = serde_json::to_value(&parsed).unwrap();
+        // aws must be absent from serialized output when Null
+        assert!(
+            reserialized.get("aws").is_none(),
+            "aws:null must be skipped on serialize for AirflowSection"
+        );
+    }
+
+    #[test]
+    fn airflow_section_with_aws() {
+        let input = json!({
+            "schedule": "@daily",
+            "aws": {
+                "assume_role": "arn:aws:iam::222222222222:role/DagUpload",
+                "session_name": "yard-dag"
+            }
+        });
+        let parsed: AirflowSection = serde_json::from_value(input).unwrap();
+        assert_eq!(
+            parsed.aws.get("assume_role").and_then(|v| v.as_str()),
+            Some("arn:aws:iam::222222222222:role/DagUpload")
+        );
+        assert_eq!(
+            parsed.aws.get("session_name").and_then(|v| v.as_str()),
+            Some("yard-dag")
+        );
+    }
+}
