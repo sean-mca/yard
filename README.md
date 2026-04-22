@@ -1,4 +1,4 @@
-
+<!-- generated-by: gsd-doc-writer -->
 # YARD
 
 **YAML Architecture for Rapid Development**
@@ -22,6 +22,19 @@ YARD replaces all of that with a single YAML-driven workflow:
 - **PySpark codegen.** Write transforms in YAML, get production-ready scripts. Or bring your own.
 - **Plan/apply lifecycle.** See what will change before it changes. State is per-job, so teams deploy concurrently without locks.
 - **Airflow DAG generation.** Drop a `dag.yaml` marker in a directory, and YARD generates the DAG Python file with dependency wiring and uploads it to your MWAA bucket.
+
+## Installation
+
+No releases are published yet — build from source:
+
+```bash
+git clone https://github.com/sean-mca/yard.git
+cd yard
+cargo build --release
+# Binary lives at target/release/yard
+```
+
+See [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md) for prerequisites and first-run setup.
 
 ## Demo
 
@@ -116,7 +129,7 @@ Web dashboard with GitHub webhook integration and drift detection. PR-driven wor
 
 ![Drift Detection](docs/images/diff_with_content_sheet.png)
 
-See [yard-server docs](docs/server.md) for setup instructions.
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for setup instructions.
 
 ## Architecture
 
@@ -131,17 +144,29 @@ Rust workspace with four crates:
 
 Provider system is trait-based. Adding a new provider means implementing the `Provider` trait -- no changes to existing code.
 
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a deeper walk-through.
+
 ## Documentation
 
-- [Job definitions](docs/jobs.md) -- sources, transforms, sinks, external scripts
-- [Root config (yard.yaml)](docs/config.md) -- state backends, provider defaults
-- [Airflow DAGs](docs/airflow.md) -- DAG generation, MWAA setup, operator mapping
-- [yard-server](docs/server.md) -- dashboard setup, webhooks, drift detection
+- [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md) -- prerequisites, installation, first run
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) -- system overview, components, data flow
+- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) -- local setup, build commands, code style
+- [docs/TESTING.md](docs/TESTING.md) -- running tests, writing tests, coverage
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) -- yard.yaml, environment variables, state backends
+- [docs/API.md](docs/API.md) -- yard-server HTTP + WebSocket API
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) -- deploying yard-server, webhook setup, drift detection
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+## License
+
+Business Source License 1.1. See [LICENSE](LICENSE) for the full text.
 
 ## AI Disclosure
 Claude was used as follows:
-- yard-server 
+- yard-server
     - UI creation as I'm horrible at FE but wanted to try Dioxus
 - Documentation: This README & `docs/**`
 - General: a partner "architect"
