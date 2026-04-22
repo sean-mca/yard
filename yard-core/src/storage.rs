@@ -516,6 +516,7 @@ pub async fn get_storage(backend: &StateBackend) -> Result<Storage> {
             bucket,
             key,
             region,
+            aws: _,
         } => {
             // State backend loads before yard.yaml is fully parsed, so no aws
             // block is available here — fall through to the default provider
@@ -783,6 +784,7 @@ mod tests {
                 applied_at: "2025-01-01T00:00:00Z".to_string(),
                 s3_uri: None,
             },
+            aws: serde_json::Value::Null,
         }
     }
 

@@ -49,6 +49,11 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
                 .unwrap_or("us-east-1")
                 .to_string(),
             key: state_node["key"].as_str().unwrap_or("state/").to_string(),
+            // Plan 02 owns reading `state.aws` from yaml and env-merging
+            // `YARD_STATE_AWS_*`. Until then, default to Null so Plan 01's
+            // `#[serde(default)]` deserialization behavior is preserved here
+            // and nothing in today's codepath changes.
+            aws: serde_json::Value::Null,
         },
         _ => return Err(anyhow!("Unsupported state type in root")),
     };

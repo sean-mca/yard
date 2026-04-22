@@ -2,9 +2,7 @@ use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
-use yard_structs::{
-    DagDeployment, DagDiff, DagState, DiffType, ProjectManifest,
-};
+use yard_structs::{DagDeployment, DagDiff, DagState, DiffType, ProjectManifest};
 
 use crate::airflow_dag;
 use crate::providers;
@@ -156,11 +154,17 @@ pub async fn apply_dags(
                 let dag_path = dag_gen_dir.join(format!("{}.py", diff.name));
                 std::fs::write(&dag_path, &content)?;
 
-                // Upload to S3 if dags_bucket is configured and not dry-run
-                let s3_uri = if !dry_run {
+                // Upload to S3 if dags_bucket is configured and not dry-run.
+                // Returns (s3_uri, effective_aws) — persist aws on DagState so
+                // the destroy path can re-auth without the DAG's source dir (D-05).
+                let upload_result = if !dry_run {
                     upload_dag_to_s3(manifest, dag, &content).await?
                 } else {
                     None
+                };
+                let (s3_uri, effective_aws) = match upload_result {
+                    Some((uri, aws)) => (Some(uri), aws),
+                    None => (None, Value::Null),
                 };
 
                 let status = if s3_uri.is_some() {
@@ -180,6 +184,7 @@ pub async fn apply_dags(
                         applied_at: chrono::Utc::now().to_rfc3339(),
                         s3_uri,
                     },
+                    aws: effective_aws,
                 };
 
                 storage.write_dag(&diff.name, &dag_state).await?;
@@ -227,35 +232,58 @@ pub async fn apply_dags(
     Ok(result)
 }
 
+/// Resolve the effective `aws:` block for a DAG's upload bucket.
+///
+/// Precedence (highest first):
+///   1. `dag.config.aws` — the `AirflowSection.aws` field (D-05).
+///   2. Root `aws:` shallow-merged with nearest `account.yaml` `aws:` via
+///      `resolve_aws_for_dir` — today's cascade, preserved when the new
+///      `AirflowSection.aws` is Null (D-02 strictly additive).
+///
+/// Per-job `_aws` is intentionally ignored; see the
+/// `dag_upload_credentials_ignore_job_aws` test for the invariant.
+///
+/// Returns `Value::Null` if neither source produces a value; callers pass
+/// `None` to `providers::aws_config` in that case (default chain).
+fn resolve_effective_dag_aws(manifest: &ProjectManifest, dag: &airflow_dag::ResolvedDag) -> Value {
+    if !dag.config.aws.is_null() {
+        // Explicit config on the AirflowSection — use verbatim, no merge.
+        return dag.config.aws.clone();
+    }
+    resolve_aws_for_dir(&manifest.aws, &dag.dir)
+}
+
 /// Upload a generated DAG file to S3 using the resolved dags_bucket/dags_prefix.
-/// Returns `Ok(Some(s3_uri))` on success, `Ok(None)` if no dags_bucket is configured.
+/// Returns `Ok(Some((s3_uri, effective_aws)))` on success — the `effective_aws`
+/// must be persisted on `DagState.aws` so the destroy path can re-authenticate
+/// to the same account without needing the DAG's source dir (D-05).
+/// Returns `Ok(None)` if no `dags_bucket` is configured.
 async fn upload_dag_to_s3(
     manifest: &ProjectManifest,
     dag: &airflow_dag::ResolvedDag,
     content: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, Value)>> {
     let Some(ref bucket) = dag.config.dags_bucket else {
         return Ok(None);
     };
 
     let region = extract_airflow_region(manifest)?;
-    let prefix = dag
-        .config
-        .dags_prefix
-        .as_deref()
-        .unwrap_or("dags/");
+    let prefix = dag.config.dags_prefix.as_deref().unwrap_or("dags/");
 
-    let aws_cfg = resolve_aws_for_dir(&manifest.aws, &dag.dir);
+    let effective_aws = resolve_effective_dag_aws(manifest, dag);
+    let aws_cfg_opt = if effective_aws.is_null() {
+        None
+    } else {
+        Some(&effective_aws)
+    };
     let s3_ops = providers::S3ScriptOps {
-        s3_client: aws_sdk_s3::Client::new(
-            &providers::aws_config(&region, Some(&aws_cfg)).await,
-        ),
+        s3_client: aws_sdk_s3::Client::new(&providers::aws_config(&region, aws_cfg_opt).await),
         script_bucket: bucket.clone(),
         script_prefix: prefix.to_string(),
     };
 
     let uri = s3_ops.upload_script(&dag.name, content).await?;
-    Ok(Some(uri))
+    Ok(Some((uri, effective_aws)))
 }
 
 /// Merge the root `aws:` block with the nearest-ancestor `account.yaml` `aws:`
@@ -430,10 +458,8 @@ mod tests {
     /// cascade (root <- account.yaml) behaves as expected.
     #[test]
     fn dag_upload_credentials_ignore_job_aws() {
-        let tmp = std::env::temp_dir().join(format!(
-            "yard_dag_upload_invariant_{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("yard_dag_upload_invariant_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -516,10 +542,7 @@ mod tests {
         }
     }
 
-    fn make_dag_deployment(
-        content_hash: &str,
-        tasks: Vec<&str>,
-    ) -> DagDeployment {
+    fn make_dag_deployment(content_hash: &str, tasks: Vec<&str>) -> DagDeployment {
         DagDeployment {
             content_hash: content_hash.to_string(),
             config: json!({"schedule": "@daily"}),
@@ -636,10 +659,8 @@ mod tests {
 
     #[test]
     fn resolve_effective_dag_aws_prefers_dag_config_aws() {
-        let tmp = std::env::temp_dir().join(format!(
-            "yard_dag_aws_priority_{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("yard_dag_aws_priority_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -683,10 +704,8 @@ mod tests {
 
     #[test]
     fn resolve_effective_dag_aws_falls_back_to_cascade() {
-        let tmp = std::env::temp_dir().join(format!(
-            "yard_dag_aws_fallback_{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("yard_dag_aws_fallback_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -729,10 +748,7 @@ mod tests {
 
     #[test]
     fn resolve_effective_dag_aws_all_null_returns_null() {
-        let tmp = std::env::temp_dir().join(format!(
-            "yard_dag_aws_null_{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("yard_dag_aws_null_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
