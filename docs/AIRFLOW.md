@@ -175,6 +175,7 @@ shape.
 | `dags_bucket` | string | any layer | — (deployment) | S3 bucket the generated `.py` is uploaded to during `yard apply`. Typically the MWAA DAGs bucket. |
 | `dags_prefix` | string | any layer | — (deployment) | S3 key prefix under `dags_bucket`. Defaults to `dags/` when unset. |
 | `triggered_by` | array of strings | any layer | `schedule=[Dataset("uri"), ...]` | Dataset URIs that trigger the DAG. See [Airflow Datasets](#airflow-datasets). |
+| `aws` | object | any layer | — (deployment) | Optional credential override for DAG upload/destroy. When set, this `aws:` block OVERRIDES the root+account.yaml cascade. Same shape as root `aws:` (`assume_role`, `session_name`, `external_id`). See [DAG bucket credentials](#dag-bucket-credentials). |
 
 Unknown keys in an `airflow:` body are ignored — forward compatibility.
 
@@ -419,6 +420,144 @@ schedule=[Dataset("s3://warehouse/sales/orders"), Dataset("s3://warehouse/sales/
 
 The `from airflow.datasets import Dataset` import is emitted only when the
 DAG uses datasets on either side.
+
+---
+
+## DAG bucket credentials
+
+When your Airflow DAG bucket lives in a different AWS account than your
+deployment targets (common for MWAA in a shared-services account), add
+an optional `aws:` sub-block to the airflow provider config — or to any
+`dag.yaml` / `account.yaml` in the cascade. Example:
+
+```yaml
+providers:
+  airflow:
+    region: us-east-1
+    dags_bucket: my-mwaa-dags
+    dags_prefix: dags/
+    aws:
+      assume_role: arn:aws:iam::333333333333:role/MwaaDagUploader
+      session_name: yard-dag-upload
+```
+
+Resolution order for DAG-upload credentials (highest precedence first):
+
+1. The `aws:` sub-block on `providers.airflow` or on a DAG's resolved
+   `AirflowSection` (after the airflow-section cascade: yard.yaml →
+   account.yaml → region.yaml → dag.yaml → per-job overrides).
+2. The root `aws:` block, shallow-merged with the nearest ancestor
+   `account.yaml`'s `aws:` block (today's cascade; preserved when the
+   new `aws:` sub-block is unset).
+
+**`providers.airflow.aws` OVERRIDES the cascade when set — it does NOT
+merge with `account.yaml`.** Operators who want hierarchical cascade
+behavior should leave the airflow `aws:` unset and rely on root `aws:`
++ `account.yaml`.
+
+**Per-job `_aws` is IGNORED for DAG upload.** This is a locked
+invariant (test `dag_upload_credentials_ignore_job_aws`): a per-job
+`assume_role` affects the job's Glue/EMR provider run, not the DAG
+file upload target. If job and DAG buckets live in the same account,
+set the same `aws:` at both layers; if they diverge, the DAG bucket
+wins for upload/destroy.
+
+**Destroy uses persisted state.** At apply time, yard writes the
+effective DAG `aws:` into `DagState.aws` on the state file
+(`_dag_<name>.json`). At destroy time, `destroy_dag` and
+`destroy_all_dags` read that field and re-authenticate to the same
+account — the DAG's source directory does NOT need to be present.
+
+**Migration note for pre-Phase-9 state.** DAG state files written by
+a pre-Phase-9 yard have no `aws` field; destroy falls back to the
+caller-supplied `aws:` parameter (today sourced from the project
+root). To populate `DagState.aws`, run `yard apply` against the DAG
+once after upgrading to Phase 9.
+
+Implementation:
+`yard-core/src/dag_lifecycle.rs::upload_dag_to_s3`,
+`yard-core/src/dag_lifecycle.rs::resolve_effective_dag_aws`, and
+`yard-core/src/dag_lifecycle.rs::resolve_destroy_dag_aws`.
+
+---
+
+## Worked example: three-account deployment
+
+A realistic configuration where state, deployment targets, and the
+DAG bucket each live in different AWS accounts:
+
+- **Account A (`111111111111`)** — holds the S3 state bucket.
+- **Account B (`222222222222`)** — holds the Glue jobs and EMR
+  clusters (deployment targets).
+- **Account C (`333333333333`)** — holds the MWAA DAG bucket.
+
+Yard is invoked from a CI role in a fourth "runner" account (or any
+account whose IAM allows AssumeRole into roles in A, B, and C).
+
+```yaml
+# yard.yaml
+project: trifecta
+
+state:
+  type: s3
+  bucket: account-a-yard-state
+  region: us-east-1
+  key: trifecta/state/
+  aws:
+    assume_role: arn:aws:iam::111111111111:role/YardStateAccess
+
+# Root aws: targets Account B (deployment targets). Jobs inherit this
+# unless overridden in an account.yaml / region.yaml / job.yaml.
+aws:
+  assume_role: arn:aws:iam::222222222222:role/YardDeploy
+
+providers:
+  glue:
+    region: us-east-1
+    # no aws: here — inherits root (Account B)
+  emr:
+    region: us-east-1
+    # no aws: here — inherits root (Account B)
+  airflow:
+    region: us-east-1
+    dags_bucket: account-c-mwaa-dags
+    dags_prefix: dags/
+    aws:
+      assume_role: arn:aws:iam::333333333333:role/MwaaDagUploader
+```
+
+With this config:
+
+- `yard plan` / `apply` reads and writes state using the
+  `arn:aws:iam::111111111111:role/YardStateAccess` role.
+- Job deploys (Glue/EMR) use
+  `arn:aws:iam::222222222222:role/YardDeploy`.
+- DAG file uploads (and destroys) use
+  `arn:aws:iam::333333333333:role/MwaaDagUploader`.
+
+Each role's IAM trust policy must permit the yard caller to assume
+it. For CI, you can additionally set any of these via env vars to
+override yaml:
+
+```bash
+# In CI, for ephemeral credentials:
+export YARD_STATE_AWS_ASSUME_ROLE=arn:aws:iam::111111111111:role/YardStateAccessCI
+export YARD_STATE_AWS_EXTERNAL_ID=xid-ci-rotate-daily
+export YARD_AWS_ASSUME_ROLE=arn:aws:iam::222222222222:role/YardDeployCI
+# (No dedicated YARD_DAG_AWS_* vars today — the airflow `aws:` sub-block
+# is yaml-only in Phase 9; DAG env overrides are a deferred follow-up.)
+```
+
+**Gotcha: external IDs in yaml vs env.** If your external id is a
+rotating secret, prefer the env vars — yaml is typically git-tracked
+and external IDs should not appear in commits.
+`YARD_STATE_AWS_EXTERNAL_ID` overrides yaml at state-load time.
+
+**Strictly-additive guarantee.** A `yard.yaml` without any of the
+`aws:` sub-blocks above, and without any `YARD_*_AWS_*` envs set,
+resolves credentials exactly as before Phase 9 — the default chain
+for state, the existing root+account.yaml cascade for providers and
+DAG uploads.
 
 ---
 
