@@ -781,4 +781,44 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    // --- Phase 9 Plan 03 Task 2: destroy-path credential resolution ---
+
+    #[test]
+    fn resolve_destroy_dag_aws_prefers_state() {
+        // When DagState.aws is populated, it wins over the caller-supplied
+        // fallback (today's manifest.aws) — this closes D-05's destroy gap.
+        let state_aws = json!({"assume_role": "arn:aws:iam::111111111111:role/FromState"});
+        let fallback = json!({"assume_role": "arn:aws:iam::999999999999:role/Fallback"});
+        let picked = resolve_destroy_dag_aws(&state_aws, &fallback);
+        assert_eq!(
+            picked.get("assume_role").and_then(|v| v.as_str()),
+            Some("arn:aws:iam::111111111111:role/FromState")
+        );
+    }
+
+    #[test]
+    fn resolve_destroy_dag_aws_falls_back_when_state_null() {
+        // Legacy pre-Phase-9 state files have DagState.aws == Null. In that
+        // case, fall back to the caller-supplied aws (typically manifest.aws)
+        // to preserve today's behavior byte-for-byte.
+        let state_aws = Value::Null;
+        let fallback = json!({"assume_role": "arn:aws:iam::999999999999:role/Fallback"});
+        let picked = resolve_destroy_dag_aws(&state_aws, &fallback);
+        assert_eq!(
+            picked.get("assume_role").and_then(|v| v.as_str()),
+            Some("arn:aws:iam::999999999999:role/Fallback")
+        );
+    }
+
+    #[test]
+    fn resolve_destroy_dag_aws_both_null_returns_null() {
+        let state_aws = Value::Null;
+        let fallback = Value::Null;
+        let picked = resolve_destroy_dag_aws(&state_aws, &fallback);
+        assert!(
+            picked.is_null(),
+            "both null → Null → caller passes None to aws_config → default chain (D-02)"
+        );
+    }
 }
