@@ -566,6 +566,22 @@ mod tests {
         assert!(!script.contains(".tableProperty(\"location\""));
     }
 
+    // --- fill_nulls helper shape (Phase 14 regression matrix) ---
+
+    #[test]
+    fn fill_nulls_uses_exact_null_type_check() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        let script = generate_python_script("test_job", &job).unwrap();
+        // New pattern wired (FILL-02 helper body)
+        assert!(script.contains("isinstance(dt, NullType)"));
+        // Old buggy substring-match fully gone (regression guard)
+        assert!(!script.contains("\"void\" in dt.simpleString()"));
+        // NullType appended to emitted pyspark.sql.types imports (FILL-02 import side, D-10)
+        assert!(script.contains("BooleanType, NullType)"));
+    }
+
     // --- Body override still works ---
 
     #[test]
