@@ -108,20 +108,12 @@ pub async fn execute(
 
     println!("\nApplying...");
 
-    // When targeting a single job, filter the manifest
-    let manifest = if let Some(ref name) = target {
-        let mut filtered = project.manifest.clone();
-        filtered.jobs.retain(|k, _| k == name);
-        filtered
-    } else {
-        project.manifest.clone()
-    };
-
     let result = yard_core::apply(
-        &manifest,
+        &project.manifest,
         &project.current_state,
         &project.root_dir,
         dry_run,
+        target,
     )
     .await?;
 
