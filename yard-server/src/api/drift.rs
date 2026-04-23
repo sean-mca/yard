@@ -311,6 +311,30 @@ fn walk_for_jobs(dir: &Path, workdir: &Path, jobs: &mut HashMap<String, JobFileI
     }
 }
 
+fn extract_env_region(job_path: &Path, workdir: &Path) -> (String, String) {
+    let relative = job_path.strip_prefix(workdir).unwrap_or(job_path);
+
+    let segments: Vec<&str> = relative.iter().filter_map(|s| s.to_str()).collect();
+
+    // Path convention: <provider>/<env>/<region>/job.yaml
+    let offset = if segments.first() == Some(&"jobs") {
+        1
+    } else {
+        0
+    };
+
+    let environment = segments
+        .get(1 + offset)
+        .unwrap_or(&"unknown")
+        .to_string();
+    let region = segments
+        .get(2 + offset)
+        .unwrap_or(&"unknown")
+        .to_string();
+
+    (environment, region)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,28 +397,4 @@ mod tests {
         assert_eq!(result.0.drifted, 0);
         assert_eq!(result.0.in_sync, 0);
     }
-}
-
-fn extract_env_region(job_path: &Path, workdir: &Path) -> (String, String) {
-    let relative = job_path.strip_prefix(workdir).unwrap_or(job_path);
-
-    let segments: Vec<&str> = relative.iter().filter_map(|s| s.to_str()).collect();
-
-    // Path convention: <provider>/<env>/<region>/job.yaml
-    let offset = if segments.first() == Some(&"jobs") {
-        1
-    } else {
-        0
-    };
-
-    let environment = segments
-        .get(1 + offset)
-        .unwrap_or(&"unknown")
-        .to_string();
-    let region = segments
-        .get(2 + offset)
-        .unwrap_or(&"unknown")
-        .to_string();
-
-    (environment, region)
 }
