@@ -582,6 +582,16 @@ mod tests {
         assert!(script.contains("BooleanType, NullType)"));
     }
 
+    #[test]
+    fn fill_nulls_top_level_void_still_coerced() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        let script = generate_python_script("test_job", &job).unwrap();
+        // Top-level NullType branch still coerces to empty string (FILL-03/FILL-05.a)
+        assert!(script.contains("F.coalesce(col.cast(\"string\"), F.lit(\"\"))"));
+    }
+
     // --- Body override still works ---
 
     #[test]
