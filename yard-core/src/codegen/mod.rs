@@ -623,6 +623,20 @@ mod tests {
         assert!(script.contains("else:\n            df = df.withColumn(name, F.coalesce(col.cast(\"string\"), F.lit(\"\")))"));
     }
 
+    #[test]
+    fn fill_nulls_coerces_nested_struct_voids() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        let script = generate_python_script("test_job", &job).unwrap();
+        // Non-null struct branch routes through FILL-06 helper (D-12)
+        assert!(script.contains("_yard_coerce_struct_voids(col, dt)"));
+        // The FILL-06 helper is defined in the emitted script
+        assert!(script.contains("def _yard_coerce_struct_voids(col, struct_type):"));
+        // The helper's NullType branch emits an empty-string alias (preserves outer struct shape)
+        assert!(script.contains("F.lit(\"\").alias(f.name)"));
+    }
+
     // --- Body override still works ---
 
     #[test]
