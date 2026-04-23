@@ -114,6 +114,7 @@ pub async fn apply(
     current_state: &ProjectState,
     root_dir: &Path,
     dry_run: bool,
+    target: Option<String>,
 ) -> Result<ApplyResult> {
     // Validate all jobs up front (schema + syntax) — abort before making any changes
     let mut all_errors: Vec<(String, Vec<yard_structs::ValidationError>)> = Vec::new();
@@ -144,10 +145,25 @@ pub async fn apply(
         return Err(anyhow!("{msg}"));
     }
 
+    // Target validation: the name must match a job OR a DAG in the full project.
+    // Runs AFTER orphan validation so structural errors surface before typos (D-03).
+    if let Some(ref name) = target {
+        let is_job = manifest.jobs.contains_key(name);
+        let is_dag = pre_dags.iter().any(|d| &d.name == name);
+        if !is_job && !is_dag {
+            return Err(anyhow!(
+                "target '{name}' not found — no job or DAG with that name"
+            ));
+        }
+    }
+
     let storage = storage::get_storage(&manifest.state).await?;
 
     // Preliminary diff to identify which jobs need locking
-    let preliminary_diffs = calculate_diff(manifest, current_state)?;
+    let mut preliminary_diffs = calculate_diff(manifest, current_state)?;
+    if let Some(ref name) = target {
+        preliminary_diffs.retain(|d| &d.name == name);
+    }
 
     // Lock ALL affected jobs upfront — prevents concurrent applies from
     // modifying state between diff calculation and execution
@@ -173,8 +189,11 @@ pub async fn apply(
             deployments: fresh_deployments,
         };
 
-        // Authoritative diff against fresh state
-        let diffs = calculate_diff(manifest, &fresh_state)?;
+        // Authoritative diff against fresh state (full manifest preserved per TGT-03; filter runs on output).
+        let mut diffs = calculate_diff(manifest, &fresh_state)?;
+        if let Some(ref name) = target {
+            diffs.retain(|d| &d.name == name);
+        }
 
         let mut result = ApplyResult {
             created: Vec::new(),
@@ -300,26 +319,40 @@ pub async fn apply(
         }
 
         // --- DAG phase: generate, diff, deploy DAG files ---
-        let dags = airflow_dag::collect_dags(root_dir, manifest)?;
-        if !dags.is_empty() {
-            let dag_result =
-                apply_dags(manifest, &dags, root_dir, dry_run, &storage).await?;
-            result.dag_created = dag_result.created;
-            result.dag_modified = dag_result.modified;
-            result.dag_deleted = dag_result.deleted;
-            result.dag_required_connections = dag_result.required_connections;
-        } else {
-            // No DAG dirs in the project — clean up any orphaned DAG state
-            let dag_names = storage.list_dags().await?;
-            for dag_name in dag_names {
-                storage.delete_dag(&dag_name).await?;
-                let dag_path = root_dir
-                    .join(".yard/generated/dags")
-                    .join(format!("{dag_name}.py"));
-                if dag_path.exists() {
-                    let _ = std::fs::remove_file(dag_path);
+        // Skip entirely when target is a job name (D-09): narrow-scope applies
+        // must not touch DAG state for DAGs the operator didn't mention.
+        let target_is_job_only = match &target {
+            Some(name) => manifest.jobs.contains_key(name)
+                && !pre_dags.iter().any(|d| &d.name == name),
+            None => false,
+        };
+        if !target_is_job_only {
+            let mut dags = airflow_dag::collect_dags(root_dir, manifest)?;
+            // D-04: when target names a DAG (not a job), deploy only that DAG.
+            // Unrelated DAGs must not be diffed, deployed, or written to state.
+            if let Some(name) = &target {
+                dags.retain(|d| &d.name == name);
+            }
+            if !dags.is_empty() {
+                let dag_result =
+                    apply_dags(manifest, &dags, root_dir, dry_run, &storage).await?;
+                result.dag_created = dag_result.created;
+                result.dag_modified = dag_result.modified;
+                result.dag_deleted = dag_result.deleted;
+                result.dag_required_connections = dag_result.required_connections;
+            } else {
+                // No DAG dirs in the project — clean up any orphaned DAG state
+                let dag_names = storage.list_dags().await?;
+                for dag_name in dag_names {
+                    storage.delete_dag(&dag_name).await?;
+                    let dag_path = root_dir
+                        .join(".yard/generated/dags")
+                        .join(format!("{dag_name}.py"));
+                    if dag_path.exists() {
+                        let _ = std::fs::remove_file(dag_path);
+                    }
+                    result.dag_deleted.push(dag_name);
                 }
-                result.dag_deleted.push(dag_name);
             }
         }
 
@@ -752,7 +785,7 @@ mod tests {
             aws: serde_json::Value::Null,
         };
 
-        let result = apply(&manifest, &empty_state(), &dir, true).await.unwrap();
+        let result = apply(&manifest, &empty_state(), &dir, true, None).await.unwrap();
 
         assert_eq!(result.created, vec!["new_job"]);
         assert!(result.modified.is_empty());
@@ -791,7 +824,7 @@ mod tests {
         };
 
         // Apply first to create state + script
-        apply(&manifest, &empty_state(), &dir, true).await.unwrap();
+        apply(&manifest, &empty_state(), &dir, true, None).await.unwrap();
         assert!(state_dir.join("doomed.json").exists());
         assert!(dir.join(".yard/generated/doomed.py").exists());
 
@@ -847,7 +880,7 @@ mod tests {
         };
 
         // Apply both
-        apply(&manifest, &empty_state(), &dir, true).await.unwrap();
+        apply(&manifest, &empty_state(), &dir, true, None).await.unwrap();
         assert!(state_dir.join("job_a.json").exists());
         assert!(state_dir.join("job_b.json").exists());
 
@@ -885,7 +918,7 @@ mod tests {
             aws: serde_json::Value::Null,
         };
 
-        let result = apply(&manifest, &empty_state(), &dir, true).await;
+        let result = apply(&manifest, &empty_state(), &dir, true, None).await;
         assert!(result.is_err());
         assert!(
             result

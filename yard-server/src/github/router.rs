@@ -314,6 +314,7 @@ async fn handle_webhook(
                                 &project.current_state,
                                 &project.root_dir,
                                 false,
+                                None,
                             )
                             .await
                             {
