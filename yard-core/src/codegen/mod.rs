@@ -43,14 +43,27 @@ const ICEBERG_FILL_NULLS_HELPERS: &str = r#"def _yard_default_struct(struct_type
     return F.struct(*out)
 
 
+def _yard_coerce_struct_voids(col, struct_type):
+    fields = []
+    for f in struct_type.fields:
+        dt = f.dataType
+        if isinstance(dt, NullType):
+            fields.append(F.lit("").alias(f.name))
+        elif isinstance(dt, StructType):
+            fields.append(_yard_coerce_struct_voids(col[f.name], dt).alias(f.name))
+        else:
+            fields.append(col[f.name].alias(f.name))
+    return F.struct(*fields)
+
+
 def _yard_fill_nulls(df):
     for field in df.schema.fields:
         dt, name = field.dataType, field.name
         col = F.col(f"`{name}`")
-        if "void" in dt.simpleString():
+        if isinstance(dt, NullType):
             df = df.withColumn(name, F.coalesce(col.cast("string"), F.lit("")))
         elif isinstance(dt, StructType):
-            df = df.withColumn(name, F.when(col.isNull(), _yard_default_struct(dt)).otherwise(col))
+            df = df.withColumn(name, F.when(col.isNull(), _yard_default_struct(dt)).otherwise(_yard_coerce_struct_voids(col, dt)))
         elif isinstance(dt, ArrayType):
             if isinstance(dt.elementType, StructType):
                 inner = _yard_default_struct(dt.elementType)
@@ -125,7 +138,7 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
     if fill_nulls {
         extra_imports.push(
             "from pyspark.sql.types import (StructType, ArrayType, DoubleType, FloatType, \
-             IntegerType, LongType, TimestampType, DateType, BooleanType)"
+             IntegerType, LongType, TimestampType, DateType, BooleanType, NullType)"
                 .to_string(),
         );
     }
@@ -551,6 +564,77 @@ mod tests {
         job.sink = Some(iceberg_sink("analytics", "events", Some("")));
         let script = generate_python_script("test_job", &job).unwrap();
         assert!(!script.contains(".tableProperty(\"location\""));
+    }
+
+    // --- fill_nulls helper shape (Phase 14 regression matrix) ---
+
+    #[test]
+    fn fill_nulls_uses_exact_null_type_check() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        let script = generate_python_script("test_job", &job).unwrap();
+        // New pattern wired (FILL-02 helper body)
+        assert!(script.contains("isinstance(dt, NullType)"));
+        // Old buggy substring-match fully gone (regression guard)
+        assert!(!script.contains("\"void\" in dt.simpleString()"));
+        // NullType appended to emitted pyspark.sql.types imports (FILL-02 import side, D-10)
+        assert!(script.contains("BooleanType, NullType)"));
+    }
+
+    #[test]
+    fn fill_nulls_top_level_void_still_coerced() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        let script = generate_python_script("test_job", &job).unwrap();
+        // Top-level NullType branch still coerces to empty string (FILL-03/FILL-05.a)
+        assert!(script.contains("F.coalesce(col.cast(\"string\"), F.lit(\"\"))"));
+    }
+
+    #[test]
+    fn fill_nulls_null_struct_still_defaults() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        let script = generate_python_script("test_job", &job).unwrap();
+        // Null-struct branch still invokes _yard_default_struct (FILL-03/FILL-05.b; D-06)
+        assert!(script.contains("_yard_default_struct(dt)"));
+        // StructType branch still wires the null-check guard
+        assert!(script.contains("F.when(col.isNull(), _yard_default_struct(dt))"));
+    }
+
+    #[test]
+    fn fill_nulls_other_branches_intact() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        let script = generate_python_script("test_job", &job).unwrap();
+        // ArrayType branch (with and without nested struct element)
+        assert!(script.contains("elif isinstance(dt, ArrayType):"));
+        assert!(script.contains("F.array().cast(dt)"));
+        // Numeric branch (Double/Float/Integer/Long coalesce to 0)
+        assert!(script.contains("elif isinstance(dt, (DoubleType, FloatType, IntegerType, LongType)):"));
+        assert!(script.contains("F.coalesce(col, F.lit(0).cast(dt))"));
+        // Boolean branch (coalesce to False)
+        assert!(script.contains("elif isinstance(dt, BooleanType):"));
+        assert!(script.contains("F.coalesce(col, F.lit(False))"));
+        // Fallback branch (else → coerce to empty string)
+        assert!(script.contains("else:\n            df = df.withColumn(name, F.coalesce(col.cast(\"string\"), F.lit(\"\")))"));
+    }
+
+    #[test]
+    fn fill_nulls_coerces_nested_struct_voids() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        let script = generate_python_script("test_job", &job).unwrap();
+        // Non-null struct branch routes through FILL-06 helper (D-12)
+        assert!(script.contains("_yard_coerce_struct_voids(col, dt)"));
+        // The FILL-06 helper is defined in the emitted script
+        assert!(script.contains("def _yard_coerce_struct_voids(col, struct_type):"));
+        // The helper's NullType branch emits an empty-string alias (preserves outer struct shape)
+        assert!(script.contains("F.lit(\"\").alias(f.name)"));
     }
 
     // --- Body override still works ---
