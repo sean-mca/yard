@@ -104,6 +104,27 @@ pub struct ApplyResult {
     pub dag_required_connections: Vec<airflow_dag::RequiredConnection>,
 }
 
+/// Validate that `target` (if Some) matches either a job in `manifest.jobs`
+/// or a DAG in `pre_dags` by name. Returns Ok(()) when target is None.
+/// Shared by `apply` and `plan` to guarantee an identical user-visible error
+/// contract across both commands (D-01 of Phase 13; mirrors Phase 12 D-01/D-02).
+pub fn validate_target(
+    manifest: &ProjectManifest,
+    pre_dags: &[airflow_dag::ResolvedDag],
+    target: Option<&str>,
+) -> Result<()> {
+    if let Some(name) = target {
+        let is_job = manifest.jobs.contains_key(name);
+        let is_dag = pre_dags.iter().any(|d| d.name == name);
+        if !is_job && !is_dag {
+            return Err(anyhow!(
+                "target '{name}' not found — no job or DAG with that name"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Apply changes: generate scripts, deploy via provider, update state.
 /// `root_dir` is where `.yard/generated/` lives.
 /// All affected jobs are locked upfront before diffing to prevent race conditions.
@@ -145,17 +166,8 @@ pub async fn apply(
         return Err(anyhow!("{msg}"));
     }
 
-    // Target validation: the name must match a job OR a DAG in the full project.
-    // Runs AFTER orphan validation so structural errors surface before typos (D-03).
-    if let Some(ref name) = target {
-        let is_job = manifest.jobs.contains_key(name);
-        let is_dag = pre_dags.iter().any(|d| &d.name == name);
-        if !is_job && !is_dag {
-            return Err(anyhow!(
-                "target '{name}' not found — no job or DAG with that name"
-            ));
-        }
-    }
+    // Target validation: shared helper, identical contract for apply + plan (D-02).
+    validate_target(manifest, &pre_dags, target.as_deref())?;
 
     let storage = storage::get_storage(&manifest.state).await?;
 
