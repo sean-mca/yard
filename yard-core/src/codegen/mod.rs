@@ -23,6 +23,8 @@ const EMR_TEMPLATE: &str = include_str!("../templates/emr.py.tera");
 /// void schemas or unresolvable nullable nested types. Opt-out via
 /// `fill_nulls: false` on the sink.
 const ICEBERG_FILL_NULLS_HELPERS: &str = r#"def _yard_default_struct(struct_type):
+    if len(struct_type.fields) == 0:
+        return F.struct(F.lit("").cast("string").alias("_yard_empty"))
     out = []
     for f in struct_type.fields:
         dt = f.dataType
@@ -49,6 +51,8 @@ def _yard_has_void(dt):
     if isinstance(dt, NullType):
         return True
     if isinstance(dt, StructType):
+        if len(dt.fields) == 0:
+            return True
         return any(_yard_has_void(f.dataType) for f in dt.fields)
     if isinstance(dt, ArrayType):
         return _yard_has_void(dt.elementType)
@@ -61,6 +65,8 @@ def _yard_void_free_ddl(dt):
     if isinstance(dt, NullType):
         return "string"
     if isinstance(dt, StructType):
+        if len(dt.fields) == 0:
+            return "struct<`_yard_empty`:string>"
         parts = ["`" + f.name.replace("`", "``") + "`:" + _yard_void_free_ddl(f.dataType) for f in dt.fields]
         return "struct<" + ",".join(parts) + ">"
     if isinstance(dt, ArrayType):
@@ -76,6 +82,8 @@ def _yard_coerce_voids(col, dt):
     if isinstance(dt, NullType):
         return F.coalesce(col.cast("string"), F.lit(""))
     if isinstance(dt, StructType):
+        if len(dt.fields) == 0:
+            return F.struct(F.lit("").cast("string").alias("_yard_empty"))
         fields = [_yard_coerce_voids(col[f.name], f.dataType).alias(f.name) for f in dt.fields]
         return F.struct(*fields)
     if isinstance(dt, ArrayType):
@@ -723,6 +731,21 @@ mod tests {
         assert!(script.contains("F.lit(None).cast(target)"));
         // MapType value recursion: structurally-voidful value types recurse through _yard_coerce_voids
         assert!(script.contains("lambda v: _yard_coerce_voids(v, dt.valueType)"));
+    }
+
+    #[test]
+    fn fill_nulls_handles_empty_structs() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        let script = generate_python_script("test_job", &job).unwrap();
+        // Empty structs (struct<>) get a synthetic _yard_empty: string field so Parquet doesn't reject them
+        assert!(script.contains("if len(struct_type.fields) == 0:"));
+        assert!(script.contains("if len(dt.fields) == 0:"));
+        assert!(script.contains("F.struct(F.lit(\"\").cast(\"string\").alias(\"_yard_empty\"))"));
+        assert!(script.contains("\"struct<`_yard_empty`:string>\""));
+        // _yard_has_void flags empty structs so they get routed through coercion
+        assert!(script.contains("if len(dt.fields) == 0:\n            return True"));
     }
 
     #[test]
