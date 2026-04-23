@@ -166,17 +166,8 @@ pub async fn apply(
         return Err(anyhow!("{msg}"));
     }
 
-    // Target validation: the name must match a job OR a DAG in the full project.
-    // Runs AFTER orphan validation so structural errors surface before typos (D-03).
-    if let Some(ref name) = target {
-        let is_job = manifest.jobs.contains_key(name);
-        let is_dag = pre_dags.iter().any(|d| &d.name == name);
-        if !is_job && !is_dag {
-            return Err(anyhow!(
-                "target '{name}' not found — no job or DAG with that name"
-            ));
-        }
-    }
+    // Target validation: shared helper, identical contract for apply + plan (D-02).
+    validate_target(manifest, &pre_dags, target.as_deref())?;
 
     let storage = storage::get_storage(&manifest.state).await?;
 
