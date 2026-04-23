@@ -3,7 +3,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 use yard_structs::{
-    Deployment, DiffType, JobState, ProjectManifest, ProjectState, ResourceStatus,
+    DagDiff, Deployment, DiffType, JobDiff, JobState, ProjectManifest, ProjectState,
+    ResourceStatus,
 };
 
 use crate::airflow_dag;
@@ -104,6 +105,36 @@ pub struct ApplyResult {
     pub dag_required_connections: Vec<airflow_dag::RequiredConnection>,
 }
 
+/// Result of planning changes — the already-filtered diff set.
+/// Mirrors `ApplyResult` for grep parity; minimal two-field shape per D-06
+/// of Phase 13 (extend only when a concrete consumer needs more).
+#[derive(Debug)]
+pub struct PlanResult {
+    pub job_diffs: Vec<JobDiff>,
+    pub dag_diffs: Vec<DagDiff>,
+}
+
+/// Validate that `target` (if Some) matches either a job in `manifest.jobs`
+/// or a DAG in `pre_dags` by name. Returns Ok(()) when target is None.
+/// Shared by `apply` and `plan` to guarantee an identical user-visible error
+/// contract across both commands (D-01 of Phase 13; mirrors Phase 12 D-01/D-02).
+pub fn validate_target(
+    manifest: &ProjectManifest,
+    pre_dags: &[airflow_dag::ResolvedDag],
+    target: Option<&str>,
+) -> Result<()> {
+    if let Some(name) = target {
+        let is_job = manifest.jobs.contains_key(name);
+        let is_dag = pre_dags.iter().any(|d| d.name == name);
+        if !is_job && !is_dag {
+            return Err(anyhow!(
+                "target '{name}' not found — no job or DAG with that name"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Apply changes: generate scripts, deploy via provider, update state.
 /// `root_dir` is where `.yard/generated/` lives.
 /// All affected jobs are locked upfront before diffing to prevent race conditions.
@@ -145,17 +176,8 @@ pub async fn apply(
         return Err(anyhow!("{msg}"));
     }
 
-    // Target validation: the name must match a job OR a DAG in the full project.
-    // Runs AFTER orphan validation so structural errors surface before typos (D-03).
-    if let Some(ref name) = target {
-        let is_job = manifest.jobs.contains_key(name);
-        let is_dag = pre_dags.iter().any(|d| &d.name == name);
-        if !is_job && !is_dag {
-            return Err(anyhow!(
-                "target '{name}' not found — no job or DAG with that name"
-            ));
-        }
-    }
+    // Target validation: shared helper, identical contract for apply + plan (D-02).
+    validate_target(manifest, &pre_dags, target.as_deref())?;
 
     let storage = storage::get_storage(&manifest.state).await?;
 
@@ -364,6 +386,48 @@ pub async fn apply(
     storage.unlock_jobs(&locks).await;
 
     apply_result
+}
+
+/// Compute the filtered diff set for a project — the read-only mirror of `apply`.
+/// Returns already-filtered `job_diffs` and `dag_diffs` per the target contract.
+/// `target=None` returns the full diff set; `target=Some(name)` validates `name`
+/// against jobs+DAGs (D-04) and filters both diff vecs to that name (D-07/D-08 of Phase 13).
+pub async fn plan(
+    manifest: &ProjectManifest,
+    current_state: &ProjectState,
+    root_dir: &Path,
+    target: Option<String>,
+) -> Result<PlanResult> {
+    // Resolve DAGs from the full manifest (D-10 / TGT-03 invariant — unchanged manifest).
+    let pre_dags = airflow_dag::collect_dags(root_dir, manifest)?;
+
+    // Orphan-airflow structural validation runs on the full manifest (D-11(c) disposition: KEEP).
+    let orphans = airflow_dag::validate_orphan_airflow_blocks(manifest, &pre_dags);
+    if !orphans.is_empty() {
+        let mut msg = String::from("Validation failed:\n");
+        for (name, err) in &orphans {
+            msg.push_str(&format!("  [{name}] {err}\n"));
+        }
+        return Err(anyhow!("{msg}"));
+    }
+
+    // Target validation: shared helper, identical contract with apply (D-01 / D-04).
+    validate_target(manifest, &pre_dags, target.as_deref())?;
+
+    // Job diffs against the full manifest; filter on output.
+    let mut job_diffs = calculate_diff(manifest, current_state)?;
+    if let Some(ref name) = target {
+        job_diffs.retain(|d| &d.name == name);
+    }
+
+    // DAG diffs against the full manifest; filter on output.
+    let dag_state = crate::dag_lifecycle::load_dag_state(&manifest.state).await?;
+    let mut dag_diffs = crate::dag_lifecycle::calculate_dag_diffs(manifest, &pre_dags, &dag_state)?;
+    if let Some(ref name) = target {
+        dag_diffs.retain(|d| &d.name == name);
+    }
+
+    Ok(PlanResult { job_diffs, dag_diffs })
 }
 
 /// Validate the state backend is reachable. Local: creates the state directory

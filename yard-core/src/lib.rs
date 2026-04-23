@@ -20,7 +20,8 @@ pub use dag_lifecycle::{
 pub use diff::calculate_diff;
 pub use orchestrate::{
     apply, destroy_all, destroy_job, force_unlock, init_state_backend,
-    load_state, verify_deployed_resources, ApplyResult, DestroyResult,
+    load_state, plan, validate_target, verify_deployed_resources,
+    ApplyResult, DestroyResult, PlanResult,
 };
 pub use parsing::{
     merge_airflow_sections, parse_airflow_job_block, parse_airflow_section,
