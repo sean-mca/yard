@@ -33,7 +33,9 @@ const ICEBERG_FILL_NULLS_HELPERS: &str = r#"def _yard_default_struct(struct_type
         elif isinstance(dt, (IntegerType, LongType)):
             out.append(F.lit(0).cast(dt).alias(f.name))
         elif isinstance(dt, ArrayType):
-            out.append(F.array().cast(dt).alias(f.name))
+            out.append(F.array().cast(_yard_void_free_ddl(dt)).alias(f.name))
+        elif isinstance(dt, MapType):
+            out.append(F.create_map().cast(_yard_void_free_ddl(dt)).alias(f.name))
         elif isinstance(dt, (TimestampType, DateType)):
             out.append(F.lit(None).cast(dt).alias(f.name))
         elif isinstance(dt, BooleanType):
@@ -43,25 +45,63 @@ const ICEBERG_FILL_NULLS_HELPERS: &str = r#"def _yard_default_struct(struct_type
     return F.struct(*out)
 
 
-def _yard_coerce_struct_voids(col, struct_type):
-    fields = []
-    for f in struct_type.fields:
-        dt = f.dataType
-        sub = col[f.name]
-        if isinstance(dt, NullType):
-            fields.append(F.lit("").alias(f.name))
-        elif isinstance(dt, StructType):
-            fields.append(_yard_coerce_struct_voids(sub, dt).alias(f.name))
-        elif isinstance(dt, ArrayType) and isinstance(dt.elementType, NullType):
-            fields.append(F.when(sub.isNull(), F.array().cast("array<string>"))
-                .otherwise(F.transform(sub, lambda _: F.lit(""))).alias(f.name))
-        elif isinstance(dt, ArrayType) and isinstance(dt.elementType, StructType):
-            inner = _yard_default_struct(dt.elementType)
-            fields.append(F.when(sub.isNull(), F.array().cast(dt))
-                .otherwise(F.transform(sub, lambda x: F.when(x.isNull(), inner).otherwise(_yard_coerce_struct_voids(x, dt.elementType)))).alias(f.name))
-        else:
-            fields.append(sub.alias(f.name))
-    return F.struct(*fields)
+def _yard_has_void(dt):
+    if isinstance(dt, NullType):
+        return True
+    if isinstance(dt, StructType):
+        return any(_yard_has_void(f.dataType) for f in dt.fields)
+    if isinstance(dt, ArrayType):
+        return _yard_has_void(dt.elementType)
+    if isinstance(dt, MapType):
+        return _yard_has_void(dt.keyType) or _yard_has_void(dt.valueType)
+    return False
+
+
+def _yard_void_free_ddl(dt):
+    if isinstance(dt, NullType):
+        return "string"
+    if isinstance(dt, StructType):
+        parts = ["`" + f.name.replace("`", "``") + "`:" + _yard_void_free_ddl(f.dataType) for f in dt.fields]
+        return "struct<" + ",".join(parts) + ">"
+    if isinstance(dt, ArrayType):
+        return "array<" + _yard_void_free_ddl(dt.elementType) + ">"
+    if isinstance(dt, MapType):
+        k = "string" if isinstance(dt.keyType, NullType) else _yard_void_free_ddl(dt.keyType)
+        v = "string" if isinstance(dt.valueType, NullType) else _yard_void_free_ddl(dt.valueType)
+        return "map<" + k + "," + v + ">"
+    return dt.simpleString()
+
+
+def _yard_coerce_voids(col, dt):
+    if isinstance(dt, NullType):
+        return F.coalesce(col.cast("string"), F.lit(""))
+    if isinstance(dt, StructType):
+        fields = [_yard_coerce_voids(col[f.name], f.dataType).alias(f.name) for f in dt.fields]
+        return F.struct(*fields)
+    if isinstance(dt, ArrayType):
+        et = dt.elementType
+        target = _yard_void_free_ddl(dt)
+        if isinstance(et, NullType):
+            return F.when(col.isNull(), F.lit(None).cast(target)) \
+                .otherwise(F.transform(col, lambda x: F.coalesce(x.cast("string"), F.lit(""))))
+        if _yard_has_void(et):
+            return F.when(col.isNull(), F.lit(None).cast(target)) \
+                .otherwise(F.transform(col, lambda x: _yard_coerce_voids(x, et)))
+        return col
+    if isinstance(dt, MapType):
+        target = _yard_void_free_ddl(dt)
+        if isinstance(dt.keyType, NullType):
+            return F.create_map().cast("map<string,string>")
+        if isinstance(dt.valueType, NullType):
+            return F.when(col.isNull(), F.lit(None).cast(target)) \
+                .otherwise(F.map_from_arrays(F.map_keys(col),
+                    F.transform(F.map_values(col), lambda _: F.lit(""))))
+        if _yard_has_void(dt.valueType):
+            return F.when(col.isNull(), F.lit(None).cast(target)) \
+                .otherwise(F.map_from_arrays(F.map_keys(col),
+                    F.transform(F.map_values(col), lambda v: _yard_coerce_voids(v, dt.valueType))))
+        return col
+    return col
 
 
 def _yard_fill_nulls(df):
@@ -71,18 +111,19 @@ def _yard_fill_nulls(df):
         if isinstance(dt, NullType):
             df = df.withColumn(name, F.coalesce(col.cast("string"), F.lit("")))
         elif isinstance(dt, StructType):
-            df = df.withColumn(name, F.when(col.isNull(), _yard_default_struct(dt)).otherwise(_yard_coerce_struct_voids(col, dt)))
+            if _yard_has_void(dt):
+                df = df.withColumn(name, F.when(col.isNull(), _yard_default_struct(dt)).otherwise(_yard_coerce_voids(col, dt)))
+            else:
+                df = df.withColumn(name, F.when(col.isNull(), _yard_default_struct(dt)).otherwise(col))
         elif isinstance(dt, ArrayType):
-            et = dt.elementType
-            if isinstance(et, NullType):
-                df = df.withColumn(name, F.when(col.isNull(), F.array().cast("array<string>"))
-                    .otherwise(F.transform(col, lambda _: F.lit(""))))
-            elif isinstance(et, StructType):
-                inner = _yard_default_struct(et)
-                df = df.withColumn(name, F.when(col.isNull(), F.array().cast(dt))
-                    .otherwise(F.transform(col, lambda x: F.when(x.isNull(), inner).otherwise(_yard_coerce_struct_voids(x, et)))))
+            target = _yard_void_free_ddl(dt)
+            if _yard_has_void(dt):
+                df = df.withColumn(name, F.when(col.isNull(), F.array().cast(target)).otherwise(_yard_coerce_voids(col, dt)))
             else:
                 df = df.withColumn(name, F.when(col.isNull(), F.array().cast(dt)).otherwise(col))
+        elif isinstance(dt, MapType):
+            if _yard_has_void(dt):
+                df = df.withColumn(name, _yard_coerce_voids(col, dt))
         elif isinstance(dt, (DoubleType, FloatType, IntegerType, LongType)):
             df = df.withColumn(name, F.coalesce(col, F.lit(0).cast(dt)))
         elif isinstance(dt, BooleanType):
@@ -149,7 +190,7 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
     }
     if fill_nulls {
         extra_imports.push(
-            "from pyspark.sql.types import (StructType, ArrayType, DoubleType, FloatType, \
+            "from pyspark.sql.types import (StructType, ArrayType, MapType, DoubleType, FloatType, \
              IntegerType, LongType, TimestampType, DateType, BooleanType, NullType)"
                 .to_string(),
         );
@@ -578,7 +619,7 @@ mod tests {
         assert!(!script.contains(".tableProperty(\"location\""));
     }
 
-    // --- fill_nulls helper shape (Phase 14 regression matrix) ---
+    // --- fill_nulls helper shape (recursive void coercion) ---
 
     #[test]
     fn fill_nulls_uses_exact_null_type_check() {
@@ -586,12 +627,10 @@ mod tests {
         job.sources = vec![s3_source("events", "s3://b/in")];
         job.sink = Some(iceberg_sink("analytics", "events", None));
         let script = generate_python_script("test_job", &job).unwrap();
-        // New pattern wired (FILL-02 helper body)
+        // Exact NullType check wired in both _yard_fill_nulls and _yard_coerce_voids
         assert!(script.contains("isinstance(dt, NullType)"));
-        // Old buggy substring-match fully gone (regression guard)
+        // Old buggy substring-match fully gone
         assert!(!script.contains("\"void\" in dt.simpleString()"));
-        // NullType appended to emitted pyspark.sql.types imports (FILL-02 import side, D-10)
-        assert!(script.contains("BooleanType, NullType)"));
     }
 
     #[test]
@@ -600,7 +639,6 @@ mod tests {
         job.sources = vec![s3_source("events", "s3://b/in")];
         job.sink = Some(iceberg_sink("analytics", "events", None));
         let script = generate_python_script("test_job", &job).unwrap();
-        // Top-level NullType branch still coerces to empty string (FILL-03/FILL-05.a)
         assert!(script.contains("F.coalesce(col.cast(\"string\"), F.lit(\"\"))"));
     }
 
@@ -610,9 +648,7 @@ mod tests {
         job.sources = vec![s3_source("events", "s3://b/in")];
         job.sink = Some(iceberg_sink("analytics", "events", None));
         let script = generate_python_script("test_job", &job).unwrap();
-        // Null-struct branch still invokes _yard_default_struct (FILL-03/FILL-05.b; D-06)
         assert!(script.contains("_yard_default_struct(dt)"));
-        // StructType branch still wires the null-check guard
         assert!(script.contains("F.when(col.isNull(), _yard_default_struct(dt))"));
     }
 
@@ -622,68 +658,85 @@ mod tests {
         job.sources = vec![s3_source("events", "s3://b/in")];
         job.sink = Some(iceberg_sink("analytics", "events", None));
         let script = generate_python_script("test_job", &job).unwrap();
-        // ArrayType branch (with and without nested struct element)
         assert!(script.contains("elif isinstance(dt, ArrayType):"));
         assert!(script.contains("F.array().cast(dt)"));
-        // Numeric branch (Double/Float/Integer/Long coalesce to 0)
         assert!(script.contains("elif isinstance(dt, (DoubleType, FloatType, IntegerType, LongType)):"));
         assert!(script.contains("F.coalesce(col, F.lit(0).cast(dt))"));
-        // Boolean branch (coalesce to False)
         assert!(script.contains("elif isinstance(dt, BooleanType):"));
         assert!(script.contains("F.coalesce(col, F.lit(False))"));
-        // Fallback branch (else → coerce to empty string)
         assert!(script.contains("else:\n            df = df.withColumn(name, F.coalesce(col.cast(\"string\"), F.lit(\"\")))"));
     }
 
     #[test]
-    fn fill_nulls_coerces_nested_struct_voids() {
+    fn fill_nulls_defines_recursive_helpers() {
         let mut job = base_job();
         job.sources = vec![s3_source("events", "s3://b/in")];
         job.sink = Some(iceberg_sink("analytics", "events", None));
         let script = generate_python_script("test_job", &job).unwrap();
-        // Non-null struct branch routes through FILL-06 helper (D-12)
-        assert!(script.contains("_yard_coerce_struct_voids(col, dt)"));
-        // The FILL-06 helper is defined in the emitted script
-        assert!(script.contains("def _yard_coerce_struct_voids(col, struct_type):"));
-        // The helper's NullType branch emits an empty-string alias (preserves outer struct shape)
-        assert!(script.contains("F.lit(\"\").alias(f.name)"));
+        // Three recursive helpers power the coercion at arbitrary nesting depth
+        assert!(script.contains("def _yard_has_void(dt):"));
+        assert!(script.contains("def _yard_void_free_ddl(dt):"));
+        assert!(script.contains("def _yard_coerce_voids(col, dt):"));
+        // _yard_has_void recognizes every container type
+        assert!(script.contains("isinstance(dt, StructType)"));
+        assert!(script.contains("isinstance(dt, ArrayType)"));
+        assert!(script.contains("isinstance(dt, MapType)"));
     }
 
     #[test]
-    fn fill_nulls_coerces_top_level_array_void() {
+    fn fill_nulls_routes_void_containers_through_coerce_voids() {
         let mut job = base_job();
         job.sources = vec![s3_source("events", "s3://b/in")];
         job.sink = Some(iceberg_sink("analytics", "events", None));
         let script = generate_python_script("test_job", &job).unwrap();
-        // array<void> branch rewrites to array<string> of empty strings so Iceberg can write it
-        assert!(script.contains("if isinstance(et, NullType):"));
-        assert!(script.contains("F.array().cast(\"array<string>\")"));
-        assert!(script.contains("F.transform(col, lambda _: F.lit(\"\"))"));
+        // Top-level struct/array branches gate on _yard_has_void and dispatch to _yard_coerce_voids
+        assert!(script.contains("if _yard_has_void(dt):"));
+        assert!(script.contains(".otherwise(_yard_coerce_voids(col, dt))"));
     }
 
     #[test]
-    fn fill_nulls_coerces_array_of_struct_with_voids() {
+    fn fill_nulls_handles_maps() {
         let mut job = base_job();
         job.sources = vec![s3_source("events", "s3://b/in")];
         job.sink = Some(iceberg_sink("analytics", "events", None));
         let script = generate_python_script("test_job", &job).unwrap();
-        // Non-null elements of array<struct> now route through _yard_coerce_struct_voids
-        assert!(script.contains(".otherwise(_yard_coerce_struct_voids(x, et))"));
-        // Null-element default path preserved
-        assert!(script.contains("F.when(x.isNull(), inner)"));
+        // MapType added to emitted imports
+        assert!(script.contains("StructType, ArrayType, MapType,"));
+        // MapType branch exists in _yard_fill_nulls
+        assert!(script.contains("elif isinstance(dt, MapType):"));
+        // Void-value map path: preserve keys, rewrite values to empty strings via map_from_arrays
+        assert!(script.contains("F.map_from_arrays(F.map_keys(col)"));
+        assert!(script.contains("F.transform(F.map_values(col), lambda _: F.lit(\"\"))"));
+        // Void-key map path: drop to empty string-string map (keys carried no data)
+        assert!(script.contains("F.create_map().cast(\"map<string,string>\")"));
     }
 
     #[test]
-    fn coerce_struct_voids_recurses_through_array() {
+    fn coerce_voids_recurses_through_arrays_and_maps() {
         let mut job = base_job();
         job.sources = vec![s3_source("events", "s3://b/in")];
         job.sink = Some(iceberg_sink("analytics", "events", None));
         let script = generate_python_script("test_job", &job).unwrap();
-        // _yard_coerce_struct_voids handles array<void> fields inside nested structs
-        assert!(script.contains("isinstance(dt, ArrayType) and isinstance(dt.elementType, NullType)"));
-        // _yard_coerce_struct_voids handles array<struct> fields and recurses into each element
-        assert!(script.contains("isinstance(dt, ArrayType) and isinstance(dt.elementType, StructType)"));
-        assert!(script.contains("_yard_coerce_struct_voids(x, dt.elementType)"));
+        // ArrayType recursion: non-void element types pass through col; voidful arrays recurse via F.transform
+        assert!(script.contains("F.transform(col, lambda x: _yard_coerce_voids(x, et))"));
+        // Nested void arrays/maps get cast to the void-free target type on null
+        assert!(script.contains("F.lit(None).cast(target)"));
+        // MapType value recursion: structurally-voidful value types recurse through _yard_coerce_voids
+        assert!(script.contains("lambda v: _yard_coerce_voids(v, dt.valueType)"));
+    }
+
+    #[test]
+    fn void_free_ddl_covers_all_container_types() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        let script = generate_python_script("test_job", &job).unwrap();
+        // _yard_void_free_ddl rewrites NullType → "string" and recurses through containers
+        assert!(script.contains("if isinstance(dt, NullType):\n        return \"string\""));
+        assert!(script.contains("\"array<\" + _yard_void_free_ddl(dt.elementType) + \">\""));
+        assert!(script.contains("\"map<\" + k + \",\" + v + \">\""));
+        // Struct DDL backtick-quotes field names to survive dots/spaces
+        assert!(script.contains("\"`\" + f.name.replace(\"`\", \"``\") + \"`:\""));
     }
 
     // --- Body override still works ---
