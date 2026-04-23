@@ -114,6 +114,7 @@ pub async fn apply(
     current_state: &ProjectState,
     root_dir: &Path,
     dry_run: bool,
+    target: Option<String>,
 ) -> Result<ApplyResult> {
     // Validate all jobs up front (schema + syntax) — abort before making any changes
     let mut all_errors: Vec<(String, Vec<yard_structs::ValidationError>)> = Vec::new();
@@ -752,7 +753,7 @@ mod tests {
             aws: serde_json::Value::Null,
         };
 
-        let result = apply(&manifest, &empty_state(), &dir, true).await.unwrap();
+        let result = apply(&manifest, &empty_state(), &dir, true, None).await.unwrap();
 
         assert_eq!(result.created, vec!["new_job"]);
         assert!(result.modified.is_empty());
@@ -791,7 +792,7 @@ mod tests {
         };
 
         // Apply first to create state + script
-        apply(&manifest, &empty_state(), &dir, true).await.unwrap();
+        apply(&manifest, &empty_state(), &dir, true, None).await.unwrap();
         assert!(state_dir.join("doomed.json").exists());
         assert!(dir.join(".yard/generated/doomed.py").exists());
 
@@ -847,7 +848,7 @@ mod tests {
         };
 
         // Apply both
-        apply(&manifest, &empty_state(), &dir, true).await.unwrap();
+        apply(&manifest, &empty_state(), &dir, true, None).await.unwrap();
         assert!(state_dir.join("job_a.json").exists());
         assert!(state_dir.join("job_b.json").exists());
 
@@ -885,7 +886,7 @@ mod tests {
             aws: serde_json::Value::Null,
         };
 
-        let result = apply(&manifest, &empty_state(), &dir, true).await;
+        let result = apply(&manifest, &empty_state(), &dir, true, None).await;
         assert!(result.is_err());
         assert!(
             result
