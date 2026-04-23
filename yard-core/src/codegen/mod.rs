@@ -43,6 +43,19 @@ const ICEBERG_FILL_NULLS_HELPERS: &str = r#"def _yard_default_struct(struct_type
     return F.struct(*out)
 
 
+def _yard_coerce_struct_voids(col, struct_type):
+    fields = []
+    for f in struct_type.fields:
+        dt = f.dataType
+        if isinstance(dt, NullType):
+            fields.append(F.lit("").alias(f.name))
+        elif isinstance(dt, StructType):
+            fields.append(_yard_coerce_struct_voids(col[f.name], dt).alias(f.name))
+        else:
+            fields.append(col[f.name].alias(f.name))
+    return F.struct(*fields)
+
+
 def _yard_fill_nulls(df):
     for field in df.schema.fields:
         dt, name = field.dataType, field.name
