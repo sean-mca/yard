@@ -47,7 +47,7 @@ def _yard_fill_nulls(df):
     for field in df.schema.fields:
         dt, name = field.dataType, field.name
         col = F.col(f"`{name}`")
-        if "void" in dt.simpleString():
+        if isinstance(dt, NullType):
             df = df.withColumn(name, F.coalesce(col.cast("string"), F.lit("")))
         elif isinstance(dt, StructType):
             df = df.withColumn(name, F.when(col.isNull(), _yard_default_struct(dt)).otherwise(col))
