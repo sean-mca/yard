@@ -592,6 +592,18 @@ mod tests {
         assert!(script.contains("F.coalesce(col.cast(\"string\"), F.lit(\"\"))"));
     }
 
+    #[test]
+    fn fill_nulls_null_struct_still_defaults() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        let script = generate_python_script("test_job", &job).unwrap();
+        // Null-struct branch still invokes _yard_default_struct (FILL-03/FILL-05.b; D-06)
+        assert!(script.contains("_yard_default_struct(dt)"));
+        // StructType branch still wires the null-check guard
+        assert!(script.contains("F.when(col.isNull(), _yard_default_struct(dt))"));
+    }
+
     // --- Body override still works ---
 
     #[test]
