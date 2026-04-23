@@ -327,7 +327,12 @@ pub async fn apply(
             None => false,
         };
         if !target_is_job_only {
-            let dags = airflow_dag::collect_dags(root_dir, manifest)?;
+            let mut dags = airflow_dag::collect_dags(root_dir, manifest)?;
+            // D-04: when target names a DAG (not a job), deploy only that DAG.
+            // Unrelated DAGs must not be diffed, deployed, or written to state.
+            if let Some(name) = &target {
+                dags.retain(|d| &d.name == name);
+            }
             if !dags.is_empty() {
                 let dag_result =
                     apply_dags(manifest, &dags, root_dir, dry_run, &storage).await?;
