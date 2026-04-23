@@ -184,8 +184,7 @@ pub mod test_support {
         async fn get_latest_plan_result(&self, pr_number: u64) -> anyhow::Result<Option<PlanResultRow>> {
             let plans = self.plans.lock().await;
             Ok(plans.iter()
-                .filter(|p| p.pr_number == pr_number)
-                .last()
+                .rfind(|p| p.pr_number == pr_number)
                 .cloned())
         }
         async fn list_plan_results(&self, limit: u32) -> anyhow::Result<Vec<PlanResultRow>> {
@@ -199,8 +198,7 @@ pub mod test_support {
         async fn get_latest_drift_snapshot(&self, job_name: &str) -> anyhow::Result<Option<DriftSnapshot>> {
             let drift = self.drift.lock().await;
             Ok(drift.iter()
-                .filter(|d| d.job_name == job_name)
-                .last()
+                .rfind(|d| d.job_name == job_name)
                 .cloned())
         }
         async fn list_drift_snapshots(&self, drifted_only: bool, limit: u32) -> anyhow::Result<Vec<DriftSnapshot>> {
