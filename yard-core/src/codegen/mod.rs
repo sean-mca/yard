@@ -125,7 +125,7 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
     if fill_nulls {
         extra_imports.push(
             "from pyspark.sql.types import (StructType, ArrayType, DoubleType, FloatType, \
-             IntegerType, LongType, TimestampType, DateType, BooleanType)"
+             IntegerType, LongType, TimestampType, DateType, BooleanType, NullType)"
                 .to_string(),
         );
     }
