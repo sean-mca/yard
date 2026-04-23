@@ -649,6 +649,43 @@ mod tests {
         assert!(script.contains("F.lit(\"\").alias(f.name)"));
     }
 
+    #[test]
+    fn fill_nulls_coerces_top_level_array_void() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        let script = generate_python_script("test_job", &job).unwrap();
+        // array<void> branch rewrites to array<string> of empty strings so Iceberg can write it
+        assert!(script.contains("if isinstance(et, NullType):"));
+        assert!(script.contains("F.array().cast(\"array<string>\")"));
+        assert!(script.contains("F.transform(col, lambda _: F.lit(\"\"))"));
+    }
+
+    #[test]
+    fn fill_nulls_coerces_array_of_struct_with_voids() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        let script = generate_python_script("test_job", &job).unwrap();
+        // Non-null elements of array<struct> now route through _yard_coerce_struct_voids
+        assert!(script.contains(".otherwise(_yard_coerce_struct_voids(x, et))"));
+        // Null-element default path preserved
+        assert!(script.contains("F.when(x.isNull(), inner)"));
+    }
+
+    #[test]
+    fn coerce_struct_voids_recurses_through_array() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        let script = generate_python_script("test_job", &job).unwrap();
+        // _yard_coerce_struct_voids handles array<void> fields inside nested structs
+        assert!(script.contains("isinstance(dt, ArrayType) and isinstance(dt.elementType, NullType)"));
+        // _yard_coerce_struct_voids handles array<struct> fields and recurses into each element
+        assert!(script.contains("isinstance(dt, ArrayType) and isinstance(dt.elementType, StructType)"));
+        assert!(script.contains("_yard_coerce_struct_voids(x, dt.elementType)"));
+    }
+
     // --- Body override still works ---
 
     #[test]
