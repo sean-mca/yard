@@ -293,6 +293,23 @@ async fn count_job_files(
     Ok(0)
 }
 
+fn format_relative_time(dt: chrono::DateTime<chrono::Utc>) -> String {
+    let now = chrono::Utc::now();
+    let duration = now.signed_duration_since(dt);
+
+    if duration.num_minutes() < 1 {
+        "just now".to_string()
+    } else if duration.num_minutes() < 60 {
+        format!("{} min ago", duration.num_minutes())
+    } else if duration.num_hours() < 24 {
+        let h = duration.num_hours();
+        format!("{h} hour{} ago", if h == 1 { "" } else { "s" })
+    } else {
+        let d = duration.num_days();
+        format!("{d} day{} ago", if d == 1 { "" } else { "s" })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,22 +351,5 @@ mod tests {
         let params = Query(PaginationParams { page: None, per_page: None });
         let result = get_dashboard_cached(State(state), params).await.unwrap();
         assert_eq!(result.0.open_prs, 0);
-    }
-}
-
-fn format_relative_time(dt: chrono::DateTime<chrono::Utc>) -> String {
-    let now = chrono::Utc::now();
-    let duration = now.signed_duration_since(dt);
-
-    if duration.num_minutes() < 1 {
-        "just now".to_string()
-    } else if duration.num_minutes() < 60 {
-        format!("{} min ago", duration.num_minutes())
-    } else if duration.num_hours() < 24 {
-        let h = duration.num_hours();
-        format!("{h} hour{} ago", if h == 1 { "" } else { "s" })
-    } else {
-        let d = duration.num_days();
-        format!("{d} day{} ago", if d == 1 { "" } else { "s" })
     }
 }
