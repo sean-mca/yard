@@ -63,7 +63,7 @@ def _yard_fill_nulls(df):
         if isinstance(dt, NullType):
             df = df.withColumn(name, F.coalesce(col.cast("string"), F.lit("")))
         elif isinstance(dt, StructType):
-            df = df.withColumn(name, F.when(col.isNull(), _yard_default_struct(dt)).otherwise(col))
+            df = df.withColumn(name, F.when(col.isNull(), _yard_default_struct(dt)).otherwise(_yard_coerce_struct_voids(col, dt)))
         elif isinstance(dt, ArrayType):
             if isinstance(dt.elementType, StructType):
                 inner = _yard_default_struct(dt.elementType)
