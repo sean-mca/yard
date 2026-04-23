@@ -185,7 +185,7 @@ pub mod test_support {
             let plans = self.plans.lock().await;
             Ok(plans.iter()
                 .filter(|p| p.pr_number == pr_number)
-                .last()
+                .next_back()
                 .cloned())
         }
         async fn list_plan_results(&self, limit: u32) -> anyhow::Result<Vec<PlanResultRow>> {
@@ -200,7 +200,7 @@ pub mod test_support {
             let drift = self.drift.lock().await;
             Ok(drift.iter()
                 .filter(|d| d.job_name == job_name)
-                .last()
+                .next_back()
                 .cloned())
         }
         async fn list_drift_snapshots(&self, drifted_only: bool, limit: u32) -> anyhow::Result<Vec<DriftSnapshot>> {
