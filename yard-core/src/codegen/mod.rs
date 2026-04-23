@@ -47,12 +47,20 @@ def _yard_coerce_struct_voids(col, struct_type):
     fields = []
     for f in struct_type.fields:
         dt = f.dataType
+        sub = col[f.name]
         if isinstance(dt, NullType):
             fields.append(F.lit("").alias(f.name))
         elif isinstance(dt, StructType):
-            fields.append(_yard_coerce_struct_voids(col[f.name], dt).alias(f.name))
+            fields.append(_yard_coerce_struct_voids(sub, dt).alias(f.name))
+        elif isinstance(dt, ArrayType) and isinstance(dt.elementType, NullType):
+            fields.append(F.when(sub.isNull(), F.array().cast("array<string>"))
+                .otherwise(F.transform(sub, lambda _: F.lit(""))).alias(f.name))
+        elif isinstance(dt, ArrayType) and isinstance(dt.elementType, StructType):
+            inner = _yard_default_struct(dt.elementType)
+            fields.append(F.when(sub.isNull(), F.array().cast(dt))
+                .otherwise(F.transform(sub, lambda x: F.when(x.isNull(), inner).otherwise(_yard_coerce_struct_voids(x, dt.elementType)))).alias(f.name))
         else:
-            fields.append(col[f.name].alias(f.name))
+            fields.append(sub.alias(f.name))
     return F.struct(*fields)
 
 
@@ -65,10 +73,14 @@ def _yard_fill_nulls(df):
         elif isinstance(dt, StructType):
             df = df.withColumn(name, F.when(col.isNull(), _yard_default_struct(dt)).otherwise(_yard_coerce_struct_voids(col, dt)))
         elif isinstance(dt, ArrayType):
-            if isinstance(dt.elementType, StructType):
-                inner = _yard_default_struct(dt.elementType)
+            et = dt.elementType
+            if isinstance(et, NullType):
+                df = df.withColumn(name, F.when(col.isNull(), F.array().cast("array<string>"))
+                    .otherwise(F.transform(col, lambda _: F.lit(""))))
+            elif isinstance(et, StructType):
+                inner = _yard_default_struct(et)
                 df = df.withColumn(name, F.when(col.isNull(), F.array().cast(dt))
-                    .otherwise(F.transform(col, lambda x: F.when(x.isNull(), inner).otherwise(x))))
+                    .otherwise(F.transform(col, lambda x: F.when(x.isNull(), inner).otherwise(_yard_coerce_struct_voids(x, et)))))
             else:
                 df = df.withColumn(name, F.when(col.isNull(), F.array().cast(dt)).otherwise(col))
         elif isinstance(dt, (DoubleType, FloatType, IntegerType, LongType)):
