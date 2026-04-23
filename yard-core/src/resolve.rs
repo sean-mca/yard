@@ -239,7 +239,9 @@ fn context_field(dir: &Path, filename: &str, field: &str) -> Value {
 
 /// Deep-merge cascade applied to every job:
 ///
-///     root (yard.yaml)  →  account.yaml  →  region.yaml  →  job-inline
+/// ```text
+/// root (yard.yaml)  →  account.yaml  →  region.yaml  →  job-inline
+/// ```
 ///
 /// Each layer wins over the one before it via `merge_provider_config` (recursive
 /// deep-merge). Both `providers.<type>` and `aws:` follow the same four-layer
