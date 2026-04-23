@@ -604,6 +604,25 @@ mod tests {
         assert!(script.contains("F.when(col.isNull(), _yard_default_struct(dt))"));
     }
 
+    #[test]
+    fn fill_nulls_other_branches_intact() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        let script = generate_python_script("test_job", &job).unwrap();
+        // ArrayType branch (with and without nested struct element)
+        assert!(script.contains("elif isinstance(dt, ArrayType):"));
+        assert!(script.contains("F.array().cast(dt)"));
+        // Numeric branch (Double/Float/Integer/Long coalesce to 0)
+        assert!(script.contains("elif isinstance(dt, (DoubleType, FloatType, IntegerType, LongType)):"));
+        assert!(script.contains("F.coalesce(col, F.lit(0).cast(dt))"));
+        // Boolean branch (coalesce to False)
+        assert!(script.contains("elif isinstance(dt, BooleanType):"));
+        assert!(script.contains("F.coalesce(col, F.lit(False))"));
+        // Fallback branch (else → coerce to empty string)
+        assert!(script.contains("else:\n            df = df.withColumn(name, F.coalesce(col.cast(\"string\"), F.lit(\"\")))"));
+    }
+
     // --- Body override still works ---
 
     #[test]
