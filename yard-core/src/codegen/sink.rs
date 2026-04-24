@@ -15,7 +15,7 @@ pub(super) const ICEBERG_TABLE_PROPERTIES: &[(&str, &str)] = &[
     ("write.distribution-mode", "hash"),
 ];
 
-pub(super) fn render_sink(sink: &Sink, default_source: &str) -> Result<String> {
+pub(super) fn render_sink(sink: &Sink, default_source: &str, fill_nulls: bool) -> Result<String> {
     let source_name = sink.source.as_deref().unwrap_or(default_source);
     let var = format!("df_{source_name}");
     let mut lines = Vec::new();
@@ -94,13 +94,30 @@ pub(super) fn render_sink(sink: &Sink, default_source: &str) -> Result<String> {
                      _glue.create_database(DatabaseInput={{\"Name\": \"{db}\"}})"
             ));
             lines.push(format!("    _tbl = \"glue_catalog.{db}.{table}\""));
+            // Per-branch coercion emission (Phase 18.1).
+            // New-table branch: preserve existing _yard_fill_nulls fallback (D-04).
+            // Existing-table branch: conform to live Iceberg schema, no _yard_empty synthesis (D-05).
+            let new_table_coerce = if fill_nulls {
+                format!("{var} = _yard_fill_nulls({var})\n        ")
+            } else {
+                String::new()
+            };
+            let existing_table_coerce = if fill_nulls {
+                format!(
+                    "# --- Conform to Iceberg table schema ---\n        \
+                     _tgt_schema = _yard_read_iceberg_schema(spark, _tbl)\n        \
+                     {var} = _yard_conform_voids_to_schema({var}, _tgt_schema)\n        "
+                )
+            } else {
+                String::new()
+            };
             lines.push(format!(
                 "    if not spark.catalog.tableExists(_tbl):\n        \
-                     ({var}.writeTo(_tbl)\n            \
+                     {new_table_coerce}({var}.writeTo(_tbl)\n            \
                          .using(\"iceberg\"){partition_clause}{tbl_props}\n            \
                          .create())\n    \
                  else:\n        \
-                     {var}.writeTo(_tbl).option(\"mergeSchema\", \"true\").{write_op}()"
+                     {existing_table_coerce}{var}.writeTo(_tbl).option(\"mergeSchema\", \"true\").{write_op}()"
             ));
         }
         other => {
