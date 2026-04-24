@@ -292,7 +292,7 @@ pub async fn apply_dags(
 ///
 /// Returns `Value::Null` if neither source produces a value; callers pass
 /// `None` to `providers::aws_config` in that case (default chain).
-fn resolve_effective_dag_aws(manifest: &ProjectManifest, dag: &airflow_dag::ResolvedDag) -> Value {
+pub(crate) fn resolve_effective_dag_aws(manifest: &ProjectManifest, dag: &airflow_dag::ResolvedDag) -> Value {
     if !dag.config.aws.is_null() {
         // Explicit config on the AirflowSection — use verbatim, no merge.
         return dag.config.aws.clone();
