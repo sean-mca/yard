@@ -13,7 +13,13 @@ pub async fn execute(name: String, directory: Option<String>) -> Result<()> {
 
     // Try as a DAG
     let dags = yard_core::airflow_dag::collect_dags(&project.root_dir, &project.manifest)?;
-    let script = yard_core::show_dag(&project.manifest, &dags, &name)?;
+    let script = yard_core::show_dag_with_state(
+        &project.manifest,
+        &dags,
+        &name,
+        &project.manifest.state,
+    )
+    .await?;
     print!("{script}");
     Ok(())
 }

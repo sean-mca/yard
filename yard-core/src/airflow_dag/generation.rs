@@ -1,4 +1,5 @@
 use anyhow::{Context as AnyhowContext, Result, anyhow};
+use std::collections::HashMap;
 use tera::{Context, Tera};
 use yard_structs::{AirflowSection, JobDefinition, ProjectManifest};
 
@@ -10,7 +11,11 @@ use super::AIRFLOW_DAG_TEMPLATE;
 use crate::is_task_only;
 
 /// Render a resolved DAG into an Airflow Python file.
-pub fn generate_dag(manifest: &ProjectManifest, dag: &ResolvedDag) -> Result<String> {
+pub fn generate_dag(
+    manifest: &ProjectManifest,
+    dag: &ResolvedDag,
+    script_locations: &HashMap<String, String>,
+) -> Result<String> {
     let mut tera = Tera::default();
     tera.add_raw_template("airflow_dag", AIRFLOW_DAG_TEMPLATE)?;
 
@@ -96,7 +101,7 @@ pub fn generate_dag(manifest: &ProjectManifest, dag: &ResolvedDag) -> Result<Str
     // Task definitions, one per line, indented one level for inside `with DAG:`.
     let mut task_lines = Vec::new();
     for (task_id, job_type, job) in &task_types {
-        task_lines.push(render_task(task_id, job_type, job, manifest)?);
+        task_lines.push(render_task(task_id, job_type, job, manifest, script_locations)?);
     }
     let tasks_block = task_lines.join("\n");
 
@@ -167,6 +172,7 @@ fn render_task(
     job_type: &str,
     job: &JobDefinition,
     manifest: &ProjectManifest,
+    script_locations: &HashMap<String, String>,
 ) -> Result<String> {
     let var = python_var_name(task_id);
     let tid = python_string_literal(task_id);
@@ -187,13 +193,33 @@ fn render_task(
             ))
         }
         "glue" => {
+            let role = job
+                .config
+                .get("role")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!(
+                    "Glue render requires 'config.role' on the resolved job config"
+                ))
+                .with_context(|| format!("task '{task_id}'"))?;
+
+            let script_uri = script_locations
+                .get(task_id)
+                .ok_or_else(|| anyhow!(
+                    "Glue render requires a persisted script URI — \
+                     run 'yard apply' to upload and persist state"
+                ))
+                .with_context(|| format!("task '{task_id}'"))?;
+
             let conn_id = resolve_task_aws_conn_id(job, manifest)
                 .with_context(|| format!("task '{task_id}'"))?;
+
             Ok(format!(
-                "    {var} = GlueJobOperator(\n        task_id={tid},\n        job_name={jn},\n        aws_conn_id={cn},{outlets}\n    )",
+                "    {var} = GlueJobOperator(\n        task_id={tid},\n        job_name={jn},\n        script_location={sl},\n        iam_role_name={ir},\n        aws_conn_id={cn},{outlets}\n    )",
                 var = var,
                 tid = tid,
                 jn = python_string_literal(task_id),
+                sl = python_string_literal(script_uri),
+                ir = python_string_literal(role),
                 cn = python_string_literal(&conn_id),
                 outlets = outlets,
             ))

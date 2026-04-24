@@ -69,13 +69,11 @@ pub struct ResolvedDag {
 /// Filters `deployment.resources` for `type == "s3_object"` and returns
 /// `job_name -> s3_uri`. Jobs without an `s3_object` resource are absent
 /// from the output map (caller decides if that's an error per task).
-//
-// Plan 15-01 (DAG-02) lands this helper independently of its consumers.
-// Plan 15-02 wires `dag_lifecycle::apply_dags` and `show::show_dag` to call
-// it; until then, the non-test lib has no caller and `-D dead_code`
-// (implied by `-D warnings`) would fail CI. Remove this allow when
-// Plan 15-02 merges.
-#[allow(dead_code)]
+///
+/// Consumed by `dag_lifecycle::apply_dags`, `show::show_dag`, and
+/// `orchestrate::plan` to thread per-task script URIs into `generate_dag`
+/// (DAG-02). A public `dag_lifecycle::load_script_locations` wrapper exposes
+/// this to the CLI without widening the helper's visibility.
 pub(crate) fn script_locations_from_state(
     states: &HashMap<String, JobState>,
 ) -> HashMap<String, String> {
@@ -219,7 +217,7 @@ mod tests {
         assert_eq!(dags[0].tasks, vec!["runit".to_string()]);
         assert_eq!(dags[0].config.schedule.as_deref(), Some("@daily"));
 
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
         assert!(script.contains("BashOperator"));
         assert!(script.contains("dag_id=\"test_pipeline\""));
         assert!(script.contains("bash_command=\"echo hi\""));
@@ -256,7 +254,7 @@ mod tests {
         let dags = collect_dags(root, &manifest).unwrap();
         assert_eq!(dags[0].tasks, vec!["a", "b", "c"]);
 
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
         assert!(script.contains("t_a >> t_b"));
         assert!(script.contains("t_b >> t_c"));
         assert!(validate_python_syntax(&script).is_none());
@@ -287,7 +285,7 @@ mod tests {
 
         let dags = collect_dags(root, &manifest).unwrap();
         assert_eq!(dags[0].tasks, vec!["a", "b", "c"]);
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
         assert!(script.contains("t_a >> t_b"));
         assert!(script.contains("t_a >> t_c"));
         assert!(validate_python_syntax(&script).is_none());
@@ -454,7 +452,11 @@ mod tests {
         manifest.jobs.insert("notify".to_string(), notify);
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
         assert!(script.contains("GlueJobOperator"));
         assert!(script.contains("BashOperator"));
         assert!(script.contains("t_orders >> t_notify"));
@@ -526,7 +528,7 @@ mod tests {
 
         let dags = collect_dags(root, &manifest).unwrap();
         assert_eq!(dags[0].tasks, vec!["sales-orders", "sales-shipments"]);
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
         assert!(script.contains("t_sales_orders >> t_sales_shipments"));
     }
 
@@ -552,7 +554,7 @@ mod tests {
             .insert("sales-shipments".to_string(), b);
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
         assert!(script.contains("t_sales_orders >> t_sales_shipments"));
     }
 
@@ -620,7 +622,7 @@ mod tests {
         );
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
         assert!(validate_python_syntax(&script).is_none(), "{script}");
     }
 
@@ -733,7 +735,11 @@ mod tests {
         manifest.jobs.insert("orders".into(), glue_job(&dag_dir));
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
         assert!(script.contains("aws_conn_id=\"aws_default\""));
         assert!(!script.contains("Required Airflow connections"));
     }
@@ -756,7 +762,11 @@ mod tests {
         );
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
         assert!(script.contains("aws_conn_id=\"yard_222222222222_GlueInvoker\""));
         assert!(script.contains("Required Airflow connections"));
         assert!(script.contains("yard_222222222222_GlueInvoker  ->  arn:aws:iam::222222222222:role/GlueInvoker"));
@@ -779,7 +789,11 @@ mod tests {
             .insert("orders".into(), glue_job_with_assume_role(&dag_dir, root_arn));
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
         assert!(script.contains("aws_conn_id=\"aws_default\""));
         assert!(!script.contains("Required Airflow connections"));
     }
@@ -845,7 +859,15 @@ mod tests {
             .insert("orders".into(), glue_job_with_assume_role(&dag_dir, "garbage"));
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let err = generate_dag(&manifest, &dags[0]).unwrap_err();
+        // Supply a populated script_locations so the new D-05/D-06/D-07
+        // checks pass (role is set in the fixture; URI now present), letting
+        // the original "malformed role ARN" error from resolve_task_aws_conn_id
+        // surface unchanged.
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let err = generate_dag(&manifest, &dags[0], &script_locations).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("malformed role ARN"), "error was: {msg}");
     }
@@ -889,7 +911,11 @@ mod tests {
         manifest.jobs.insert("orders".into(), job);
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
         assert!(script.contains("from airflow.datasets import Dataset"));
         assert!(script.contains("outlets=[Dataset(\"s3://warehouse/sales/orders\")]"));
         assert!(validate_python_syntax(&script).is_none(), "{script}");
@@ -906,7 +932,11 @@ mod tests {
         manifest.jobs.insert("orders".into(), glue_job(&dag_dir));
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
         assert!(!script.contains("outlets"));
         assert!(!script.contains("Dataset"));
     }
@@ -925,7 +955,7 @@ mod tests {
         manifest.jobs.insert("agg".into(), bash_job("echo agg", &dag_dir));
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
         assert!(script.contains("from airflow.datasets import Dataset"));
         assert!(script.contains(
             "schedule=[Dataset(\"s3://warehouse/sales/orders\"), Dataset(\"s3://warehouse/sales/shipments\")]"
@@ -948,7 +978,7 @@ mod tests {
         manifest.jobs.insert("task".into(), bash_job("echo hi", &dag_dir));
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
         assert!(script.contains("schedule=[Dataset(\"s3://warehouse/foo\")]"));
         assert!(!script.contains("@daily"));
         assert!(validate_python_syntax(&script).is_none(), "{script}");
@@ -973,7 +1003,7 @@ mod tests {
         manifest.jobs.insert("multi".into(), job);
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
         assert!(script.contains(
             "outlets=[Dataset(\"s3://warehouse/a\"), Dataset(\"s3://warehouse/b\")]"
         ));
