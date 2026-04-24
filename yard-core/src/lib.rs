@@ -3,6 +3,7 @@ pub mod codegen;
 pub mod config_merge;
 pub mod dag_lifecycle;
 pub mod diff;
+pub mod list_targets;
 pub mod orchestrate;
 pub mod parsing;
 pub mod providers;
@@ -30,3 +31,4 @@ pub use parsing::{
     parse_sources, parse_transforms,
 };
 pub use show::{show, show_dag, show_dag_with_state};
+pub use list_targets::{list_targets, TargetRow};
