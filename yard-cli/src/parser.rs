@@ -94,4 +94,24 @@ pub enum Commands {
         #[arg(index = 2)]
         directory: Option<String>,
     },
+
+    /// List deployment targets (jobs + DAGs) as JSON for CI matrix builders
+    List {
+        #[command(subcommand)]
+        target: ListTarget,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ListTarget {
+    /// Emit all deployment targets as a JSON array to stdout
+    Targets {
+        /// Project directory (defaults to current working directory)
+        #[arg(index = 1)]
+        directory: Option<String>,
+
+        /// Accepted for forward-compatibility; JSON is the only output mode in v1.4
+        #[arg(long)]
+        json: bool,
+    },
 }

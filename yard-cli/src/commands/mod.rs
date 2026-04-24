@@ -2,6 +2,7 @@ pub mod apply;
 pub mod destroy;
 pub mod force_unlock;
 pub mod init;
+pub mod list;
 pub mod plan;
 pub mod show;
 pub mod validate;
