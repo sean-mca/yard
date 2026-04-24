@@ -12,8 +12,10 @@ mod helpers;
 mod resolve;
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use yard_structs::AirflowSection;
+use yard_structs::JobState;
 
 // Re-export sub-module items as public API
 pub use collection::collect_dags;
@@ -61,6 +63,33 @@ pub struct ResolvedDag {
     /// Per-task upstream dependencies, sorted. Keys cover every task in
     /// `tasks` (absent entries would be ambiguous).
     pub depends_on: BTreeMap<String, Vec<String>>,
+}
+
+/// Extract the persisted Glue script URI for each job from per-job state.
+/// Filters `deployment.resources` for `type == "s3_object"` and returns
+/// `job_name -> s3_uri`. Jobs without an `s3_object` resource are absent
+/// from the output map (caller decides if that's an error per task).
+//
+// Plan 15-01 (DAG-02) lands this helper independently of its consumers.
+// Plan 15-02 wires `dag_lifecycle::apply_dags` and `show::show_dag` to call
+// it; until then, the non-test lib has no caller and `-D dead_code`
+// (implied by `-D warnings`) would fail CI. Remove this allow when
+// Plan 15-02 merges.
+#[allow(dead_code)]
+pub(crate) fn script_locations_from_state(
+    states: &HashMap<String, JobState>,
+) -> HashMap<String, String> {
+    states
+        .iter()
+        .filter_map(|(job_name, state)| {
+            state
+                .deployment
+                .resources
+                .iter()
+                .find(|r| r.r#type == "s3_object")
+                .map(|r| (job_name.clone(), r.id.clone()))
+        })
+        .collect()
 }
 
 // ------------------------------------------------------------------
