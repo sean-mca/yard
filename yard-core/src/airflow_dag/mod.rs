@@ -70,10 +70,10 @@ pub struct ResolvedDag {
 /// `job_name -> s3_uri`. Jobs without an `s3_object` resource are absent
 /// from the output map (caller decides if that's an error per task).
 ///
-/// Consumed by `dag_lifecycle::apply_dags`, `show::show_dag`, and
-/// `orchestrate::plan` to thread per-task script URIs into `generate_dag`
-/// (DAG-02). A public `dag_lifecycle::load_script_locations` wrapper exposes
-/// this to the CLI without widening the helper's visibility.
+/// This is the projection DAG rendering needs to thread per-task script
+/// URIs into `generate_dag` (DAG-02); call sites pre-compute it via
+/// `dag_lifecycle::load_script_locations_from_storage` (or the public
+/// `load_script_locations` backend wrapper for CLI entry points).
 pub(crate) fn script_locations_from_state(
     states: &HashMap<String, JobState>,
 ) -> HashMap<String, String> {
