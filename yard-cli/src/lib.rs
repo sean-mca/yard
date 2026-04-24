@@ -42,6 +42,11 @@ pub async fn run() -> Result<()> {
             job_name,
             directory,
         } => commands::force_unlock::execute(job_name, directory).await?,
+        parser::Commands::List { target } => match target {
+            parser::ListTarget::Targets { directory, json } => {
+                commands::list::execute(directory, json).await?
+            }
+        },
     };
 
     Ok(())
