@@ -1,0 +1,31 @@
+name: Install yard
+description: Download the yard binary, verify its SHA256 checksum, and add it to PATH. Linux x86_64 only.
+inputs:
+  version:
+    description: yard release tag (e.g. v1.3.4)
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        YARD_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        if [ "${RUNNER_OS:-}" != "Linux" ] || [ "${RUNNER_ARCH:-}" != "X64" ]; then
+          echo "::error::yard composite action supports only Linux x86_64 runners (got os=${RUNNER_OS:-unknown} arch=${RUNNER_ARCH:-unknown})"
+          exit 1
+        fi
+
+        base="https://github.com/sean-mca/yard/releases/download/${YARD_VERSION}"
+        tmp="$(mktemp -d)"
+        curl -fsSL -o "$tmp/yard-linux-x86_64" "$base/yard-linux-x86_64"
+        curl -fsSL -o "$tmp/yard-linux-x86_64.sha256" "$base/yard-linux-x86_64.sha256"
+        (cd "$tmp" && sha256sum -c yard-linux-x86_64.sha256)
+
+        bin_dir="$HOME/.local/bin"
+        mkdir -p "$bin_dir"
+        install -m 0755 "$tmp/yard-linux-x86_64" "$bin_dir/yard"
+        echo "$bin_dir" >> "$GITHUB_PATH"
+        "$bin_dir/yard" --version
