@@ -772,6 +772,84 @@ mod tests {
         assert!(script.contains("yard_222222222222_GlueInvoker  ->  arn:aws:iam::222222222222:role/GlueInvoker"));
     }
 
+    // ---- Phase 15 DAG-03 regression: both new kwargs render correctly ----
+
+    #[test]
+    fn render_task_glue_same_account_emits_role_and_script() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("orders".to_string(), glue_job(&dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
+
+        // DAG-01: iam_role_name from config.role (full ARN, verbatim per D-13)
+        assert!(
+            script.contains("iam_role_name=\"arn:aws:iam::123456789:role/TestGlueRole\""),
+            "expected iam_role_name kwarg from config.role, got:\n{script}"
+        );
+        // DAG-02: script_location from the script_locations map
+        assert!(
+            script.contains("script_location=\"s3://bucket/scripts/orders.py\""),
+            "expected script_location kwarg from script_locations map, got:\n{script}"
+        );
+    }
+
+    #[test]
+    fn render_task_glue_cross_account_emits_role_and_script() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        manifest.aws = json!({"assume_role": "arn:aws:iam::111111111111:role/OperatorA"});
+        manifest.jobs.insert(
+            "orders".into(),
+            glue_job_with_assume_role(
+                &dag_dir,
+                "arn:aws:iam::222222222222:role/GlueInvoker",
+            ),
+        );
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        // D-11: distinct cross-account bucket URI — proves render is indifferent
+        // to which account uploaded the script.
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://cross-acct-bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
+
+        // DAG-01: per-job execution role from config.role — NOT the assume_role ARN.
+        // The assume_role drives aws_conn_id, not iam_role_name.
+        assert!(
+            script.contains("iam_role_name=\"arn:aws:iam::123456789:role/TestGlueRole\""),
+            "expected iam_role_name kwarg from per-job config.role, got:\n{script}"
+        );
+        // DAG-02 + D-11: distinct cross-account bucket URI
+        assert!(
+            script.contains("script_location=\"s3://cross-acct-bucket/scripts/orders.py\""),
+            "expected cross-account script_location kwarg, got:\n{script}"
+        );
+        // D-12: aws_conn_id still emitted under the new kwarg order — proves the
+        // reorder did not drop the cross-account connection contract.
+        assert!(
+            script.contains("aws_conn_id=\"yard_222222222222_GlueInvoker\""),
+            "expected cross-account aws_conn_id, got:\n{script}"
+        );
+    }
+
     #[test]
     fn render_task_glue_same_account_role_uses_default_conn() {
         // Job declares an assume_role that matches the project root — no
