@@ -258,13 +258,6 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
             if let Some(deriv) = render_partition_derivation(job_def, sink_source) {
                 parts.push(deriv);
             }
-            if fill_nulls {
-                let var = format!("df_{sink_source}");
-                parts.push(format!(
-                    "    # --- Null/void coercion for Iceberg ---\n    \
-                     {var} = _yard_fill_nulls({var})"
-                ));
-            }
             // Mirror job-level partition_by onto the iceberg sink so writeTo
             // emits `.partitionedBy(...)` on first table creation.
             let effective_sink = if sink.sink_type == "iceberg" && !job_def.partition_by.is_empty()
@@ -277,7 +270,7 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
             };
             parts.push(format!(
                 "    # --- Sink ---\n{}",
-                render_sink(&effective_sink, default_source)?
+                render_sink(&effective_sink, default_source, fill_nulls)?
             ));
         }
         if parts.is_empty() {
