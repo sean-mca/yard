@@ -37,14 +37,14 @@ pub async fn load_dag_state(
     Ok(deployments)
 }
 
-/// Load the current persisted script URIs for every job in state.
-/// Returns `job_name -> s3_uri` filtered to jobs with a persisted
-/// `s3_object` resource. Used by callers that must pre-compute
+/// Load the current persisted script URIs for every job in state, given an
+/// already-open storage handle. Returns `job_name -> s3_uri` filtered to jobs
+/// with a persisted `s3_object` resource. Single source of truth for the
+/// in-core call sites (`apply_dags`, `plan`, `show_dag`) that must pre-compute
 /// `script_locations` for `calculate_dag_diffs` / `generate_dag`.
-pub async fn load_script_locations(
-    backend: &yard_structs::StateBackend,
+pub(crate) async fn load_script_locations_from_storage(
+    storage: &storage::Storage,
 ) -> Result<HashMap<String, String>> {
-    let storage = storage::get_storage(backend).await?;
     let mut job_states: HashMap<String, JobState> = HashMap::new();
     let job_names = storage.list_jobs().await?;
     for name in &job_names {
@@ -53,6 +53,18 @@ pub async fn load_script_locations(
         }
     }
     Ok(airflow_dag::script_locations_from_state(&job_states))
+}
+
+/// CLI-facing wrapper around `load_script_locations_from_storage`: opens
+/// storage from a state backend and returns the same `job_name -> s3_uri`
+/// projection. Kept as the public entry point so CLI callers don't need to
+/// know about `storage::Storage` directly (per CLAUDE.md "all logic in
+/// yard-core").
+pub async fn load_script_locations(
+    backend: &yard_structs::StateBackend,
+) -> Result<HashMap<String, String>> {
+    let storage = storage::get_storage(backend).await?;
+    load_script_locations_from_storage(&storage).await
 }
 
 /// Compute the diff between resolved DAGs and stored DAG state.
@@ -153,14 +165,7 @@ pub async fn apply_dags(
     // Pre-load all JobStates so DAG render (which now reads each Glue task's
     // persisted script_location from state per DAG-02) does not re-traverse
     // storage per render. Mirrors the dag_states bulk-load above.
-    let mut job_states: HashMap<String, JobState> = HashMap::new();
-    let job_names = storage.list_jobs().await?;
-    for name in &job_names {
-        if let Some(state) = storage.read_job(name).await? {
-            job_states.insert(name.clone(), state);
-        }
-    }
-    let script_locations = airflow_dag::script_locations_from_state(&job_states);
+    let script_locations = load_script_locations_from_storage(storage).await?;
 
     let diffs = calculate_dag_diffs(manifest, dags, &dag_deployments, &script_locations)?;
     let mut result = DagApplyResult {

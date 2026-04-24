@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Context, Result};
-use std::collections::HashMap;
-use yard_structs::{JobState, ProjectManifest, StateBackend};
+use yard_structs::{ProjectManifest, StateBackend};
 
 use crate::airflow_dag;
+use crate::dag_lifecycle;
 use crate::storage;
 
 /// Generate and return the Python content for a DAG without deploying.
@@ -23,14 +23,7 @@ pub async fn show_dag(
 
     // Pre-load JobStates so the renderer can read each Glue task's
     // persisted script_location. Mirrors dag_lifecycle::apply_dags.
-    let mut job_states: HashMap<String, JobState> = HashMap::new();
-    let job_names = storage.list_jobs().await?;
-    for name in &job_names {
-        if let Some(state) = storage.read_job(name).await? {
-            job_states.insert(name.clone(), state);
-        }
-    }
-    let script_locations = airflow_dag::script_locations_from_state(&job_states);
+    let script_locations = dag_lifecycle::load_script_locations_from_storage(storage).await?;
 
     airflow_dag::generate_dag(manifest, dag, &script_locations)
         .with_context(|| format!("Failed to generate DAG \"{dag_name}\""))

@@ -426,15 +426,7 @@ pub async fn plan(
     // Pre-load JobStates so the renderer (via calculate_dag_diffs ->
     // generate_dag) can read each Glue task's persisted script_location
     // per DAG-02. Mirrors apply_dags' bulk-load.
-    let storage = crate::storage::get_storage(&manifest.state).await?;
-    let mut job_states: HashMap<String, JobState> = HashMap::new();
-    let job_names = storage.list_jobs().await?;
-    for name in &job_names {
-        if let Some(state) = storage.read_job(name).await? {
-            job_states.insert(name.clone(), state);
-        }
-    }
-    let script_locations = crate::airflow_dag::script_locations_from_state(&job_states);
+    let script_locations = crate::dag_lifecycle::load_script_locations(&manifest.state).await?;
 
     let mut dag_diffs = crate::dag_lifecycle::calculate_dag_diffs(
         manifest,
