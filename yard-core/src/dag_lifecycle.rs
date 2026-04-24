@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
-use yard_structs::{DagDeployment, DagDiff, DagState, DiffType, ProjectManifest};
+use yard_structs::{DagDeployment, DagDiff, DagState, DiffType, JobState, ProjectManifest};
 
 use crate::airflow_dag;
 use crate::providers;
@@ -42,11 +42,12 @@ pub fn calculate_dag_diffs(
     manifest: &ProjectManifest,
     dags: &[airflow_dag::ResolvedDag],
     dag_deployments: &HashMap<String, DagDeployment>,
+    script_locations: &HashMap<String, String>,
 ) -> Result<Vec<DagDiff>> {
     let mut diffs = Vec::new();
 
     for dag in dags {
-        let content = airflow_dag::generate_dag(manifest, dag)?;
+        let content = airflow_dag::generate_dag(manifest, dag, script_locations)?;
         let current_hash = utils::calculate_hash(&content);
 
         if let Some(existing) = dag_deployments.get(&dag.name) {
@@ -131,7 +132,19 @@ pub async fn apply_dags(
         .map(|(k, v)| (k.clone(), v.deployment.clone()))
         .collect();
 
-    let diffs = calculate_dag_diffs(manifest, dags, &dag_deployments)?;
+    // Pre-load all JobStates so DAG render (which now reads each Glue task's
+    // persisted script_location from state per DAG-02) does not re-traverse
+    // storage per render. Mirrors the dag_states bulk-load above.
+    let mut job_states: HashMap<String, JobState> = HashMap::new();
+    let job_names = storage.list_jobs().await?;
+    for name in &job_names {
+        if let Some(state) = storage.read_job(name).await? {
+            job_states.insert(name.clone(), state);
+        }
+    }
+    let script_locations = airflow_dag::script_locations_from_state(&job_states);
+
+    let diffs = calculate_dag_diffs(manifest, dags, &dag_deployments, &script_locations)?;
     let mut result = DagApplyResult {
         created: Vec::new(),
         modified: Vec::new(),
@@ -154,7 +167,7 @@ pub async fn apply_dags(
                     .find(|d| d.name == diff.name)
                     .ok_or_else(|| anyhow!("DAG {} missing during apply", diff.name))?;
 
-                let content = airflow_dag::generate_dag(manifest, dag)?;
+                let content = airflow_dag::generate_dag(manifest, dag, &script_locations)?;
                 let content_hash = utils::calculate_hash(&content);
 
                 // Write locally
@@ -615,7 +628,8 @@ mod tests {
         };
 
         let dag_deployments = HashMap::new();
-        let diffs = calculate_dag_diffs(&manifest, &[dag], &dag_deployments).unwrap();
+        let diffs =
+            calculate_dag_diffs(&manifest, &[dag], &dag_deployments, &HashMap::new()).unwrap();
         assert_eq!(diffs.len(), 1);
         assert!(matches!(diffs[0].diff_type, DiffType::Create));
         assert_eq!(diffs[0].name, "test_dag");
@@ -638,7 +652,8 @@ mod tests {
             make_dag_deployment("oldhash", vec!["task_a"]),
         )]);
 
-        let diffs = calculate_dag_diffs(&manifest, &[], &dag_deployments).unwrap();
+        let diffs =
+            calculate_dag_diffs(&manifest, &[], &dag_deployments, &HashMap::new()).unwrap();
         assert_eq!(diffs.len(), 1);
         assert!(matches!(diffs[0].diff_type, DiffType::Delete));
         assert_eq!(diffs[0].name, "old_dag");
@@ -661,7 +676,7 @@ mod tests {
         };
 
         // Generate the actual hash that would be produced
-        let content = airflow_dag::generate_dag(&manifest, &dag).unwrap();
+        let content = airflow_dag::generate_dag(&manifest, &dag, &HashMap::new()).unwrap();
         let hash = crate::utils::calculate_hash(&content);
 
         let dag_deployments = HashMap::from([(
@@ -669,7 +684,8 @@ mod tests {
             make_dag_deployment(&hash, vec!["task_a"]),
         )]);
 
-        let diffs = calculate_dag_diffs(&manifest, &[dag], &dag_deployments).unwrap();
+        let diffs =
+            calculate_dag_diffs(&manifest, &[dag], &dag_deployments, &HashMap::new()).unwrap();
         assert!(diffs.is_empty());
     }
 
@@ -695,7 +711,8 @@ mod tests {
             make_dag_deployment("stale_hash", vec!["task_a"]),
         )]);
 
-        let diffs = calculate_dag_diffs(&manifest, &[dag], &dag_deployments).unwrap();
+        let diffs =
+            calculate_dag_diffs(&manifest, &[dag], &dag_deployments, &HashMap::new()).unwrap();
         assert_eq!(diffs.len(), 1);
         assert!(matches!(diffs[0].diff_type, DiffType::Modify { .. }));
     }
