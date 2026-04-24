@@ -69,13 +69,11 @@ pub struct ResolvedDag {
 /// Filters `deployment.resources` for `type == "s3_object"` and returns
 /// `job_name -> s3_uri`. Jobs without an `s3_object` resource are absent
 /// from the output map (caller decides if that's an error per task).
-//
-// Plan 15-01 (DAG-02) lands this helper independently of its consumers.
-// Plan 15-02 wires `dag_lifecycle::apply_dags` and `show::show_dag` to call
-// it; until then, the non-test lib has no caller and `-D dead_code`
-// (implied by `-D warnings`) would fail CI. Remove this allow when
-// Plan 15-02 merges.
-#[allow(dead_code)]
+///
+/// Consumed by `dag_lifecycle::apply_dags`, `show::show_dag`, and
+/// `orchestrate::plan` to thread per-task script URIs into `generate_dag`
+/// (DAG-02). A public `dag_lifecycle::load_script_locations` wrapper exposes
+/// this to the CLI without widening the helper's visibility.
 pub(crate) fn script_locations_from_state(
     states: &HashMap<String, JobState>,
 ) -> HashMap<String, String> {

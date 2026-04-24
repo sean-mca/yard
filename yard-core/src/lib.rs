@@ -29,4 +29,4 @@ pub use parsing::{
     parse_partition_by, parse_partition_timestamp_column, parse_sink,
     parse_sources, parse_transforms,
 };
-pub use show::{show, show_dag};
+pub use show::{show, show_dag, show_dag_with_state};
