@@ -75,7 +75,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use yard_structs::{AirflowJobBlock, ProjectManifest, StateBackend};
+    use yard_structs::{AirflowJobBlock, Deployment, ProjectManifest, Resource, StateBackend};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -949,5 +949,147 @@ mod tests {
             "outlets=[Dataset(\"s3://warehouse/a\"), Dataset(\"s3://warehouse/b\")]"
         ));
         assert!(validate_python_syntax(&script).is_none(), "{script}");
+    }
+
+    // ---- D-09: script_locations_from_state helper ----
+
+    #[test]
+    fn script_locations_from_state_extracts_s3_object_ids() {
+        let mut states: HashMap<String, JobState> = HashMap::new();
+        for name in ["alpha", "beta"] {
+            states.insert(
+                name.to_string(),
+                JobState {
+                    job_name: name.to_string(),
+                    project: "test".to_string(),
+                    deployment: Deployment {
+                        env: None,
+                        config_hash: String::new(),
+                        config: serde_json::Value::Null,
+                        status: "deployed".to_string(),
+                        applied_at: String::new(),
+                        resources: vec![Resource {
+                            r#type: "s3_object".to_string(),
+                            id: format!("s3://bucket/{name}.py"),
+                            provider: "glue".to_string(),
+                        }],
+                    },
+                },
+            );
+        }
+        let out = script_locations_from_state(&states);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out.get("alpha").map(String::as_str), Some("s3://bucket/alpha.py"));
+        assert_eq!(out.get("beta").map(String::as_str), Some("s3://bucket/beta.py"));
+    }
+
+    #[test]
+    fn script_locations_from_state_skips_jobs_without_s3_object() {
+        let mut states: HashMap<String, JobState> = HashMap::new();
+        // Job A: has s3_object
+        states.insert(
+            "a".to_string(),
+            JobState {
+                job_name: "a".to_string(),
+                project: "test".to_string(),
+                deployment: Deployment {
+                    env: None,
+                    config_hash: String::new(),
+                    config: serde_json::Value::Null,
+                    status: "deployed".to_string(),
+                    applied_at: String::new(),
+                    resources: vec![Resource {
+                        r#type: "s3_object".to_string(),
+                        id: "s3://bucket/a.py".to_string(),
+                        provider: "glue".to_string(),
+                    }],
+                },
+            },
+        );
+        // Job B: only glue_job, no s3_object
+        states.insert(
+            "b".to_string(),
+            JobState {
+                job_name: "b".to_string(),
+                project: "test".to_string(),
+                deployment: Deployment {
+                    env: None,
+                    config_hash: String::new(),
+                    config: serde_json::Value::Null,
+                    status: "deployed".to_string(),
+                    applied_at: String::new(),
+                    resources: vec![Resource {
+                        r#type: "glue_job".to_string(),
+                        id: "b_name".to_string(),
+                        provider: "glue".to_string(),
+                    }],
+                },
+            },
+        );
+        // Job C: empty resources
+        states.insert(
+            "c".to_string(),
+            JobState {
+                job_name: "c".to_string(),
+                project: "test".to_string(),
+                deployment: Deployment {
+                    env: None,
+                    config_hash: String::new(),
+                    config: serde_json::Value::Null,
+                    status: "deployed".to_string(),
+                    applied_at: String::new(),
+                    resources: vec![],
+                },
+            },
+        );
+        let out = script_locations_from_state(&states);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.get("a").map(String::as_str), Some("s3://bucket/a.py"));
+        assert!(!out.contains_key("b"));
+        assert!(!out.contains_key("c"));
+    }
+
+    #[test]
+    fn script_locations_from_state_picks_s3_object_not_glue_job() {
+        let mut states: HashMap<String, JobState> = HashMap::new();
+        states.insert(
+            "my_job".to_string(),
+            JobState {
+                job_name: "my_job".to_string(),
+                project: "test".to_string(),
+                deployment: Deployment {
+                    env: None,
+                    config_hash: String::new(),
+                    config: serde_json::Value::Null,
+                    status: "deployed".to_string(),
+                    applied_at: String::new(),
+                    resources: vec![
+                        // glue_job FIRST — filter is by type, not position
+                        Resource {
+                            r#type: "glue_job".to_string(),
+                            id: "my_glue_job_name".to_string(),
+                            provider: "glue".to_string(),
+                        },
+                        Resource {
+                            r#type: "s3_object".to_string(),
+                            id: "s3://bucket/script.py".to_string(),
+                            provider: "glue".to_string(),
+                        },
+                    ],
+                },
+            },
+        );
+        let out = script_locations_from_state(&states);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.get("my_job").map(String::as_str), Some("s3://bucket/script.py"));
+        // Explicitly prove the helper did NOT pick the glue_job id:
+        assert_ne!(out.get("my_job").map(String::as_str), Some("my_glue_job_name"));
+    }
+
+    #[test]
+    fn script_locations_from_state_empty_input() {
+        let states: HashMap<String, JobState> = HashMap::new();
+        let out = script_locations_from_state(&states);
+        assert!(out.is_empty());
     }
 }
