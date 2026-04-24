@@ -234,20 +234,17 @@ fn render_task(
 }
 
 fn render_outlets(job: &JobDefinition) -> String {
-    let produces = job
-        .airflow
+    job.airflow
         .as_ref()
         .map(|a| &a.produces)
-        .filter(|p| !p.is_empty());
-    match produces {
-        Some(uris) => {
+        .filter(|p| !p.is_empty())
+        .map(|uris| {
             let items = uris
                 .iter()
                 .map(|u| format!("Dataset({})", python_string_literal(u)))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("\n        outlets=[{items}],")
-        }
-        None => String::new(),
-    }
+        })
+        .unwrap_or_default()
 }
