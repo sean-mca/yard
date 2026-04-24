@@ -139,6 +139,20 @@ def _yard_fill_nulls(df):
         else:
             df = df.withColumn(name, F.coalesce(col.cast("string"), F.lit("")))
     return df
+
+
+def _yard_read_iceberg_schema(spark, tbl):
+    return spark.table(tbl).schema
+
+
+def _yard_conform_voids_to_schema(df, target):
+    tmap = {f.name: f.dataType for f in target.fields}
+    for field in df.schema.fields:
+        name = field.name
+        dt = field.dataType
+        if name in tmap and (isinstance(dt, NullType) or _yard_has_void(dt)):
+            df = df.withColumn(name, F.lit(None).cast(tmap[name]))
+    return df
 "#;
 
 pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result<String> {
