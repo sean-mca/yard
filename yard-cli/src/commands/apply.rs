@@ -19,7 +19,14 @@ pub async fn execute(
     // Also compute DAG diffs for the plan display
     let dags = yard_core::airflow_dag::collect_dags(&project.root_dir, &project.manifest)?;
     let dag_state = yard_core::load_dag_state(&project.manifest.state).await?;
-    let mut dag_diffs = yard_core::calculate_dag_diffs(&project.manifest, &dags, &dag_state)?;
+    let script_locations =
+        yard_core::load_script_locations(&project.manifest.state).await?;
+    let mut dag_diffs = yard_core::calculate_dag_diffs(
+        &project.manifest,
+        &dags,
+        &dag_state,
+        &script_locations,
+    )?;
 
     if let Some(ref name) = target {
         dag_diffs.retain(|d| &d.name == name);

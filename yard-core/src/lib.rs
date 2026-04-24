@@ -15,7 +15,7 @@ pub mod validation;
 pub use config_merge::{build_provider_config, is_task_only, merge_provider_config};
 pub use dag_lifecycle::{
     apply_dags, calculate_dag_diffs, destroy_all_dags, destroy_dag,
-    load_dag_state, DagApplyResult, DagDestroyResult,
+    load_dag_state, load_script_locations, DagApplyResult, DagDestroyResult,
 };
 pub use diff::calculate_diff;
 pub use orchestrate::{

@@ -37,6 +37,24 @@ pub async fn load_dag_state(
     Ok(deployments)
 }
 
+/// Load the current persisted script URIs for every job in state.
+/// Returns `job_name -> s3_uri` filtered to jobs with a persisted
+/// `s3_object` resource. Used by callers that must pre-compute
+/// `script_locations` for `calculate_dag_diffs` / `generate_dag`.
+pub async fn load_script_locations(
+    backend: &yard_structs::StateBackend,
+) -> Result<HashMap<String, String>> {
+    let storage = storage::get_storage(backend).await?;
+    let mut job_states: HashMap<String, JobState> = HashMap::new();
+    let job_names = storage.list_jobs().await?;
+    for name in &job_names {
+        if let Some(state) = storage.read_job(name).await? {
+            job_states.insert(name.clone(), state);
+        }
+    }
+    Ok(airflow_dag::script_locations_from_state(&job_states))
+}
+
 /// Compute the diff between resolved DAGs and stored DAG state.
 pub fn calculate_dag_diffs(
     manifest: &ProjectManifest,
