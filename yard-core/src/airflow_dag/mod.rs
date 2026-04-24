@@ -772,6 +772,158 @@ mod tests {
         assert!(script.contains("yard_222222222222_GlueInvoker  ->  arn:aws:iam::222222222222:role/GlueInvoker"));
     }
 
+    // ---- Phase 15 DAG-03 regression: both new kwargs render correctly ----
+
+    #[test]
+    fn render_task_glue_same_account_emits_role_and_script() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("orders".to_string(), glue_job(&dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
+
+        // DAG-01: iam_role_name from config.role (full ARN, verbatim per D-13)
+        assert!(
+            script.contains("iam_role_name=\"arn:aws:iam::123456789:role/TestGlueRole\""),
+            "expected iam_role_name kwarg from config.role, got:\n{script}"
+        );
+        // DAG-02: script_location from the script_locations map
+        assert!(
+            script.contains("script_location=\"s3://bucket/scripts/orders.py\""),
+            "expected script_location kwarg from script_locations map, got:\n{script}"
+        );
+    }
+
+    #[test]
+    fn render_task_glue_cross_account_emits_role_and_script() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        manifest.aws = json!({"assume_role": "arn:aws:iam::111111111111:role/OperatorA"});
+        manifest.jobs.insert(
+            "orders".into(),
+            glue_job_with_assume_role(
+                &dag_dir,
+                "arn:aws:iam::222222222222:role/GlueInvoker",
+            ),
+        );
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        // D-11: distinct cross-account bucket URI — proves render is indifferent
+        // to which account uploaded the script.
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://cross-acct-bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
+
+        // DAG-01: per-job execution role from config.role — NOT the assume_role ARN.
+        // The assume_role drives aws_conn_id, not iam_role_name.
+        assert!(
+            script.contains("iam_role_name=\"arn:aws:iam::123456789:role/TestGlueRole\""),
+            "expected iam_role_name kwarg from per-job config.role, got:\n{script}"
+        );
+        // DAG-02 + D-11: distinct cross-account bucket URI
+        assert!(
+            script.contains("script_location=\"s3://cross-acct-bucket/scripts/orders.py\""),
+            "expected cross-account script_location kwarg, got:\n{script}"
+        );
+        // D-12: aws_conn_id still emitted under the new kwarg order — proves the
+        // reorder did not drop the cross-account connection contract.
+        assert!(
+            script.contains("aws_conn_id=\"yard_222222222222_GlueInvoker\""),
+            "expected cross-account aws_conn_id, got:\n{script}"
+        );
+    }
+
+    // ---- Phase 15 DAG-04 regression: D-06/D-07 error-path wording ----
+
+    #[test]
+    fn render_task_glue_missing_script_uri_errors() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("orders".to_string(), glue_job(&dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        // Empty script_locations: role check passes (fixture sets role), then
+        // script URI lookup fails per D-05 ordering -> D-07 error surfaces.
+        let script_locations: HashMap<String, String> = HashMap::new();
+        let err = generate_dag(&manifest, &dags[0], &script_locations).unwrap_err();
+        // `{err:#}` renders the full anyhow chain with outer `with_context` joined.
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("task 'orders'"),
+            "expected 'task \\'orders\\'' prefix from with_context, got: {chain}"
+        );
+        assert!(
+            chain.contains("persisted script URI"),
+            "expected D-07 'persisted script URI' wording, got: {chain}"
+        );
+    }
+
+    #[test]
+    fn render_task_glue_missing_role_errors() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        // Inline fixture: Glue task whose config does NOT contain `role`.
+        // Do not modify the shared `glue_job` fixture — other tests depend on
+        // it having a role.
+        manifest.jobs.insert(
+            "orders".to_string(),
+            JobDefinition {
+                job_type: "glue".to_string(),
+                config: json!({
+                    "type": "glue",
+                    // role intentionally omitted
+                }),
+                dir: dag_dir.to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        // Populated script_locations so the role check (D-05 first) is the
+        // failing predicate — proving ordering contract.
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let err = generate_dag(&manifest, &dags[0], &script_locations).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("task 'orders'"),
+            "expected 'task \\'orders\\'' prefix from with_context, got: {chain}"
+        );
+        assert!(
+            chain.contains("'config.role'"),
+            "expected D-06 'config.role' wording, got: {chain}"
+        );
+    }
+
     #[test]
     fn render_task_glue_same_account_role_uses_default_conn() {
         // Job declares an assume_role that matches the project root — no
