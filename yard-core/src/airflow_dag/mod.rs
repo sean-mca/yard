@@ -12,8 +12,10 @@ mod helpers;
 mod resolve;
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use yard_structs::AirflowSection;
+use yard_structs::JobState;
 
 // Re-export sub-module items as public API
 pub use collection::collect_dags;
@@ -63,6 +65,31 @@ pub struct ResolvedDag {
     pub depends_on: BTreeMap<String, Vec<String>>,
 }
 
+/// Extract the persisted Glue script URI for each job from per-job state.
+/// Filters `deployment.resources` for `type == "s3_object"` and returns
+/// `job_name -> s3_uri`. Jobs without an `s3_object` resource are absent
+/// from the output map (caller decides if that's an error per task).
+///
+/// This is the projection DAG rendering needs to thread per-task script
+/// URIs into `generate_dag` (DAG-02); call sites pre-compute it via
+/// `dag_lifecycle::load_script_locations_from_storage` (or the public
+/// `load_script_locations` backend wrapper for CLI entry points).
+pub(crate) fn script_locations_from_state(
+    states: &HashMap<String, JobState>,
+) -> HashMap<String, String> {
+    states
+        .iter()
+        .filter_map(|(job_name, state)| {
+            state
+                .deployment
+                .resources
+                .iter()
+                .find(|r| r.r#type == "s3_object")
+                .map(|r| (job_name.clone(), r.id.clone()))
+        })
+        .collect()
+}
+
 // ------------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------------
@@ -75,7 +102,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use yard_structs::{AirflowJobBlock, ProjectManifest, StateBackend};
+    use yard_structs::{AirflowJobBlock, Deployment, ProjectManifest, Resource, StateBackend};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -190,7 +217,7 @@ mod tests {
         assert_eq!(dags[0].tasks, vec!["runit".to_string()]);
         assert_eq!(dags[0].config.schedule.as_deref(), Some("@daily"));
 
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
         assert!(script.contains("BashOperator"));
         assert!(script.contains("dag_id=\"test_pipeline\""));
         assert!(script.contains("bash_command=\"echo hi\""));
@@ -227,7 +254,7 @@ mod tests {
         let dags = collect_dags(root, &manifest).unwrap();
         assert_eq!(dags[0].tasks, vec!["a", "b", "c"]);
 
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
         assert!(script.contains("t_a >> t_b"));
         assert!(script.contains("t_b >> t_c"));
         assert!(validate_python_syntax(&script).is_none());
@@ -258,7 +285,7 @@ mod tests {
 
         let dags = collect_dags(root, &manifest).unwrap();
         assert_eq!(dags[0].tasks, vec!["a", "b", "c"]);
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
         assert!(script.contains("t_a >> t_b"));
         assert!(script.contains("t_a >> t_c"));
         assert!(validate_python_syntax(&script).is_none());
@@ -425,7 +452,11 @@ mod tests {
         manifest.jobs.insert("notify".to_string(), notify);
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
         assert!(script.contains("GlueJobOperator"));
         assert!(script.contains("BashOperator"));
         assert!(script.contains("t_orders >> t_notify"));
@@ -497,7 +528,7 @@ mod tests {
 
         let dags = collect_dags(root, &manifest).unwrap();
         assert_eq!(dags[0].tasks, vec!["sales-orders", "sales-shipments"]);
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
         assert!(script.contains("t_sales_orders >> t_sales_shipments"));
     }
 
@@ -523,7 +554,7 @@ mod tests {
             .insert("sales-shipments".to_string(), b);
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
         assert!(script.contains("t_sales_orders >> t_sales_shipments"));
     }
 
@@ -591,7 +622,7 @@ mod tests {
         );
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
         assert!(validate_python_syntax(&script).is_none(), "{script}");
     }
 
@@ -704,7 +735,11 @@ mod tests {
         manifest.jobs.insert("orders".into(), glue_job(&dag_dir));
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
         assert!(script.contains("aws_conn_id=\"aws_default\""));
         assert!(!script.contains("Required Airflow connections"));
     }
@@ -727,10 +762,166 @@ mod tests {
         );
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
         assert!(script.contains("aws_conn_id=\"yard_222222222222_GlueInvoker\""));
         assert!(script.contains("Required Airflow connections"));
         assert!(script.contains("yard_222222222222_GlueInvoker  ->  arn:aws:iam::222222222222:role/GlueInvoker"));
+    }
+
+    // ---- Phase 15 DAG-03 regression: both new kwargs render correctly ----
+
+    #[test]
+    fn render_task_glue_same_account_emits_role_and_script() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("orders".to_string(), glue_job(&dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
+
+        // DAG-01: iam_role_name from config.role (full ARN, verbatim per D-13)
+        assert!(
+            script.contains("iam_role_name=\"arn:aws:iam::123456789:role/TestGlueRole\""),
+            "expected iam_role_name kwarg from config.role, got:\n{script}"
+        );
+        // DAG-02: script_location from the script_locations map
+        assert!(
+            script.contains("script_location=\"s3://bucket/scripts/orders.py\""),
+            "expected script_location kwarg from script_locations map, got:\n{script}"
+        );
+    }
+
+    #[test]
+    fn render_task_glue_cross_account_emits_role_and_script() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        manifest.aws = json!({"assume_role": "arn:aws:iam::111111111111:role/OperatorA"});
+        manifest.jobs.insert(
+            "orders".into(),
+            glue_job_with_assume_role(
+                &dag_dir,
+                "arn:aws:iam::222222222222:role/GlueInvoker",
+            ),
+        );
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        // D-11: distinct cross-account bucket URI — proves render is indifferent
+        // to which account uploaded the script.
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://cross-acct-bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
+
+        // DAG-01: per-job execution role from config.role — NOT the assume_role ARN.
+        // The assume_role drives aws_conn_id, not iam_role_name.
+        assert!(
+            script.contains("iam_role_name=\"arn:aws:iam::123456789:role/TestGlueRole\""),
+            "expected iam_role_name kwarg from per-job config.role, got:\n{script}"
+        );
+        // DAG-02 + D-11: distinct cross-account bucket URI
+        assert!(
+            script.contains("script_location=\"s3://cross-acct-bucket/scripts/orders.py\""),
+            "expected cross-account script_location kwarg, got:\n{script}"
+        );
+        // D-12: aws_conn_id still emitted under the new kwarg order — proves the
+        // reorder did not drop the cross-account connection contract.
+        assert!(
+            script.contains("aws_conn_id=\"yard_222222222222_GlueInvoker\""),
+            "expected cross-account aws_conn_id, got:\n{script}"
+        );
+    }
+
+    // ---- Phase 15 DAG-04 regression: D-06/D-07 error-path wording ----
+
+    #[test]
+    fn render_task_glue_missing_script_uri_errors() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("orders".to_string(), glue_job(&dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        // Empty script_locations: role check passes (fixture sets role), then
+        // script URI lookup fails per D-05 ordering -> D-07 error surfaces.
+        let script_locations: HashMap<String, String> = HashMap::new();
+        let err = generate_dag(&manifest, &dags[0], &script_locations).unwrap_err();
+        // `{err:#}` renders the full anyhow chain with outer `with_context` joined.
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("task 'orders'"),
+            "expected 'task \\'orders\\'' prefix from with_context, got: {chain}"
+        );
+        assert!(
+            chain.contains("persisted script URI"),
+            "expected D-07 'persisted script URI' wording, got: {chain}"
+        );
+    }
+
+    #[test]
+    fn render_task_glue_missing_role_errors() {
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        // Inline fixture: Glue task whose config does NOT contain `role`.
+        // Do not modify the shared `glue_job` fixture — other tests depend on
+        // it having a role.
+        manifest.jobs.insert(
+            "orders".to_string(),
+            JobDefinition {
+                job_type: "glue".to_string(),
+                config: json!({
+                    "type": "glue",
+                    // role intentionally omitted
+                }),
+                dir: dag_dir.to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        // Populated script_locations so the role check (D-05 first) is the
+        // failing predicate — proving ordering contract.
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let err = generate_dag(&manifest, &dags[0], &script_locations).unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("task 'orders'"),
+            "expected 'task \\'orders\\'' prefix from with_context, got: {chain}"
+        );
+        assert!(
+            chain.contains("'config.role'"),
+            "expected D-06 'config.role' wording, got: {chain}"
+        );
     }
 
     #[test]
@@ -750,7 +941,11 @@ mod tests {
             .insert("orders".into(), glue_job_with_assume_role(&dag_dir, root_arn));
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
         assert!(script.contains("aws_conn_id=\"aws_default\""));
         assert!(!script.contains("Required Airflow connections"));
     }
@@ -816,7 +1011,15 @@ mod tests {
             .insert("orders".into(), glue_job_with_assume_role(&dag_dir, "garbage"));
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let err = generate_dag(&manifest, &dags[0]).unwrap_err();
+        // Supply a populated script_locations so the new D-05/D-06/D-07
+        // checks pass (role is set in the fixture; URI now present), letting
+        // the original "malformed role ARN" error from resolve_task_aws_conn_id
+        // surface unchanged.
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let err = generate_dag(&manifest, &dags[0], &script_locations).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("malformed role ARN"), "error was: {msg}");
     }
@@ -860,7 +1063,11 @@ mod tests {
         manifest.jobs.insert("orders".into(), job);
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
         assert!(script.contains("from airflow.datasets import Dataset"));
         assert!(script.contains("outlets=[Dataset(\"s3://warehouse/sales/orders\")]"));
         assert!(validate_python_syntax(&script).is_none(), "{script}");
@@ -877,7 +1084,11 @@ mod tests {
         manifest.jobs.insert("orders".into(), glue_job(&dag_dir));
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script_locations: HashMap<String, String> =
+            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
+                .into_iter()
+                .collect();
+        let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
         assert!(!script.contains("outlets"));
         assert!(!script.contains("Dataset"));
     }
@@ -896,7 +1107,7 @@ mod tests {
         manifest.jobs.insert("agg".into(), bash_job("echo agg", &dag_dir));
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
         assert!(script.contains("from airflow.datasets import Dataset"));
         assert!(script.contains(
             "schedule=[Dataset(\"s3://warehouse/sales/orders\"), Dataset(\"s3://warehouse/sales/shipments\")]"
@@ -919,7 +1130,7 @@ mod tests {
         manifest.jobs.insert("task".into(), bash_job("echo hi", &dag_dir));
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
         assert!(script.contains("schedule=[Dataset(\"s3://warehouse/foo\")]"));
         assert!(!script.contains("@daily"));
         assert!(validate_python_syntax(&script).is_none(), "{script}");
@@ -944,10 +1155,152 @@ mod tests {
         manifest.jobs.insert("multi".into(), job);
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script = generate_dag(&manifest, &dags[0]).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
         assert!(script.contains(
             "outlets=[Dataset(\"s3://warehouse/a\"), Dataset(\"s3://warehouse/b\")]"
         ));
         assert!(validate_python_syntax(&script).is_none(), "{script}");
+    }
+
+    // ---- D-09: script_locations_from_state helper ----
+
+    #[test]
+    fn script_locations_from_state_extracts_s3_object_ids() {
+        let mut states: HashMap<String, JobState> = HashMap::new();
+        for name in ["alpha", "beta"] {
+            states.insert(
+                name.to_string(),
+                JobState {
+                    job_name: name.to_string(),
+                    project: "test".to_string(),
+                    deployment: Deployment {
+                        env: None,
+                        config_hash: String::new(),
+                        config: serde_json::Value::Null,
+                        status: "deployed".to_string(),
+                        applied_at: String::new(),
+                        resources: vec![Resource {
+                            r#type: "s3_object".to_string(),
+                            id: format!("s3://bucket/{name}.py"),
+                            provider: "glue".to_string(),
+                        }],
+                    },
+                },
+            );
+        }
+        let out = script_locations_from_state(&states);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out.get("alpha").map(String::as_str), Some("s3://bucket/alpha.py"));
+        assert_eq!(out.get("beta").map(String::as_str), Some("s3://bucket/beta.py"));
+    }
+
+    #[test]
+    fn script_locations_from_state_skips_jobs_without_s3_object() {
+        let mut states: HashMap<String, JobState> = HashMap::new();
+        // Job A: has s3_object
+        states.insert(
+            "a".to_string(),
+            JobState {
+                job_name: "a".to_string(),
+                project: "test".to_string(),
+                deployment: Deployment {
+                    env: None,
+                    config_hash: String::new(),
+                    config: serde_json::Value::Null,
+                    status: "deployed".to_string(),
+                    applied_at: String::new(),
+                    resources: vec![Resource {
+                        r#type: "s3_object".to_string(),
+                        id: "s3://bucket/a.py".to_string(),
+                        provider: "glue".to_string(),
+                    }],
+                },
+            },
+        );
+        // Job B: only glue_job, no s3_object
+        states.insert(
+            "b".to_string(),
+            JobState {
+                job_name: "b".to_string(),
+                project: "test".to_string(),
+                deployment: Deployment {
+                    env: None,
+                    config_hash: String::new(),
+                    config: serde_json::Value::Null,
+                    status: "deployed".to_string(),
+                    applied_at: String::new(),
+                    resources: vec![Resource {
+                        r#type: "glue_job".to_string(),
+                        id: "b_name".to_string(),
+                        provider: "glue".to_string(),
+                    }],
+                },
+            },
+        );
+        // Job C: empty resources
+        states.insert(
+            "c".to_string(),
+            JobState {
+                job_name: "c".to_string(),
+                project: "test".to_string(),
+                deployment: Deployment {
+                    env: None,
+                    config_hash: String::new(),
+                    config: serde_json::Value::Null,
+                    status: "deployed".to_string(),
+                    applied_at: String::new(),
+                    resources: vec![],
+                },
+            },
+        );
+        let out = script_locations_from_state(&states);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.get("a").map(String::as_str), Some("s3://bucket/a.py"));
+        assert!(!out.contains_key("b"));
+        assert!(!out.contains_key("c"));
+    }
+
+    #[test]
+    fn script_locations_from_state_picks_s3_object_not_glue_job() {
+        let mut states: HashMap<String, JobState> = HashMap::new();
+        states.insert(
+            "my_job".to_string(),
+            JobState {
+                job_name: "my_job".to_string(),
+                project: "test".to_string(),
+                deployment: Deployment {
+                    env: None,
+                    config_hash: String::new(),
+                    config: serde_json::Value::Null,
+                    status: "deployed".to_string(),
+                    applied_at: String::new(),
+                    resources: vec![
+                        // glue_job FIRST — filter is by type, not position
+                        Resource {
+                            r#type: "glue_job".to_string(),
+                            id: "my_glue_job_name".to_string(),
+                            provider: "glue".to_string(),
+                        },
+                        Resource {
+                            r#type: "s3_object".to_string(),
+                            id: "s3://bucket/script.py".to_string(),
+                            provider: "glue".to_string(),
+                        },
+                    ],
+                },
+            },
+        );
+        let out = script_locations_from_state(&states);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.get("my_job").map(String::as_str), Some("s3://bucket/script.py"));
+        // Explicitly prove the helper did NOT pick the glue_job id:
+        assert_ne!(out.get("my_job").map(String::as_str), Some("my_glue_job_name"));
+    }
+
+    #[test]
+    fn script_locations_from_state_empty_input() {
+        let states: HashMap<String, JobState> = HashMap::new();
+        let out = script_locations_from_state(&states);
+        assert!(out.is_empty());
     }
 }

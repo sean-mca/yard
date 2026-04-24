@@ -15,7 +15,7 @@ pub mod validation;
 pub use config_merge::{build_provider_config, is_task_only, merge_provider_config};
 pub use dag_lifecycle::{
     apply_dags, calculate_dag_diffs, destroy_all_dags, destroy_dag,
-    load_dag_state, DagApplyResult, DagDestroyResult,
+    load_dag_state, load_script_locations, DagApplyResult, DagDestroyResult,
 };
 pub use diff::calculate_diff;
 pub use orchestrate::{
@@ -29,4 +29,4 @@ pub use parsing::{
     parse_partition_by, parse_partition_timestamp_column, parse_sink,
     parse_sources, parse_transforms,
 };
-pub use show::{show, show_dag};
+pub use show::{show, show_dag, show_dag_with_state};

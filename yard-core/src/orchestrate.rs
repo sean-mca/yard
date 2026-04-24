@@ -422,7 +422,18 @@ pub async fn plan(
 
     // DAG diffs against the full manifest; filter on output.
     let dag_state = crate::dag_lifecycle::load_dag_state(&manifest.state).await?;
-    let mut dag_diffs = crate::dag_lifecycle::calculate_dag_diffs(manifest, &pre_dags, &dag_state)?;
+
+    // Pre-load JobStates so the renderer (via calculate_dag_diffs ->
+    // generate_dag) can read each Glue task's persisted script_location
+    // per DAG-02. Mirrors apply_dags' bulk-load.
+    let script_locations = crate::dag_lifecycle::load_script_locations(&manifest.state).await?;
+
+    let mut dag_diffs = crate::dag_lifecycle::calculate_dag_diffs(
+        manifest,
+        &pre_dags,
+        &dag_state,
+        &script_locations,
+    )?;
     if let Some(ref name) = target {
         dag_diffs.retain(|d| &d.name == name);
     }
