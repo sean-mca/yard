@@ -687,6 +687,57 @@ mod tests {
         assert!(derive_aws_conn_id("").is_err());
     }
 
+    // ---- Cross-account: parse_account_from_role_arn (shared helper, D-03) ----
+
+    #[test]
+    fn parse_account_from_role_arn_happy_path() {
+        let got = connections::parse_account_from_role_arn(
+            "arn:aws:iam::222222222222:role/GlueInvoker",
+        )
+        .unwrap();
+        assert_eq!(got, "222222222222");
+    }
+
+    #[test]
+    fn parse_account_from_role_arn_rejects_non_iam() {
+        assert!(
+            connections::parse_account_from_role_arn("arn:aws:s3:::my-bucket").is_err()
+        );
+    }
+
+    #[test]
+    fn parse_account_from_role_arn_rejects_bad_account() {
+        assert!(
+            connections::parse_account_from_role_arn("arn:aws:iam::12345:role/R").is_err()
+        );
+        assert!(
+            connections::parse_account_from_role_arn("arn:aws:iam::abcdefghijkl:role/R")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_account_from_role_arn_rejects_missing_role_prefix() {
+        assert!(
+            connections::parse_account_from_role_arn("arn:aws:iam::222222222222:user/Alice")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_account_from_role_arn_rejects_empty_role_name() {
+        assert!(
+            connections::parse_account_from_role_arn("arn:aws:iam::222222222222:role/")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_account_from_role_arn_rejects_garbage() {
+        assert!(connections::parse_account_from_role_arn("not-an-arn").is_err());
+        assert!(connections::parse_account_from_role_arn("").is_err());
+    }
+
     // ---- Cross-account: render_task picks aws_conn_id per job ----
 
     fn glue_job_with_assume_role(dir: &Path, role_arn: &str) -> JobDefinition {
