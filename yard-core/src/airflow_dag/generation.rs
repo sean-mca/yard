@@ -35,7 +35,7 @@ pub fn generate_dag(
     // Imports block: one line per distinct operator needed.
     let mut needs_bash = false;
     let mut needs_glue = false;
-    for (_, ty, _) in &task_types {
+    for (task_id, ty, _) in &task_types {
         match ty.as_str() {
             "bash" => needs_bash = true,
             "glue" => needs_glue = true,
@@ -43,11 +43,7 @@ pub fn generate_dag(
                 return Err(anyhow!(
                     "DAG '{}' task '{}': job type '{}' is not supported in Airflow codegen yet",
                     dag.name,
-                    task_types
-                        .iter()
-                        .find(|(_, t, _)| t == other)
-                        .map(|(n, _, _)| n.as_str())
-                        .unwrap_or("?"),
+                    task_id,
                     other
                 ));
             }
