@@ -452,10 +452,12 @@ mod tests {
         manifest.jobs.insert("notify".to_string(), notify);
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script_locations: HashMap<String, String> =
-            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
-                .into_iter()
-                .collect();
+        let script_locations: HashMap<String, String> = [(
+            "orders".to_string(),
+            "s3://bucket/scripts/orders.py".to_string(),
+        )]
+        .into_iter()
+        .collect();
         let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
         assert!(script.contains("GlueJobOperator"));
         assert!(script.contains("BashOperator"));
@@ -519,12 +521,8 @@ mod tests {
             depends_on: vec!["orders".to_string()],
             ..Default::default()
         });
-        manifest
-            .jobs
-            .insert("sales-orders".to_string(), a);
-        manifest
-            .jobs
-            .insert("sales-shipments".to_string(), b);
+        manifest.jobs.insert("sales-orders".to_string(), a);
+        manifest.jobs.insert("sales-shipments".to_string(), b);
 
         let dags = collect_dags(root, &manifest).unwrap();
         assert_eq!(dags[0].tasks, vec!["sales-orders", "sales-shipments"]);
@@ -546,12 +544,8 @@ mod tests {
             depends_on: vec!["sales-orders".to_string()],
             ..Default::default()
         });
-        manifest
-            .jobs
-            .insert("sales-orders".to_string(), a);
-        manifest
-            .jobs
-            .insert("sales-shipments".to_string(), b);
+        manifest.jobs.insert("sales-orders".to_string(), a);
+        manifest.jobs.insert("sales-shipments".to_string(), b);
 
         let dags = collect_dags(root, &manifest).unwrap();
         let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
@@ -573,15 +567,9 @@ mod tests {
             depends_on: vec!["orders".to_string()],
             ..Default::default()
         });
-        manifest
-            .jobs
-            .insert("sales-orders".to_string(), a);
-        manifest
-            .jobs
-            .insert("billing-orders".to_string(), b);
-        manifest
-            .jobs
-            .insert("pipeline-notify".to_string(), c);
+        manifest.jobs.insert("sales-orders".to_string(), a);
+        manifest.jobs.insert("billing-orders".to_string(), b);
+        manifest.jobs.insert("pipeline-notify".to_string(), c);
 
         let err = collect_dags(root, &manifest).unwrap_err().to_string();
         assert!(err.contains("ambiguous"), "got: {err}");
@@ -600,9 +588,7 @@ mod tests {
             depends_on: vec!["orders".to_string()],
             ..Default::default()
         });
-        manifest
-            .jobs
-            .insert("sales-orders".to_string(), a);
+        manifest.jobs.insert("sales-orders".to_string(), a);
 
         let err = collect_dags(root, &manifest).unwrap_err().to_string();
         assert!(err.contains("depends on itself"), "got: {err}");
@@ -648,12 +634,8 @@ mod tests {
         orphan.airflow = Some(AirflowJobBlock::default());
 
         let mut manifest = empty_manifest("test");
-        manifest
-            .jobs
-            .insert("task_a".to_string(), task_a);
-        manifest
-            .jobs
-            .insert("orphan_job".to_string(), orphan);
+        manifest.jobs.insert("task_a".to_string(), task_a);
+        manifest.jobs.insert("orphan_job".to_string(), orphan);
 
         let dags = collect_dags(root, &manifest).unwrap();
         let errors = validate_orphan_airflow_blocks(&manifest, &dags);
@@ -665,8 +647,7 @@ mod tests {
 
     #[test]
     fn derive_aws_conn_id_happy_path() {
-        let got =
-            derive_aws_conn_id("arn:aws:iam::222222222222:role/GlueInvoker").unwrap();
+        let got = derive_aws_conn_id("arn:aws:iam::222222222222:role/GlueInvoker").unwrap();
         assert_eq!(got, "yard_222222222222_GlueInvoker");
     }
 
@@ -674,8 +655,7 @@ mod tests {
     fn derive_aws_conn_id_sanitizes_role_path() {
         // IAM role paths (slashes) are allowed; we sanitize them for
         // Airflow-friendly conn ids.
-        let got =
-            derive_aws_conn_id("arn:aws:iam::111111111111:role/path/to/MyRole").unwrap();
+        let got = derive_aws_conn_id("arn:aws:iam::111111111111:role/path/to/MyRole").unwrap();
         assert_eq!(got, "yard_111111111111_path_to_MyRole");
     }
 
@@ -693,9 +673,7 @@ mod tests {
 
     #[test]
     fn derive_aws_conn_id_rejects_missing_role_prefix() {
-        assert!(
-            derive_aws_conn_id("arn:aws:iam::222222222222:user/Alice").is_err()
-        );
+        assert!(derive_aws_conn_id("arn:aws:iam::222222222222:user/Alice").is_err());
     }
 
     #[test]
@@ -735,10 +713,12 @@ mod tests {
         manifest.jobs.insert("orders".into(), glue_job(&dag_dir));
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script_locations: HashMap<String, String> =
-            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
-                .into_iter()
-                .collect();
+        let script_locations: HashMap<String, String> = [(
+            "orders".to_string(),
+            "s3://bucket/scripts/orders.py".to_string(),
+        )]
+        .into_iter()
+        .collect();
         let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
         assert!(script.contains("aws_conn_id=\"aws_default\""));
         assert!(!script.contains("Required Airflow connections"));
@@ -755,21 +735,22 @@ mod tests {
         manifest.aws = json!({"assume_role": "arn:aws:iam::111111111111:role/OperatorA"});
         manifest.jobs.insert(
             "orders".into(),
-            glue_job_with_assume_role(
-                &dag_dir,
-                "arn:aws:iam::222222222222:role/GlueInvoker",
-            ),
+            glue_job_with_assume_role(&dag_dir, "arn:aws:iam::222222222222:role/GlueInvoker"),
         );
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script_locations: HashMap<String, String> =
-            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
-                .into_iter()
-                .collect();
+        let script_locations: HashMap<String, String> = [(
+            "orders".to_string(),
+            "s3://bucket/scripts/orders.py".to_string(),
+        )]
+        .into_iter()
+        .collect();
         let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
         assert!(script.contains("aws_conn_id=\"yard_222222222222_GlueInvoker\""));
         assert!(script.contains("Required Airflow connections"));
-        assert!(script.contains("yard_222222222222_GlueInvoker  ->  arn:aws:iam::222222222222:role/GlueInvoker"));
+        assert!(script.contains(
+            "yard_222222222222_GlueInvoker  ->  arn:aws:iam::222222222222:role/GlueInvoker"
+        ));
     }
 
     // ---- Phase 15 DAG-03 regression: both new kwargs render correctly ----
@@ -787,16 +768,18 @@ mod tests {
             .insert("orders".to_string(), glue_job(&dag_dir));
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script_locations: HashMap<String, String> =
-            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
-                .into_iter()
-                .collect();
+        let script_locations: HashMap<String, String> = [(
+            "orders".to_string(),
+            "s3://bucket/scripts/orders.py".to_string(),
+        )]
+        .into_iter()
+        .collect();
         let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
 
-        // DAG-01: iam_role_name from config.role (full ARN, verbatim per D-13)
+        // DAG-01: iam_role_arn from config.role (full ARN, verbatim per D-13)
         assert!(
-            script.contains("iam_role_name=\"arn:aws:iam::123456789:role/TestGlueRole\""),
-            "expected iam_role_name kwarg from config.role, got:\n{script}"
+            script.contains("iam_role_arn=\"arn:aws:iam::123456789:role/TestGlueRole\""),
+            "expected iam_role_arn kwarg from config.role, got:\n{script}"
         );
         // DAG-02: script_location from the script_locations map
         assert!(
@@ -816,26 +799,25 @@ mod tests {
         manifest.aws = json!({"assume_role": "arn:aws:iam::111111111111:role/OperatorA"});
         manifest.jobs.insert(
             "orders".into(),
-            glue_job_with_assume_role(
-                &dag_dir,
-                "arn:aws:iam::222222222222:role/GlueInvoker",
-            ),
+            glue_job_with_assume_role(&dag_dir, "arn:aws:iam::222222222222:role/GlueInvoker"),
         );
 
         let dags = collect_dags(root, &manifest).unwrap();
         // D-11: distinct cross-account bucket URI — proves render is indifferent
         // to which account uploaded the script.
-        let script_locations: HashMap<String, String> =
-            [("orders".to_string(), "s3://cross-acct-bucket/scripts/orders.py".to_string())]
-                .into_iter()
-                .collect();
+        let script_locations: HashMap<String, String> = [(
+            "orders".to_string(),
+            "s3://cross-acct-bucket/scripts/orders.py".to_string(),
+        )]
+        .into_iter()
+        .collect();
         let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
 
         // DAG-01: per-job execution role from config.role — NOT the assume_role ARN.
-        // The assume_role drives aws_conn_id, not iam_role_name.
+        // The assume_role drives aws_conn_id, not iam_role_arn.
         assert!(
-            script.contains("iam_role_name=\"arn:aws:iam::123456789:role/TestGlueRole\""),
-            "expected iam_role_name kwarg from per-job config.role, got:\n{script}"
+            script.contains("iam_role_arn=\"arn:aws:iam::123456789:role/TestGlueRole\""),
+            "expected iam_role_arn kwarg from per-job config.role, got:\n{script}"
         );
         // DAG-02 + D-11: distinct cross-account bucket URI
         assert!(
@@ -908,10 +890,12 @@ mod tests {
         let dags = collect_dags(root, &manifest).unwrap();
         // Populated script_locations so the role check (D-05 first) is the
         // failing predicate — proving ordering contract.
-        let script_locations: HashMap<String, String> =
-            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
-                .into_iter()
-                .collect();
+        let script_locations: HashMap<String, String> = [(
+            "orders".to_string(),
+            "s3://bucket/scripts/orders.py".to_string(),
+        )]
+        .into_iter()
+        .collect();
         let err = generate_dag(&manifest, &dags[0], &script_locations).unwrap_err();
         let chain = format!("{err:#}");
         assert!(
@@ -936,15 +920,18 @@ mod tests {
         let root_arn = "arn:aws:iam::111111111111:role/OperatorA";
         let mut manifest = empty_manifest("test");
         manifest.aws = json!({"assume_role": root_arn});
-        manifest
-            .jobs
-            .insert("orders".into(), glue_job_with_assume_role(&dag_dir, root_arn));
+        manifest.jobs.insert(
+            "orders".into(),
+            glue_job_with_assume_role(&dag_dir, root_arn),
+        );
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script_locations: HashMap<String, String> =
-            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
-                .into_iter()
-                .collect();
+        let script_locations: HashMap<String, String> = [(
+            "orders".to_string(),
+            "s3://bucket/scripts/orders.py".to_string(),
+        )]
+        .into_iter()
+        .collect();
         let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
         assert!(script.contains("aws_conn_id=\"aws_default\""));
         assert!(!script.contains("Required Airflow connections"));
@@ -964,12 +951,14 @@ mod tests {
         manifest
             .jobs
             .insert("orders".into(), glue_job_with_assume_role(&dag_dir, role_b));
-        manifest
-            .jobs
-            .insert("shipments".into(), glue_job_with_assume_role(&dag_dir, role_b));
-        manifest
-            .jobs
-            .insert("billing".into(), glue_job_with_assume_role(&dag_dir, role_c));
+        manifest.jobs.insert(
+            "shipments".into(),
+            glue_job_with_assume_role(&dag_dir, role_b),
+        );
+        manifest.jobs.insert(
+            "billing".into(),
+            glue_job_with_assume_role(&dag_dir, role_c),
+        );
 
         let dags = collect_dags(root, &manifest).unwrap();
         let conns = required_connections_for_dag(&manifest, &dags[0]).unwrap();
@@ -989,7 +978,9 @@ mod tests {
         write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
 
         let mut manifest = empty_manifest("test");
-        manifest.jobs.insert("run".into(), bash_job("echo hi", &dag_dir));
+        manifest
+            .jobs
+            .insert("run".into(), bash_job("echo hi", &dag_dir));
         let dags = collect_dags(root, &manifest).unwrap();
         assert!(
             required_connections_for_dag(&manifest, &dags[0])
@@ -1006,19 +997,22 @@ mod tests {
         write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
 
         let mut manifest = empty_manifest("test");
-        manifest
-            .jobs
-            .insert("orders".into(), glue_job_with_assume_role(&dag_dir, "garbage"));
+        manifest.jobs.insert(
+            "orders".into(),
+            glue_job_with_assume_role(&dag_dir, "garbage"),
+        );
 
         let dags = collect_dags(root, &manifest).unwrap();
         // Supply a populated script_locations so the new D-05/D-06/D-07
         // checks pass (role is set in the fixture; URI now present), letting
         // the original "malformed role ARN" error from resolve_task_aws_conn_id
         // surface unchanged.
-        let script_locations: HashMap<String, String> =
-            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
-                .into_iter()
-                .collect();
+        let script_locations: HashMap<String, String> = [(
+            "orders".to_string(),
+            "s3://bucket/scripts/orders.py".to_string(),
+        )]
+        .into_iter()
+        .collect();
         let err = generate_dag(&manifest, &dags[0], &script_locations).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("malformed role ARN"), "error was: {msg}");
@@ -1036,9 +1030,7 @@ mod tests {
         task_a.airflow = Some(AirflowJobBlock::default());
 
         let mut manifest = empty_manifest("test");
-        manifest
-            .jobs
-            .insert("task_a".to_string(), task_a);
+        manifest.jobs.insert("task_a".to_string(), task_a);
 
         let dags = collect_dags(root, &manifest).unwrap();
         let errors = validate_orphan_airflow_blocks(&manifest, &dags);
@@ -1063,10 +1055,12 @@ mod tests {
         manifest.jobs.insert("orders".into(), job);
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script_locations: HashMap<String, String> =
-            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
-                .into_iter()
-                .collect();
+        let script_locations: HashMap<String, String> = [(
+            "orders".to_string(),
+            "s3://bucket/scripts/orders.py".to_string(),
+        )]
+        .into_iter()
+        .collect();
         let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
         assert!(script.contains("from airflow.datasets import Dataset"));
         assert!(script.contains("outlets=[Dataset(\"s3://warehouse/sales/orders\")]"));
@@ -1084,10 +1078,12 @@ mod tests {
         manifest.jobs.insert("orders".into(), glue_job(&dag_dir));
 
         let dags = collect_dags(root, &manifest).unwrap();
-        let script_locations: HashMap<String, String> =
-            [("orders".to_string(), "s3://bucket/scripts/orders.py".to_string())]
-                .into_iter()
-                .collect();
+        let script_locations: HashMap<String, String> = [(
+            "orders".to_string(),
+            "s3://bucket/scripts/orders.py".to_string(),
+        )]
+        .into_iter()
+        .collect();
         let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
         assert!(!script.contains("outlets"));
         assert!(!script.contains("Dataset"));
@@ -1104,7 +1100,9 @@ mod tests {
         );
 
         let mut manifest = empty_manifest("test");
-        manifest.jobs.insert("agg".into(), bash_job("echo agg", &dag_dir));
+        manifest
+            .jobs
+            .insert("agg".into(), bash_job("echo agg", &dag_dir));
 
         let dags = collect_dags(root, &manifest).unwrap();
         let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
@@ -1127,7 +1125,9 @@ mod tests {
         );
 
         let mut manifest = empty_manifest("test");
-        manifest.jobs.insert("task".into(), bash_job("echo hi", &dag_dir));
+        manifest
+            .jobs
+            .insert("task".into(), bash_job("echo hi", &dag_dir));
 
         let dags = collect_dags(root, &manifest).unwrap();
         let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
@@ -1156,9 +1156,10 @@ mod tests {
 
         let dags = collect_dags(root, &manifest).unwrap();
         let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
-        assert!(script.contains(
-            "outlets=[Dataset(\"s3://warehouse/a\"), Dataset(\"s3://warehouse/b\")]"
-        ));
+        assert!(
+            script
+                .contains("outlets=[Dataset(\"s3://warehouse/a\"), Dataset(\"s3://warehouse/b\")]")
+        );
         assert!(validate_python_syntax(&script).is_none(), "{script}");
     }
 
@@ -1190,8 +1191,14 @@ mod tests {
         }
         let out = script_locations_from_state(&states);
         assert_eq!(out.len(), 2);
-        assert_eq!(out.get("alpha").map(String::as_str), Some("s3://bucket/alpha.py"));
-        assert_eq!(out.get("beta").map(String::as_str), Some("s3://bucket/beta.py"));
+        assert_eq!(
+            out.get("alpha").map(String::as_str),
+            Some("s3://bucket/alpha.py")
+        );
+        assert_eq!(
+            out.get("beta").map(String::as_str),
+            Some("s3://bucket/beta.py")
+        );
     }
 
     #[test]
@@ -1292,9 +1299,15 @@ mod tests {
         );
         let out = script_locations_from_state(&states);
         assert_eq!(out.len(), 1);
-        assert_eq!(out.get("my_job").map(String::as_str), Some("s3://bucket/script.py"));
+        assert_eq!(
+            out.get("my_job").map(String::as_str),
+            Some("s3://bucket/script.py")
+        );
         // Explicitly prove the helper did NOT pick the glue_job id:
-        assert_ne!(out.get("my_job").map(String::as_str), Some("my_glue_job_name"));
+        assert_ne!(
+            out.get("my_job").map(String::as_str),
+            Some("my_glue_job_name")
+        );
     }
 
     #[test]

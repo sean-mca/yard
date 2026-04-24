@@ -3,10 +3,10 @@ use std::collections::HashMap;
 use tera::{Context, Tera};
 use yard_structs::{AirflowSection, JobDefinition, ProjectManifest};
 
+use super::AIRFLOW_DAG_TEMPLATE;
+use super::ResolvedDag;
 use super::connections::{required_connections_for_dag, resolve_task_aws_conn_id};
 use super::helpers::{python_string_literal, python_var_name};
-use super::ResolvedDag;
-use super::AIRFLOW_DAG_TEMPLATE;
 
 use crate::is_task_only;
 
@@ -97,7 +97,13 @@ pub fn generate_dag(
     // Task definitions, one per line, indented one level for inside `with DAG:`.
     let mut task_lines = Vec::new();
     for (task_id, job_type, job) in &task_types {
-        task_lines.push(render_task(task_id, job_type, job, manifest, script_locations)?);
+        task_lines.push(render_task(
+            task_id,
+            job_type,
+            job,
+            manifest,
+            script_locations,
+        )?);
     }
     let tasks_block = task_lines.join("\n");
 
@@ -107,7 +113,8 @@ pub fn generate_dag(
     let required_connections_block = if required.is_empty() {
         String::new()
     } else {
-        let mut out = String::from("# Required Airflow connections (create in MWAA before running):\n");
+        let mut out =
+            String::from("# Required Airflow connections (create in MWAA before running):\n");
         for rc in &required {
             out.push_str(&format!("#   - {}  ->  {}\n", rc.conn_id, rc.role_arn));
         }
@@ -193,24 +200,26 @@ fn render_task(
                 .config
                 .get("role")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!(
-                    "Glue render requires 'config.role' on the resolved job config"
-                ))
+                .ok_or_else(|| {
+                    anyhow!("Glue render requires 'config.role' on the resolved job config")
+                })
                 .with_context(|| format!("task '{task_id}'"))?;
 
             let script_uri = script_locations
                 .get(task_id)
-                .ok_or_else(|| anyhow!(
-                    "Glue render requires a persisted script URI — \
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Glue render requires a persisted script URI — \
                      run 'yard apply' to upload and persist state"
-                ))
+                    )
+                })
                 .with_context(|| format!("task '{task_id}'"))?;
 
             let conn_id = resolve_task_aws_conn_id(job, manifest)
                 .with_context(|| format!("task '{task_id}'"))?;
 
             Ok(format!(
-                "    {var} = GlueJobOperator(\n        task_id={tid},\n        job_name={jn},\n        script_location={sl},\n        iam_role_name={ir},\n        aws_conn_id={cn},{outlets}\n    )",
+                "    {var} = GlueJobOperator(\n        task_id={tid},\n        job_name={jn},\n        script_location={sl},\n        iam_role_arn={ir},\n        aws_conn_id={cn},{outlets}\n    )",
                 var = var,
                 tid = tid,
                 jn = python_string_literal(task_id),

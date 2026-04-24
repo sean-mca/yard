@@ -9,9 +9,7 @@ pub(super) type TopoResult = (Vec<String>, BTreeMap<String, Vec<String>>);
 
 /// Build a lookup from short name (base_name) to full job name for all tasks
 /// in this DAG. Returns entries only where base_name differs from the full name.
-fn build_short_name_index(
-    jobs: &[(String, &JobDefinition)],
-) -> HashMap<String, Vec<String>> {
+fn build_short_name_index(jobs: &[(String, &JobDefinition)]) -> HashMap<String, Vec<String>> {
     let mut index: HashMap<String, Vec<String>> = HashMap::new();
     for (full_name, job) in jobs {
         if !job.base_name.is_empty() && job.base_name != *full_name {
@@ -73,7 +71,11 @@ fn resolve_dep(
                 task_name,
                 dag_dir.display(),
                 dep,
-                filtered.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                filtered
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )),
         };
     }
@@ -142,10 +144,7 @@ pub(super) fn topo_sort(
     let mut downstream: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (name, ds) in deps.iter() {
         for d in ds {
-            downstream
-                .entry(d.clone())
-                .or_default()
-                .push(name.clone());
+            downstream.entry(d.clone()).or_default().push(name.clone());
         }
     }
     for v in downstream.values_mut() {
