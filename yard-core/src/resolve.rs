@@ -239,6 +239,10 @@ fn context_field(dir: &Path, filename: &str, field: &str) -> Value {
 
 /// Deep-merge cascade applied to every job:
 ///
+/// (`text` fence: this block is ASCII art, not Rust code — fencing as `text`
+/// keeps it out of doctest compilation entirely, which is more correct than
+/// `no_run` for non-Rust content.)
+///
 /// ```text
 /// root (yard.yaml)  →  account.yaml  →  region.yaml  →  job-inline
 /// ```
