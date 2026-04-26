@@ -27,6 +27,86 @@ pub enum Storage {
     S3(S3Storage),
 }
 
+/// Trait for reading/writing job + DAG state and managing job locks.
+///
+/// Each backend (Local filesystem, S3 object store, future DynamoDB / GCS / etc.)
+/// implements this trait. The `Storage` wrapper struct holds a `Box<dyn StorageBackend>`
+/// and exposes thin wrapper methods so consumers don't need to know which backend
+/// is in use.
+///
+/// Mirrors the manual async-trait shape established by `crate::providers::Provider`
+/// (object-safe via `Pin<Box<dyn Future<...>>>` returns; no `async-trait` dep).
+pub trait StorageBackend: Send + Sync {
+    // --- Per-job state operations ---
+
+    /// Read a single job's state file. Returns None if the file doesn't exist.
+    fn read_job(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<JobState>>> + Send + '_>>;
+
+    /// Write a job's state file. Overwrites any existing file.
+    fn write_job(
+        &self,
+        job_name: &str,
+        state: &JobState,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+
+    /// Delete a job's state file. No-op if the file doesn't exist.
+    fn delete_job(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+
+    /// List all job names with state files (excluding lock files and DAG files).
+    fn list_jobs(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>>;
+
+    // --- Per-DAG state operations ---
+
+    /// Read a DAG's state file. Returns None if the file doesn't exist.
+    fn read_dag(
+        &self,
+        dag_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<DagState>>> + Send + '_>>;
+
+    /// Write a DAG's state file. Overwrites any existing file.
+    fn write_dag(
+        &self,
+        dag_name: &str,
+        state: &DagState,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+
+    /// Delete a DAG's state file. No-op if the file doesn't exist.
+    fn delete_dag(
+        &self,
+        dag_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+
+    /// List all DAG names with state files.
+    fn list_dags(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>>;
+
+    // --- Locking primitives ---
+
+    /// Acquire a lock for a job. Returns the lock info on success.
+    /// Errors if the job is already locked.
+    fn lock(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<LockInfo>> + Send + '_>>;
+
+    /// Remove the lock regardless of who holds it.
+    fn force_unlock(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+
+    /// Get the current lock info for a job, or None if not locked.
+    fn get_lock(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<LockInfo>>> + Send + '_>>;
+}
+
 // --- Helpers ---
 
 fn lock_info() -> LockInfo {
