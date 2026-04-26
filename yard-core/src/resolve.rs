@@ -4,7 +4,56 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use yaml_rust2::YamlLoader;
-use yard_structs::{JobDefinition, ProjectManifest, ProjectState, StateBackend, YARDContext};
+use yard_structs::{
+    JobDefinition, JobType, ProjectManifest, ProjectState, StateBackend, YARDContext,
+};
+
+/// Allowed top-level keys on a yard.yaml manifest (TYPE-03 D-19). Any other
+/// key surfaces as an `unknown field 'X' at yard.yaml ...` error at parse
+/// time.
+const ALLOWED_TOP_LEVEL: &[&str] = &["project", "state", "providers", "jobs", "aws"];
+
+/// Allowed keys on a yard.yaml `state:` block (StateBackend wire surface).
+/// Both `Local` (path) and `S3` (bucket/region/key/aws) variants share the
+/// same flat allow-list — serde dispatches on the `type` discriminator.
+const ALLOWED_STATE_BLOCK: &[&str] = &["type", "bucket", "region", "key", "path", "aws"];
+
+/// Static allowed keys on a job-doc (the `JobDefinition` wire surface, as
+/// the user types it in `<job>.yaml`). Dynamic provider-block keys (the
+/// wire strings from each `JobType` variant) are appended at runtime per
+/// D-21 to keep this list in sync with TYPE-01.
+const STATIC_JOB_DOC_ALLOWED: &[&str] = &[
+    "type",
+    "imports",
+    "body",
+    "job_file",
+    "sources",
+    "source",
+    "sink",
+    "transforms",
+    "airflow",
+    "partition_by",
+    "partition_timestamp_column",
+    "create_timestamp",
+    "_aws",
+];
+
+/// Build the full allowed-keys list for a job doc by combining the static
+/// fields with the wire-form of every `JobType` variant (so `glue: {...}`,
+/// `emr: {...}`, `bash: {...}` provider-block siblings are accepted but
+/// `sprk: {...}` is rejected). D-21: list is derived from the live
+/// `JobType` enum, not hard-coded — adding a fourth variant in TYPE-01
+/// flows through here without an edit.
+fn job_doc_allowed_keys() -> Vec<String> {
+    let mut all: Vec<String> = STATIC_JOB_DOC_ALLOWED
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    for variant in [JobType::Glue, JobType::Emr, JobType::Bash] {
+        all.push(variant.to_string());
+    }
+    all
+}
 
 pub struct ResolvedProject {
     pub manifest: ProjectManifest,
@@ -26,6 +75,21 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
     let root_doc = root_docs
         .first()
         .ok_or_else(|| anyhow!("yard.yaml is empty"))?;
+
+    // TYPE-03 D-19: gate the yard.yaml top-level + the `state:` block
+    // against unknown keys. Catches the user-typo footgun (e.g. `provider:`
+    // instead of `providers:`) at parse time with a structured error.
+    // Validates against the JSON-converted view so the helper's `as_object`
+    // check works the same way it does for the `parse_*` callers.
+    let root_value = yaml_to_json(root_doc);
+    crate::parsing::validate_unknown_keys(&root_value, ALLOWED_TOP_LEVEL, "yard.yaml")?;
+    if let Some(state_value) = root_value.get("state") {
+        crate::parsing::validate_unknown_keys(
+            state_value,
+            ALLOWED_STATE_BLOCK,
+            "yard.yaml.state",
+        )?;
+    }
 
     // 2. Extract global config
     let project = root_doc["project"]
@@ -50,10 +114,11 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
                 .to_string(),
             key: state_node["key"].as_str().unwrap_or("state/").to_string(),
             // Plan 02 owns reading `state.aws` from yaml and env-merging
-            // `YARD_STATE_AWS_*`. Until then, default to Null so Plan 01's
+            // `YARD_STATE_AWS_*`. Until then, default to None so the
             // `#[serde(default)]` deserialization behavior is preserved here
-            // and nothing in today's codepath changes.
-            aws: serde_json::Value::Null,
+            // and nothing in today's codepath changes. (TYPE-02 retypes the
+            // field; the runtime intent is unchanged.)
+            aws: None,
         },
         _ => return Err(anyhow!("Unsupported state type in root")),
     };
@@ -78,6 +143,12 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
     }
 
     // Root-level aws block — yard's own AWS credential config (AssumeRole etc.)
+    // Kept as Value here for `cascade_provider_defaults` (which still merges
+    // into the per-job `JobDefinition.config: Value` blob via `_aws` per
+    // D-09 / D-14). The structural manifest field is the typed
+    // `Option<AwsCredentialConfig>` produced via best-effort parse —
+    // malformed root `aws:` blocks fall through to None today (plan 21-03
+    // owns strict typo gating via `validate_unknown_keys`).
     let root_aws = yaml_to_json(&root_doc["aws"]);
 
     // Cascade provider defaults into each job's `config.<job_type>` block so
@@ -86,12 +157,18 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
     // this cascade only widens visibility — precedence is unchanged.
     let all_jobs = cascade_provider_defaults(all_jobs, &providers, &root_aws);
 
+    let typed_root_aws: Option<yard_structs::AwsCredentialConfig> = if root_aws.is_null() {
+        None
+    } else {
+        serde_json::from_value(root_aws.clone()).ok()
+    };
+
     let manifest = ProjectManifest {
         project: project.clone(),
         state: state_backend.clone(),
         providers,
         jobs: all_jobs,
-        aws: root_aws,
+        aws: typed_root_aws,
     };
 
     // 5. Load current state
@@ -176,7 +253,7 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
             .flatten()
             .collect::<Vec<_>>()
             .join("-");
-        let job_type = job_doc["type"]
+        let job_type: JobType = job_doc["type"]
             .as_str()
             .ok_or_else(|| {
                 anyhow!(
@@ -184,14 +261,26 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
                     job_name
                 )
             })?
-            .to_string();
+            .parse()
+            .with_context(|| format!("invalid job type for job '{job_name}'"))?;
         let config = yaml_to_json(job_doc);
+
+        // TYPE-03 D-19/D-21: gate the job doc against the static
+        // `JobDefinition` keys plus the dynamic `JobType`-derived
+        // provider-block keys. Catches user typos like `sceudule:`,
+        // `transformsss:`, or `glu: { ... }` at parse time with a
+        // structured error.
+        let allowed_owned = job_doc_allowed_keys();
+        let allowed_borrowed: Vec<&str> = allowed_owned.iter().map(String::as_str).collect();
+        let job_path = format!("jobs.{job_name}");
+        crate::parsing::validate_unknown_keys(&config, &allowed_borrowed, &job_path)?;
+
         let imports = crate::parse_imports(&config);
         let body = crate::parse_body(&config);
-        let sources = crate::parse_sources(&config);
-        let sink = crate::parse_sink(&config);
-        let transforms = crate::parse_transforms(&config);
-        let airflow = crate::parse_airflow_job_block(&config);
+        let sources = crate::parse_sources(&config, &job_path)?;
+        let sink = crate::parse_sink(&config, &job_path)?;
+        let transforms = crate::parse_transforms(&config, &job_path)?;
+        let airflow = crate::parse_airflow_job_block(&config, &job_path)?;
 
         // Resolve job_file path relative to the job YAML's directory
         let job_file = crate::parse_job_file(&config).map(|p| {
@@ -257,15 +346,18 @@ fn cascade_provider_defaults(
 ) -> HashMap<String, JobDefinition> {
     for job in jobs.values_mut() {
         // --- providers.<type> cascade ---
+        // The providers HashMap is keyed by wire-string job type ("glue",
+        // "emr", "bash"); JobType::to_string() gives the canonical wire form.
+        let job_type_key = job.job_type.to_string();
         let root_provider = providers
-            .get(&job.job_type)
+            .get(&job_type_key)
             .cloned()
             .unwrap_or(Value::Null);
-        let account_provider = context_field(&job.dir, "account.yaml", &job.job_type);
-        let region_provider = context_field(&job.dir, "region.yaml", &job.job_type);
+        let account_provider = context_field(&job.dir, "account.yaml", &job_type_key);
+        let region_provider = context_field(&job.dir, "region.yaml", &job_type_key);
         let job_inline_provider = job
             .config
-            .get(&job.job_type)
+            .get(&job_type_key)
             .cloned()
             .unwrap_or(Value::Null);
 
@@ -276,7 +368,7 @@ fn cascade_provider_defaults(
             &job_inline_provider,
         ]);
         if let Some(obj) = job.config.as_object_mut() {
-            obj.insert(job.job_type.clone(), merged);
+            obj.insert(job_type_key, merged);
         }
 
         // --- aws cascade ---
@@ -417,7 +509,7 @@ mod tests {
             cfg.as_object_mut().unwrap().insert("aws".into(), aws);
         }
         JobDefinition {
-            job_type: "glue".to_string(),
+            job_type: JobType::Glue,
             config: cfg,
             dir: dir.to_path_buf(),
             ..Default::default()

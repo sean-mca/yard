@@ -195,9 +195,11 @@ pub(super) fn needs_requests_import(job_def: &JobDefinition) -> bool {
 }
 
 pub(super) fn default_engine_for(job_def: &JobDefinition) -> String {
+    // The `config` map is keyed by the wire-format string ("glue", "emr",
+    // "bash"); JobType::to_string() returns that canonical form.
     job_def
         .config
-        .get(&job_def.job_type)
+        .get(job_def.job_type.to_string().as_str())
         .and_then(|g| g.get("default_engine"))
         .and_then(|v| v.as_str())
         .unwrap_or("spark")

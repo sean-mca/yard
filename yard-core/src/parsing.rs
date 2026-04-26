@@ -1,8 +1,130 @@
+use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
 use yard_structs::{
-    AirflowJobBlock, AirflowSection, Import, Sink, Source, Transform,
+    AirflowJobBlock, AirflowSection, AwsCredentialConfig, Import, Sink, Source, Transform,
 };
+
+/// Validate that a JSON object has no keys outside `allowed`. Used by every
+/// `parse_*` fn in this file (and by `discover_jobs` / `resolve_project` in
+/// resolve.rs) to surface user yard.yaml typos as parse-time errors.
+///
+/// The structural `path` argument is passed by the caller (which already
+/// knows what it's parsing) so error messages are actionable. Path examples:
+/// `"jobs.{job_name}.airflow"`, `"yard.yaml.state"`, `"jobs.{job_name}.sink"`.
+///
+/// **Behavior on non-object Values:** Returns `Ok(())`. The caller's
+/// downstream extraction handles non-object inputs via its existing
+/// `.get(...).as_str()`-style chain (typically returning `None` and
+/// falling through to defaults). This keeps the validator focused on its
+/// one job (catching unknown KEYS) without overlapping with type checks.
+///
+/// **Returned error format** (D-18):
+///   `unknown field '<key>' at <path> (allowed: <csv>)`
+pub fn validate_unknown_keys(
+    value: &serde_json::Value,
+    allowed: &[&str],
+    path: &str,
+) -> anyhow::Result<()> {
+    let Some(obj) = value.as_object() else {
+        return Ok(());
+    };
+    for key in obj.keys() {
+        if !allowed.contains(&key.as_str()) {
+            let allowed_csv = allowed.join(", ");
+            return Err(anyhow::anyhow!(
+                "unknown field '{key}' at {path} (allowed: {allowed_csv})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Allowed keys on a parsed `airflow:` section block (TYPE-03 D-19).
+/// Stricter list than `ALLOWED_AIRFLOW_JOB_BLOCK` — used at the manifest
+/// `providers.airflow` site, account.yaml/region.yaml/dag.yaml airflow
+/// blocks, and the recursive call from `parse_airflow_job_block` is
+/// avoided via the `parse_airflow_section_inner` split.
+const ALLOWED_AIRFLOW_SECTION: &[&str] = &[
+    "schedule",
+    "owner",
+    "retries",
+    "dags_bucket",
+    "dags_prefix",
+    "triggered_by",
+    "aws",
+];
+
+/// Allowed keys on a per-job `airflow:` block (`AirflowJobBlock` —
+/// includes the AirflowSection-flattened fields plus job-specific
+/// `depends_on` and `produces`). `AirflowJobBlock` is excluded from
+/// `deny_unknown_fields` because of `#[serde(flatten)]`; this validator
+/// covers its user-yaml typo path per D-CTX:177.
+const ALLOWED_AIRFLOW_JOB_BLOCK: &[&str] = &[
+    "depends_on",
+    "produces",
+    "schedule",
+    "owner",
+    "retries",
+    "dags_bucket",
+    "dags_prefix",
+    "triggered_by",
+    "aws",
+];
+
+/// Allowed keys on a single source entry (or single-source `source:` block).
+const ALLOWED_SOURCE: &[&str] = &[
+    "name",
+    "type",
+    "format",
+    "path",
+    "connection_url",
+    "table",
+    "database",
+    "secret_id",
+    "engine",
+    "connection_type",
+    "topic",
+    "url",
+    "headers",
+    "options",
+];
+
+/// Allowed keys on a `sink:` block.
+const ALLOWED_SINK: &[&str] = &[
+    "source",
+    "type",
+    "format",
+    "path",
+    "connection_url",
+    "table",
+    "database",
+    "secret_id",
+    "mode",
+    "partition_by",
+    "fill_nulls",
+];
+
+/// Allowed keys on a single transform entry inside the `transforms:` array.
+const ALLOWED_TRANSFORM: &[&str] = &[
+    "type",
+    "source",
+    "output",
+    "condition",
+    "query",
+    "columns",
+    "mapping",
+    "name",
+    "expression",
+    "left",
+    "right",
+    "on",
+    "how",
+    "group_by",
+    "aggs",
+    "partition_by",
+    "order_by",
+];
 
 /// Extract optional body override from a job config.
 pub fn parse_body(config: &Value) -> Option<String> {
@@ -20,15 +142,15 @@ pub fn parse_job_file(config: &Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Parse an `airflow:` section body into an [`AirflowSection`]. The same
-/// parser is used at every layer of the inheritance chain (yard.yaml
-/// `providers.airflow`, `account.yaml` / `region.yaml` / `dag.yaml` airflow
-/// keys, and the `overrides` nested under a job's `airflow:` block).
-///
-/// `value` is the object directly under the `airflow:` key (or the object
-/// passed as `providers.airflow`). Unknown fields are ignored — forward
-/// compatibility with future PR additions.
-pub fn parse_airflow_section(value: &Value) -> AirflowSection {
+/// Inner extraction for [`AirflowSection`] without unknown-key validation.
+/// Validation happens in the public callers so they can choose the right
+/// allow-list for their structural context — `parse_airflow_section` uses
+/// the strict `ALLOWED_AIRFLOW_SECTION` list, while `parse_airflow_job_block`
+/// uses the wider `ALLOWED_AIRFLOW_JOB_BLOCK` list (which adds `depends_on`
+/// and `produces`). Without this split the per-job validator would reject
+/// `depends_on` as unknown when delegating, or the standalone path would
+/// silently accept those keys.
+fn parse_airflow_section_inner(value: &Value) -> AirflowSection {
     let retries = value
         .get("retries")
         .and_then(|v| v.as_i64())
@@ -53,21 +175,55 @@ pub fn parse_airflow_section(value: &Value) -> AirflowSection {
             .map(|s| s.to_string()),
         triggered_by: str_array_field(value, "triggered_by"),
         // Optional per-DAG-bucket AWS creds sub-block (Phase 9 D-05).
-        // Passed through unchanged to dag_lifecycle where precedence is resolved.
-        aws: value.get("aws").cloned().unwrap_or(Value::Null),
+        // Best-effort typed parse — malformed `aws:` blocks fall through
+        // silently to None, preserving today's permissive behavior here.
+        // (Strict typo gating for the user yard.yaml `aws:` block sits at
+        // the structural extraction layer above via `validate_unknown_keys`.)
+        aws: value
+            .get("aws")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<AwsCredentialConfig>(v).ok()),
     }
 }
 
-/// Parse the per-job `airflow:` block, if present. Returns `None` if the job
-/// has no `airflow:` key. The block mixes task-level fields (`depends_on`)
-/// with [`AirflowSection`] overrides (schedule, retries, etc.).
-pub fn parse_airflow_job_block(config: &Value) -> Option<AirflowJobBlock> {
-    let block = config.get("airflow")?;
-    Some(AirflowJobBlock {
+/// Parse an `airflow:` section body into an [`AirflowSection`]. The same
+/// parser is used at every layer of the inheritance chain (yard.yaml
+/// `providers.airflow`, `account.yaml` / `region.yaml` / `dag.yaml` airflow
+/// keys, and the `overrides` nested under a job's `airflow:` block).
+///
+/// `value` is the object directly under the `airflow:` key (or the object
+/// passed as `providers.airflow`). `path` is the structural yaml path the
+/// caller is parsing — used in error messages from `validate_unknown_keys`
+/// when the section contains an unknown key (TYPE-03 D-19). Returns
+/// `Err` on the first unknown field; otherwise returns the parsed section.
+pub fn parse_airflow_section(value: &Value, path: &str) -> Result<AirflowSection> {
+    validate_unknown_keys(value, ALLOWED_AIRFLOW_SECTION, path)?;
+    Ok(parse_airflow_section_inner(value))
+}
+
+/// Parse the per-job `airflow:` block, if present. Returns `Ok(None)` if
+/// the job has no `airflow:` key. The block mixes task-level fields
+/// (`depends_on`, `produces`) with [`AirflowSection`] overrides (schedule,
+/// retries, etc.). Unknown keys at this scope produce a parse-time error
+/// via `validate_unknown_keys` against `ALLOWED_AIRFLOW_JOB_BLOCK`
+/// (the AirflowSection's strict list plus `depends_on`/`produces`).
+///
+/// `path` is the job-level structural path (e.g. `"jobs.{job_name}"`) —
+/// the function appends `.airflow` for its error messages.
+pub fn parse_airflow_job_block(config: &Value, path: &str) -> Result<Option<AirflowJobBlock>> {
+    let Some(block) = config.get("airflow") else {
+        return Ok(None);
+    };
+    let block_path = format!("{path}.airflow");
+    validate_unknown_keys(block, ALLOWED_AIRFLOW_JOB_BLOCK, &block_path)?;
+    Ok(Some(AirflowJobBlock {
         depends_on: str_array_field(block, "depends_on"),
         produces: str_array_field(block, "produces"),
-        overrides: parse_airflow_section(block),
-    })
+        // Use the inner extractor so we don't double-validate against the
+        // stricter ALLOWED_AIRFLOW_SECTION list — `depends_on`/`produces`
+        // would be rejected as unknowns there.
+        overrides: parse_airflow_section_inner(block),
+    }))
 }
 
 /// Shallow-merge two [`AirflowSection`]s: each `Some` field in `overlay`
@@ -92,12 +248,8 @@ pub fn merge_airflow_sections(base: &AirflowSection, overlay: &AirflowSection) -
         } else {
             overlay.triggered_by.clone()
         },
-        // Overlay wins when non-null; Null means "not set" so fall back to base.
-        aws: if overlay.aws.is_null() {
-            base.aws.clone()
-        } else {
-            overlay.aws.clone()
-        },
+        // Overlay wins when Some; None means "not set" so fall back to base.
+        aws: overlay.aws.clone().or_else(|| base.aws.clone()),
     }
 }
 
@@ -191,7 +343,8 @@ fn str_map_field(obj: &Value, key: &str) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
-fn parse_single_source(src: &Value, default_name: &str) -> Option<Source> {
+fn parse_single_source(src: &Value, default_name: &str, path: &str) -> Result<Option<Source>> {
+    validate_unknown_keys(src, ALLOWED_SOURCE, path)?;
     let headers = src
         .get("headers")
         .and_then(|v| v.as_object())
@@ -207,9 +360,17 @@ fn parse_single_source(src: &Value, default_name: &str) -> Option<Source> {
         .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
         .unwrap_or_default();
 
-    Some(Source {
+    // `type` is required; if absent the source is malformed — return Ok(None)
+    // so the caller can choose to skip (today's behavior) instead of erroring.
+    // Unknown-keys ARE errored above; missing `type` is a separate concern
+    // handled by validation/rules.rs.
+    let Some(source_type) = src.get("type").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+
+    Ok(Some(Source {
         name: str_field(src, "name").unwrap_or_else(|| default_name.to_string()),
-        source_type: src.get("type")?.as_str()?.to_string(),
+        source_type: source_type.to_string(),
         format: str_field(src, "format"),
         path: str_field(src, "path"),
         connection_url: str_field(src, "connection_url"),
@@ -222,34 +383,51 @@ fn parse_single_source(src: &Value, default_name: &str) -> Option<Source> {
         url: str_field(src, "url"),
         headers,
         options,
-    })
+    }))
 }
 
 /// Extract sources from a job config. Supports both `source:` (single) and `sources:` (list).
-pub fn parse_sources(config: &Value) -> Vec<Source> {
+///
+/// `path` is the job-level structural path (e.g. `"jobs.{job_name}"`); the
+/// function appends `.sources[i]` or `.source` for each entry's error path.
+pub fn parse_sources(config: &Value, path: &str) -> Result<Vec<Source>> {
     // Try `sources:` (list) first
     if let Some(arr) = config.get("sources").and_then(|v| v.as_array()) {
-        return arr
-            .iter()
-            .enumerate()
-            .filter_map(|(i, item)| parse_single_source(item, &format!("source_{i}")))
-            .collect();
+        let mut out = Vec::with_capacity(arr.len());
+        for (i, item) in arr.iter().enumerate() {
+            let item_path = format!("{path}.sources[{i}]");
+            if let Some(s) = parse_single_source(item, &format!("source_{i}"), &item_path)? {
+                out.push(s);
+            }
+        }
+        return Ok(out);
     }
     // Fall back to `source:` (single)
-    if let Some(src) = config.get("source")
-        && let Some(parsed) = parse_single_source(src, "source")
-    {
-        return vec![parsed];
+    if let Some(src) = config.get("source") {
+        let src_path = format!("{path}.source");
+        if let Some(parsed) = parse_single_source(src, "source", &src_path)? {
+            return Ok(vec![parsed]);
+        }
     }
-    vec![]
+    Ok(vec![])
 }
 
 /// Extract sink configuration from a job config.
-pub fn parse_sink(config: &Value) -> Option<Sink> {
-    let snk = config.get("sink")?;
-    Some(Sink {
+///
+/// `path` is the job-level structural path; the function appends `.sink`
+/// for its error messages.
+pub fn parse_sink(config: &Value, path: &str) -> Result<Option<Sink>> {
+    let Some(snk) = config.get("sink") else {
+        return Ok(None);
+    };
+    let sink_path = format!("{path}.sink");
+    validate_unknown_keys(snk, ALLOWED_SINK, &sink_path)?;
+    let Some(sink_type) = snk.get("type").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    Ok(Some(Sink {
         source: str_field(snk, "source"),
-        sink_type: snk.get("type")?.as_str()?.to_string(),
+        sink_type: sink_type.to_string(),
         format: str_field(snk, "format"),
         path: str_field(snk, "path"),
         connection_url: str_field(snk, "connection_url"),
@@ -259,17 +437,22 @@ pub fn parse_sink(config: &Value) -> Option<Sink> {
         mode: str_field(snk, "mode"),
         partition_by: str_array_field(snk, "partition_by"),
         fill_nulls: snk.get("fill_nulls").and_then(|v| v.as_bool()),
-    })
+    }))
 }
 
 /// Extract transforms from a job config.
-pub fn parse_transforms(config: &Value) -> Vec<Transform> {
-    let mut transforms = Vec::new();
+///
+/// `path` is the job-level structural path; per-transform error paths
+/// are built as `{path}.transforms[i]`.
+pub fn parse_transforms(config: &Value, path: &str) -> Result<Vec<Transform>> {
     let Some(arr) = config.get("transforms").and_then(|v| v.as_array()) else {
-        return transforms;
+        return Ok(Vec::new());
     };
 
-    for item in arr {
+    let mut transforms = Vec::with_capacity(arr.len());
+    for (i, item) in arr.iter().enumerate() {
+        let item_path = format!("{path}.transforms[{i}]");
+        validate_unknown_keys(item, ALLOWED_TRANSFORM, &item_path)?;
         let Some(transform_type) = item.get("type").and_then(|v| v.as_str()) else {
             continue;
         };
@@ -295,7 +478,7 @@ pub fn parse_transforms(config: &Value) -> Vec<Transform> {
         });
     }
 
-    transforms
+    Ok(transforms)
 }
 
 #[cfg(test)]
@@ -315,7 +498,7 @@ mod tests {
             "dags_bucket": "my-dags",
             "dags_prefix": "airflow/"
         });
-        let s = parse_airflow_section(&v);
+        let s = parse_airflow_section(&v, "test.providers.airflow").unwrap();
         assert_eq!(s.schedule.as_deref(), Some("@daily"));
         assert_eq!(s.owner.as_deref(), Some("data-team"));
         assert_eq!(s.retries, Some(3));
@@ -325,14 +508,24 @@ mod tests {
 
     #[test]
     fn parse_airflow_section_empty_has_no_fields() {
-        let s = parse_airflow_section(&json!({}));
+        let s = parse_airflow_section(&json!({}), "test").unwrap();
         assert_eq!(s, AirflowSection::default());
     }
 
+    /// Inverted from `parse_airflow_section_ignores_unknown_fields` after
+    /// TYPE-03 wired `validate_unknown_keys` into `parse_airflow_section`.
+    /// The OLD behavior (silently accept `future_field`) is exactly the
+    /// "user yard.yaml typo" footgun this plan closes.
     #[test]
-    fn parse_airflow_section_ignores_unknown_fields() {
-        let s = parse_airflow_section(&json!({"schedule": "@hourly", "future_field": true}));
-        assert_eq!(s.schedule.as_deref(), Some("@hourly"));
+    fn parse_airflow_section_rejects_unknown_fields() {
+        let err = parse_airflow_section(
+            &json!({"schedule": "@hourly", "future_field": true}),
+            "providers.airflow",
+        )
+        .expect_err("unknown field must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown field 'future_field'"), "got: {msg}");
+        assert!(msg.contains("at providers.airflow"), "got: {msg}");
     }
 
     // --- parse_airflow_job_block ---
@@ -340,7 +533,11 @@ mod tests {
     #[test]
     fn parse_airflow_job_block_absent_returns_none() {
         let config = json!({"type": "glue"});
-        assert!(parse_airflow_job_block(&config).is_none());
+        assert!(
+            parse_airflow_job_block(&config, "jobs.foo")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -353,7 +550,9 @@ mod tests {
                 "retries": 5
             }
         });
-        let block = parse_airflow_job_block(&config).expect("expected block");
+        let block = parse_airflow_job_block(&config, "jobs.foo")
+            .unwrap()
+            .expect("expected block");
         assert_eq!(block.depends_on, vec!["customers", "products"]);
         assert_eq!(block.overrides.schedule.as_deref(), Some("@hourly"));
         assert_eq!(block.overrides.retries, Some(5));
@@ -362,9 +561,29 @@ mod tests {
     #[test]
     fn parse_airflow_job_block_depends_on_only() {
         let config = json!({"type": "glue", "airflow": {"depends_on": ["a"]}});
-        let block = parse_airflow_job_block(&config).expect("expected block");
+        let block = parse_airflow_job_block(&config, "jobs.foo")
+            .unwrap()
+            .expect("expected block");
         assert_eq!(block.depends_on, vec!["a"]);
         assert_eq!(block.overrides, AirflowSection::default());
+    }
+
+    /// `parse_airflow_job_block` uses the wider allow-list so `depends_on`
+    /// and `produces` are accepted alongside the AirflowSection keys; an
+    /// unknown key is still rejected.
+    #[test]
+    fn parse_airflow_job_block_rejects_unknown_fields() {
+        let config = json!({
+            "type": "glue",
+            "airflow": {
+                "depends_on": ["a"],
+                "scheule": "@daily"
+            }
+        });
+        let err = parse_airflow_job_block(&config, "jobs.foo").expect_err("typo must reject");
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown field 'scheule'"), "got: {msg}");
+        assert!(msg.contains("at jobs.foo.airflow"), "got: {msg}");
     }
 
     // --- merge_airflow_sections ---
@@ -423,5 +642,96 @@ mod tests {
         assert_eq!(final_cfg.owner.as_deref(), Some("data"));
         assert_eq!(final_cfg.retries, Some(3));
         assert_eq!(final_cfg.dags_bucket.as_deref(), Some("proj-bucket"));
+    }
+
+    // --- validate_unknown_keys (TYPE-03) ---
+
+    #[test]
+    fn validate_unknown_keys_accepts_subset() {
+        let v = json!({"a": 1, "b": 2});
+        assert!(validate_unknown_keys(&v, &["a", "b", "c"], "test.path").is_ok());
+    }
+
+    #[test]
+    fn validate_unknown_keys_accepts_exact() {
+        let v = json!({"a": 1});
+        assert!(validate_unknown_keys(&v, &["a"], "test.path").is_ok());
+    }
+
+    #[test]
+    fn validate_unknown_keys_rejects_unknown() {
+        let v = json!({"a": 1, "wat": 2});
+        let err = validate_unknown_keys(&v, &["a", "b"], "jobs.foo.airflow").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown field 'wat'"), "got: {msg}");
+        assert!(msg.contains("at jobs.foo.airflow"), "got: {msg}");
+        assert!(msg.contains("allowed: a, b"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_unknown_keys_passes_through_non_object() {
+        // Strings, numbers, arrays — not our concern; downstream extraction
+        // handles them via its existing `.as_str()`-style chain.
+        assert!(validate_unknown_keys(&json!("hello"), &["a"], "p").is_ok());
+        assert!(validate_unknown_keys(&json!(42), &["a"], "p").is_ok());
+        assert!(validate_unknown_keys(&json!([1, 2, 3]), &["a"], "p").is_ok());
+        assert!(validate_unknown_keys(&json!(null), &["a"], "p").is_ok());
+    }
+
+    #[test]
+    fn validate_unknown_keys_empty_object_is_ok() {
+        assert!(validate_unknown_keys(&json!({}), &[], "p").is_ok());
+        assert!(validate_unknown_keys(&json!({}), &["a", "b"], "p").is_ok());
+    }
+
+    // Sanity tests on the per-extractor allowed-keys lists. Each list is
+    // wired into a `parse_*` fn in commit 2; these tests assert the lists
+    // hold the expected keys today so future edits don't accidentally drop
+    // a key. (They also keep the consts marked-used until commit 2 wires
+    // them into actual parsers, satisfying the workspace clippy
+    // dead_code gate.)
+
+    #[test]
+    fn allowed_airflow_section_has_expected_keys() {
+        for k in ["schedule", "owner", "retries", "dags_bucket", "dags_prefix", "triggered_by", "aws"] {
+            assert!(
+                ALLOWED_AIRFLOW_SECTION.contains(&k),
+                "ALLOWED_AIRFLOW_SECTION missing '{k}'"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_airflow_job_block_extends_section_with_depends_on_and_produces() {
+        assert!(ALLOWED_AIRFLOW_JOB_BLOCK.contains(&"depends_on"));
+        assert!(ALLOWED_AIRFLOW_JOB_BLOCK.contains(&"produces"));
+        // every section key is also valid on the per-job block
+        for k in ALLOWED_AIRFLOW_SECTION {
+            assert!(
+                ALLOWED_AIRFLOW_JOB_BLOCK.contains(k),
+                "ALLOWED_AIRFLOW_JOB_BLOCK missing '{k}'"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_source_has_expected_keys() {
+        for k in ["name", "type", "format", "path", "options", "headers"] {
+            assert!(ALLOWED_SOURCE.contains(&k), "ALLOWED_SOURCE missing '{k}'");
+        }
+    }
+
+    #[test]
+    fn allowed_sink_has_expected_keys() {
+        for k in ["type", "path", "mode", "partition_by", "fill_nulls"] {
+            assert!(ALLOWED_SINK.contains(&k), "ALLOWED_SINK missing '{k}'");
+        }
+    }
+
+    #[test]
+    fn allowed_transform_has_expected_keys() {
+        for k in ["type", "source", "output", "condition", "query", "columns"] {
+            assert!(ALLOWED_TRANSFORM.contains(&k), "ALLOWED_TRANSFORM missing '{k}'");
+        }
     }
 }

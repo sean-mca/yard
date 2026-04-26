@@ -26,7 +26,9 @@
 
 use aws_sdk_s3::Client as S3Client;
 use serde_json::json;
-use yard_structs::{DagDeployment, DagState, Deployment, JobState, StateBackend};
+use yard_structs::{
+    AwsCredentialConfig, DagDeployment, DagState, Deployment, JobState, StateBackend,
+};
 
 const REGION: &str = "us-east-1";
 const TEST_STATE_BUCKET: &str = "yard-test-state-phase9";
@@ -60,7 +62,7 @@ fn sample_job_state(name: &str) -> JobState {
     }
 }
 
-fn sample_dag_state(name: &str, aws: serde_json::Value) -> DagState {
+fn sample_dag_state(name: &str, aws: Option<AwsCredentialConfig>) -> DagState {
     DagState {
         dag_name: name.to_string(),
         project: "phase9-test".to_string(),
@@ -87,7 +89,7 @@ async fn state_backend_s3_null_aws_roundtrip() {
         bucket: TEST_STATE_BUCKET.to_string(),
         region: REGION.to_string(),
         key: "projects/phase9-null/".to_string(),
-        aws: serde_json::Value::Null,
+        aws: None,
     };
 
     let storage = yard_core::storage::get_storage(&backend)
@@ -129,9 +131,10 @@ async fn state_backend_s3_with_assume_role_constructs() {
         bucket: TEST_STATE_BUCKET.to_string(),
         region: REGION.to_string(),
         key: "projects/phase9-assume/".to_string(),
-        aws: json!({
-            "assume_role": "arn:aws:iam::111111111111:role/YardStateAccess",
-            "session_name": "yard-phase9-integration",
+        aws: Some(AwsCredentialConfig {
+            assume_role: Some("arn:aws:iam::111111111111:role/YardStateAccess".to_string()),
+            session_name: Some("yard-phase9-integration".to_string()),
+            ..Default::default()
         }),
     };
 
@@ -170,9 +173,10 @@ async fn state_backend_s3_assume_role_s3_write_attempt() {
         bucket: TEST_STATE_BUCKET.to_string(),
         region: REGION.to_string(),
         key: "projects/phase9-assume-write/".to_string(),
-        aws: json!({
-            "assume_role": "arn:aws:iam::111111111111:role/YardStateAccess",
-            "session_name": "yard-phase9-write",
+        aws: Some(AwsCredentialConfig {
+            assume_role: Some("arn:aws:iam::111111111111:role/YardStateAccess".to_string()),
+            session_name: Some("yard-phase9-write".to_string()),
+            ..Default::default()
         }),
     };
 
@@ -230,7 +234,7 @@ async fn state_backend_s3_env_override_constructs() {
         bucket: TEST_STATE_BUCKET.to_string(),
         region: REGION.to_string(),
         key: "projects/phase9-env/".to_string(),
-        aws: serde_json::Value::Null,
+        aws: None,
     };
 
     let result = yard_core::storage::get_storage(&backend).await;
@@ -259,15 +263,16 @@ async fn dag_state_aws_roundtrips_through_s3_storage() {
         bucket: TEST_STATE_BUCKET.to_string(),
         region: REGION.to_string(),
         key: "projects/phase9-dag/".to_string(),
-        aws: serde_json::Value::Null,
+        aws: None,
     };
     let storage = yard_core::storage::get_storage(&backend)
         .await
         .expect("get_storage");
 
-    let expected_aws = json!({
-        "assume_role": "arn:aws:iam::333333333333:role/MwaaDagUploader",
-        "session_name": "yard-dag-upload",
+    let expected_aws = Some(AwsCredentialConfig {
+        assume_role: Some("arn:aws:iam::333333333333:role/MwaaDagUploader".to_string()),
+        session_name: Some("yard-dag-upload".to_string()),
+        ..Default::default()
     });
 
     let dag = sample_dag_state("dag_with_aws", expected_aws.clone());
@@ -288,7 +293,7 @@ async fn dag_state_aws_roundtrips_through_s3_storage() {
         "DagState.aws must survive S3 round-trip byte-for-byte"
     );
     assert_eq!(
-        readback.aws.get("assume_role").and_then(|v| v.as_str()),
+        readback.aws.as_ref().and_then(|c| c.assume_role.as_deref()),
         Some("arn:aws:iam::333333333333:role/MwaaDagUploader")
     );
 
@@ -311,13 +316,13 @@ async fn dag_state_null_aws_roundtrips_through_s3_storage() {
         bucket: TEST_STATE_BUCKET.to_string(),
         region: REGION.to_string(),
         key: "projects/phase9-dag-null/".to_string(),
-        aws: serde_json::Value::Null,
+        aws: None,
     };
     let storage = yard_core::storage::get_storage(&backend)
         .await
         .expect("get_storage");
 
-    let dag = sample_dag_state("dag_null_aws", serde_json::Value::Null);
+    let dag = sample_dag_state("dag_null_aws", None);
     storage
         .write_dag(&dag.dag_name, &dag)
         .await
@@ -330,8 +335,8 @@ async fn dag_state_null_aws_roundtrips_through_s3_storage() {
         .expect("dag must exist");
 
     assert!(
-        readback.aws.is_null(),
-        "Null aws must round-trip as Null (skip_serializing_if + default)"
+        readback.aws.is_none(),
+        "None aws must round-trip as None (skip_serializing_if + default)"
     );
 
     // Cleanup

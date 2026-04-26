@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 use std::path::Path;
-use yard_structs::ProjectManifest;
+use yard_structs::{AwsCredentialConfig, ProjectManifest};
 
 use crate::airflow_dag;
 use crate::airflow_dag::parse_account_from_role_arn;
@@ -64,7 +64,7 @@ pub fn list_targets(
     let dags = airflow_dag::collect_dags(root_dir, manifest)?;
     for dag in &dags {
         let effective = dag_lifecycle::resolve_effective_dag_aws(manifest, dag);
-        let account = assume_role_str(Some(&effective))
+        let account = typed_assume_role_str(effective.as_ref())
             .map(parse_account_from_role_arn)
             .transpose()
             .with_context(|| format!("target '{}'", dag.name))?;
@@ -81,14 +81,22 @@ pub fn list_targets(
 }
 
 /// Extract a non-empty `assume_role` string from an aws block Value.
-/// Returns None when the input is None, not a JSON object, has no
-/// `assume_role` key, has a non-string `assume_role`, or has an empty-string
-/// `assume_role`. Matches `airflow_dag::connections::assume_role_of`'s
-/// three-case behavior (D-04).
+/// Used for the per-job `_aws` override which still lives inside
+/// `JobDefinition.config: Value` (D-09 / D-14). Returns None when the input
+/// is None, not a JSON object, has no `assume_role` key, has a non-string
+/// `assume_role`, or has an empty-string `assume_role`. Matches
+/// `airflow_dag::connections::value_assume_role`'s behavior (D-04).
 fn assume_role_str(aws: Option<&Value>) -> Option<&str> {
     aws?.get("assume_role")
         .and_then(|r| r.as_str())
         .filter(|s| !s.is_empty())
+}
+
+/// Extract a non-empty `assume_role` string from a typed `AwsCredentialConfig`.
+/// Used for the typed manifest-level cascade (D-04 / TYPE-02). Returns None
+/// when the credentials are None or `assume_role` is unset / empty.
+fn typed_assume_role_str(creds: Option<&AwsCredentialConfig>) -> Option<&str> {
+    creds?.assume_role.as_deref().filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
@@ -97,18 +105,18 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
-    use yard_structs::{JobDefinition, StateBackend};
+    use yard_structs::{JobDefinition, JobType, StateBackend};
 
     fn make_manifest(
         jobs: Vec<(&str, Value)>,
-        root_aws: Value,
+        root_aws: Option<AwsCredentialConfig>,
     ) -> ProjectManifest {
         let mut job_map: HashMap<String, JobDefinition> = HashMap::new();
         for (name, config) in jobs {
             job_map.insert(
                 name.to_string(),
                 JobDefinition {
-                    job_type: "glue".to_string(),
+                    job_type: JobType::Glue,
                     config,
                     ..Default::default()
                 },
@@ -139,7 +147,7 @@ mod tests {
 
     #[test]
     fn empty_manifest_returns_empty_vec() {
-        let manifest = make_manifest(vec![], Value::Null);
+        let manifest = make_manifest(vec![], None);
         let root = empty_root();
         let rows = list_targets(&manifest, &root).unwrap();
         assert!(rows.is_empty());
@@ -150,7 +158,7 @@ mod tests {
     fn job_with_no_aws_emits_none() {
         let manifest = make_manifest(
             vec![("j1", json!({"type": "glue"}))],
-            Value::Null,
+            None,
         );
         let root = empty_root();
         let rows = list_targets(&manifest, &root).unwrap();
@@ -171,7 +179,7 @@ mod tests {
                     "_aws": { "assume_role": "arn:aws:iam::123456789012:role/Deployer" }
                 }),
             )],
-            Value::Null,
+            None,
         );
         let root = empty_root();
         let rows = list_targets(&manifest, &root).unwrap();
@@ -190,7 +198,7 @@ mod tests {
                     "_aws": { "assume_role": "" }
                 }),
             )],
-            Value::Null,
+            None,
         );
         let root = empty_root();
         let rows = list_targets(&manifest, &root).unwrap();
@@ -208,7 +216,7 @@ mod tests {
                     "_aws": { "assume_role": "not-an-arn" }
                 }),
             )],
-            Value::Null,
+            None,
         );
         let root = empty_root();
         let err = list_targets(&manifest, &root).unwrap_err();
@@ -228,7 +236,7 @@ mod tests {
                 ("alpha", json!({})),
                 ("mid", json!({})),
             ],
-            Value::Null,
+            None,
         );
         let root = empty_root();
         let rows = list_targets(&manifest, &root).unwrap();
@@ -239,7 +247,7 @@ mod tests {
 
     #[test]
     fn kind_is_literal_job_or_dag() {
-        let manifest = make_manifest(vec![("j1", json!({}))], Value::Null);
+        let manifest = make_manifest(vec![("j1", json!({}))], None);
         let root = empty_root();
         let rows = list_targets(&manifest, &root).unwrap();
         assert_eq!(rows[0].kind, "job");

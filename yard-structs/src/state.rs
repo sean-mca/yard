@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::config::AwsCredentialConfig;
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Resource {
     pub r#type: String,
@@ -74,11 +76,11 @@ pub struct DagState {
     /// AWS credential config resolved at apply time for this DAG's upload
     /// bucket. Persisted so the destroy path (which runs without the DAG's
     /// source dir) can re-authenticate to the same account the upload used.
-    /// `Value::Null` when the DAG's apply used the default AWS credential
-    /// chain (preserves today's behavior for existing state files via
-    /// `#[serde(default)]`).
-    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
-    pub aws: serde_json::Value,
+    /// `None` when the DAG's apply used the default AWS credential chain
+    /// (preserves today's behavior for existing pre-Phase-9 state files
+    /// via `#[serde(default)]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws: Option<AwsCredentialConfig>,
 }
 
 #[cfg(test)]
@@ -116,11 +118,11 @@ mod tests {
             }
         });
         let parsed: DagState = serde_json::from_value(legacy_json.clone()).unwrap();
-        assert!(parsed.aws.is_null(), "missing aws key must default to Null");
+        assert!(parsed.aws.is_none(), "missing aws key must default to None");
         let reserialized = serde_json::to_value(&parsed).unwrap();
         assert_eq!(
             reserialized, legacy_json,
-            "round-trip must omit aws when null"
+            "round-trip must omit aws when None"
         );
     }
 
@@ -130,7 +132,10 @@ mod tests {
             dag_name: "test_dag".to_string(),
             project: "test".to_string(),
             deployment: sample_deployment(),
-            aws: json!({"assume_role": "arn:aws:iam::333333333333:role/DagBucket"}),
+            aws: Some(AwsCredentialConfig {
+                assume_role: Some("arn:aws:iam::333333333333:role/DagBucket".to_string()),
+                ..Default::default()
+            }),
         };
         let serialized = serde_json::to_value(&state).unwrap();
         assert_eq!(
@@ -142,7 +147,7 @@ mod tests {
         );
         let parsed: DagState = serde_json::from_value(serialized).unwrap();
         assert_eq!(
-            parsed.aws.get("assume_role").and_then(|v| v.as_str()),
+            parsed.aws.as_ref().and_then(|c| c.assume_role.as_deref()),
             Some("arn:aws:iam::333333333333:role/DagBucket")
         );
     }

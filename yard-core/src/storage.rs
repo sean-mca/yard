@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use aws_sdk_s3::Client;
 use std::path::PathBuf;
-use yard_structs::{DagState, JobState, LockInfo, StateBackend};
+use yard_structs::{AwsCredentialConfig, DagState, JobState, LockInfo, StateBackend};
 
 /// Prefix for DAG state files to avoid colliding with job state files.
 pub const DAG_STATE_PREFIX: &str = "_dag_";
@@ -509,8 +509,8 @@ impl Storage {
 
 /// Merge `YARD_STATE_AWS_*` env vars over a yaml `state.aws:` block
 /// (env beats yaml, mirroring `providers::aws_config`'s `YARD_AWS_*`
-/// precedence). Produces the `Value` that `providers::aws_config` will
-/// consume as its `aws_cfg` argument.
+/// precedence). Produces the typed `AwsCredentialConfig` that callers
+/// convert to a JSON `Value` at the providers boundary.
 ///
 /// Resolution (highest precedence first):
 ///   YARD_STATE_AWS_ASSUME_ROLE  → yaml `assume_role`
@@ -519,42 +519,31 @@ impl Storage {
 ///
 /// Provider `YARD_AWS_*` env vars are NOT consulted — state creds scope
 /// is orthogonal to provider creds (D-03). If both yaml and envs are
-/// absent, returns `Value::Null` so the caller can pass `None` to
-/// `aws_config` and get the default credential provider chain —
-/// preserving today's behavior (D-02 strictly additive).
-fn merge_state_aws_with_env(state_aws: &serde_json::Value) -> serde_json::Value {
-    let yaml_str = |key: &str| {
-        state_aws
-            .get(key)
-            .and_then(|v| v.as_str())
-            .map(String::from)
+/// absent, returns `None` so the caller can pass `None` to `aws_config`
+/// and get the default credential provider chain — preserving today's
+/// behavior (D-02 strictly additive).
+fn merge_state_aws_with_env(
+    state_aws: Option<&AwsCredentialConfig>,
+) -> Option<AwsCredentialConfig> {
+    let yaml = state_aws.cloned().unwrap_or_default();
+
+    // Env beats yaml: envs are the overlay, yaml is the base.
+    let env_overlay = AwsCredentialConfig {
+        assume_role: std::env::var("YARD_STATE_AWS_ASSUME_ROLE").ok(),
+        session_name: std::env::var("YARD_STATE_AWS_SESSION_NAME").ok(),
+        external_id: std::env::var("YARD_STATE_AWS_EXTERNAL_ID").ok(),
+        // `region` lives on `StateBackend::S3.region`, not on the aws
+        // sub-block here — keep it None at this layer.
+        region: None,
     };
+    let merged = AwsCredentialConfig::merge(&yaml, &env_overlay);
 
-    let assume_role = std::env::var("YARD_STATE_AWS_ASSUME_ROLE")
-        .ok()
-        .or_else(|| yaml_str("assume_role"));
-    let session_name = std::env::var("YARD_STATE_AWS_SESSION_NAME")
-        .ok()
-        .or_else(|| yaml_str("session_name"));
-    let external_id = std::env::var("YARD_STATE_AWS_EXTERNAL_ID")
-        .ok()
-        .or_else(|| yaml_str("external_id"));
-
-    let mut merged = serde_json::Map::new();
-    if let Some(v) = assume_role {
-        merged.insert("assume_role".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = session_name {
-        merged.insert("session_name".to_string(), serde_json::Value::String(v));
-    }
-    if let Some(v) = external_id {
-        merged.insert("external_id".to_string(), serde_json::Value::String(v));
-    }
-
-    if merged.is_empty() {
-        serde_json::Value::Null
+    if merged == AwsCredentialConfig::default() {
+        // No yaml + no envs → fall through to default credential chain
+        // (D-02 strictly additive).
+        None
     } else {
-        serde_json::Value::Object(merged)
+        Some(merged)
     }
 }
 
@@ -578,14 +567,19 @@ pub async fn get_storage(backend: &StateBackend) -> Result<Storage> {
             // Provider `YARD_AWS_*` envs are intentionally NOT consulted here —
             // state cred scope is orthogonal to provider cred scope (D-03).
             // When neither yaml nor envs are set, `merge_state_aws_with_env`
-            // returns `Value::Null` and we pass `None` to `aws_config`,
-            // preserving today's default-chain behavior (D-02 strictly additive).
-            let merged = merge_state_aws_with_env(aws);
-            let aws_cfg_opt = if merged.is_null() {
-                None
-            } else {
-                Some(&merged)
-            };
+            // returns `None` and we pass `None` to `aws_config`, preserving
+            // today's default-chain behavior (D-02 strictly additive).
+            //
+            // The `providers::aws_config` boundary stays Value-typed (D-14
+            // forward-compat for provider-specific extension fields), so we
+            // convert here at the call site via `serde_json::to_value`.
+            let merged = merge_state_aws_with_env(aws.as_ref());
+            let merged_value: Option<serde_json::Value> = merged
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .context("Failed to serialize state AWS credentials to JSON")?;
+            let aws_cfg_opt = merged_value.as_ref();
             let config = crate::providers::aws_config(region, aws_cfg_opt).await;
             let client = Client::new(&config);
 
@@ -849,7 +843,7 @@ mod tests {
                 applied_at: "2025-01-01T00:00:00Z".to_string(),
                 s3_uri: None,
             },
-            aws: serde_json::Value::Null,
+            aws: None,
         }
     }
 
@@ -986,19 +980,18 @@ mod tests {
                 ("YARD_STATE_AWS_EXTERNAL_ID", None),
             ],
             || {
-                let yaml = serde_json::json!({
-                    "assume_role": "arn:aws:iam::111111111111:role/Yaml",
-                    "session_name": "yaml-sess",
-                });
-                let merged = merge_state_aws_with_env(&yaml);
+                let yaml = AwsCredentialConfig {
+                    assume_role: Some("arn:aws:iam::111111111111:role/Yaml".to_string()),
+                    session_name: Some("yaml-sess".to_string()),
+                    ..Default::default()
+                };
+                let merged = merge_state_aws_with_env(Some(&yaml))
+                    .expect("envs are set so merged must be Some");
                 assert_eq!(
-                    merged.get("assume_role").and_then(|v| v.as_str()),
+                    merged.assume_role.as_deref(),
                     Some("arn:aws:iam::999999999999:role/Env")
                 );
-                assert_eq!(
-                    merged.get("session_name").and_then(|v| v.as_str()),
-                    Some("env-sess")
-                );
+                assert_eq!(merged.session_name.as_deref(), Some("env-sess"));
             },
         );
     }
@@ -1012,11 +1005,14 @@ mod tests {
                 ("YARD_STATE_AWS_EXTERNAL_ID", None),
             ],
             || {
-                let yaml =
-                    serde_json::json!({"assume_role": "arn:aws:iam::111111111111:role/Yaml"});
-                let merged = merge_state_aws_with_env(&yaml);
+                let yaml = AwsCredentialConfig {
+                    assume_role: Some("arn:aws:iam::111111111111:role/Yaml".to_string()),
+                    ..Default::default()
+                };
+                let merged = merge_state_aws_with_env(Some(&yaml))
+                    .expect("yaml is set so merged must be Some");
                 assert_eq!(
-                    merged.get("assume_role").and_then(|v| v.as_str()),
+                    merged.assume_role.as_deref(),
                     Some("arn:aws:iam::111111111111:role/Yaml")
                 );
             },
@@ -1035,9 +1031,10 @@ mod tests {
                 ("YARD_STATE_AWS_EXTERNAL_ID", None),
             ],
             || {
-                let merged = merge_state_aws_with_env(&serde_json::Value::Null);
+                let merged = merge_state_aws_with_env(None)
+                    .expect("env is set so merged must be Some");
                 assert_eq!(
-                    merged.get("assume_role").and_then(|v| v.as_str()),
+                    merged.assume_role.as_deref(),
                     Some("arn:aws:iam::222222222222:role/Env")
                 );
             },
@@ -1053,10 +1050,10 @@ mod tests {
                 ("YARD_STATE_AWS_EXTERNAL_ID", None),
             ],
             || {
-                let merged = merge_state_aws_with_env(&serde_json::Value::Null);
+                let merged = merge_state_aws_with_env(None);
                 assert!(
-                    merged.is_null(),
-                    "absent yaml + absent envs must return Null so aws_config gets None (default chain)"
+                    merged.is_none(),
+                    "absent yaml + absent envs must return None so aws_config gets None (default chain)"
                 );
             },
         );
@@ -1071,12 +1068,13 @@ mod tests {
                 ("YARD_STATE_AWS_EXTERNAL_ID", Some("xid-env")),
             ],
             || {
-                let yaml = serde_json::json!({"external_id": "xid-yaml"});
-                let merged = merge_state_aws_with_env(&yaml);
-                assert_eq!(
-                    merged.get("external_id").and_then(|v| v.as_str()),
-                    Some("xid-env")
-                );
+                let yaml = AwsCredentialConfig {
+                    external_id: Some("xid-yaml".to_string()),
+                    ..Default::default()
+                };
+                let merged = merge_state_aws_with_env(Some(&yaml))
+                    .expect("yaml or env is set so merged must be Some");
+                assert_eq!(merged.external_id.as_deref(), Some("xid-env"));
             },
         );
     }
@@ -1095,9 +1093,9 @@ mod tests {
                 ("YARD_STATE_AWS_EXTERNAL_ID", None),
             ],
             || {
-                let merged = merge_state_aws_with_env(&serde_json::Value::Null);
+                let merged = merge_state_aws_with_env(None);
                 assert!(
-                    merged.is_null(),
+                    merged.is_none(),
                     "provider YARD_AWS_* must NOT leak into state creds (D-03)"
                 );
             },
@@ -1110,7 +1108,7 @@ mod tests {
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),
             key: "state/".to_string(),
-            aws: serde_json::Value::Null,
+            aws: None,
         };
         let result = get_storage(&backend).await;
         assert!(result.is_ok());
@@ -1123,8 +1121,9 @@ mod tests {
             bucket: "test-bucket".to_string(),
             region: "us-east-1".to_string(),
             key: "state/".to_string(),
-            aws: serde_json::json!({
-                "assume_role": "arn:aws:iam::111111111111:role/FakeState"
+            aws: Some(AwsCredentialConfig {
+                assume_role: Some("arn:aws:iam::111111111111:role/FakeState".to_string()),
+                ..Default::default()
             }),
         };
         let result = get_storage(&backend).await;

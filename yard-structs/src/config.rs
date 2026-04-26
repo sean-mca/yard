@@ -6,8 +6,97 @@ fn default_path_buf() -> PathBuf {
     PathBuf::new()
 }
 
+/// Discriminator for `JobDefinition.job_type` (TYPE-01). Wire format is the
+/// lowercase variant name — `"glue"`, `"emr"`, `"bash"`. Adding a fourth job
+/// type requires (1) a new variant here, (2) a `FromStr` arm below, (3) a new
+/// provider impl in `yard-core/src/providers/`, and (4) a new validation arm
+/// in `yard-core/src/validation/rules.rs`.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum JobType {
+    Glue,
+    Emr,
+    Bash,
+}
+
+impl std::fmt::Display for JobType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            JobType::Glue => "glue",
+            JobType::Emr => "emr",
+            JobType::Bash => "bash",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::str::FromStr for JobType {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "glue" => Ok(JobType::Glue),
+            "emr" => Ok(JobType::Emr),
+            "bash" => Ok(JobType::Bash),
+            other => Err(anyhow::anyhow!(
+                "invalid job type '{other}' (expected: glue, emr, bash)"
+            )),
+        }
+    }
+}
+
+/// Typed AWS credential configuration (TYPE-02). Replaces the previous
+/// `aws: serde_json::Value` blob on `StateBackend::S3`, `AirflowSection`,
+/// `ProjectManifest`, and `DagState`.
+///
+/// Wire format is byte-equal to today's untyped shape: each field uses
+/// `#[serde(default, skip_serializing_if = "Option::is_none")]` so absent
+/// keys stay absent on round-trip. `None` at the field-set level means
+/// "no override — fall through to env vars / default AWS credential
+/// provider chain", identical to today's `Value::Null` semantic.
+///
+/// Provider-specific extension fields (per-provider AWS knobs) keep their
+/// `serde_json::Value` envelope inside `JobDefinition.config: Value` per
+/// D-14 — this struct covers ONLY the common four fields used at the
+/// manifest level.
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+pub struct AwsCredentialConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assume_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+}
+
+impl AwsCredentialConfig {
+    /// Field-by-field shallow merge: each `Some` field in `overlay` wins over
+    /// the corresponding field in `self`. Used by the AWS cascade in
+    /// `dag_lifecycle::resolve_aws_for_dir` (root yaml ← account.yaml) and
+    /// `storage::merge_state_aws_with_env` (yaml ← envs). Mirrors the shape
+    /// of `merge_airflow_sections` in yard-core/src/parsing.rs.
+    pub fn merge(base: &Self, overlay: &Self) -> Self {
+        Self {
+            assume_role: overlay
+                .assume_role
+                .clone()
+                .or_else(|| base.assume_role.clone()),
+            external_id: overlay
+                .external_id
+                .clone()
+                .or_else(|| base.external_id.clone()),
+            session_name: overlay
+                .session_name
+                .clone()
+                .or_else(|| base.session_name.clone()),
+            region: overlay.region.clone().or_else(|| base.region.clone()),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum StateBackend {
     Local {
         path: PathBuf,
@@ -16,19 +105,17 @@ pub enum StateBackend {
         bucket: String,
         region: String,
         key: String,
-        /// Optional per-state-backend `aws:` sub-block. Shape parallels the
-        /// root `aws:` on `ProjectManifest` — untyped `serde_json::Value`
-        /// whose readers use `.get("assume_role").and_then(|v| v.as_str())`,
-        /// `.get("session_name")`, `.get("external_id")`. `Value::Null` means
-        /// "fall through to `YARD_STATE_AWS_*` envs, then the default AWS
-        /// credential provider chain" — keeps today's behavior unchanged
-        /// when unset (Phase 9 strictly-additive guarantee).
-        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
-        aws: serde_json::Value,
+        /// Optional per-state-backend `aws:` sub-block (TYPE-02). `None` falls
+        /// through to `YARD_STATE_AWS_*` envs, then the default AWS credential
+        /// provider chain — preserving today's behavior unchanged when unset
+        /// (Phase 9 strictly-additive guarantee).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        aws: Option<AwsCredentialConfig>,
     },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectManifest {
     pub project: String,
     pub state: StateBackend,
@@ -38,13 +125,20 @@ pub struct ProjectManifest {
     pub providers: HashMap<String, serde_json::Value>,
     #[serde(default)]
     pub jobs: HashMap<String, JobDefinition>,
-    /// Root-level `aws:` block from yard.yaml. Controls yard's own AWS
-    /// credentials (AssumeRole target, session name, external id, region).
-    /// Per-job and per-DAG account.yaml `aws:` blocks shallow-override this.
-    /// `Value::Null` when not set — providers fall back to the default AWS
-    /// credential provider chain.
-    #[serde(default)]
-    pub aws: serde_json::Value,
+    /// Root-level `aws:` block (TYPE-02). Per-job and per-DAG account.yaml
+    /// `aws:` blocks shallow-override this. `None` falls through to the
+    /// default AWS credential provider chain.
+    ///
+    /// Wire-format note: under the prior untyped shape this field had only
+    /// `#[serde(default)]` (no `skip_serializing_if`), so unset values
+    /// serialized as the literal `"aws": null`. With the typed
+    /// `Option<AwsCredentialConfig>` + `skip_serializing_if = "Option::is_none"`
+    /// the field is now omitted entirely on serialize when `None` —
+    /// intentional alignment with `StateBackend::S3.aws`,
+    /// `AirflowSection.aws`, and `DagState.aws`, all of which already
+    /// skip on the unset path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws: Option<AwsCredentialConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -54,6 +148,7 @@ pub struct Import {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Source {
     pub name: String,                   // variable name: produces df_<name>
     pub source_type: String,            // s3, jdbc, catalog, kafka, api
@@ -87,6 +182,7 @@ pub struct Source {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Sink {
     pub source: Option<String>, // which df to write (defaults to first/only source)
     pub sink_type: String,      // s3, jdbc, catalog
@@ -112,6 +208,7 @@ pub struct OrderBySpec {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Transform {
     pub transform_type: String, // filter, sql, drop_columns, rename, select, add_column, join, aggregate, window
     pub source: Option<String>, // which df to operate on (defaults to first/only source)
@@ -135,9 +232,10 @@ pub struct Transform {
     pub order_by: Vec<OrderBySpec>, // window: order spec
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct JobDefinition {
-    pub job_type: String,
+    pub job_type: JobType,
     pub imports: Vec<Import>,
     pub body: Option<String>,
     /// Path to an external Python file that replaces YARD's generated script entirely.
@@ -174,6 +272,34 @@ pub struct JobDefinition {
     pub base_name: String,
 }
 
+/// Hand-written `Default` because `JobType` deliberately has no `Default` impl
+/// (D-08): the only sensible default for a JobDefinition's `job_type` is
+/// `JobType::Glue` (most-tested type, least-surprising default for the
+/// non-deployable empty default), but a default at the JobType level would
+/// invite accidental `JobType::default()` calls in code that should always
+/// pick deliberately. The default JobDefinition itself stays non-deployable —
+/// empty body, no sources, no sink — same as before this refactor.
+impl Default for JobDefinition {
+    fn default() -> Self {
+        Self {
+            job_type: JobType::Glue,
+            imports: Vec::new(),
+            body: None,
+            job_file: None,
+            sources: Vec::new(),
+            sink: None,
+            transforms: Vec::new(),
+            airflow: None,
+            partition_by: Vec::new(),
+            partition_timestamp_column: None,
+            create_timestamp: false,
+            config: serde_json::Value::Null,
+            dir: PathBuf::new(),
+            base_name: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct YARDContext {
     pub account: serde_json::Value,
@@ -189,6 +315,7 @@ pub struct YARDContext {
 /// account.yaml, dag.yaml, and the per-job `airflow:` block). Every layer has
 /// the same shape; later layers override earlier ones via shallow merge.
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AirflowSection {
     pub schedule: Option<String>,
     pub owner: Option<String>,
@@ -202,11 +329,10 @@ pub struct AirflowSection {
     pub triggered_by: Vec<String>,
     /// Optional per-airflow-provider `aws:` sub-block for the DAG upload bucket.
     /// When set, takes priority over the root `aws:` + nearest `account.yaml`
-    /// cascade used elsewhere in codegen. Same untyped-`Value` shape as
-    /// `StateBackend::S3::aws` and `ProjectManifest::aws`. `Value::Null`
-    /// preserves today's account.yaml-cascade behavior.
-    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
-    pub aws: serde_json::Value,
+    /// cascade used elsewhere in codegen. `None` preserves today's
+    /// account.yaml-cascade behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws: Option<AwsCredentialConfig>,
 }
 
 /// Per-job Airflow metadata lifted out of the `airflow:` block on a job file.
@@ -258,14 +384,12 @@ mod tests {
         });
         let parsed: StateBackend = serde_json::from_value(input.clone()).unwrap();
         if let StateBackend::S3 { aws, .. } = &parsed {
+            let creds = aws.as_ref().expect("aws field must parse to Some");
             assert_eq!(
-                aws.get("assume_role").and_then(|v| v.as_str()),
+                creds.assume_role.as_deref(),
                 Some("arn:aws:iam::111111111111:role/StateAccess")
             );
-            assert_eq!(
-                aws.get("external_id").and_then(|v| v.as_str()),
-                Some("xid-1")
-            );
+            assert_eq!(creds.external_id.as_deref(), Some("xid-1"));
         } else {
             panic!("expected StateBackend::S3");
         }
@@ -311,13 +435,248 @@ mod tests {
             }
         });
         let parsed: AirflowSection = serde_json::from_value(input).unwrap();
+        let creds = parsed.aws.as_ref().expect("aws field must parse to Some");
         assert_eq!(
-            parsed.aws.get("assume_role").and_then(|v| v.as_str()),
+            creds.assume_role.as_deref(),
             Some("arn:aws:iam::222222222222:role/DagUpload")
         );
+        assert_eq!(creds.session_name.as_deref(), Some("yard-dag"));
+    }
+
+    // --- AwsCredentialConfig (TYPE-02) ---
+
+    #[test]
+    fn aws_credential_config_default_round_trip() {
+        let creds = AwsCredentialConfig::default();
+        let serialized = serde_json::to_value(&creds).unwrap();
+        // All None → empty object on serialize.
+        assert_eq!(serialized, json!({}));
+        let parsed: AwsCredentialConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(parsed, creds);
+    }
+
+    #[test]
+    fn aws_credential_config_full_round_trip() {
+        let creds = AwsCredentialConfig {
+            assume_role: Some("arn:aws:iam::111111111111:role/Foo".to_string()),
+            external_id: Some("xid-1".to_string()),
+            session_name: Some("yard-test".to_string()),
+            region: Some("us-east-1".to_string()),
+        };
+        let serialized = serde_json::to_value(&creds).unwrap();
         assert_eq!(
-            parsed.aws.get("session_name").and_then(|v| v.as_str()),
-            Some("yard-dag")
+            serialized,
+            json!({
+                "assume_role": "arn:aws:iam::111111111111:role/Foo",
+                "external_id": "xid-1",
+                "session_name": "yard-test",
+                "region": "us-east-1",
+            })
         );
+        let parsed: AwsCredentialConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(parsed, creds);
+    }
+
+    #[test]
+    fn aws_credential_config_partial_skips_none() {
+        let creds = AwsCredentialConfig {
+            assume_role: Some("arn:aws:iam::111111111111:role/Foo".to_string()),
+            external_id: None,
+            session_name: None,
+            region: None,
+        };
+        let serialized = serde_json::to_value(&creds).unwrap();
+        assert_eq!(
+            serialized,
+            json!({"assume_role": "arn:aws:iam::111111111111:role/Foo"})
+        );
+    }
+
+    #[test]
+    fn aws_credential_config_merge_overlay_wins() {
+        let base = AwsCredentialConfig {
+            assume_role: Some("base-role".to_string()),
+            external_id: Some("base-eid".to_string()),
+            session_name: None,
+            region: Some("us-east-1".to_string()),
+        };
+        let overlay = AwsCredentialConfig {
+            assume_role: Some("overlay-role".to_string()),
+            external_id: None,
+            session_name: Some("overlay-name".to_string()),
+            region: None,
+        };
+        let merged = AwsCredentialConfig::merge(&base, &overlay);
+        // overlay Some wins over base Some
+        assert_eq!(merged.assume_role.as_deref(), Some("overlay-role"));
+        // overlay None falls through to base Some
+        assert_eq!(merged.external_id.as_deref(), Some("base-eid"));
+        // base None falls through to overlay Some
+        assert_eq!(merged.session_name.as_deref(), Some("overlay-name"));
+        // overlay None falls through to base Some
+        assert_eq!(merged.region.as_deref(), Some("us-east-1"));
+    }
+
+    #[test]
+    fn aws_credential_config_merge_both_none_yields_default() {
+        let merged =
+            AwsCredentialConfig::merge(&AwsCredentialConfig::default(), &AwsCredentialConfig::default());
+        assert_eq!(merged, AwsCredentialConfig::default());
+    }
+
+    // --- JobType (TYPE-01) ---
+
+    #[test]
+    fn job_type_serialize_lowercase() {
+        assert_eq!(serde_json::to_value(JobType::Glue).unwrap(), json!("glue"));
+        assert_eq!(serde_json::to_value(JobType::Emr).unwrap(), json!("emr"));
+        assert_eq!(serde_json::to_value(JobType::Bash).unwrap(), json!("bash"));
+    }
+
+    #[test]
+    fn job_type_deserialize_lowercase() {
+        let g: JobType = serde_json::from_value(json!("glue")).unwrap();
+        assert_eq!(g, JobType::Glue);
+        let e: JobType = serde_json::from_value(json!("emr")).unwrap();
+        assert_eq!(e, JobType::Emr);
+        let b: JobType = serde_json::from_value(json!("bash")).unwrap();
+        assert_eq!(b, JobType::Bash);
+    }
+
+    #[test]
+    fn job_type_deserialize_unknown_rejects() {
+        let err = serde_json::from_value::<JobType>(json!("sprk")).unwrap_err();
+        assert!(format!("{err}").contains("unknown variant"), "got: {err}");
+    }
+
+    #[test]
+    fn job_type_from_str_round_trip() {
+        use std::str::FromStr;
+        for variant in [JobType::Glue, JobType::Emr, JobType::Bash] {
+            let s = variant.to_string();
+            let back = JobType::from_str(&s).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn job_type_from_str_invalid() {
+        use std::str::FromStr;
+        let err = JobType::from_str("sprk").unwrap_err();
+        assert!(format!("{err}").contains("invalid job type"), "got: {err}");
+    }
+
+    #[test]
+    fn job_type_display_matches_wire_format() {
+        assert_eq!(format!("{}", JobType::Glue), "glue");
+        assert_eq!(format!("{}", JobType::Emr), "emr");
+        assert_eq!(format!("{}", JobType::Bash), "bash");
+    }
+
+    // --- deny_unknown_fields (TYPE-03) ---
+    //
+    // Each of these tests exercises the structural deny gate at the serde-
+    // derived deserialize path (storage.rs's state-file persistence flows
+    // through these structs). User yard.yaml typo coverage at the manual
+    // `Value`-extraction layer in parsing.rs is exercised by the integration
+    // test at yard-core/tests/typed_config_validation.rs + the inline tests
+    // in yard-core/src/parsing.rs (D-17).
+
+    #[test]
+    fn project_manifest_deny_unknown_fields() {
+        let input = json!({
+            "project": "test",
+            "state": {"type": "local", "path": ".yard/state"},
+            "providers": {},
+            "jobs": {},
+            "wat": "this is unknown",
+        });
+        let err = serde_json::from_value::<ProjectManifest>(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown field"), "got: {msg}");
+        assert!(msg.contains("wat"), "got: {msg}");
+    }
+
+    #[test]
+    fn state_backend_s3_deny_unknown_fields() {
+        let input = json!({
+            "type": "s3", "bucket": "b", "region": "us-east-1", "key": "k/",
+            "wat": "unknown"
+        });
+        let err = serde_json::from_value::<StateBackend>(input).unwrap_err();
+        assert!(format!("{err}").contains("unknown field"));
+    }
+
+    #[test]
+    fn state_backend_local_deny_unknown_fields() {
+        let input = json!({"type": "local", "path": ".yard/state", "wat": "unknown"});
+        let err = serde_json::from_value::<StateBackend>(input).unwrap_err();
+        assert!(format!("{err}").contains("unknown field"));
+    }
+
+    #[test]
+    fn airflow_section_deny_unknown_fields() {
+        let input = json!({"schedule": "@daily", "wat": 1});
+        let err = serde_json::from_value::<AirflowSection>(input).unwrap_err();
+        assert!(format!("{err}").contains("unknown field"));
+    }
+
+    #[test]
+    fn source_deny_unknown_fields() {
+        let input = json!({
+            "name": "foo",
+            "source_type": "s3",
+            "wat": "unknown"
+        });
+        let err = serde_json::from_value::<Source>(input).unwrap_err();
+        assert!(format!("{err}").contains("unknown field"));
+    }
+
+    #[test]
+    fn sink_deny_unknown_fields() {
+        let input = json!({
+            "sink_type": "s3",
+            "wat": "unknown"
+        });
+        let err = serde_json::from_value::<Sink>(input).unwrap_err();
+        assert!(format!("{err}").contains("unknown field"));
+    }
+
+    #[test]
+    fn transform_deny_unknown_fields() {
+        let input = json!({
+            "transform_type": "filter",
+            "wat": "unknown"
+        });
+        let err = serde_json::from_value::<Transform>(input).unwrap_err();
+        assert!(format!("{err}").contains("unknown field"));
+    }
+
+    #[test]
+    fn job_definition_deny_unknown_fields() {
+        let input = json!({
+            "job_type": "glue",
+            "imports": [],
+            "body": null,
+            "job_file": null,
+            "sources": [],
+            "sink": null,
+            "transforms": [],
+            "airflow": null,
+            "config": null,
+            "wat": "unknown"
+        });
+        let err = serde_json::from_value::<JobDefinition>(input).unwrap_err();
+        assert!(format!("{err}").contains("unknown field"));
+    }
+
+    #[test]
+    fn airflow_section_subset_still_parses() {
+        // Sanity: deny_unknown_fields rejects unknowns but accepts subsets
+        // (skip_serializing_if + #[serde(default)] mean missing keys are fine).
+        let input = json!({"schedule": "@hourly"});
+        let parsed: AirflowSection = serde_json::from_value(input).unwrap();
+        assert_eq!(parsed.schedule.as_deref(), Some("@hourly"));
+        assert!(parsed.owner.is_none());
     }
 }

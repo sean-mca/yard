@@ -42,11 +42,11 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
-    use yard_structs::{Sink, Source, Transform};
+    use yard_structs::{JobType, Sink, Source, Transform};
 
     fn valid_glue_job() -> JobDefinition {
         JobDefinition {
-            job_type: "glue".to_string(),
+            job_type: JobType::Glue,
             imports: vec![],
             body: None,
             job_file: None,
@@ -100,7 +100,7 @@ mod tests {
 
     fn minimal_job() -> JobDefinition {
         JobDefinition {
-            job_type: "glue".to_string(),
+            job_type: JobType::Glue,
             config: json!({"type": "glue", "role": "arn:aws:iam::123456789:role/GlueRole"}),
             ..Default::default()
         }
@@ -115,15 +115,13 @@ mod tests {
     }
 
     // --- Job type ---
-
-    #[test]
-    fn invalid_job_type() {
-        let mut job = minimal_job();
-        job.job_type = "spark_streaming".to_string();
-        let errors = validate_job(&job);
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].field == "type");
-    }
+    //
+    // The `invalid_job_type` test was deleted in Phase 21 plan 21-01: unknown
+    // wire strings are now rejected at deserialize time by serde via
+    // JobType's `unknown variant` error (covered by
+    // `yard_structs::config::tests::job_type_deserialize_unknown_rejects`).
+    // Constructing a JobDefinition with an invalid job_type is no longer
+    // expressible — JobType is a closed three-variant enum.
 
     // --- Source types ---
 
@@ -686,8 +684,13 @@ mod tests {
 
     #[test]
     fn collects_all_errors() {
+        // Note: prior to Phase 21 plan 21-01 this test mutated job.job_type to
+        // "unknown" to also assert a job-type validation error. That arm now
+        // lives at deserialize time (serde unknown-variant rejection on
+        // JobType) and cannot be exercised by mutating a typed JobDefinition.
+        // The test still validates that source/transform/sink errors collect
+        // independently and don't short-circuit.
         let mut job = minimal_job();
-        job.job_type = "unknown".to_string();
         job.sources = vec![Source {
             name: "src".to_string(),
             source_type: "gcs".to_string(),
@@ -732,8 +735,9 @@ mod tests {
             fill_nulls: None,
         });
         let errors = validate_job(&job);
-        assert!(errors.len() >= 3);
-        assert!(errors.iter().any(|e| e.field == "type"));
+        // Down from `>= 3` after Phase 21 21-01 deleted the job-type
+        // validation arm (now enforced upstream by serde at deserialize).
+        assert!(errors.len() >= 2);
         assert!(errors.iter().any(|e| e.field == "sources[0].type"));
         assert!(errors.iter().any(|e| e.field == "sink.type"));
     }
@@ -962,7 +966,7 @@ mod tests {
                 .insert("command".to_string(), json!(c));
         }
         JobDefinition {
-            job_type: "bash".to_string(),
+            job_type: JobType::Bash,
             config: cfg,
             ..Default::default()
         }

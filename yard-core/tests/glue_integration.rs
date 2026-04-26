@@ -15,6 +15,7 @@ use aws_sdk_glue::Client as GlueClient;
 use aws_sdk_s3::Client as S3Client;
 use serde_json::json;
 use yard_core::providers::get_provider;
+use yard_structs::JobType;
 
 const ENDPOINT: &str = "http://localhost:4566";
 const REGION: &str = "us-east-1";
@@ -86,7 +87,7 @@ async fn s3_upload_script() {
     let s3 = s3_client().await;
     ensure_bucket(&s3).await;
 
-    let provider = get_provider("glue", &test_provider_config())
+    let provider = get_provider(JobType::Glue, &test_provider_config())
         .await
         .expect("Failed to create provider");
 
@@ -143,7 +144,7 @@ async fn glue_create_job() {
     let glue = glue_client().await;
     ensure_bucket(&s3).await;
 
-    let provider = get_provider("glue", &test_provider_config())
+    let provider = get_provider(JobType::Glue, &test_provider_config())
         .await
         .expect("Failed to create provider");
 
@@ -198,7 +199,7 @@ async fn glue_update_job_idempotent() {
     let s3 = s3_client().await;
     ensure_bucket(&s3).await;
 
-    let provider = get_provider("glue", &test_provider_config())
+    let provider = get_provider(JobType::Glue, &test_provider_config())
         .await
         .expect("Failed to create provider");
 
@@ -253,7 +254,7 @@ async fn glue_destroy_cleans_up() {
     let glue = glue_client().await;
     ensure_bucket(&s3).await;
 
-    let provider = get_provider("glue", &test_provider_config())
+    let provider = get_provider(JobType::Glue, &test_provider_config())
         .await
         .expect("Failed to create provider");
 
@@ -303,7 +304,7 @@ async fn glue_missing_role_errors() {
     let s3 = s3_client().await;
     ensure_bucket(&s3).await;
 
-    let provider = get_provider("glue", &test_provider_config())
+    let provider = get_provider(JobType::Glue, &test_provider_config())
         .await
         .expect("Failed to create provider");
 
@@ -331,7 +332,7 @@ async fn glue_missing_script_bucket_errors() {
         // no script_bucket
     });
 
-    let result = get_provider("glue", &config).await;
+    let result = get_provider(JobType::Glue, &config).await;
     let err = match result {
         Err(e) => e.to_string(),
         Ok(_) => panic!("Provider creation should fail without script_bucket"),
@@ -364,7 +365,7 @@ async fn glue_deploy_with_full_config() {
         "bookmark": "enabled",
     });
 
-    let provider = get_provider("glue", &config)
+    let provider = get_provider(JobType::Glue, &config)
         .await
         .expect("Failed to create provider");
 

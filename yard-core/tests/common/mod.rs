@@ -18,7 +18,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use yard_structs::{
-    Deployment, JobDefinition, ProjectManifest, ProjectState, StateBackend,
+    Deployment, JobDefinition, JobType, ProjectManifest, ProjectState, StateBackend,
 };
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -72,7 +72,7 @@ pub fn empty_state() -> ProjectState {
 /// though Phase 12 tests always pass dry_run=true).
 fn bash_job(command: &str, dir: &Path) -> JobDefinition {
     JobDefinition {
-        job_type: "bash".to_string(),
+        job_type: JobType::Bash,
         config: json!({"type": "bash", "command": command}),
         dir: dir.to_path_buf(),
         ..Default::default()
@@ -170,7 +170,7 @@ pub fn build_target_matrix_project() -> TargetMatrixProject {
         state: StateBackend::Local { path: state_dir },
         providers: HashMap::new(),
         jobs,
-        aws: serde_json::Value::Null,
+        aws: None,
     };
 
     // DAG names are computed by airflow_dag::collection as `<project>_<dirname>`.

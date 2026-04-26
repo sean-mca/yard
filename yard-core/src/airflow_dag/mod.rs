@@ -104,7 +104,10 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use yard_structs::{AirflowJobBlock, Deployment, ProjectManifest, Resource, StateBackend};
+    use yard_structs::{
+        AirflowJobBlock, AwsCredentialConfig, Deployment, JobType, ProjectManifest, Resource,
+        StateBackend,
+    };
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -144,13 +147,13 @@ mod tests {
             },
             providers: HashMap::new(),
             jobs: HashMap::new(),
-            aws: serde_json::Value::Null,
+            aws: None,
         }
     }
 
     fn bash_job(command: &str, dir: &Path) -> JobDefinition {
         JobDefinition {
-            job_type: "bash".to_string(),
+            job_type: JobType::Bash,
             config: json!({"type": "bash", "command": command}),
             dir: dir.to_path_buf(),
             ..Default::default()
@@ -159,7 +162,7 @@ mod tests {
 
     fn glue_job(dir: &Path) -> JobDefinition {
         JobDefinition {
-            job_type: "glue".to_string(),
+            job_type: JobType::Glue,
             config: json!({
                 "type": "glue",
                 "role": "arn:aws:iam::123456789:role/TestGlueRole",
@@ -500,7 +503,7 @@ mod tests {
 
     fn prefixed_bash_job(base_name: &str, command: &str, dir: &Path) -> JobDefinition {
         JobDefinition {
-            job_type: "bash".to_string(),
+            job_type: JobType::Bash,
             config: json!({"type": "bash", "command": command}),
             dir: dir.to_path_buf(),
             base_name: base_name.to_string(),
@@ -744,7 +747,7 @@ mod tests {
 
     fn glue_job_with_assume_role(dir: &Path, role_arn: &str) -> JobDefinition {
         JobDefinition {
-            job_type: "glue".to_string(),
+            job_type: JobType::Glue,
             config: json!({
                 "type": "glue",
                 "role": "arn:aws:iam::123456789:role/TestGlueRole",
@@ -785,7 +788,7 @@ mod tests {
         write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
 
         let mut manifest = empty_manifest("test");
-        manifest.aws = json!({"assume_role": "arn:aws:iam::111111111111:role/OperatorA"});
+        manifest.aws = Some(AwsCredentialConfig { assume_role: Some("arn:aws:iam::111111111111:role/OperatorA".to_string()), ..Default::default() });
         manifest.jobs.insert(
             "orders".into(),
             glue_job_with_assume_role(&dag_dir, "arn:aws:iam::222222222222:role/GlueInvoker"),
@@ -849,7 +852,7 @@ mod tests {
         write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
 
         let mut manifest = empty_manifest("test");
-        manifest.aws = json!({"assume_role": "arn:aws:iam::111111111111:role/OperatorA"});
+        manifest.aws = Some(AwsCredentialConfig { assume_role: Some("arn:aws:iam::111111111111:role/OperatorA".to_string()), ..Default::default() });
         manifest.jobs.insert(
             "orders".into(),
             glue_job_with_assume_role(&dag_dir, "arn:aws:iam::222222222222:role/GlueInvoker"),
@@ -930,7 +933,7 @@ mod tests {
         manifest.jobs.insert(
             "orders".to_string(),
             JobDefinition {
-                job_type: "glue".to_string(),
+                job_type: JobType::Glue,
                 config: json!({
                     "type": "glue",
                     // role intentionally omitted
@@ -972,7 +975,7 @@ mod tests {
 
         let root_arn = "arn:aws:iam::111111111111:role/OperatorA";
         let mut manifest = empty_manifest("test");
-        manifest.aws = json!({"assume_role": root_arn});
+        manifest.aws = Some(AwsCredentialConfig { assume_role: Some(root_arn.to_string()), ..Default::default() });
         manifest.jobs.insert(
             "orders".into(),
             glue_job_with_assume_role(&dag_dir, root_arn),
@@ -1000,7 +1003,7 @@ mod tests {
         let role_b = "arn:aws:iam::222222222222:role/GlueInvoker";
         let role_c = "arn:aws:iam::333333333333:role/GlueInvoker";
         let mut manifest = empty_manifest("test");
-        manifest.aws = json!({"assume_role": "arn:aws:iam::111111111111:role/OperatorA"});
+        manifest.aws = Some(AwsCredentialConfig { assume_role: Some("arn:aws:iam::111111111111:role/OperatorA".to_string()), ..Default::default() });
         manifest
             .jobs
             .insert("orders".into(), glue_job_with_assume_role(&dag_dir, role_b));
