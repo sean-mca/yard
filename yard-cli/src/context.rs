@@ -3,6 +3,7 @@
 pub use yard_core::resolve::{find_and_parse_context, find_in_parent_folders, load_context};
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::fs;

@@ -68,6 +68,7 @@ pub fn resolve_json_path(ctx: &YARDContext, path: &str) -> Option<serde_json::Va
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use serde_json::json;

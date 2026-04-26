@@ -1,3 +1,5 @@
+#![warn(clippy::unwrap_used, clippy::expect_used)]
+
 pub mod airflow_dag;
 pub mod codegen;
 pub mod config_merge;

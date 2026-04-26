@@ -66,14 +66,14 @@ pub(crate) fn parse_account_from_role_arn(role_arn: &str) -> Result<String> {
 /// DAG runtime.
 pub fn derive_aws_conn_id(role_arn: &str) -> Result<String> {
     let account = parse_account_from_role_arn(role_arn)?;
-    // parse_account_from_role_arn already validated the full ARN shape; these
-    // strip_prefix calls cannot fail. Using expect() is safe and keeps
-    // the error surface owned by parse_account_from_role_arn above.
     let name = role_arn
         .strip_prefix("arn:aws:iam::")
         .and_then(|rest| rest.split_once(':'))
         .and_then(|(_, tail)| tail.strip_prefix("role/"))
-        .expect("ARN shape validated by parse_account_from_role_arn");
+        .ok_or_else(|| anyhow!(
+            "internal: role ARN shape validated by parse_account_from_role_arn but \
+             strip_prefix chain returned None for '{role_arn}' — please file a bug"
+        ))?;
     let sanitized = sanitize_identifier(name);
     Ok(format!("yard_{account}_{sanitized}"))
 }

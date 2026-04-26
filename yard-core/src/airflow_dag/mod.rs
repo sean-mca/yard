@@ -96,6 +96,7 @@ pub(crate) fn script_locations_from_state(
 // ------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::validation::validate_python_syntax;

@@ -52,11 +52,15 @@ pub fn collect_dags(root_dir: &Path, manifest: &ProjectManifest) -> Result<Vec<R
     }
 
     for (name, job) in &manifest.jobs {
-        if let Some(dir) = nearest_ancestor_in(&job.dir, &dag_dir_set) {
-            dag_to_jobs
-                .get_mut(&dir)
-                .expect("dag_to_jobs missing key")
-                .push((name.clone(), job));
+        // The else arm (dir present in dag_dir_set but missing from dag_to_jobs)
+        // is unreachable in practice because every dag_dir was inserted at
+        // lines 50-52 with an empty Vec — but a defensive let-chain miss is
+        // cheaper than relying on the invariant, and matches the
+        // unwrap_or_default() convention used 13 lines below at line 67.
+        if let Some(dir) = nearest_ancestor_in(&job.dir, &dag_dir_set)
+            && let Some(jobs) = dag_to_jobs.get_mut(&dir)
+        {
+            jobs.push((name.clone(), job));
         }
     }
 

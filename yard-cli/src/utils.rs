@@ -56,6 +56,7 @@ pub fn confirm(prompt: &str) -> io::Result<bool> {
 pub use yard_core::resolve::yaml_to_json;
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use yaml_rust2::YamlLoader;

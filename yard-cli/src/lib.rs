@@ -1,3 +1,5 @@
+#![warn(clippy::unwrap_used, clippy::expect_used)]
+
 pub mod commands;
 pub mod context;
 pub mod parser;
