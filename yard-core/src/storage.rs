@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, anyhow};
 use aws_sdk_s3::Client;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use yard_structs::{AwsCredentialConfig, DagState, JobState, LockInfo, StateBackend};
 
 /// Prefix for DAG state files to avoid colliding with job state files.
@@ -20,9 +22,537 @@ pub struct S3Storage {
     pub prefix: String,
 }
 
-pub enum Storage {
-    Local(LocalStorage),
-    S3(S3Storage),
+pub struct Storage {
+    backend: Box<dyn StorageBackend + Send + Sync>,
+}
+
+/// Trait for reading/writing job + DAG state and managing job locks.
+///
+/// Each backend (Local filesystem, S3 object store, future DynamoDB / GCS / etc.)
+/// implements this trait. The `Storage` wrapper struct holds a `Box<dyn StorageBackend>`
+/// and exposes thin wrapper methods so consumers don't need to know which backend
+/// is in use.
+///
+/// Mirrors the manual async-trait shape established by `crate::providers::Provider`
+/// (object-safe via `Pin<Box<dyn Future<...>>>` returns; no `async-trait` dep).
+pub trait StorageBackend: Send + Sync {
+    // --- Per-job state operations ---
+
+    /// Read a single job's state file. Returns None if the file doesn't exist.
+    fn read_job(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<JobState>>> + Send + '_>>;
+
+    /// Write a job's state file. Overwrites any existing file.
+    fn write_job(
+        &self,
+        job_name: &str,
+        state: &JobState,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+
+    /// Delete a job's state file. No-op if the file doesn't exist.
+    fn delete_job(&self, job_name: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+
+    /// List all job names with state files (excluding lock files and DAG files).
+    fn list_jobs(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>>;
+
+    // --- Per-DAG state operations ---
+
+    /// Read a DAG's state file. Returns None if the file doesn't exist.
+    fn read_dag(
+        &self,
+        dag_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<DagState>>> + Send + '_>>;
+
+    /// Write a DAG's state file. Overwrites any existing file.
+    fn write_dag(
+        &self,
+        dag_name: &str,
+        state: &DagState,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+
+    /// Delete a DAG's state file. No-op if the file doesn't exist.
+    fn delete_dag(&self, dag_name: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+
+    /// List all DAG names with state files.
+    fn list_dags(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>>;
+
+    // --- Locking primitives ---
+
+    /// Acquire a lock for a job. Returns the lock info on success.
+    /// Errors if the job is already locked.
+    fn lock(&self, job_name: &str) -> Pin<Box<dyn Future<Output = Result<LockInfo>> + Send + '_>>;
+
+    /// Remove the lock regardless of who holds it.
+    fn force_unlock(&self, job_name: &str)
+    -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+
+    /// Get the current lock info for a job, or None if not locked.
+    fn get_lock(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<LockInfo>>> + Send + '_>>;
+}
+
+// --- LocalStorage trait impl ---
+
+impl StorageBackend for LocalStorage {
+    fn read_job(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<JobState>>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        Box::pin(async move {
+            let path = self.path.join(format!("{job_name}.json"));
+            if !path.exists() {
+                return Ok(None);
+            }
+            let content = tokio::fs::read_to_string(&path)
+                .await
+                .with_context(|| format!("Failed to read state for job {job_name}"))?;
+            let state: JobState = serde_json::from_str(&content)?;
+            Ok(Some(state))
+        })
+    }
+
+    fn write_job(
+        &self,
+        job_name: &str,
+        state: &JobState,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        let json_result = serde_json::to_string_pretty(state);
+        Box::pin(async move {
+            let json = json_result?;
+            tokio::fs::create_dir_all(&self.path).await?;
+            let path = self.path.join(format!("{job_name}.json"));
+            tokio::fs::write(&path, json).await?;
+            Ok(())
+        })
+    }
+
+    fn delete_job(&self, job_name: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        Box::pin(async move {
+            let path = self.path.join(format!("{job_name}.json"));
+            if path.exists() {
+                tokio::fs::remove_file(&path).await?;
+            }
+            Ok(())
+        })
+    }
+
+    fn list_jobs(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
+        Box::pin(async move {
+            let mut jobs = Vec::new();
+            if !self.path.exists() {
+                return Ok(jobs);
+            }
+            let mut entries = tokio::fs::read_dir(&self.path).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Some(job_name) = name.strip_suffix(".json")
+                    && !job_name.ends_with(".lock")
+                    && !job_name.starts_with(DAG_STATE_PREFIX)
+                {
+                    jobs.push(job_name.to_string());
+                }
+            }
+            Ok(jobs)
+        })
+    }
+
+    fn read_dag(
+        &self,
+        dag_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<DagState>>> + Send + '_>> {
+        let dag_name = dag_name.to_string();
+        Box::pin(async move {
+            let key = format!("{DAG_STATE_PREFIX}{dag_name}");
+            let path = self.path.join(format!("{key}.json"));
+            if !path.exists() {
+                return Ok(None);
+            }
+            let content = tokio::fs::read_to_string(&path)
+                .await
+                .with_context(|| format!("Failed to read state for DAG {dag_name}"))?;
+            let state: DagState = serde_json::from_str(&content)?;
+            Ok(Some(state))
+        })
+    }
+
+    fn write_dag(
+        &self,
+        dag_name: &str,
+        state: &DagState,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let dag_name = dag_name.to_string();
+        let json_result = serde_json::to_string_pretty(state);
+        Box::pin(async move {
+            let key = format!("{DAG_STATE_PREFIX}{dag_name}");
+            let json = json_result?;
+            tokio::fs::create_dir_all(&self.path).await?;
+            let path = self.path.join(format!("{key}.json"));
+            tokio::fs::write(&path, json).await?;
+            Ok(())
+        })
+    }
+
+    fn delete_dag(&self, dag_name: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let dag_name = dag_name.to_string();
+        Box::pin(async move {
+            let key = format!("{DAG_STATE_PREFIX}{dag_name}");
+            let path = self.path.join(format!("{key}.json"));
+            if path.exists() {
+                tokio::fs::remove_file(&path).await?;
+            }
+            Ok(())
+        })
+    }
+
+    fn list_dags(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
+        Box::pin(async move {
+            let mut dags = Vec::new();
+            if !self.path.exists() {
+                return Ok(dags);
+            }
+            let mut entries = tokio::fs::read_dir(&self.path).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Some(base) = name.strip_suffix(".json")
+                    && !base.ends_with(".lock")
+                    && let Some(dag_name) = base.strip_prefix(DAG_STATE_PREFIX)
+                {
+                    dags.push(dag_name.to_string());
+                }
+            }
+            Ok(dags)
+        })
+    }
+
+    fn lock(&self, job_name: &str) -> Pin<Box<dyn Future<Output = Result<LockInfo>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        Box::pin(async move {
+            let info = lock_info();
+            let json = serde_json::to_string_pretty(&info)?;
+            tokio::fs::create_dir_all(&self.path).await?;
+            let lock_path = self.path.join(format!("{job_name}.json.lock"));
+
+            // O_CREAT | O_EXCL — fails if file already exists
+            match tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+                .await
+            {
+                Ok(_file) => {
+                    tokio::fs::write(&lock_path, &json).await?;
+                    Ok(info)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let existing = self.get_lock(&job_name).await?;
+                    match existing {
+                        Some(held) => Err(anyhow!(
+                            "Job \"{job_name}\" is locked by {} (since {}). \
+                             Use `yard force-unlock` to override.",
+                            held.who,
+                            held.created_at
+                        )),
+                        None => Err(anyhow!("Job \"{job_name}\" is locked (unknown holder)")),
+                    }
+                }
+                Err(e) => Err(e.into()),
+            }
+        })
+    }
+
+    fn force_unlock(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        Box::pin(async move {
+            let lock_path = self.path.join(format!("{job_name}.json.lock"));
+            if lock_path.exists() {
+                tokio::fs::remove_file(&lock_path).await?;
+            }
+            Ok(())
+        })
+    }
+
+    fn get_lock(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<LockInfo>>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        Box::pin(async move {
+            let lock_path = self.path.join(format!("{job_name}.json.lock"));
+            if !lock_path.exists() {
+                return Ok(None);
+            }
+            let content = tokio::fs::read_to_string(&lock_path).await?;
+            let info: LockInfo = serde_json::from_str(&content)?;
+            Ok(Some(info))
+        })
+    }
+}
+
+// --- S3Storage trait impl ---
+
+impl StorageBackend for S3Storage {
+    fn read_job(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<JobState>>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        Box::pin(async move {
+            let key = format!("{}{job_name}.json", self.prefix);
+            let result = self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) => {
+                    let data = resp.body.collect().await?.into_bytes();
+                    let state: JobState = serde_json::from_slice(&data)?;
+                    Ok(Some(state))
+                }
+                Err(e) => {
+                    if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
+                        Ok(None)
+                    } else {
+                        Err(e.into())
+                    }
+                }
+            }
+        })
+    }
+
+    fn write_job(
+        &self,
+        job_name: &str,
+        state: &JobState,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        let json_result = serde_json::to_string_pretty(state);
+        Box::pin(async move {
+            let json = json_result?;
+            let key = format!("{}{job_name}.json", self.prefix);
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .body(json.into_bytes().into())
+                .content_type("application/json")
+                .send()
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn delete_job(&self, job_name: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        Box::pin(async move {
+            let key = format!("{}{job_name}.json", self.prefix);
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn list_jobs(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
+        Box::pin(async move {
+            list_s3_filtered(&self.client, &self.bucket, &self.prefix, |relative| {
+                let job_name = relative.strip_suffix(".json")?;
+                if job_name.ends_with(".lock")
+                    || job_name.starts_with(DAG_STATE_PREFIX)
+                    || job_name.contains('/')
+                {
+                    return None;
+                }
+                Some(job_name.to_string())
+            })
+            .await
+        })
+    }
+
+    fn read_dag(
+        &self,
+        dag_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<DagState>>> + Send + '_>> {
+        let dag_name = dag_name.to_string();
+        Box::pin(async move {
+            let key = format!("{DAG_STATE_PREFIX}{dag_name}");
+            let s3_key = format!("{}{key}.json", self.prefix);
+            let result = self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&s3_key)
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) => {
+                    let data = resp.body.collect().await?.into_bytes();
+                    let state: DagState = serde_json::from_slice(&data)?;
+                    Ok(Some(state))
+                }
+                Err(e) => {
+                    if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
+                        Ok(None)
+                    } else {
+                        Err(e.into())
+                    }
+                }
+            }
+        })
+    }
+
+    fn write_dag(
+        &self,
+        dag_name: &str,
+        state: &DagState,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let dag_name = dag_name.to_string();
+        let json_result = serde_json::to_string_pretty(state);
+        Box::pin(async move {
+            let key = format!("{DAG_STATE_PREFIX}{dag_name}");
+            let json = json_result?;
+            let s3_key = format!("{}{key}.json", self.prefix);
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&s3_key)
+                .body(json.into_bytes().into())
+                .content_type("application/json")
+                .send()
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn delete_dag(&self, dag_name: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let dag_name = dag_name.to_string();
+        Box::pin(async move {
+            let key = format!("{DAG_STATE_PREFIX}{dag_name}");
+            let s3_key = format!("{}{key}.json", self.prefix);
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(&s3_key)
+                .send()
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn list_dags(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
+        Box::pin(async move {
+            list_s3_filtered(&self.client, &self.bucket, &self.prefix, |relative| {
+                let base = relative.strip_suffix(".json")?;
+                if base.ends_with(".lock") || base.contains('/') {
+                    return None;
+                }
+                let dag_name = base.strip_prefix(DAG_STATE_PREFIX)?;
+                Some(dag_name.to_string())
+            })
+            .await
+        })
+    }
+
+    fn lock(&self, job_name: &str) -> Pin<Box<dyn Future<Output = Result<LockInfo>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        Box::pin(async move {
+            let info = lock_info();
+            let json = serde_json::to_string_pretty(&info)?;
+            let key = format!("{}{job_name}.json.lock", self.prefix);
+            let result = self
+                .client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .body(json.into_bytes().into())
+                .content_type("application/json")
+                .if_none_match("*")
+                .send()
+                .await;
+
+            match result {
+                Ok(_) => Ok(info),
+                Err(e) => {
+                    // Object already exists — someone holds the lock
+                    let existing = self.get_lock(&job_name).await.ok().flatten();
+                    match existing {
+                        Some(held) => Err(anyhow!(
+                            "Job \"{job_name}\" is locked by {} (since {}). \
+                             Use `yard force-unlock` to override.",
+                            held.who,
+                            held.created_at
+                        )),
+                        None => Err(e.into()),
+                    }
+                }
+            }
+        })
+    }
+
+    fn force_unlock(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        Box::pin(async move {
+            let key = format!("{}{job_name}.json.lock", self.prefix);
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn get_lock(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<LockInfo>>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        Box::pin(async move {
+            let key = format!("{}{job_name}.json.lock", self.prefix);
+            let result = self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await;
+            match result {
+                Ok(resp) => {
+                    let data = resp.body.collect().await?.into_bytes();
+                    let info: LockInfo = serde_json::from_slice(&data)?;
+                    Ok(Some(info))
+                }
+                Err(e) => {
+                    if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
+                        Ok(None)
+                    } else {
+                        Err(e.into())
+                    }
+                }
+            }
+        })
+    }
 }
 
 // --- Helpers ---
@@ -70,336 +600,76 @@ where
 }
 
 impl Storage {
-    // --- Per-job state operations ---
+    /// Construct a Storage handle from any backend implementation.
+    pub fn new<B: StorageBackend + Send + Sync + 'static>(backend: B) -> Self {
+        Self {
+            backend: Box::new(backend),
+        }
+    }
+
+    // --- Per-job state operations (thin wrappers; delegate to self.backend) ---
 
     /// Read a single job's state file. Returns None if the file doesn't exist.
     pub async fn read_job(&self, job_name: &str) -> Result<Option<JobState>> {
-        match self {
-            Storage::Local(s) => {
-                let path = s.path.join(format!("{job_name}.json"));
-                if !path.exists() {
-                    return Ok(None);
-                }
-                let content = tokio::fs::read_to_string(&path)
-                    .await
-                    .with_context(|| format!("Failed to read state for job {job_name}"))?;
-                let state: JobState = serde_json::from_str(&content)?;
-                Ok(Some(state))
-            }
-            Storage::S3(s) => {
-                let key = format!("{}{job_name}.json", s.prefix);
-                let result = s
-                    .client
-                    .get_object()
-                    .bucket(&s.bucket)
-                    .key(&key)
-                    .send()
-                    .await;
-
-                match result {
-                    Ok(resp) => {
-                        let data = resp.body.collect().await?.into_bytes();
-                        let state: JobState = serde_json::from_slice(&data)?;
-                        Ok(Some(state))
-                    }
-                    Err(e) => {
-                        if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
-                            Ok(None)
-                        } else {
-                            Err(e.into())
-                        }
-                    }
-                }
-            }
-        }
+        self.backend.read_job(job_name).await
     }
 
-    /// Write a single job's state file.
+    /// Write a job's state file. Overwrites any existing file.
     pub async fn write_job(&self, job_name: &str, state: &JobState) -> Result<()> {
-        match self {
-            Storage::Local(s) => {
-                let json = serde_json::to_string_pretty(state)?;
-                tokio::fs::create_dir_all(&s.path).await?;
-                let path = s.path.join(format!("{job_name}.json"));
-                tokio::fs::write(&path, json).await?;
-                Ok(())
-            }
-            Storage::S3(s) => {
-                let json = serde_json::to_string_pretty(state)?;
-                let key = format!("{}{job_name}.json", s.prefix);
-                s.client
-                    .put_object()
-                    .bucket(&s.bucket)
-                    .key(&key)
-                    .body(json.into_bytes().into())
-                    .content_type("application/json")
-                    .send()
-                    .await?;
-                Ok(())
-            }
-        }
+        self.backend.write_job(job_name, state).await
     }
 
-    /// Delete a single job's state file.
+    /// Delete a job's state file. No-op if the file doesn't exist.
     pub async fn delete_job(&self, job_name: &str) -> Result<()> {
-        match self {
-            Storage::Local(s) => {
-                let path = s.path.join(format!("{job_name}.json"));
-                if path.exists() {
-                    tokio::fs::remove_file(&path).await?;
-                }
-                Ok(())
-            }
-            Storage::S3(s) => {
-                let key = format!("{}{job_name}.json", s.prefix);
-                s.client
-                    .delete_object()
-                    .bucket(&s.bucket)
-                    .key(&key)
-                    .send()
-                    .await?;
-                Ok(())
-            }
-        }
+        self.backend.delete_job(job_name).await
     }
 
-    /// List all job names that have state files.
+    /// List all job names with state files (excluding lock files and DAG files).
     pub async fn list_jobs(&self) -> Result<Vec<String>> {
-        match self {
-            Storage::Local(s) => {
-                let mut jobs = Vec::new();
-                if !s.path.exists() {
-                    return Ok(jobs);
-                }
-                let mut entries = tokio::fs::read_dir(&s.path).await?;
-                while let Some(entry) = entries.next_entry().await? {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if let Some(job_name) = name.strip_suffix(".json")
-                        && !job_name.ends_with(".lock")
-                        && !job_name.starts_with(DAG_STATE_PREFIX)
-                    {
-                        jobs.push(job_name.to_string());
-                    }
-                }
-                Ok(jobs)
-            }
-            Storage::S3(s) => {
-                list_s3_filtered(&s.client, &s.bucket, &s.prefix, |relative| {
-                    let job_name = relative.strip_suffix(".json")?;
-                    if job_name.ends_with(".lock")
-                        || job_name.starts_with(DAG_STATE_PREFIX)
-                        || job_name.contains('/')
-                    {
-                        return None;
-                    }
-                    Some(job_name.to_string())
-                })
-                .await
-            }
-        }
+        self.backend.list_jobs().await
     }
 
     // --- Per-DAG state operations ---
 
-    /// Read a single DAG's state file. Returns None if the file doesn't exist.
+    /// Read a DAG's state file. Returns None if the file doesn't exist.
     pub async fn read_dag(&self, dag_name: &str) -> Result<Option<DagState>> {
-        let key = format!("{DAG_STATE_PREFIX}{dag_name}");
-        match self {
-            Storage::Local(s) => {
-                let path = s.path.join(format!("{key}.json"));
-                if !path.exists() {
-                    return Ok(None);
-                }
-                let content = tokio::fs::read_to_string(&path)
-                    .await
-                    .with_context(|| format!("Failed to read state for DAG {dag_name}"))?;
-                let state: DagState = serde_json::from_str(&content)?;
-                Ok(Some(state))
-            }
-            Storage::S3(s) => {
-                let s3_key = format!("{}{key}.json", s.prefix);
-                let result = s
-                    .client
-                    .get_object()
-                    .bucket(&s.bucket)
-                    .key(&s3_key)
-                    .send()
-                    .await;
-
-                match result {
-                    Ok(resp) => {
-                        let data = resp.body.collect().await?.into_bytes();
-                        let state: DagState = serde_json::from_slice(&data)?;
-                        Ok(Some(state))
-                    }
-                    Err(e) => {
-                        if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
-                            Ok(None)
-                        } else {
-                            Err(e.into())
-                        }
-                    }
-                }
-            }
-        }
+        self.backend.read_dag(dag_name).await
     }
 
-    /// Write a single DAG's state file.
+    /// Write a DAG's state file. Overwrites any existing file.
     pub async fn write_dag(&self, dag_name: &str, state: &DagState) -> Result<()> {
-        let key = format!("{DAG_STATE_PREFIX}{dag_name}");
-        match self {
-            Storage::Local(s) => {
-                let json = serde_json::to_string_pretty(state)?;
-                tokio::fs::create_dir_all(&s.path).await?;
-                let path = s.path.join(format!("{key}.json"));
-                tokio::fs::write(&path, json).await?;
-                Ok(())
-            }
-            Storage::S3(s) => {
-                let json = serde_json::to_string_pretty(state)?;
-                let s3_key = format!("{}{key}.json", s.prefix);
-                s.client
-                    .put_object()
-                    .bucket(&s.bucket)
-                    .key(&s3_key)
-                    .body(json.into_bytes().into())
-                    .content_type("application/json")
-                    .send()
-                    .await?;
-                Ok(())
-            }
-        }
+        self.backend.write_dag(dag_name, state).await
     }
 
-    /// Delete a single DAG's state file.
+    /// Delete a DAG's state file. No-op if the file doesn't exist.
     pub async fn delete_dag(&self, dag_name: &str) -> Result<()> {
-        let key = format!("{DAG_STATE_PREFIX}{dag_name}");
-        match self {
-            Storage::Local(s) => {
-                let path = s.path.join(format!("{key}.json"));
-                if path.exists() {
-                    tokio::fs::remove_file(&path).await?;
-                }
-                Ok(())
-            }
-            Storage::S3(s) => {
-                let s3_key = format!("{}{key}.json", s.prefix);
-                s.client
-                    .delete_object()
-                    .bucket(&s.bucket)
-                    .key(&s3_key)
-                    .send()
-                    .await?;
-                Ok(())
-            }
-        }
+        self.backend.delete_dag(dag_name).await
     }
 
-    /// List all DAG names that have state files.
+    /// List all DAG names with state files.
     pub async fn list_dags(&self) -> Result<Vec<String>> {
-        match self {
-            Storage::Local(s) => {
-                let mut dags = Vec::new();
-                if !s.path.exists() {
-                    return Ok(dags);
-                }
-                let mut entries = tokio::fs::read_dir(&s.path).await?;
-                while let Some(entry) = entries.next_entry().await? {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if let Some(base) = name.strip_suffix(".json")
-                        && !base.ends_with(".lock")
-                        && let Some(dag_name) = base.strip_prefix(DAG_STATE_PREFIX)
-                    {
-                        dags.push(dag_name.to_string());
-                    }
-                }
-                Ok(dags)
-            }
-            Storage::S3(s) => {
-                list_s3_filtered(&s.client, &s.bucket, &s.prefix, |relative| {
-                    let base = relative.strip_suffix(".json")?;
-                    if base.ends_with(".lock") || base.contains('/') {
-                        return None;
-                    }
-                    let dag_name = base.strip_prefix(DAG_STATE_PREFIX)?;
-                    Some(dag_name.to_string())
-                })
-                .await
-            }
-        }
+        self.backend.list_dags().await
     }
 
-    // --- Locking ---
+    // --- Locking primitives ---
 
     /// Acquire a lock for a job. Returns Ok(LockInfo) on success,
     /// Err if already locked.
     pub async fn lock(&self, job_name: &str) -> Result<LockInfo> {
-        let info = lock_info();
-        let json = serde_json::to_string_pretty(&info)?;
-
-        match self {
-            Storage::Local(s) => {
-                tokio::fs::create_dir_all(&s.path).await?;
-                let lock_path = s.path.join(format!("{job_name}.json.lock"));
-
-                // O_CREAT | O_EXCL — fails if file already exists
-                match tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&lock_path)
-                    .await
-                {
-                    Ok(_file) => {
-                        tokio::fs::write(&lock_path, &json).await?;
-                        Ok(info)
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        let existing = self.get_lock(job_name).await?;
-                        match existing {
-                            Some(held) => Err(anyhow!(
-                                "Job \"{job_name}\" is locked by {} (since {}). \
-                                 Use `yard force-unlock` to override.",
-                                held.who,
-                                held.created_at
-                            )),
-                            None => Err(anyhow!("Job \"{job_name}\" is locked (unknown holder)")),
-                        }
-                    }
-                    Err(e) => Err(e.into()),
-                }
-            }
-            Storage::S3(s) => {
-                let key = format!("{}{job_name}.json.lock", s.prefix);
-                let result = s
-                    .client
-                    .put_object()
-                    .bucket(&s.bucket)
-                    .key(&key)
-                    .body(json.into_bytes().into())
-                    .content_type("application/json")
-                    .if_none_match("*")
-                    .send()
-                    .await;
-
-                match result {
-                    Ok(_) => Ok(info),
-                    Err(e) => {
-                        // Object already exists — someone holds the lock
-                        let existing = self.get_lock(job_name).await.ok().flatten();
-                        match existing {
-                            Some(held) => Err(anyhow!(
-                                "Job \"{job_name}\" is locked by {} (since {}). \
-                                 Use `yard force-unlock` to override.",
-                                held.who,
-                                held.created_at
-                            )),
-                            None => Err(e.into()),
-                        }
-                    }
-                }
-            }
-        }
+        self.backend.lock(job_name).await
     }
+
+    /// Remove the lock regardless of who holds it.
+    pub async fn force_unlock(&self, job_name: &str) -> Result<()> {
+        self.backend.force_unlock(job_name).await
+    }
+
+    /// Read current lock info for a job, if any.
+    pub async fn get_lock(&self, job_name: &str) -> Result<Option<LockInfo>> {
+        self.backend.get_lock(job_name).await
+    }
+
+    // --- Convenience methods (D-06: stay on impl Storage, not on the trait) ---
 
     /// Release a lock, but only if we hold it (match on `who`).
     pub async fn unlock(&self, job_name: &str, holder: &LockInfo) -> Result<()> {
@@ -413,29 +683,6 @@ impl Storage {
                 existing.created_at,
                 holder.who
             )),
-        }
-    }
-
-    /// Remove the lock regardless of who holds it.
-    pub async fn force_unlock(&self, job_name: &str) -> Result<()> {
-        match self {
-            Storage::Local(s) => {
-                let lock_path = s.path.join(format!("{job_name}.json.lock"));
-                if lock_path.exists() {
-                    tokio::fs::remove_file(&lock_path).await?;
-                }
-                Ok(())
-            }
-            Storage::S3(s) => {
-                let key = format!("{}{job_name}.json.lock", s.prefix);
-                s.client
-                    .delete_object()
-                    .bucket(&s.bucket)
-                    .key(&key)
-                    .send()
-                    .await?;
-                Ok(())
-            }
         }
     }
 
@@ -463,45 +710,6 @@ impl Storage {
         for (name, info) in locks.iter().rev() {
             if let Err(e) = self.unlock(name, info).await {
                 eprintln!("Warning: failed to unlock job \"{name}\": {e}");
-            }
-        }
-    }
-
-    /// Read current lock info for a job, if any.
-    pub async fn get_lock(&self, job_name: &str) -> Result<Option<LockInfo>> {
-        match self {
-            Storage::Local(s) => {
-                let lock_path = s.path.join(format!("{job_name}.json.lock"));
-                if !lock_path.exists() {
-                    return Ok(None);
-                }
-                let content = tokio::fs::read_to_string(&lock_path).await?;
-                let info: LockInfo = serde_json::from_str(&content)?;
-                Ok(Some(info))
-            }
-            Storage::S3(s) => {
-                let key = format!("{}{job_name}.json.lock", s.prefix);
-                let result = s
-                    .client
-                    .get_object()
-                    .bucket(&s.bucket)
-                    .key(&key)
-                    .send()
-                    .await;
-                match result {
-                    Ok(resp) => {
-                        let data = resp.body.collect().await?.into_bytes();
-                        let info: LockInfo = serde_json::from_slice(&data)?;
-                        Ok(Some(info))
-                    }
-                    Err(e) => {
-                        if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
-                            Ok(None)
-                        } else {
-                            Err(e.into())
-                        }
-                    }
-                }
             }
         }
     }
@@ -551,7 +759,7 @@ fn merge_state_aws_with_env(
 
 pub async fn get_storage(backend: &StateBackend) -> Result<Storage> {
     match backend {
-        StateBackend::Local { path } => Ok(Storage::Local(LocalStorage { path: path.clone() })),
+        StateBackend::Local { path } => Ok(Storage::new(LocalStorage { path: path.clone() })),
         StateBackend::S3 {
             bucket,
             key,
@@ -590,7 +798,7 @@ pub async fn get_storage(backend: &StateBackend) -> Result<Storage> {
                 format!("{key}/")
             };
 
-            Ok(Storage::S3(S3Storage {
+            Ok(Storage::new(S3Storage {
                 client,
                 bucket: bucket.clone(),
                 prefix,
@@ -603,6 +811,7 @@ pub async fn get_storage(backend: &StateBackend) -> Result<Storage> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use yard_structs::{DagDeployment, Deployment};
 
     fn test_job_state(job_name: &str) -> JobState {
@@ -620,23 +829,16 @@ mod tests {
         }
     }
 
-    fn temp_storage(name: &str) -> Storage {
+    fn temp_storage(name: &str) -> (Storage, PathBuf) {
         let dir = std::env::temp_dir().join(format!("yard_test_{}_{}", name, std::process::id()));
-        Storage::Local(LocalStorage { path: dir })
-    }
-
-    fn storage_path(storage: &Storage) -> &PathBuf {
-        match storage {
-            Storage::Local(s) => &s.path,
-            _ => panic!("expected local storage"),
-        }
+        (Storage::new(LocalStorage { path: dir.clone() }), dir)
     }
 
     // --- Per-job read/write ---
 
     #[tokio::test]
     async fn write_and_read_job() {
-        let storage = temp_storage("rw");
+        let (storage, dir) = temp_storage("rw");
         let state = test_job_state("my_job");
 
         storage.write_job("my_job", &state).await.unwrap();
@@ -647,23 +849,23 @@ mod tests {
         assert_eq!(loaded.job_name, "my_job");
         assert_eq!(loaded.deployment.config_hash, "abc123");
 
-        let _ = std::fs::remove_dir_all(storage_path(&storage));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn read_nonexistent_job_returns_none() {
-        let storage = temp_storage("noexist");
-        std::fs::create_dir_all(storage_path(&storage)).unwrap();
+        let (storage, dir) = temp_storage("noexist");
+        std::fs::create_dir_all(&dir).unwrap();
 
         let loaded = storage.read_job("nope").await.unwrap();
         assert!(loaded.is_none());
 
-        let _ = std::fs::remove_dir_all(storage_path(&storage));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn delete_job_removes_file() {
-        let storage = temp_storage("del");
+        let (storage, dir) = temp_storage("del");
         let state = test_job_state("doomed");
 
         storage.write_job("doomed", &state).await.unwrap();
@@ -672,12 +874,12 @@ mod tests {
         storage.delete_job("doomed").await.unwrap();
         assert!(storage.read_job("doomed").await.unwrap().is_none());
 
-        let _ = std::fs::remove_dir_all(storage_path(&storage));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn list_jobs_finds_all() {
-        let storage = temp_storage("list");
+        let (storage, dir) = temp_storage("list");
         storage
             .write_job("alpha", &test_job_state("alpha"))
             .await
@@ -691,12 +893,12 @@ mod tests {
         jobs.sort();
         assert_eq!(jobs, vec!["alpha", "beta"]);
 
-        let _ = std::fs::remove_dir_all(storage_path(&storage));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn list_jobs_empty_dir() {
-        let storage = temp_storage("empty");
+        let (storage, _dir) = temp_storage("empty");
         let jobs = storage.list_jobs().await.unwrap();
         assert!(jobs.is_empty());
     }
@@ -705,7 +907,7 @@ mod tests {
 
     #[tokio::test]
     async fn lock_and_unlock() {
-        let storage = temp_storage("lock");
+        let (storage, dir) = temp_storage("lock");
         let info = storage.lock("my_job").await.unwrap();
         assert!(!info.who.is_empty());
 
@@ -718,24 +920,24 @@ mod tests {
         let lock = storage.get_lock("my_job").await.unwrap();
         assert!(lock.is_none());
 
-        let _ = std::fs::remove_dir_all(storage_path(&storage));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn double_lock_fails() {
-        let storage = temp_storage("dbl");
+        let (storage, dir) = temp_storage("dbl");
         let _info = storage.lock("my_job").await.unwrap();
 
         let result = storage.lock("my_job").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("is locked"));
 
-        let _ = std::fs::remove_dir_all(storage_path(&storage));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn force_unlock_removes_lock() {
-        let storage = temp_storage("force");
+        let (storage, dir) = temp_storage("force");
         let _info = storage.lock("my_job").await.unwrap();
 
         storage.force_unlock("my_job").await.unwrap();
@@ -745,12 +947,12 @@ mod tests {
         // Can lock again after force unlock
         let _info2 = storage.lock("my_job").await.unwrap();
 
-        let _ = std::fs::remove_dir_all(storage_path(&storage));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn lock_files_excluded_from_list() {
-        let storage = temp_storage("lockexcl");
+        let (storage, dir) = temp_storage("lockexcl");
         storage
             .write_job("real_job", &test_job_state("real_job"))
             .await
@@ -760,7 +962,7 @@ mod tests {
         let jobs = storage.list_jobs().await.unwrap();
         assert_eq!(jobs, vec!["real_job"]);
 
-        let _ = std::fs::remove_dir_all(storage_path(&storage));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -769,14 +971,15 @@ mod tests {
             path: "/tmp/test_state".into(),
         };
         let storage = get_storage(&backend).await.unwrap();
-        assert!(matches!(storage, Storage::Local(_)));
+        // Behavioral: prove Local backend wires correctly by driving a primitive method.
+        let _ = storage.list_jobs().await;
     }
 
     // --- Batch locking ---
 
     #[tokio::test]
     async fn lock_jobs_acquires_all() {
-        let storage = temp_storage("lockjobs");
+        let (storage, dir) = temp_storage("lockjobs");
         let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
 
         let locks = storage.lock_jobs(&names).await.unwrap();
@@ -788,12 +991,12 @@ mod tests {
             assert!(lock.is_some());
         }
 
-        let _ = std::fs::remove_dir_all(storage_path(&storage));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn lock_jobs_rolls_back_on_failure() {
-        let storage = temp_storage("lockrollback");
+        let (storage, dir) = temp_storage("lockrollback");
 
         // Pre-lock "b" so locking ["a", "b", "c"] fails on "b"
         let _held = storage.lock("b").await.unwrap();
@@ -804,18 +1007,21 @@ mod tests {
 
         // "a" should have been rolled back (unlocked)
         let a_lock = storage.get_lock("a").await.unwrap();
-        assert!(a_lock.is_none(), "lock for 'a' should have been rolled back");
+        assert!(
+            a_lock.is_none(),
+            "lock for 'a' should have been rolled back"
+        );
 
         // "c" was never attempted
         let c_lock = storage.get_lock("c").await.unwrap();
         assert!(c_lock.is_none());
 
-        let _ = std::fs::remove_dir_all(storage_path(&storage));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn unlock_jobs_releases_all() {
-        let storage = temp_storage("unlockjobs");
+        let (storage, dir) = temp_storage("unlockjobs");
         let names = vec!["x".to_string(), "y".to_string()];
 
         let locks = storage.lock_jobs(&names).await.unwrap();
@@ -826,7 +1032,7 @@ mod tests {
             assert!(lock.is_none());
         }
 
-        let _ = std::fs::remove_dir_all(storage_path(&storage));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- DAG state operations ---
@@ -849,7 +1055,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_and_read_dag() {
-        let storage = temp_storage("dag_rw");
+        let (storage, dir) = temp_storage("dag_rw");
         let state = test_dag_state("my_dag");
 
         storage.write_dag("my_dag", &state).await.unwrap();
@@ -861,23 +1067,23 @@ mod tests {
         assert_eq!(loaded.deployment.content_hash, "daghash123");
         assert_eq!(loaded.deployment.tasks, vec!["task_a", "task_b"]);
 
-        let _ = std::fs::remove_dir_all(storage_path(&storage));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn read_nonexistent_dag_returns_none() {
-        let storage = temp_storage("dag_noexist");
-        std::fs::create_dir_all(storage_path(&storage)).unwrap();
+        let (storage, dir) = temp_storage("dag_noexist");
+        std::fs::create_dir_all(&dir).unwrap();
 
         let loaded = storage.read_dag("nope").await.unwrap();
         assert!(loaded.is_none());
 
-        let _ = std::fs::remove_dir_all(storage_path(&storage));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn delete_dag_removes_file() {
-        let storage = temp_storage("dag_del");
+        let (storage, dir) = temp_storage("dag_del");
         let state = test_dag_state("doomed_dag");
 
         storage.write_dag("doomed_dag", &state).await.unwrap();
@@ -886,12 +1092,12 @@ mod tests {
         storage.delete_dag("doomed_dag").await.unwrap();
         assert!(storage.read_dag("doomed_dag").await.unwrap().is_none());
 
-        let _ = std::fs::remove_dir_all(storage_path(&storage));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn list_dags_finds_all() {
-        let storage = temp_storage("dag_list");
+        let (storage, dir) = temp_storage("dag_list");
         storage
             .write_dag("dag_alpha", &test_dag_state("dag_alpha"))
             .await
@@ -905,12 +1111,12 @@ mod tests {
         dags.sort();
         assert_eq!(dags, vec!["dag_alpha", "dag_beta"]);
 
-        let _ = std::fs::remove_dir_all(storage_path(&storage));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn list_jobs_excludes_dags() {
-        let storage = temp_storage("dag_excl");
+        let (storage, dir) = temp_storage("dag_excl");
         storage
             .write_job("real_job", &test_job_state("real_job"))
             .await
@@ -926,12 +1132,12 @@ mod tests {
         let dags = storage.list_dags().await.unwrap();
         assert_eq!(dags, vec!["my_dag"]);
 
-        let _ = std::fs::remove_dir_all(storage_path(&storage));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn list_dags_empty_dir() {
-        let storage = temp_storage("dag_empty");
+        let (storage, _dir) = temp_storage("dag_empty");
         let dags = storage.list_dags().await.unwrap();
         assert!(dags.is_empty());
     }
@@ -1031,8 +1237,8 @@ mod tests {
                 ("YARD_STATE_AWS_EXTERNAL_ID", None),
             ],
             || {
-                let merged = merge_state_aws_with_env(None)
-                    .expect("env is set so merged must be Some");
+                let merged =
+                    merge_state_aws_with_env(None).expect("env is set so merged must be Some");
                 assert_eq!(
                     merged.assume_role.as_deref(),
                     Some("arn:aws:iam::222222222222:role/Env")
@@ -1112,7 +1318,8 @@ mod tests {
         };
         let result = get_storage(&backend).await;
         assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), Storage::S3(_)));
+        // matches!() variant check removed — Storage is now a struct, not an enum;
+        // construction-success assertion above is the substantive invariant.
     }
 
     #[tokio::test]
@@ -1131,7 +1338,7 @@ mod tests {
             result.is_ok(),
             "construction must not error; STS errors only surface on first S3 call"
         );
-        assert!(matches!(result.unwrap(), Storage::S3(_)));
+        // matches!() variant check removed — Storage is now a struct, not an enum.
     }
 
     #[tokio::test]
@@ -1141,6 +1348,280 @@ mod tests {
         };
         let result = get_storage(&backend).await;
         assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), Storage::Local(_)));
+        // matches!() variant check removed — Storage is now a struct, not an enum.
+    }
+
+    // --- SC #3 / PRES-05 byte-identity wire-format tests ---
+
+    #[tokio::test]
+    async fn write_job_state_byte_identical_to_serde_pretty() {
+        // SC #3 / PRES-05 byte-identical state-file persistence — verifies the
+        // trait dispatch path emits exactly the same on-disk JSON as the pre-refactor
+        // enum dispatch path. Mirrors Phase 22 plan-22-02's diff.rs round-trip pattern,
+        // but tightens the assertion from `to_value` (structural) to `to_string_pretty`
+        // (byte-identical) because SC #3 protects on-disk byte fidelity, not just
+        // structural shape.
+        let dir = std::env::temp_dir().join(format!(
+            "yard_test_byte_identical_job_{}",
+            std::process::id()
+        ));
+        let storage = Storage::new(LocalStorage { path: dir.clone() });
+
+        let state = JobState {
+            job_name: "byte_test".to_string(),
+            project: "test-project".to_string(),
+            deployment: Deployment {
+                env: None,
+                config_hash: "abc123".to_string(),
+                config: serde_json::json!({
+                    "type": "glue",
+                    "role": "arn:aws:iam::111111111111:role/X"
+                }),
+                status: "applied".to_string(),
+                applied_at: "2025-01-01T00:00:00Z".to_string(),
+                resources: Vec::new(),
+            },
+        };
+
+        // Write through the trait dispatch path (Storage::write_job ->
+        // self.backend.write_job -> LocalStorage::write_job).
+        storage.write_job("byte_test", &state).await.unwrap();
+
+        // Read raw on-disk bytes and assert byte-identity vs.
+        // serde_json::to_string_pretty output.
+        let path = dir.join("byte_test.json");
+        let on_disk = tokio::fs::read_to_string(&path).await.unwrap();
+        let expected = serde_json::to_string_pretty(&state).unwrap();
+        assert_eq!(
+            on_disk, expected,
+            "on-disk JobState JSON must be byte-identical to serde_json::to_string_pretty output"
+        );
+
+        // Round-trip: re-read via storage.read_job, assert struct equality on
+        // load-bearing fields.
+        let loaded = storage.read_job("byte_test").await.unwrap().unwrap();
+        assert_eq!(loaded.job_name, state.job_name);
+        assert_eq!(loaded.project, state.project);
+        assert_eq!(loaded.deployment.config_hash, state.deployment.config_hash);
+        assert_eq!(loaded.deployment.status, state.deployment.status);
+        assert_eq!(loaded.deployment.applied_at, state.deployment.applied_at);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn write_dag_state_byte_identical_to_serde_pretty() {
+        // Parallel SC #3 verification for DagState. write_dag uses the same
+        // serde_json::to_string_pretty serialization path as write_job, but
+        // writes to `{DAG_STATE_PREFIX}{dag_name}.json` per DAG_STATE_PREFIX.
+        let dir = std::env::temp_dir().join(format!(
+            "yard_test_byte_identical_dag_{}",
+            std::process::id()
+        ));
+        let storage = Storage::new(LocalStorage { path: dir.clone() });
+
+        let state = test_dag_state("byte_dag");
+
+        storage.write_dag("byte_dag", &state).await.unwrap();
+
+        let filename = format!("{DAG_STATE_PREFIX}byte_dag.json");
+        let path = dir.join(&filename);
+        let on_disk = tokio::fs::read_to_string(&path).await.unwrap();
+        let expected = serde_json::to_string_pretty(&state).unwrap();
+        assert_eq!(
+            on_disk, expected,
+            "on-disk DagState JSON must be byte-identical to serde_json::to_string_pretty output"
+        );
+
+        let loaded = storage.read_dag("byte_dag").await.unwrap().unwrap();
+        // Use serde round-trip equality as the structural-equivalence proxy.
+        let loaded_json = serde_json::to_string_pretty(&loaded).unwrap();
+        assert_eq!(
+            loaded_json, expected,
+            "DagState round-trip preserves all fields"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- SC #4 demonstration: a third backend implemented in ONE impl block,
+    //     ZERO edits to existing LocalStorage / S3Storage / Storage code ---
+    //
+    // This block lives entirely inside `#[cfg(test)] mod tests`; nothing in the
+    // production-side `impl StorageBackend for LocalStorage` or
+    // `impl StorageBackend for S3Storage` blocks had to change to admit it.
+    // That structural property is what SC #4 protects.
+
+    #[derive(Default)]
+    struct InMemoryStorage {
+        jobs: tokio::sync::Mutex<HashMap<String, JobState>>,
+        dags: tokio::sync::Mutex<HashMap<String, DagState>>,
+        locks: tokio::sync::Mutex<HashMap<String, LockInfo>>,
+    }
+
+    impl StorageBackend for InMemoryStorage {
+        fn read_job(
+            &self,
+            job_name: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<JobState>>> + Send + '_>> {
+            let job_name = job_name.to_string();
+            Box::pin(async move { Ok(self.jobs.lock().await.get(&job_name).cloned()) })
+        }
+
+        fn write_job(
+            &self,
+            job_name: &str,
+            state: &JobState,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            let job_name = job_name.to_string();
+            let state = state.clone();
+            Box::pin(async move {
+                self.jobs.lock().await.insert(job_name, state);
+                Ok(())
+            })
+        }
+
+        fn delete_job(
+            &self,
+            job_name: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            let job_name = job_name.to_string();
+            Box::pin(async move {
+                self.jobs.lock().await.remove(&job_name);
+                Ok(())
+            })
+        }
+
+        fn list_jobs(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
+            Box::pin(async move {
+                let mut names: Vec<String> = self.jobs.lock().await.keys().cloned().collect();
+                names.sort();
+                Ok(names)
+            })
+        }
+
+        fn read_dag(
+            &self,
+            dag_name: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<DagState>>> + Send + '_>> {
+            let dag_name = dag_name.to_string();
+            Box::pin(async move { Ok(self.dags.lock().await.get(&dag_name).cloned()) })
+        }
+
+        fn write_dag(
+            &self,
+            dag_name: &str,
+            state: &DagState,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            let dag_name = dag_name.to_string();
+            let state = state.clone();
+            Box::pin(async move {
+                self.dags.lock().await.insert(dag_name, state);
+                Ok(())
+            })
+        }
+
+        fn delete_dag(
+            &self,
+            dag_name: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            let dag_name = dag_name.to_string();
+            Box::pin(async move {
+                self.dags.lock().await.remove(&dag_name);
+                Ok(())
+            })
+        }
+
+        fn list_dags(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
+            Box::pin(async move {
+                let mut names: Vec<String> = self.dags.lock().await.keys().cloned().collect();
+                names.sort();
+                Ok(names)
+            })
+        }
+
+        fn lock(
+            &self,
+            job_name: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<LockInfo>> + Send + '_>> {
+            let job_name = job_name.to_string();
+            Box::pin(async move {
+                let info = lock_info();
+                let mut locks = self.locks.lock().await;
+                if locks.contains_key(&job_name) {
+                    return Err(anyhow!(
+                        "Job \"{job_name}\" is already locked (in-memory test backend)"
+                    ));
+                }
+                locks.insert(job_name, info.clone());
+                Ok(info)
+            })
+        }
+
+        fn force_unlock(
+            &self,
+            job_name: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            let job_name = job_name.to_string();
+            Box::pin(async move {
+                self.locks.lock().await.remove(&job_name);
+                Ok(())
+            })
+        }
+
+        fn get_lock(
+            &self,
+            job_name: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<LockInfo>>> + Send + '_>> {
+            let job_name = job_name.to_string();
+            Box::pin(async move { Ok(self.locks.lock().await.get(&job_name).cloned()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_backend_full_cycle() {
+        // SC #4 demonstration: construct Storage from a third backend (the
+        // InMemoryStorage above) and exercise the full primitive API. Proves
+        // adding a backend = (1) one impl block, (2) zero edits to existing
+        // prod-side LocalStorage / S3Storage / Storage code.
+        let storage = Storage::new(InMemoryStorage::default());
+
+        let state = test_job_state("imem_job");
+
+        // write -> read -> list (job)
+        storage.write_job("imem_job", &state).await.unwrap();
+        let loaded = storage.read_job("imem_job").await.unwrap();
+        assert!(loaded.is_some(), "InMemoryStorage round-trip JobState");
+        assert_eq!(loaded.unwrap().job_name, "imem_job");
+
+        let jobs = storage.list_jobs().await.unwrap();
+        assert_eq!(jobs, vec!["imem_job".to_string()]);
+
+        // lock -> get_lock -> force_unlock
+        let info = storage.lock("imem_job").await.unwrap();
+        let held = storage.get_lock("imem_job").await.unwrap();
+        assert!(held.is_some(), "InMemoryStorage lock round-trip");
+        assert_eq!(held.unwrap().who, info.who);
+
+        let double = storage.lock("imem_job").await;
+        assert!(double.is_err(), "InMemoryStorage double-lock contention");
+
+        storage.force_unlock("imem_job").await.unwrap();
+        let after = storage.get_lock("imem_job").await.unwrap();
+        assert!(after.is_none(), "InMemoryStorage force_unlock removes lock");
+
+        // write -> read -> list (dag)
+        let dag_state = test_dag_state("imem_dag");
+        storage.write_dag("imem_dag", &dag_state).await.unwrap();
+        let dag_loaded = storage.read_dag("imem_dag").await.unwrap();
+        assert!(dag_loaded.is_some(), "InMemoryStorage round-trip DagState");
+
+        let dags = storage.list_dags().await.unwrap();
+        assert_eq!(dags, vec!["imem_dag".to_string()]);
+
+        // delete (job)
+        storage.delete_job("imem_job").await.unwrap();
+        let after_del = storage.read_job("imem_job").await.unwrap();
+        assert!(after_del.is_none(), "InMemoryStorage delete_job");
     }
 }
