@@ -465,7 +465,7 @@ pub async fn plan(
 /// bucket existence.
 pub async fn init_state_backend(
     backend: &yard_structs::StateBackend,
-    aws_cfg: Option<&Value>,
+    aws_cfg: Option<&yard_structs::AwsCredentialConfig>,
 ) -> Result<()> {
     match backend {
         yard_structs::StateBackend::Local { path } => {
@@ -475,7 +475,13 @@ pub async fn init_state_backend(
             println!("Initialized state at {}", path.display());
         }
         yard_structs::StateBackend::S3 { bucket, region, .. } => {
-            let config = providers::aws_config(region, aws_cfg).await;
+            // The providers::aws_config boundary stays Value-typed (D-14);
+            // convert the typed credentials at the call site.
+            let aws_value: Option<Value> = aws_cfg
+                .map(serde_json::to_value)
+                .transpose()
+                .context("Failed to serialize state-init AWS credentials to JSON")?;
+            let config = providers::aws_config(region, aws_value.as_ref()).await;
             let client = aws_sdk_s3::Client::new(&config);
             client
                 .head_bucket()
@@ -576,7 +582,7 @@ pub async fn destroy_job(
 pub async fn destroy_all(
     backend: &yard_structs::StateBackend,
     provider_configs: &HashMap<String, Value>,
-    aws: &Value,
+    aws: Option<&yard_structs::AwsCredentialConfig>,
     root_dir: &Path,
     dry_run: bool,
 ) -> Result<DestroyResult> {
@@ -691,7 +697,7 @@ mod tests {
             },
             providers: HashMap::new(),
             jobs: HashMap::from([("new_job".to_string(), job)]),
-            aws: serde_json::Value::Null,
+            aws: None,
         };
 
         let diffs = calculate_diff(&manifest, &empty_state()).unwrap();
@@ -717,7 +723,7 @@ mod tests {
             },
             providers: HashMap::new(),
             jobs: HashMap::new(),
-            aws: serde_json::Value::Null,
+            aws: None,
         };
 
         let diffs = calculate_diff(&manifest, &state).unwrap();
@@ -747,7 +753,7 @@ mod tests {
             },
             providers: HashMap::new(),
             jobs: HashMap::from([("stable".to_string(), job)]),
-            aws: serde_json::Value::Null,
+            aws: None,
         };
 
         let diffs = calculate_diff(&manifest, &state).unwrap();
@@ -780,7 +786,7 @@ mod tests {
             },
             providers: HashMap::new(),
             jobs: HashMap::from([("my_job".to_string(), new_job)]),
-            aws: serde_json::Value::Null,
+            aws: None,
         };
 
         let diffs = calculate_diff(&manifest, &state).unwrap();
@@ -809,7 +815,7 @@ mod tests {
             },
             providers: HashMap::new(),
             jobs: HashMap::from([("my_job".to_string(), new_job)]),
-            aws: serde_json::Value::Null,
+            aws: None,
         };
 
         let diffs = calculate_diff(&manifest, &state).unwrap();
@@ -858,7 +864,7 @@ mod tests {
                     make_job(JobType::Glue, json!({"type": "glue"})),
                 ),
             ]),
-            aws: serde_json::Value::Null,
+            aws: None,
         };
 
         let diffs = calculate_diff(&manifest, &state).unwrap();
@@ -883,7 +889,7 @@ mod tests {
             },
             providers: HashMap::new(),
             jobs: HashMap::from([("new_job".to_string(), job)]),
-            aws: serde_json::Value::Null,
+            aws: None,
         };
 
         let result = apply(&manifest, &empty_state(), &dir, true, None).await.unwrap();
@@ -921,7 +927,7 @@ mod tests {
             state: backend.clone(),
             providers: HashMap::new(),
             jobs: HashMap::from([("doomed".to_string(), job)]),
-            aws: serde_json::Value::Null,
+            aws: None,
         };
 
         // Apply first to create state + script
@@ -977,7 +983,7 @@ mod tests {
                     make_job(JobType::Glue, json!({"type": "glue", "script_name": "b"})),
                 ),
             ]),
-            aws: serde_json::Value::Null,
+            aws: None,
         };
 
         // Apply both
@@ -986,7 +992,7 @@ mod tests {
         assert!(state_dir.join("job_b.json").exists());
 
         // Destroy all
-        let result = destroy_all(&backend, &HashMap::new(), &Value::Null, &dir, true)
+        let result = destroy_all(&backend, &HashMap::new(), None, &dir, true)
             .await
             .unwrap();
         let mut destroyed = result.destroyed.clone();

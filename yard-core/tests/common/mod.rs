@@ -170,7 +170,7 @@ pub fn build_target_matrix_project() -> TargetMatrixProject {
         state: StateBackend::Local { path: state_dir },
         providers: HashMap::new(),
         jobs,
-        aws: serde_json::Value::Null,
+        aws: None,
     };
 
     // DAG names are computed by airflow_dag::collection as `<project>_<dirname>`.

@@ -35,7 +35,8 @@ pub async fn execute(directory: Option<String>) -> Result<()> {
     }
 
     let project = yard_core::resolve::resolve_project(&base_path).await?;
-    yard_core::init_state_backend(&project.manifest.state, Some(&project.manifest.aws)).await?;
+    yard_core::init_state_backend(&project.manifest.state, project.manifest.aws.as_ref())
+        .await?;
 
     Ok(())
 }

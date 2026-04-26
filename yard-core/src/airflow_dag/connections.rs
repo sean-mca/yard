@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use yard_structs::{JobDefinition, JobType, ProjectManifest};
+use yard_structs::{AwsCredentialConfig, JobDefinition, JobType, ProjectManifest};
 
 use super::helpers::sanitize_identifier;
 use super::RequiredConnection;
@@ -14,7 +14,10 @@ use super::DEFAULT_AWS_CONN_ID;
 /// set. Otherwise returns a deterministic id derived from the role ARN.
 pub(super) fn resolve_task_aws_conn_id(job: &JobDefinition, manifest: &ProjectManifest) -> Result<String> {
     let task_role = job_assume_role(job);
-    let root_role = assume_role_of(&manifest.aws);
+    let root_role = manifest
+        .aws
+        .as_ref()
+        .and_then(typed_assume_role);
     match (task_role, root_role) {
         (Some(task), Some(root)) if task == root => Ok(DEFAULT_AWS_CONN_ID.to_string()),
         (Some(task), _) => derive_aws_conn_id(task),
@@ -25,11 +28,17 @@ pub(super) fn resolve_task_aws_conn_id(job: &JobDefinition, manifest: &ProjectMa
 fn job_assume_role(job: &JobDefinition) -> Option<&str> {
     // `_aws` is the merged view (root + account.yaml + job-inline) produced by
     // `cascade_provider_defaults`; it's authoritative, no fallbacks needed.
-    job.config.get("_aws").and_then(assume_role_of)
+    // The per-job _aws override stays a Value blob inside JobDefinition.config
+    // per D-09 / D-14, so it's still extracted via Value-style getter.
+    job.config.get("_aws").and_then(value_assume_role)
 }
 
-fn assume_role_of(v: &Value) -> Option<&str> {
+fn value_assume_role(v: &Value) -> Option<&str> {
     v.get("assume_role").and_then(|r| r.as_str()).filter(|s| !s.is_empty())
+}
+
+fn typed_assume_role(c: &AwsCredentialConfig) -> Option<&str> {
+    c.assume_role.as_deref().filter(|s| !s.is_empty())
 }
 
 /// Extract the 12-digit AWS account id from an IAM role ARN. Validates the

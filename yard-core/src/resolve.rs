@@ -52,10 +52,11 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
                 .to_string(),
             key: state_node["key"].as_str().unwrap_or("state/").to_string(),
             // Plan 02 owns reading `state.aws` from yaml and env-merging
-            // `YARD_STATE_AWS_*`. Until then, default to Null so Plan 01's
+            // `YARD_STATE_AWS_*`. Until then, default to None so the
             // `#[serde(default)]` deserialization behavior is preserved here
-            // and nothing in today's codepath changes.
-            aws: serde_json::Value::Null,
+            // and nothing in today's codepath changes. (TYPE-02 retypes the
+            // field; the runtime intent is unchanged.)
+            aws: None,
         },
         _ => return Err(anyhow!("Unsupported state type in root")),
     };
@@ -80,6 +81,12 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
     }
 
     // Root-level aws block — yard's own AWS credential config (AssumeRole etc.)
+    // Kept as Value here for `cascade_provider_defaults` (which still merges
+    // into the per-job `JobDefinition.config: Value` blob via `_aws` per
+    // D-09 / D-14). The structural manifest field is the typed
+    // `Option<AwsCredentialConfig>` produced via best-effort parse —
+    // malformed root `aws:` blocks fall through to None today (plan 21-03
+    // owns strict typo gating via `validate_unknown_keys`).
     let root_aws = yaml_to_json(&root_doc["aws"]);
 
     // Cascade provider defaults into each job's `config.<job_type>` block so
@@ -88,12 +95,18 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
     // this cascade only widens visibility — precedence is unchanged.
     let all_jobs = cascade_provider_defaults(all_jobs, &providers, &root_aws);
 
+    let typed_root_aws: Option<yard_structs::AwsCredentialConfig> = if root_aws.is_null() {
+        None
+    } else {
+        serde_json::from_value(root_aws.clone()).ok()
+    };
+
     let manifest = ProjectManifest {
         project: project.clone(),
         state: state_backend.clone(),
         providers,
         jobs: all_jobs,
-        aws: root_aws,
+        aws: typed_root_aws,
     };
 
     // 5. Load current state

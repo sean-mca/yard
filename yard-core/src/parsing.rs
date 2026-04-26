@@ -1,7 +1,7 @@
 use serde_json::Value;
 use std::collections::HashMap;
 use yard_structs::{
-    AirflowJobBlock, AirflowSection, Import, Sink, Source, Transform,
+    AirflowJobBlock, AirflowSection, AwsCredentialConfig, Import, Sink, Source, Transform,
 };
 
 /// Extract optional body override from a job config.
@@ -53,8 +53,14 @@ pub fn parse_airflow_section(value: &Value) -> AirflowSection {
             .map(|s| s.to_string()),
         triggered_by: str_array_field(value, "triggered_by"),
         // Optional per-DAG-bucket AWS creds sub-block (Phase 9 D-05).
-        // Passed through unchanged to dag_lifecycle where precedence is resolved.
-        aws: value.get("aws").cloned().unwrap_or(Value::Null),
+        // Best-effort typed parse — malformed `aws:` blocks fall through
+        // silently to None, preserving today's permissive behavior here.
+        // (Strict typo gating for the user yard.yaml `aws:` block lives in
+        // plan 21-03 via the `validate_unknown_keys` helper.)
+        aws: value
+            .get("aws")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<AwsCredentialConfig>(v).ok()),
     }
 }
 
@@ -92,12 +98,8 @@ pub fn merge_airflow_sections(base: &AirflowSection, overlay: &AirflowSection) -
         } else {
             overlay.triggered_by.clone()
         },
-        // Overlay wins when non-null; Null means "not set" so fall back to base.
-        aws: if overlay.aws.is_null() {
-            base.aws.clone()
-        } else {
-            overlay.aws.clone()
-        },
+        // Overlay wins when Some; None means "not set" so fall back to base.
+        aws: overlay.aws.clone().or_else(|| base.aws.clone()),
     }
 }
 
