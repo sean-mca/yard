@@ -606,6 +606,7 @@ pub async fn get_storage(backend: &StateBackend) -> Result<Storage> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use yard_structs::{DagDeployment, Deployment};

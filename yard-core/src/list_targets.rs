@@ -92,6 +92,7 @@ fn assume_role_str(aws: Option<&Value>) -> Option<&str> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use serde_json::json;

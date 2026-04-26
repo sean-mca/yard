@@ -37,6 +37,7 @@ pub fn validate_job_full(job_name: &str, job_def: &JobDefinition) -> Vec<Validat
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use serde_json::json;
