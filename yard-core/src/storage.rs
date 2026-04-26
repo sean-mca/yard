@@ -1377,6 +1377,95 @@ mod tests {
         // matches!() variant check removed — Storage is now a struct, not an enum.
     }
 
+    // --- SC #3 / PRES-05 byte-identity wire-format tests ---
+
+    #[tokio::test]
+    async fn write_job_state_byte_identical_to_serde_pretty() {
+        // SC #3 / PRES-05 byte-identical state-file persistence — verifies the
+        // trait dispatch path emits exactly the same on-disk JSON as the pre-refactor
+        // enum dispatch path. Mirrors Phase 22 plan-22-02's diff.rs round-trip pattern,
+        // but tightens the assertion from `to_value` (structural) to `to_string_pretty`
+        // (byte-identical) because SC #3 protects on-disk byte fidelity, not just
+        // structural shape.
+        let dir = std::env::temp_dir()
+            .join(format!("yard_test_byte_identical_job_{}", std::process::id()));
+        let storage = Storage::new(LocalStorage { path: dir.clone() });
+
+        let state = JobState {
+            job_name: "byte_test".to_string(),
+            project: "test-project".to_string(),
+            deployment: Deployment {
+                env: None,
+                config_hash: "abc123".to_string(),
+                config: serde_json::json!({
+                    "type": "glue",
+                    "role": "arn:aws:iam::111111111111:role/X"
+                }),
+                status: "applied".to_string(),
+                applied_at: "2025-01-01T00:00:00Z".to_string(),
+                resources: Vec::new(),
+            },
+        };
+
+        // Write through the trait dispatch path (Storage::write_job ->
+        // self.backend.write_job -> LocalStorage::write_job).
+        storage.write_job("byte_test", &state).await.unwrap();
+
+        // Read raw on-disk bytes and assert byte-identity vs.
+        // serde_json::to_string_pretty output.
+        let path = dir.join("byte_test.json");
+        let on_disk = tokio::fs::read_to_string(&path).await.unwrap();
+        let expected = serde_json::to_string_pretty(&state).unwrap();
+        assert_eq!(
+            on_disk, expected,
+            "on-disk JobState JSON must be byte-identical to serde_json::to_string_pretty output"
+        );
+
+        // Round-trip: re-read via storage.read_job, assert struct equality on
+        // load-bearing fields.
+        let loaded = storage.read_job("byte_test").await.unwrap().unwrap();
+        assert_eq!(loaded.job_name, state.job_name);
+        assert_eq!(loaded.project, state.project);
+        assert_eq!(loaded.deployment.config_hash, state.deployment.config_hash);
+        assert_eq!(loaded.deployment.status, state.deployment.status);
+        assert_eq!(loaded.deployment.applied_at, state.deployment.applied_at);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn write_dag_state_byte_identical_to_serde_pretty() {
+        // Parallel SC #3 verification for DagState. write_dag uses the same
+        // serde_json::to_string_pretty serialization path as write_job, but
+        // writes to `{DAG_STATE_PREFIX}{dag_name}.json` per DAG_STATE_PREFIX.
+        let dir = std::env::temp_dir()
+            .join(format!("yard_test_byte_identical_dag_{}", std::process::id()));
+        let storage = Storage::new(LocalStorage { path: dir.clone() });
+
+        let state = test_dag_state("byte_dag");
+
+        storage.write_dag("byte_dag", &state).await.unwrap();
+
+        let filename = format!("{DAG_STATE_PREFIX}byte_dag.json");
+        let path = dir.join(&filename);
+        let on_disk = tokio::fs::read_to_string(&path).await.unwrap();
+        let expected = serde_json::to_string_pretty(&state).unwrap();
+        assert_eq!(
+            on_disk, expected,
+            "on-disk DagState JSON must be byte-identical to serde_json::to_string_pretty output"
+        );
+
+        let loaded = storage.read_dag("byte_dag").await.unwrap().unwrap();
+        // Use serde round-trip equality as the structural-equivalence proxy.
+        let loaded_json = serde_json::to_string_pretty(&loaded).unwrap();
+        assert_eq!(
+            loaded_json, expected,
+            "DagState round-trip preserves all fields"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- SC #4 demonstration: a third backend implemented in ONE impl block,
     //     ZERO edits to existing LocalStorage / S3Storage / Storage code ---
     //
