@@ -107,6 +107,218 @@ pub trait StorageBackend: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Option<LockInfo>>> + Send + '_>>;
 }
 
+// --- LocalStorage trait impl ---
+
+impl StorageBackend for LocalStorage {
+    fn read_job(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<JobState>>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        Box::pin(async move {
+            let path = self.path.join(format!("{job_name}.json"));
+            if !path.exists() {
+                return Ok(None);
+            }
+            let content = tokio::fs::read_to_string(&path)
+                .await
+                .with_context(|| format!("Failed to read state for job {job_name}"))?;
+            let state: JobState = serde_json::from_str(&content)?;
+            Ok(Some(state))
+        })
+    }
+
+    fn write_job(
+        &self,
+        job_name: &str,
+        state: &JobState,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        let json_result = serde_json::to_string_pretty(state);
+        Box::pin(async move {
+            let json = json_result?;
+            tokio::fs::create_dir_all(&self.path).await?;
+            let path = self.path.join(format!("{job_name}.json"));
+            tokio::fs::write(&path, json).await?;
+            Ok(())
+        })
+    }
+
+    fn delete_job(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        Box::pin(async move {
+            let path = self.path.join(format!("{job_name}.json"));
+            if path.exists() {
+                tokio::fs::remove_file(&path).await?;
+            }
+            Ok(())
+        })
+    }
+
+    fn list_jobs(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
+        Box::pin(async move {
+            let mut jobs = Vec::new();
+            if !self.path.exists() {
+                return Ok(jobs);
+            }
+            let mut entries = tokio::fs::read_dir(&self.path).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Some(job_name) = name.strip_suffix(".json")
+                    && !job_name.ends_with(".lock")
+                    && !job_name.starts_with(DAG_STATE_PREFIX)
+                {
+                    jobs.push(job_name.to_string());
+                }
+            }
+            Ok(jobs)
+        })
+    }
+
+    fn read_dag(
+        &self,
+        dag_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<DagState>>> + Send + '_>> {
+        let dag_name = dag_name.to_string();
+        Box::pin(async move {
+            let key = format!("{DAG_STATE_PREFIX}{dag_name}");
+            let path = self.path.join(format!("{key}.json"));
+            if !path.exists() {
+                return Ok(None);
+            }
+            let content = tokio::fs::read_to_string(&path)
+                .await
+                .with_context(|| format!("Failed to read state for DAG {dag_name}"))?;
+            let state: DagState = serde_json::from_str(&content)?;
+            Ok(Some(state))
+        })
+    }
+
+    fn write_dag(
+        &self,
+        dag_name: &str,
+        state: &DagState,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let dag_name = dag_name.to_string();
+        let json_result = serde_json::to_string_pretty(state);
+        Box::pin(async move {
+            let key = format!("{DAG_STATE_PREFIX}{dag_name}");
+            let json = json_result?;
+            tokio::fs::create_dir_all(&self.path).await?;
+            let path = self.path.join(format!("{key}.json"));
+            tokio::fs::write(&path, json).await?;
+            Ok(())
+        })
+    }
+
+    fn delete_dag(
+        &self,
+        dag_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let dag_name = dag_name.to_string();
+        Box::pin(async move {
+            let key = format!("{DAG_STATE_PREFIX}{dag_name}");
+            let path = self.path.join(format!("{key}.json"));
+            if path.exists() {
+                tokio::fs::remove_file(&path).await?;
+            }
+            Ok(())
+        })
+    }
+
+    fn list_dags(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
+        Box::pin(async move {
+            let mut dags = Vec::new();
+            if !self.path.exists() {
+                return Ok(dags);
+            }
+            let mut entries = tokio::fs::read_dir(&self.path).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Some(base) = name.strip_suffix(".json")
+                    && !base.ends_with(".lock")
+                    && let Some(dag_name) = base.strip_prefix(DAG_STATE_PREFIX)
+                {
+                    dags.push(dag_name.to_string());
+                }
+            }
+            Ok(dags)
+        })
+    }
+
+    fn lock(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<LockInfo>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        Box::pin(async move {
+            let info = lock_info();
+            let json = serde_json::to_string_pretty(&info)?;
+            tokio::fs::create_dir_all(&self.path).await?;
+            let lock_path = self.path.join(format!("{job_name}.json.lock"));
+
+            // O_CREAT | O_EXCL — fails if file already exists
+            match tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+                .await
+            {
+                Ok(_file) => {
+                    tokio::fs::write(&lock_path, &json).await?;
+                    Ok(info)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let existing = self.get_lock(&job_name).await?;
+                    match existing {
+                        Some(held) => Err(anyhow!(
+                            "Job \"{job_name}\" is locked by {} (since {}). \
+                             Use `yard force-unlock` to override.",
+                            held.who,
+                            held.created_at
+                        )),
+                        None => Err(anyhow!("Job \"{job_name}\" is locked (unknown holder)")),
+                    }
+                }
+                Err(e) => Err(e.into()),
+            }
+        })
+    }
+
+    fn force_unlock(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        Box::pin(async move {
+            let lock_path = self.path.join(format!("{job_name}.json.lock"));
+            if lock_path.exists() {
+                tokio::fs::remove_file(&lock_path).await?;
+            }
+            Ok(())
+        })
+    }
+
+    fn get_lock(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<LockInfo>>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        Box::pin(async move {
+            let lock_path = self.path.join(format!("{job_name}.json.lock"));
+            if !lock_path.exists() {
+                return Ok(None);
+            }
+            let content = tokio::fs::read_to_string(&lock_path).await?;
+            let info: LockInfo = serde_json::from_str(&content)?;
+            Ok(Some(info))
+        })
+    }
+}
+
 // --- Helpers ---
 
 fn lock_info() -> LockInfo {
