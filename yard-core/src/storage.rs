@@ -22,9 +22,8 @@ pub struct S3Storage {
     pub prefix: String,
 }
 
-pub enum Storage {
-    Local(LocalStorage),
-    S3(S3Storage),
+pub struct Storage {
+    backend: Box<dyn StorageBackend + Send + Sync>,
 }
 
 /// Trait for reading/writing job + DAG state and managing job locks.
@@ -630,336 +629,76 @@ where
 }
 
 impl Storage {
-    // --- Per-job state operations ---
+    /// Construct a Storage handle from any backend implementation.
+    pub fn new<B: StorageBackend + Send + Sync + 'static>(backend: B) -> Self {
+        Self {
+            backend: Box::new(backend),
+        }
+    }
+
+    // --- Per-job state operations (thin wrappers; delegate to self.backend) ---
 
     /// Read a single job's state file. Returns None if the file doesn't exist.
     pub async fn read_job(&self, job_name: &str) -> Result<Option<JobState>> {
-        match self {
-            Storage::Local(s) => {
-                let path = s.path.join(format!("{job_name}.json"));
-                if !path.exists() {
-                    return Ok(None);
-                }
-                let content = tokio::fs::read_to_string(&path)
-                    .await
-                    .with_context(|| format!("Failed to read state for job {job_name}"))?;
-                let state: JobState = serde_json::from_str(&content)?;
-                Ok(Some(state))
-            }
-            Storage::S3(s) => {
-                let key = format!("{}{job_name}.json", s.prefix);
-                let result = s
-                    .client
-                    .get_object()
-                    .bucket(&s.bucket)
-                    .key(&key)
-                    .send()
-                    .await;
-
-                match result {
-                    Ok(resp) => {
-                        let data = resp.body.collect().await?.into_bytes();
-                        let state: JobState = serde_json::from_slice(&data)?;
-                        Ok(Some(state))
-                    }
-                    Err(e) => {
-                        if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
-                            Ok(None)
-                        } else {
-                            Err(e.into())
-                        }
-                    }
-                }
-            }
-        }
+        self.backend.read_job(job_name).await
     }
 
-    /// Write a single job's state file.
+    /// Write a job's state file. Overwrites any existing file.
     pub async fn write_job(&self, job_name: &str, state: &JobState) -> Result<()> {
-        match self {
-            Storage::Local(s) => {
-                let json = serde_json::to_string_pretty(state)?;
-                tokio::fs::create_dir_all(&s.path).await?;
-                let path = s.path.join(format!("{job_name}.json"));
-                tokio::fs::write(&path, json).await?;
-                Ok(())
-            }
-            Storage::S3(s) => {
-                let json = serde_json::to_string_pretty(state)?;
-                let key = format!("{}{job_name}.json", s.prefix);
-                s.client
-                    .put_object()
-                    .bucket(&s.bucket)
-                    .key(&key)
-                    .body(json.into_bytes().into())
-                    .content_type("application/json")
-                    .send()
-                    .await?;
-                Ok(())
-            }
-        }
+        self.backend.write_job(job_name, state).await
     }
 
-    /// Delete a single job's state file.
+    /// Delete a job's state file. No-op if the file doesn't exist.
     pub async fn delete_job(&self, job_name: &str) -> Result<()> {
-        match self {
-            Storage::Local(s) => {
-                let path = s.path.join(format!("{job_name}.json"));
-                if path.exists() {
-                    tokio::fs::remove_file(&path).await?;
-                }
-                Ok(())
-            }
-            Storage::S3(s) => {
-                let key = format!("{}{job_name}.json", s.prefix);
-                s.client
-                    .delete_object()
-                    .bucket(&s.bucket)
-                    .key(&key)
-                    .send()
-                    .await?;
-                Ok(())
-            }
-        }
+        self.backend.delete_job(job_name).await
     }
 
-    /// List all job names that have state files.
+    /// List all job names with state files (excluding lock files and DAG files).
     pub async fn list_jobs(&self) -> Result<Vec<String>> {
-        match self {
-            Storage::Local(s) => {
-                let mut jobs = Vec::new();
-                if !s.path.exists() {
-                    return Ok(jobs);
-                }
-                let mut entries = tokio::fs::read_dir(&s.path).await?;
-                while let Some(entry) = entries.next_entry().await? {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if let Some(job_name) = name.strip_suffix(".json")
-                        && !job_name.ends_with(".lock")
-                        && !job_name.starts_with(DAG_STATE_PREFIX)
-                    {
-                        jobs.push(job_name.to_string());
-                    }
-                }
-                Ok(jobs)
-            }
-            Storage::S3(s) => {
-                list_s3_filtered(&s.client, &s.bucket, &s.prefix, |relative| {
-                    let job_name = relative.strip_suffix(".json")?;
-                    if job_name.ends_with(".lock")
-                        || job_name.starts_with(DAG_STATE_PREFIX)
-                        || job_name.contains('/')
-                    {
-                        return None;
-                    }
-                    Some(job_name.to_string())
-                })
-                .await
-            }
-        }
+        self.backend.list_jobs().await
     }
 
     // --- Per-DAG state operations ---
 
-    /// Read a single DAG's state file. Returns None if the file doesn't exist.
+    /// Read a DAG's state file. Returns None if the file doesn't exist.
     pub async fn read_dag(&self, dag_name: &str) -> Result<Option<DagState>> {
-        let key = format!("{DAG_STATE_PREFIX}{dag_name}");
-        match self {
-            Storage::Local(s) => {
-                let path = s.path.join(format!("{key}.json"));
-                if !path.exists() {
-                    return Ok(None);
-                }
-                let content = tokio::fs::read_to_string(&path)
-                    .await
-                    .with_context(|| format!("Failed to read state for DAG {dag_name}"))?;
-                let state: DagState = serde_json::from_str(&content)?;
-                Ok(Some(state))
-            }
-            Storage::S3(s) => {
-                let s3_key = format!("{}{key}.json", s.prefix);
-                let result = s
-                    .client
-                    .get_object()
-                    .bucket(&s.bucket)
-                    .key(&s3_key)
-                    .send()
-                    .await;
-
-                match result {
-                    Ok(resp) => {
-                        let data = resp.body.collect().await?.into_bytes();
-                        let state: DagState = serde_json::from_slice(&data)?;
-                        Ok(Some(state))
-                    }
-                    Err(e) => {
-                        if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
-                            Ok(None)
-                        } else {
-                            Err(e.into())
-                        }
-                    }
-                }
-            }
-        }
+        self.backend.read_dag(dag_name).await
     }
 
-    /// Write a single DAG's state file.
+    /// Write a DAG's state file. Overwrites any existing file.
     pub async fn write_dag(&self, dag_name: &str, state: &DagState) -> Result<()> {
-        let key = format!("{DAG_STATE_PREFIX}{dag_name}");
-        match self {
-            Storage::Local(s) => {
-                let json = serde_json::to_string_pretty(state)?;
-                tokio::fs::create_dir_all(&s.path).await?;
-                let path = s.path.join(format!("{key}.json"));
-                tokio::fs::write(&path, json).await?;
-                Ok(())
-            }
-            Storage::S3(s) => {
-                let json = serde_json::to_string_pretty(state)?;
-                let s3_key = format!("{}{key}.json", s.prefix);
-                s.client
-                    .put_object()
-                    .bucket(&s.bucket)
-                    .key(&s3_key)
-                    .body(json.into_bytes().into())
-                    .content_type("application/json")
-                    .send()
-                    .await?;
-                Ok(())
-            }
-        }
+        self.backend.write_dag(dag_name, state).await
     }
 
-    /// Delete a single DAG's state file.
+    /// Delete a DAG's state file. No-op if the file doesn't exist.
     pub async fn delete_dag(&self, dag_name: &str) -> Result<()> {
-        let key = format!("{DAG_STATE_PREFIX}{dag_name}");
-        match self {
-            Storage::Local(s) => {
-                let path = s.path.join(format!("{key}.json"));
-                if path.exists() {
-                    tokio::fs::remove_file(&path).await?;
-                }
-                Ok(())
-            }
-            Storage::S3(s) => {
-                let s3_key = format!("{}{key}.json", s.prefix);
-                s.client
-                    .delete_object()
-                    .bucket(&s.bucket)
-                    .key(&s3_key)
-                    .send()
-                    .await?;
-                Ok(())
-            }
-        }
+        self.backend.delete_dag(dag_name).await
     }
 
-    /// List all DAG names that have state files.
+    /// List all DAG names with state files.
     pub async fn list_dags(&self) -> Result<Vec<String>> {
-        match self {
-            Storage::Local(s) => {
-                let mut dags = Vec::new();
-                if !s.path.exists() {
-                    return Ok(dags);
-                }
-                let mut entries = tokio::fs::read_dir(&s.path).await?;
-                while let Some(entry) = entries.next_entry().await? {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if let Some(base) = name.strip_suffix(".json")
-                        && !base.ends_with(".lock")
-                        && let Some(dag_name) = base.strip_prefix(DAG_STATE_PREFIX)
-                    {
-                        dags.push(dag_name.to_string());
-                    }
-                }
-                Ok(dags)
-            }
-            Storage::S3(s) => {
-                list_s3_filtered(&s.client, &s.bucket, &s.prefix, |relative| {
-                    let base = relative.strip_suffix(".json")?;
-                    if base.ends_with(".lock") || base.contains('/') {
-                        return None;
-                    }
-                    let dag_name = base.strip_prefix(DAG_STATE_PREFIX)?;
-                    Some(dag_name.to_string())
-                })
-                .await
-            }
-        }
+        self.backend.list_dags().await
     }
 
-    // --- Locking ---
+    // --- Locking primitives ---
 
     /// Acquire a lock for a job. Returns Ok(LockInfo) on success,
     /// Err if already locked.
     pub async fn lock(&self, job_name: &str) -> Result<LockInfo> {
-        let info = lock_info();
-        let json = serde_json::to_string_pretty(&info)?;
-
-        match self {
-            Storage::Local(s) => {
-                tokio::fs::create_dir_all(&s.path).await?;
-                let lock_path = s.path.join(format!("{job_name}.json.lock"));
-
-                // O_CREAT | O_EXCL — fails if file already exists
-                match tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&lock_path)
-                    .await
-                {
-                    Ok(_file) => {
-                        tokio::fs::write(&lock_path, &json).await?;
-                        Ok(info)
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        let existing = self.get_lock(job_name).await?;
-                        match existing {
-                            Some(held) => Err(anyhow!(
-                                "Job \"{job_name}\" is locked by {} (since {}). \
-                                 Use `yard force-unlock` to override.",
-                                held.who,
-                                held.created_at
-                            )),
-                            None => Err(anyhow!("Job \"{job_name}\" is locked (unknown holder)")),
-                        }
-                    }
-                    Err(e) => Err(e.into()),
-                }
-            }
-            Storage::S3(s) => {
-                let key = format!("{}{job_name}.json.lock", s.prefix);
-                let result = s
-                    .client
-                    .put_object()
-                    .bucket(&s.bucket)
-                    .key(&key)
-                    .body(json.into_bytes().into())
-                    .content_type("application/json")
-                    .if_none_match("*")
-                    .send()
-                    .await;
-
-                match result {
-                    Ok(_) => Ok(info),
-                    Err(e) => {
-                        // Object already exists — someone holds the lock
-                        let existing = self.get_lock(job_name).await.ok().flatten();
-                        match existing {
-                            Some(held) => Err(anyhow!(
-                                "Job \"{job_name}\" is locked by {} (since {}). \
-                                 Use `yard force-unlock` to override.",
-                                held.who,
-                                held.created_at
-                            )),
-                            None => Err(e.into()),
-                        }
-                    }
-                }
-            }
-        }
+        self.backend.lock(job_name).await
     }
+
+    /// Remove the lock regardless of who holds it.
+    pub async fn force_unlock(&self, job_name: &str) -> Result<()> {
+        self.backend.force_unlock(job_name).await
+    }
+
+    /// Read current lock info for a job, if any.
+    pub async fn get_lock(&self, job_name: &str) -> Result<Option<LockInfo>> {
+        self.backend.get_lock(job_name).await
+    }
+
+    // --- Convenience methods (D-06: stay on impl Storage, not on the trait) ---
 
     /// Release a lock, but only if we hold it (match on `who`).
     pub async fn unlock(&self, job_name: &str, holder: &LockInfo) -> Result<()> {
@@ -973,29 +712,6 @@ impl Storage {
                 existing.created_at,
                 holder.who
             )),
-        }
-    }
-
-    /// Remove the lock regardless of who holds it.
-    pub async fn force_unlock(&self, job_name: &str) -> Result<()> {
-        match self {
-            Storage::Local(s) => {
-                let lock_path = s.path.join(format!("{job_name}.json.lock"));
-                if lock_path.exists() {
-                    tokio::fs::remove_file(&lock_path).await?;
-                }
-                Ok(())
-            }
-            Storage::S3(s) => {
-                let key = format!("{}{job_name}.json.lock", s.prefix);
-                s.client
-                    .delete_object()
-                    .bucket(&s.bucket)
-                    .key(&key)
-                    .send()
-                    .await?;
-                Ok(())
-            }
         }
     }
 
@@ -1023,45 +739,6 @@ impl Storage {
         for (name, info) in locks.iter().rev() {
             if let Err(e) = self.unlock(name, info).await {
                 eprintln!("Warning: failed to unlock job \"{name}\": {e}");
-            }
-        }
-    }
-
-    /// Read current lock info for a job, if any.
-    pub async fn get_lock(&self, job_name: &str) -> Result<Option<LockInfo>> {
-        match self {
-            Storage::Local(s) => {
-                let lock_path = s.path.join(format!("{job_name}.json.lock"));
-                if !lock_path.exists() {
-                    return Ok(None);
-                }
-                let content = tokio::fs::read_to_string(&lock_path).await?;
-                let info: LockInfo = serde_json::from_str(&content)?;
-                Ok(Some(info))
-            }
-            Storage::S3(s) => {
-                let key = format!("{}{job_name}.json.lock", s.prefix);
-                let result = s
-                    .client
-                    .get_object()
-                    .bucket(&s.bucket)
-                    .key(&key)
-                    .send()
-                    .await;
-                match result {
-                    Ok(resp) => {
-                        let data = resp.body.collect().await?.into_bytes();
-                        let info: LockInfo = serde_json::from_slice(&data)?;
-                        Ok(Some(info))
-                    }
-                    Err(e) => {
-                        if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
-                            Ok(None)
-                        } else {
-                            Err(e.into())
-                        }
-                    }
-                }
             }
         }
     }
@@ -1111,7 +788,7 @@ fn merge_state_aws_with_env(
 
 pub async fn get_storage(backend: &StateBackend) -> Result<Storage> {
     match backend {
-        StateBackend::Local { path } => Ok(Storage::Local(LocalStorage { path: path.clone() })),
+        StateBackend::Local { path } => Ok(Storage::new(LocalStorage { path: path.clone() })),
         StateBackend::S3 {
             bucket,
             key,
@@ -1150,7 +827,7 @@ pub async fn get_storage(backend: &StateBackend) -> Result<Storage> {
                 format!("{key}/")
             };
 
-            Ok(Storage::S3(S3Storage {
+            Ok(Storage::new(S3Storage {
                 client,
                 bucket: bucket.clone(),
                 prefix,
