@@ -96,7 +96,7 @@ impl AwsCredentialConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum StateBackend {
     Local {
         path: PathBuf,
@@ -115,6 +115,7 @@ pub enum StateBackend {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectManifest {
     pub project: String,
     pub state: StateBackend,
@@ -147,6 +148,7 @@ pub struct Import {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Source {
     pub name: String,                   // variable name: produces df_<name>
     pub source_type: String,            // s3, jdbc, catalog, kafka, api
@@ -180,6 +182,7 @@ pub struct Source {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Sink {
     pub source: Option<String>, // which df to write (defaults to first/only source)
     pub sink_type: String,      // s3, jdbc, catalog
@@ -205,6 +208,7 @@ pub struct OrderBySpec {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Transform {
     pub transform_type: String, // filter, sql, drop_columns, rename, select, add_column, join, aggregate, window
     pub source: Option<String>, // which df to operate on (defaults to first/only source)
@@ -229,6 +233,7 @@ pub struct Transform {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct JobDefinition {
     pub job_type: JobType,
     pub imports: Vec<Import>,
@@ -310,6 +315,7 @@ pub struct YARDContext {
 /// account.yaml, dag.yaml, and the per-job `airflow:` block). Every layer has
 /// the same shape; later layers override earlier ones via shallow merge.
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AirflowSection {
     pub schedule: Option<String>,
     pub owner: Option<String>,
@@ -565,5 +571,112 @@ mod tests {
         assert_eq!(format!("{}", JobType::Glue), "glue");
         assert_eq!(format!("{}", JobType::Emr), "emr");
         assert_eq!(format!("{}", JobType::Bash), "bash");
+    }
+
+    // --- deny_unknown_fields (TYPE-03) ---
+    //
+    // Each of these tests exercises the structural deny gate at the serde-
+    // derived deserialize path (storage.rs's state-file persistence flows
+    // through these structs). User yard.yaml typo coverage at the manual
+    // `Value`-extraction layer in parsing.rs is exercised by the integration
+    // test at yard-core/tests/typed_config_validation.rs + the inline tests
+    // in yard-core/src/parsing.rs (D-17).
+
+    #[test]
+    fn project_manifest_deny_unknown_fields() {
+        let input = json!({
+            "project": "test",
+            "state": {"type": "local", "path": ".yard/state"},
+            "providers": {},
+            "jobs": {},
+            "wat": "this is unknown",
+        });
+        let err = serde_json::from_value::<ProjectManifest>(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown field"), "got: {msg}");
+        assert!(msg.contains("wat"), "got: {msg}");
+    }
+
+    #[test]
+    fn state_backend_s3_deny_unknown_fields() {
+        let input = json!({
+            "type": "s3", "bucket": "b", "region": "us-east-1", "key": "k/",
+            "wat": "unknown"
+        });
+        let err = serde_json::from_value::<StateBackend>(input).unwrap_err();
+        assert!(format!("{err}").contains("unknown field"));
+    }
+
+    #[test]
+    fn state_backend_local_deny_unknown_fields() {
+        let input = json!({"type": "local", "path": ".yard/state", "wat": "unknown"});
+        let err = serde_json::from_value::<StateBackend>(input).unwrap_err();
+        assert!(format!("{err}").contains("unknown field"));
+    }
+
+    #[test]
+    fn airflow_section_deny_unknown_fields() {
+        let input = json!({"schedule": "@daily", "wat": 1});
+        let err = serde_json::from_value::<AirflowSection>(input).unwrap_err();
+        assert!(format!("{err}").contains("unknown field"));
+    }
+
+    #[test]
+    fn source_deny_unknown_fields() {
+        let input = json!({
+            "name": "foo",
+            "source_type": "s3",
+            "wat": "unknown"
+        });
+        let err = serde_json::from_value::<Source>(input).unwrap_err();
+        assert!(format!("{err}").contains("unknown field"));
+    }
+
+    #[test]
+    fn sink_deny_unknown_fields() {
+        let input = json!({
+            "sink_type": "s3",
+            "wat": "unknown"
+        });
+        let err = serde_json::from_value::<Sink>(input).unwrap_err();
+        assert!(format!("{err}").contains("unknown field"));
+    }
+
+    #[test]
+    fn transform_deny_unknown_fields() {
+        let input = json!({
+            "transform_type": "filter",
+            "wat": "unknown"
+        });
+        let err = serde_json::from_value::<Transform>(input).unwrap_err();
+        assert!(format!("{err}").contains("unknown field"));
+    }
+
+    #[test]
+    fn job_definition_deny_unknown_fields() {
+        let input = json!({
+            "job_type": "glue",
+            "imports": [],
+            "body": null,
+            "job_file": null,
+            "sources": [],
+            "sink": null,
+            "transforms": [],
+            "airflow": null,
+            "config": null,
+            "wat": "unknown"
+        });
+        let err = serde_json::from_value::<JobDefinition>(input).unwrap_err();
+        assert!(format!("{err}").contains("unknown field"));
+    }
+
+    #[test]
+    fn airflow_section_subset_still_parses() {
+        // Sanity: deny_unknown_fields rejects unknowns but accepts subsets
+        // (skip_serializing_if + #[serde(default)] mean missing keys are fine).
+        let input = json!({"schedule": "@hourly"});
+        let parsed: AirflowSection = serde_json::from_value(input).unwrap();
+        assert_eq!(parsed.schedule.as_deref(), Some("@hourly"));
+        assert!(parsed.owner.is_none());
     }
 }

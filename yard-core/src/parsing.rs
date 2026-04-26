@@ -4,6 +4,137 @@ use yard_structs::{
     AirflowJobBlock, AirflowSection, AwsCredentialConfig, Import, Sink, Source, Transform,
 };
 
+/// Validate that a JSON object has no keys outside `allowed`. Used by every
+/// `parse_*` fn in this file (and by `discover_jobs` / `resolve_project` in
+/// resolve.rs) to surface user yard.yaml typos as parse-time errors.
+///
+/// The structural `path` argument is passed by the caller (which already
+/// knows what it's parsing) so error messages are actionable. Path examples:
+/// `"jobs.{job_name}.airflow"`, `"yard.yaml.state"`, `"jobs.{job_name}.sink"`.
+///
+/// **Behavior on non-object Values:** Returns `Ok(())`. The caller's
+/// downstream extraction handles non-object inputs via its existing
+/// `.get(...).as_str()`-style chain (typically returning `None` and
+/// falling through to defaults). This keeps the validator focused on its
+/// one job (catching unknown KEYS) without overlapping with type checks.
+///
+/// **Returned error format** (D-18):
+///   `unknown field '<key>' at <path> (allowed: <csv>)`
+pub fn validate_unknown_keys(
+    value: &serde_json::Value,
+    allowed: &[&str],
+    path: &str,
+) -> anyhow::Result<()> {
+    let Some(obj) = value.as_object() else {
+        return Ok(());
+    };
+    for key in obj.keys() {
+        if !allowed.contains(&key.as_str()) {
+            let allowed_csv = allowed.join(", ");
+            return Err(anyhow::anyhow!(
+                "unknown field '{key}' at {path} (allowed: {allowed_csv})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+// `#[allow(dead_code)]` on each ALLOWED_* const below: this commit lands
+// the consts + the validator helper additively. Commit 2 wires each list
+// into its parser and the `dead_code` allow goes away then. Sanity tests
+// in this file's `mod tests` reference each list to lock the contents.
+
+/// Allowed keys on a parsed `airflow:` section block (TYPE-03 D-19).
+/// Stricter list than `ALLOWED_AIRFLOW_JOB_BLOCK` — used at the manifest
+/// `providers.airflow` site, account.yaml/region.yaml/dag.yaml airflow
+/// blocks, and the recursive call from `parse_airflow_job_block` is
+/// avoided via the `parse_airflow_section_inner` split.
+#[allow(dead_code)]
+const ALLOWED_AIRFLOW_SECTION: &[&str] = &[
+    "schedule",
+    "owner",
+    "retries",
+    "dags_bucket",
+    "dags_prefix",
+    "triggered_by",
+    "aws",
+];
+
+/// Allowed keys on a per-job `airflow:` block (`AirflowJobBlock` —
+/// includes the AirflowSection-flattened fields plus job-specific
+/// `depends_on` and `produces`). `AirflowJobBlock` is excluded from
+/// `deny_unknown_fields` because of `#[serde(flatten)]`; this validator
+/// covers its user-yaml typo path per D-CTX:177.
+#[allow(dead_code)]
+const ALLOWED_AIRFLOW_JOB_BLOCK: &[&str] = &[
+    "depends_on",
+    "produces",
+    "schedule",
+    "owner",
+    "retries",
+    "dags_bucket",
+    "dags_prefix",
+    "triggered_by",
+    "aws",
+];
+
+/// Allowed keys on a single source entry (or single-source `source:` block).
+#[allow(dead_code)]
+const ALLOWED_SOURCE: &[&str] = &[
+    "name",
+    "type",
+    "format",
+    "path",
+    "connection_url",
+    "table",
+    "database",
+    "secret_id",
+    "engine",
+    "connection_type",
+    "topic",
+    "url",
+    "headers",
+    "options",
+];
+
+/// Allowed keys on a `sink:` block.
+#[allow(dead_code)]
+const ALLOWED_SINK: &[&str] = &[
+    "source",
+    "type",
+    "format",
+    "path",
+    "connection_url",
+    "table",
+    "database",
+    "secret_id",
+    "mode",
+    "partition_by",
+    "fill_nulls",
+];
+
+/// Allowed keys on a single transform entry inside the `transforms:` array.
+#[allow(dead_code)]
+const ALLOWED_TRANSFORM: &[&str] = &[
+    "type",
+    "source",
+    "output",
+    "condition",
+    "query",
+    "columns",
+    "mapping",
+    "name",
+    "expression",
+    "left",
+    "right",
+    "on",
+    "how",
+    "group_by",
+    "aggs",
+    "partition_by",
+    "order_by",
+];
+
 /// Extract optional body override from a job config.
 pub fn parse_body(config: &Value) -> Option<String> {
     config
@@ -425,5 +556,96 @@ mod tests {
         assert_eq!(final_cfg.owner.as_deref(), Some("data"));
         assert_eq!(final_cfg.retries, Some(3));
         assert_eq!(final_cfg.dags_bucket.as_deref(), Some("proj-bucket"));
+    }
+
+    // --- validate_unknown_keys (TYPE-03) ---
+
+    #[test]
+    fn validate_unknown_keys_accepts_subset() {
+        let v = json!({"a": 1, "b": 2});
+        assert!(validate_unknown_keys(&v, &["a", "b", "c"], "test.path").is_ok());
+    }
+
+    #[test]
+    fn validate_unknown_keys_accepts_exact() {
+        let v = json!({"a": 1});
+        assert!(validate_unknown_keys(&v, &["a"], "test.path").is_ok());
+    }
+
+    #[test]
+    fn validate_unknown_keys_rejects_unknown() {
+        let v = json!({"a": 1, "wat": 2});
+        let err = validate_unknown_keys(&v, &["a", "b"], "jobs.foo.airflow").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown field 'wat'"), "got: {msg}");
+        assert!(msg.contains("at jobs.foo.airflow"), "got: {msg}");
+        assert!(msg.contains("allowed: a, b"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_unknown_keys_passes_through_non_object() {
+        // Strings, numbers, arrays — not our concern; downstream extraction
+        // handles them via its existing `.as_str()`-style chain.
+        assert!(validate_unknown_keys(&json!("hello"), &["a"], "p").is_ok());
+        assert!(validate_unknown_keys(&json!(42), &["a"], "p").is_ok());
+        assert!(validate_unknown_keys(&json!([1, 2, 3]), &["a"], "p").is_ok());
+        assert!(validate_unknown_keys(&json!(null), &["a"], "p").is_ok());
+    }
+
+    #[test]
+    fn validate_unknown_keys_empty_object_is_ok() {
+        assert!(validate_unknown_keys(&json!({}), &[], "p").is_ok());
+        assert!(validate_unknown_keys(&json!({}), &["a", "b"], "p").is_ok());
+    }
+
+    // Sanity tests on the per-extractor allowed-keys lists. Each list is
+    // wired into a `parse_*` fn in commit 2; these tests assert the lists
+    // hold the expected keys today so future edits don't accidentally drop
+    // a key. (They also keep the consts marked-used until commit 2 wires
+    // them into actual parsers, satisfying the workspace clippy
+    // dead_code gate.)
+
+    #[test]
+    fn allowed_airflow_section_has_expected_keys() {
+        for k in ["schedule", "owner", "retries", "dags_bucket", "dags_prefix", "triggered_by", "aws"] {
+            assert!(
+                ALLOWED_AIRFLOW_SECTION.contains(&k),
+                "ALLOWED_AIRFLOW_SECTION missing '{k}'"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_airflow_job_block_extends_section_with_depends_on_and_produces() {
+        assert!(ALLOWED_AIRFLOW_JOB_BLOCK.contains(&"depends_on"));
+        assert!(ALLOWED_AIRFLOW_JOB_BLOCK.contains(&"produces"));
+        // every section key is also valid on the per-job block
+        for k in ALLOWED_AIRFLOW_SECTION {
+            assert!(
+                ALLOWED_AIRFLOW_JOB_BLOCK.contains(k),
+                "ALLOWED_AIRFLOW_JOB_BLOCK missing '{k}'"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_source_has_expected_keys() {
+        for k in ["name", "type", "format", "path", "options", "headers"] {
+            assert!(ALLOWED_SOURCE.contains(&k), "ALLOWED_SOURCE missing '{k}'");
+        }
+    }
+
+    #[test]
+    fn allowed_sink_has_expected_keys() {
+        for k in ["type", "path", "mode", "partition_by", "fill_nulls"] {
+            assert!(ALLOWED_SINK.contains(&k), "ALLOWED_SINK missing '{k}'");
+        }
+    }
+
+    #[test]
+    fn allowed_transform_has_expected_keys() {
+        for k in ["type", "source", "output", "condition", "query", "columns"] {
+            assert!(ALLOWED_TRANSFORM.contains(&k), "ALLOWED_TRANSFORM missing '{k}'");
+        }
     }
 }
