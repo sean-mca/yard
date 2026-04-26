@@ -176,27 +176,29 @@ fn resolve_dag_airflow_config(
     dag_dir: &Path,
     jobs: &[(String, &JobDefinition)],
 ) -> Result<AirflowSection> {
-    let project_level = manifest
-        .providers
-        .get("airflow")
-        .map(parse_airflow_section)
-        .unwrap_or_default();
+    // TYPE-03: each `parse_airflow_section` call gates its airflow block
+    // against unknown keys. Project-level catches typos in
+    // `providers.airflow:` from yard.yaml; account/region/dag levels catch
+    // typos in those context files' `airflow:` blocks. The path argument
+    // narrates the structural location for actionable error messages.
+    let project_level = match manifest.providers.get("airflow") {
+        Some(v) => parse_airflow_section(v, "providers.airflow")?,
+        None => AirflowSection::default(),
+    };
 
     let ctx = crate::resolve::load_context(dag_dir)
         .with_context(|| format!("Failed to load context for DAG at {}", dag_dir.display()))?;
 
-    let account_level = ctx
-        .account
-        .get("airflow")
-        .map(parse_airflow_section)
-        .unwrap_or_default();
-    let region_level = ctx
-        .region
-        .get("airflow")
-        .map(parse_airflow_section)
-        .unwrap_or_default();
+    let account_level = match ctx.account.get("airflow") {
+        Some(v) => parse_airflow_section(v, "account.yaml.airflow")?,
+        None => AirflowSection::default(),
+    };
+    let region_level = match ctx.region.get("airflow") {
+        Some(v) => parse_airflow_section(v, "region.yaml.airflow")?,
+        None => AirflowSection::default(),
+    };
     // dag.yaml fields sit at the top level of the file (it IS the airflow section).
-    let dag_level = parse_airflow_section(&ctx.dag);
+    let dag_level = parse_airflow_section(&ctx.dag, "dag.yaml")?;
 
     let mut merged = merge_airflow_sections(&project_level, &account_level);
     merged = merge_airflow_sections(&merged, &region_level);

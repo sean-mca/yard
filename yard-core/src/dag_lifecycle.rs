@@ -400,7 +400,7 @@ async fn delete_dag_from_s3(
         .providers
         .get("airflow")
         .ok_or_else(|| anyhow!("Cannot delete DAG from S3: no airflow provider config"))?;
-    let section = parse_airflow_section(airflow_config);
+    let section = parse_airflow_section(airflow_config, "providers.airflow")?;
 
     let Some(ref bucket) = section.dags_bucket else {
         return Ok(());
@@ -478,7 +478,7 @@ pub async fn destroy_dag(
             && dag_state.deployment.s3_uri.is_some()
             && let Some(airflow_config) = provider_configs.get("airflow")
         {
-            let section = parse_airflow_section(airflow_config);
+            let section = parse_airflow_section(airflow_config, "providers.airflow")?;
             if let Some(ref bucket) = section.dags_bucket {
                 let region = airflow_config
                     .get("region")
@@ -601,10 +601,10 @@ mod tests {
         let imports = parse_imports(&config);
         let body = parse_body(&config);
         let job_file = parse_job_file(&config);
-        let sources = parse_sources(&config);
-        let sink = parse_sink(&config);
-        let transforms = parse_transforms(&config);
-        let airflow = parse_airflow_job_block(&config);
+        let sources = parse_sources(&config, "test").expect("test fixture must parse");
+        let sink = parse_sink(&config, "test").expect("test fixture must parse");
+        let transforms = parse_transforms(&config, "test").expect("test fixture must parse");
+        let airflow = parse_airflow_job_block(&config, "test").expect("test fixture must parse");
 
         // Inject a default role for glue jobs so tests pass validation
         let config = if job_type == JobType::Glue && config.get("role").is_none() {

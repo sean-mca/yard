@@ -621,10 +621,10 @@ mod tests {
         let imports = parse_imports(&config);
         let body = parse_body(&config);
         let job_file = parse_job_file(&config);
-        let sources = parse_sources(&config);
-        let sink = parse_sink(&config);
-        let transforms = parse_transforms(&config);
-        let airflow = parse_airflow_job_block(&config);
+        let sources = parse_sources(&config, "test").expect("test fixture must parse");
+        let sink = parse_sink(&config, "test").expect("test fixture must parse");
+        let transforms = parse_transforms(&config, "test").expect("test fixture must parse");
+        let airflow = parse_airflow_job_block(&config, "test").expect("test fixture must parse");
 
         // Inject a default role for glue jobs so tests pass validation
         let config = if job_type == JobType::Glue && config.get("role").is_none() {

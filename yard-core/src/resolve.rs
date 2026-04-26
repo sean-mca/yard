@@ -8,6 +8,53 @@ use yard_structs::{
     JobDefinition, JobType, ProjectManifest, ProjectState, StateBackend, YARDContext,
 };
 
+/// Allowed top-level keys on a yard.yaml manifest (TYPE-03 D-19). Any other
+/// key surfaces as an `unknown field 'X' at yard.yaml ...` error at parse
+/// time.
+const ALLOWED_TOP_LEVEL: &[&str] = &["project", "state", "providers", "jobs", "aws"];
+
+/// Allowed keys on a yard.yaml `state:` block (StateBackend wire surface).
+/// Both `Local` (path) and `S3` (bucket/region/key/aws) variants share the
+/// same flat allow-list — serde dispatches on the `type` discriminator.
+const ALLOWED_STATE_BLOCK: &[&str] = &["type", "bucket", "region", "key", "path", "aws"];
+
+/// Static allowed keys on a job-doc (the `JobDefinition` wire surface, as
+/// the user types it in `<job>.yaml`). Dynamic provider-block keys (the
+/// wire strings from each `JobType` variant) are appended at runtime per
+/// D-21 to keep this list in sync with TYPE-01.
+const STATIC_JOB_DOC_ALLOWED: &[&str] = &[
+    "type",
+    "imports",
+    "body",
+    "job_file",
+    "sources",
+    "source",
+    "sink",
+    "transforms",
+    "airflow",
+    "partition_by",
+    "partition_timestamp_column",
+    "create_timestamp",
+    "_aws",
+];
+
+/// Build the full allowed-keys list for a job doc by combining the static
+/// fields with the wire-form of every `JobType` variant (so `glue: {...}`,
+/// `emr: {...}`, `bash: {...}` provider-block siblings are accepted but
+/// `sprk: {...}` is rejected). D-21: list is derived from the live
+/// `JobType` enum, not hard-coded — adding a fourth variant in TYPE-01
+/// flows through here without an edit.
+fn job_doc_allowed_keys() -> Vec<String> {
+    let mut all: Vec<String> = STATIC_JOB_DOC_ALLOWED
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    for variant in [JobType::Glue, JobType::Emr, JobType::Bash] {
+        all.push(variant.to_string());
+    }
+    all
+}
+
 pub struct ResolvedProject {
     pub manifest: ProjectManifest,
     pub current_state: ProjectState,
@@ -28,6 +75,21 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
     let root_doc = root_docs
         .first()
         .ok_or_else(|| anyhow!("yard.yaml is empty"))?;
+
+    // TYPE-03 D-19: gate the yard.yaml top-level + the `state:` block
+    // against unknown keys. Catches the user-typo footgun (e.g. `provider:`
+    // instead of `providers:`) at parse time with a structured error.
+    // Validates against the JSON-converted view so the helper's `as_object`
+    // check works the same way it does for the `parse_*` callers.
+    let root_value = yaml_to_json(root_doc);
+    crate::parsing::validate_unknown_keys(&root_value, ALLOWED_TOP_LEVEL, "yard.yaml")?;
+    if let Some(state_value) = root_value.get("state") {
+        crate::parsing::validate_unknown_keys(
+            state_value,
+            ALLOWED_STATE_BLOCK,
+            "yard.yaml.state",
+        )?;
+    }
 
     // 2. Extract global config
     let project = root_doc["project"]
@@ -202,12 +264,23 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
             .parse()
             .with_context(|| format!("invalid job type for job '{job_name}'"))?;
         let config = yaml_to_json(job_doc);
+
+        // TYPE-03 D-19/D-21: gate the job doc against the static
+        // `JobDefinition` keys plus the dynamic `JobType`-derived
+        // provider-block keys. Catches user typos like `sceudule:`,
+        // `transformsss:`, or `glu: { ... }` at parse time with a
+        // structured error.
+        let allowed_owned = job_doc_allowed_keys();
+        let allowed_borrowed: Vec<&str> = allowed_owned.iter().map(String::as_str).collect();
+        let job_path = format!("jobs.{job_name}");
+        crate::parsing::validate_unknown_keys(&config, &allowed_borrowed, &job_path)?;
+
         let imports = crate::parse_imports(&config);
         let body = crate::parse_body(&config);
-        let sources = crate::parse_sources(&config);
-        let sink = crate::parse_sink(&config);
-        let transforms = crate::parse_transforms(&config);
-        let airflow = crate::parse_airflow_job_block(&config);
+        let sources = crate::parse_sources(&config, &job_path)?;
+        let sink = crate::parse_sink(&config, &job_path)?;
+        let transforms = crate::parse_transforms(&config, &job_path)?;
+        let airflow = crate::parse_airflow_job_block(&config, &job_path)?;
 
         // Resolve job_file path relative to the job YAML's directory
         let job_file = crate::parse_job_file(&config).map(|p| {
