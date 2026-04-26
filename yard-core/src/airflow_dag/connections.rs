@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use yard_structs::{JobDefinition, ProjectManifest};
+use yard_structs::{JobDefinition, JobType, ProjectManifest};
 
 use super::helpers::sanitize_identifier;
 use super::RequiredConnection;
@@ -89,7 +89,7 @@ pub fn required_connections_for_dag(
         let Some(job) = manifest.jobs.get(task_id) else {
             continue;
         };
-        if job.job_type != "glue" {
+        if job.job_type != JobType::Glue {
             continue;
         }
         let conn_id = resolve_task_aws_conn_id(job, manifest)?;

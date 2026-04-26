@@ -97,7 +97,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
-    use yard_structs::{JobDefinition, StateBackend};
+    use yard_structs::{JobDefinition, JobType, StateBackend};
 
     fn make_manifest(
         jobs: Vec<(&str, Value)>,
@@ -108,7 +108,7 @@ mod tests {
             job_map.insert(
                 name.to_string(),
                 JobDefinition {
-                    job_type: "glue".to_string(),
+                    job_type: JobType::Glue,
                     config,
                     ..Default::default()
                 },

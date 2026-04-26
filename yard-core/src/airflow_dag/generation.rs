@@ -1,14 +1,12 @@
 use anyhow::{Context as AnyhowContext, Result, anyhow};
 use std::collections::HashMap;
 use tera::{Context, Tera};
-use yard_structs::{AirflowSection, JobDefinition, ProjectManifest};
+use yard_structs::{AirflowSection, JobDefinition, JobType, ProjectManifest};
 
 use super::AIRFLOW_DAG_TEMPLATE;
 use super::ResolvedDag;
 use super::connections::{required_connections_for_dag, resolve_task_aws_conn_id};
 use super::helpers::{python_string_literal, python_var_name};
-
-use crate::is_task_only;
 
 /// Render a resolved DAG into an Airflow Python file.
 pub fn generate_dag(
@@ -20,7 +18,7 @@ pub fn generate_dag(
     tera.add_raw_template("airflow_dag", AIRFLOW_DAG_TEMPLATE)?;
 
     // Collect the job_type used by each task so we can pick operator classes.
-    let mut task_types: Vec<(String, String, &JobDefinition)> = Vec::with_capacity(dag.tasks.len());
+    let mut task_types: Vec<(String, JobType, &JobDefinition)> = Vec::with_capacity(dag.tasks.len());
     for task_id in &dag.tasks {
         let job = manifest.jobs.get(task_id).ok_or_else(|| {
             anyhow!(
@@ -29,22 +27,22 @@ pub fn generate_dag(
                 task_id
             )
         })?;
-        task_types.push((task_id.clone(), job.job_type.clone(), job));
+        task_types.push((task_id.clone(), job.job_type, job));
     }
 
     // Imports block: one line per distinct operator needed.
     let mut needs_bash = false;
     let mut needs_glue = false;
     for (task_id, ty, _) in &task_types {
-        match ty.as_str() {
-            "bash" => needs_bash = true,
-            "glue" => needs_glue = true,
-            other => {
+        match ty {
+            JobType::Bash => needs_bash = true,
+            JobType::Glue => needs_glue = true,
+            JobType::Emr => {
                 return Err(anyhow!(
                     "DAG '{}' task '{}': job type '{}' is not supported in Airflow codegen yet",
                     dag.name,
                     task_id,
-                    other
+                    ty
                 ));
             }
         }
@@ -99,7 +97,7 @@ pub fn generate_dag(
     for (task_id, job_type, job) in &task_types {
         task_lines.push(render_task(
             task_id,
-            job_type,
+            *job_type,
             job,
             manifest,
             script_locations,
@@ -172,7 +170,7 @@ fn render_default_args(cfg: &AirflowSection) -> String {
 
 fn render_task(
     task_id: &str,
-    job_type: &str,
+    job_type: JobType,
     job: &JobDefinition,
     manifest: &ProjectManifest,
     script_locations: &HashMap<String, String>,
@@ -181,7 +179,7 @@ fn render_task(
     let tid = python_string_literal(task_id);
     let outlets = render_outlets(job);
     match job_type {
-        "bash" => {
+        JobType::Bash => {
             let cmd = job
                 .config
                 .get("command")
@@ -195,7 +193,7 @@ fn render_task(
                 outlets = outlets,
             ))
         }
-        "glue" => {
+        JobType::Glue => {
             let role = job
                 .config
                 .get("role")
@@ -229,11 +227,8 @@ fn render_task(
                 outlets = outlets,
             ))
         }
-        other if is_task_only(other) => Err(anyhow!(
-            "task-only job type '{other}' is not yet supported in Airflow codegen"
-        )),
-        other => Err(anyhow!(
-            "job type '{other}' is not supported in Airflow codegen yet"
+        JobType::Emr => Err(anyhow!(
+            "job type '{job_type}' is not supported in Airflow codegen yet"
         )),
     }
 }

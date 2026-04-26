@@ -1,11 +1,12 @@
 use serde_json::Value;
+use yard_structs::JobType;
 
 /// Job types that are Airflow tasks only — they don't have a Spark artifact to
 /// generate and no provider to deploy through. Used in validation, codegen,
 /// and apply to short-circuit the Spark path. **Single source of truth** —
 /// callers must use this helper instead of hard-coding the list.
-pub fn is_task_only(job_type: &str) -> bool {
-    matches!(job_type, "bash")
+pub fn is_task_only(job_type: JobType) -> bool {
+    matches!(job_type, JobType::Bash)
 }
 
 /// Build the `Value` passed to `get_provider`: provider defaults shallow-
@@ -149,13 +150,16 @@ mod tests {
 
     #[test]
     fn is_task_only_recognizes_bash() {
-        assert!(is_task_only("bash"));
+        assert!(is_task_only(JobType::Bash));
     }
 
     #[test]
     fn is_task_only_rejects_spark_types() {
-        assert!(!is_task_only("glue"));
-        assert!(!is_task_only("emr"));
-        assert!(!is_task_only("unknown"));
+        // The "unknown" assertion present before Phase 21 plan 21-01 is gone:
+        // JobType is a closed three-variant enum, so an "unknown" value is not
+        // expressible — that surface is now serde-deserialize-time and is
+        // covered by `yard_structs::config::tests::job_type_deserialize_unknown_rejects`.
+        assert!(!is_task_only(JobType::Glue));
+        assert!(!is_task_only(JobType::Emr));
     }
 }

@@ -1,7 +1,6 @@
 use std::collections::HashSet;
-use yard_structs::{JobDefinition, ValidationError};
+use yard_structs::{JobDefinition, JobType, ValidationError};
 
-const SUPPORTED_JOB_TYPES: &[&str] = &["glue", "emr", "bash"];
 const SUPPORTED_SOURCE_TYPES: &[&str] = &["s3", "jdbc", "catalog", "kafka", "api"];
 const VALID_ENGINES: &[&str] = &["spark", "glue"];
 const SUPPORTED_SINK_TYPES: &[&str] = &["s3", "jdbc", "catalog", "iceberg"];
@@ -29,22 +28,16 @@ pub fn err(field: &str, message: &str) -> ValidationError {
 pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
     let mut errors = Vec::new();
 
-    // Job type
-    if !SUPPORTED_JOB_TYPES.contains(&job.job_type.as_str()) {
-        errors.push(err(
-            "type",
-            &format!(
-                "\"{}\" is not a supported job type (expected: {})",
-                job.job_type,
-                SUPPORTED_JOB_TYPES.join(", ")
-            ),
-        ));
-    }
+    // Note: job-type validity (one of `glue`, `emr`, `bash`) is now enforced
+    // by serde at deserialize time via the `JobType` enum's `rename_all =
+    // "lowercase"` attribute. Unknown wire strings are rejected at parse time
+    // with serde's "unknown variant" error, so the previous
+    // `SUPPORTED_JOB_TYPES.contains(...)` arm is no longer reachable here.
 
     // Task-only job types (bash, ...) take a separate path — they don't have
     // sources/sinks/transforms and don't deploy anywhere. Validate them here
     // and skip the Spark-job checks below.
-    if crate::is_task_only(&job.job_type) {
+    if crate::is_task_only(job.job_type) {
         validate_task_only_job(job, &mut errors);
         return errors;
     }
@@ -417,8 +410,8 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
     }
 
     // Provider-specific config validation — dispatched to provider modules
-    match job.job_type.as_str() {
-        "glue" => {
+    match job.job_type {
+        JobType::Glue => {
             let has_role = job
                 .config
                 .get("role")
@@ -435,12 +428,12 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
                 crate::providers::glue::validate_config(config, &mut errors);
             }
         }
-        "emr" => {
+        JobType::Emr => {
             if let Some(config) = job.config.get("emr") {
                 crate::providers::emr::validate_config(config, &mut errors);
             }
         }
-        _ => {}
+        JobType::Bash => {}
     }
 
     errors
@@ -488,7 +481,7 @@ fn validate_task_only_job(job: &JobDefinition, errors: &mut Vec<ValidationError>
         ));
     }
 
-    if job.job_type == "bash" {
+    if job.job_type == JobType::Bash {
         let has_command = job
             .config
             .get("command")

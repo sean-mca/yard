@@ -529,7 +529,7 @@ mod tests {
         parse_sources, parse_transforms,
     };
     use serde_json::json;
-    use yard_structs::JobDefinition;
+    use yard_structs::{JobDefinition, JobType};
 
     /// Locks the invariant flagged when scoping cross-account DAGs:
     /// DAG-upload credentials come strictly from root + nearest `account.yaml`.
@@ -567,7 +567,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    fn make_job(job_type: &str, config: serde_json::Value) -> JobDefinition {
+    fn make_job(job_type: JobType, config: serde_json::Value) -> JobDefinition {
         let imports = parse_imports(&config);
         let body = parse_body(&config);
         let job_file = parse_job_file(&config);
@@ -577,7 +577,7 @@ mod tests {
         let airflow = parse_airflow_job_block(&config);
 
         // Inject a default role for glue jobs so tests pass validation
-        let config = if job_type == "glue" && config.get("role").is_none() {
+        let config = if job_type == JobType::Glue && config.get("role").is_none() {
             let mut obj = config;
             obj.as_object_mut()
                 .expect("config must be a JSON object")
@@ -593,7 +593,7 @@ mod tests {
         };
 
         JobDefinition {
-            job_type: job_type.to_string(),
+            job_type,
             imports,
             body,
             job_file,
@@ -646,7 +646,7 @@ mod tests {
             providers: HashMap::new(),
             jobs: HashMap::from([(
                 "task_a".to_string(),
-                make_job("bash", json!({"type": "bash", "command": "echo hi"})),
+                make_job(JobType::Bash, json!({"type": "bash", "command": "echo hi"})),
             )]),
             aws: serde_json::Value::Null,
         };
@@ -694,7 +694,7 @@ mod tests {
             providers: HashMap::new(),
             jobs: HashMap::from([(
                 "task_a".to_string(),
-                make_job("bash", json!({"type": "bash", "command": "echo hi"})),
+                make_job(JobType::Bash, json!({"type": "bash", "command": "echo hi"})),
             )]),
             aws: serde_json::Value::Null,
         };
@@ -724,7 +724,7 @@ mod tests {
             providers: HashMap::new(),
             jobs: HashMap::from([(
                 "task_a".to_string(),
-                make_job("bash", json!({"type": "bash", "command": "echo hi"})),
+                make_job(JobType::Bash, json!({"type": "bash", "command": "echo hi"})),
             )]),
             aws: serde_json::Value::Null,
         };

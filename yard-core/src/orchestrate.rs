@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 use yard_structs::{
-    DagDiff, Deployment, DiffType, JobDiff, JobState, ProjectManifest, ProjectState,
+    DagDiff, Deployment, DiffType, JobDiff, JobState, JobType, ProjectManifest, ProjectState,
     ResourceStatus,
 };
 
@@ -67,19 +67,27 @@ pub async fn verify_deployed_resources(
             continue;
         }
 
-        // Determine the job type from the deployment config
-        let job_type = match deployment.config.get("type").and_then(|v| v.as_str()) {
+        // Determine the job type from the deployment config. Unparseable or
+        // missing values silently skip — drift verification is best-effort.
+        let job_type: JobType = match deployment
+            .config
+            .get("type")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+        {
             Some(t) => t,
             None => continue,
         };
 
         // Need provider config from the manifest to instantiate the provider
-        let provider_defaults = match manifest.providers.get(job_type) {
+        let provider_key = job_type.to_string();
+        let provider_defaults = match manifest.providers.get(&provider_key) {
             Some(config) => config,
             None => continue,
         };
 
-        let merged_config = build_provider_config(provider_defaults, &deployment.config, job_type);
+        let merged_config =
+            build_provider_config(provider_defaults, &deployment.config, &provider_key);
         let provider = providers::get_provider(job_type, &merged_config).await?;
         let statuses = provider
             .verify_resources(job_name, &deployment.resources)
@@ -252,23 +260,26 @@ pub async fn apply(
                     // Deploy via provider if configured (skip in dry-run mode).
                     // Task-only job types (bash, ...) have no Provider impl and
                     // skip straight to state bookkeeping.
-                    let resources = if dry_run || is_task_only(&job_def.job_type) {
+                    let resources = if dry_run || is_task_only(job_def.job_type) {
                         Vec::new()
-                    } else if let Some(provider_defaults) =
-                        manifest.providers.get(&job_def.job_type)
-                    {
-                        let merged_config = build_provider_config(
-                            provider_defaults,
-                            &job_def.config,
-                            &job_def.job_type,
-                        );
-                        let provider =
-                            providers::get_provider(&job_def.job_type, &merged_config).await?;
-                        provider
-                            .deploy(&diff.name, &script_content, &job_def.config)
-                            .await?
                     } else {
-                        Vec::new()
+                        let provider_key = job_def.job_type.to_string();
+                        if let Some(provider_defaults) =
+                            manifest.providers.get(&provider_key)
+                        {
+                            let merged_config = build_provider_config(
+                                provider_defaults,
+                                &job_def.config,
+                                &provider_key,
+                            );
+                            let provider =
+                                providers::get_provider(job_def.job_type, &merged_config).await?;
+                            provider
+                                .deploy(&diff.name, &script_content, &job_def.config)
+                                .await?
+                        } else {
+                            Vec::new()
+                        }
                     };
 
                     let status = if resources.is_empty() {
@@ -309,17 +320,25 @@ pub async fn apply(
                         && let Some(existing) = fresh_state.deployments.get(&diff.name)
                         && !existing.resources.is_empty()
                     {
-                        let job_type = existing
+                        let job_type: JobType = existing
                             .config
                             .get("type")
                             .and_then(|v| v.as_str())
                             .ok_or_else(|| {
                                 anyhow!("Job '{}' state is missing a 'type' field", diff.name)
+                            })?
+                            .parse()
+                            .with_context(|| {
+                                format!("invalid job type in state for job '{}'", diff.name)
                             })?;
 
-                        if let Some(provider_defaults) = manifest.providers.get(job_type) {
-                            let merged_config =
-                                build_provider_config(provider_defaults, &existing.config, job_type);
+                        let provider_key = job_type.to_string();
+                        if let Some(provider_defaults) = manifest.providers.get(&provider_key) {
+                            let merged_config = build_provider_config(
+                                provider_defaults,
+                                &existing.config,
+                                &provider_key,
+                            );
                             let provider =
                                 providers::get_provider(job_type, &merged_config).await?;
                             provider.destroy(&diff.name, &existing.resources).await?;
@@ -509,16 +528,22 @@ pub async fn destroy_job(
     let result: Result<()> = async {
         // Destroy provider resources if they exist
         if !dry_run && !job_state.deployment.resources.is_empty() {
-            let job_type = job_state
+            let job_type: JobType = job_state
                 .deployment
                 .config
                 .get("type")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("Job '{}' state is missing a 'type' field", job_name))?;
+                .ok_or_else(|| anyhow!("Job '{}' state is missing a 'type' field", job_name))?
+                .parse()
+                .with_context(|| format!("invalid job type in state for job '{job_name}'"))?;
 
-            if let Some(provider_defaults) = provider_configs.get(job_type) {
-                let merged_config =
-                    build_provider_config(provider_defaults, &job_state.deployment.config, job_type);
+            let provider_key = job_type.to_string();
+            if let Some(provider_defaults) = provider_configs.get(&provider_key) {
+                let merged_config = build_provider_config(
+                    provider_defaults,
+                    &job_state.deployment.config,
+                    &provider_key,
+                );
                 let provider = providers::get_provider(job_type, &merged_config).await?;
                 provider
                     .destroy(job_name, &job_state.deployment.resources)
@@ -586,7 +611,7 @@ mod tests {
     use serde_json::json;
     use yard_structs::{JobDefinition, StateBackend};
 
-    fn make_job(job_type: &str, config: serde_json::Value) -> JobDefinition {
+    fn make_job(job_type: JobType, config: serde_json::Value) -> JobDefinition {
         let imports = parse_imports(&config);
         let body = parse_body(&config);
         let job_file = parse_job_file(&config);
@@ -596,7 +621,7 @@ mod tests {
         let airflow = parse_airflow_job_block(&config);
 
         // Inject a default role for glue jobs so tests pass validation
-        let config = if job_type == "glue" && config.get("role").is_none() {
+        let config = if job_type == JobType::Glue && config.get("role").is_none() {
             let mut obj = config;
             obj.as_object_mut()
                 .expect("config must be a JSON object")
@@ -612,7 +637,7 @@ mod tests {
         };
 
         JobDefinition {
-            job_type: job_type.to_string(),
+            job_type,
             imports,
             body,
             job_file,
@@ -658,7 +683,7 @@ mod tests {
 
     #[test]
     fn diff_detects_create() {
-        let job = make_job("glue", json!({"type": "glue", "script_name": "new_job"}));
+        let job = make_job(JobType::Glue, json!({"type": "glue", "script_name": "new_job"}));
         let manifest = ProjectManifest {
             project: "test".to_string(),
             state: StateBackend::Local {
@@ -703,7 +728,7 @@ mod tests {
 
     #[test]
     fn diff_detects_no_change() {
-        let job = make_job("glue", json!({"type": "glue", "script_name": "stable"}));
+        let job = make_job(JobType::Glue, json!({"type": "glue", "script_name": "stable"}));
         let hash = job_hash("stable", &job);
 
         let state = ProjectState {
@@ -735,7 +760,7 @@ mod tests {
         let old_config = json!({"type": "glue", "glue": {"worker_type": "G.1X"}});
         let new_config = json!({"type": "glue", "glue": {"worker_type": "G.2X"}});
 
-        let old_job = make_job("glue", old_config.clone());
+        let old_job = make_job(JobType::Glue, old_config.clone());
         let hash = job_hash("my_job", &old_job);
 
         let state = ProjectState {
@@ -747,7 +772,7 @@ mod tests {
             )]),
         };
 
-        let new_job = make_job("glue", new_config);
+        let new_job = make_job(JobType::Glue, new_config);
         let manifest = ProjectManifest {
             project: "test".to_string(),
             state: StateBackend::Local {
@@ -766,7 +791,7 @@ mod tests {
     #[test]
     fn diff_detects_modify() {
         let old_config = json!({"type": "glue", "script_name": "v1"});
-        let new_job = make_job("glue", json!({"type": "glue", "script_name": "v2"}));
+        let new_job = make_job(JobType::Glue, json!({"type": "glue", "script_name": "v2"}));
 
         let state = ProjectState {
             project: "test".to_string(),
@@ -794,7 +819,7 @@ mod tests {
 
     #[test]
     fn diff_mixed_create_modify_delete() {
-        let keep_job = make_job("glue", json!({"type": "glue", "script_name": "keep"}));
+        let keep_job = make_job(JobType::Glue, json!({"type": "glue", "script_name": "keep"}));
         let keep_hash = job_hash("keep", &keep_job);
 
         let state = ProjectState {
@@ -826,11 +851,11 @@ mod tests {
                 ("keep".to_string(), keep_job),
                 (
                     "to_modify".to_string(),
-                    make_job("glue", json!({"type": "glue", "v": "2"})),
+                    make_job(JobType::Glue, json!({"type": "glue", "v": "2"})),
                 ),
                 (
                     "new_job".to_string(),
-                    make_job("glue", json!({"type": "glue"})),
+                    make_job(JobType::Glue, json!({"type": "glue"})),
                 ),
             ]),
             aws: serde_json::Value::Null,
@@ -850,7 +875,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("yard_apply_{}", std::process::id()));
         let state_dir = dir.join(".yard/state");
 
-        let job = make_job("glue", json!({"type": "glue", "script_name": "new_job"}));
+        let job = make_job(JobType::Glue, json!({"type": "glue", "script_name": "new_job"}));
         let manifest = ProjectManifest {
             project: "test".to_string(),
             state: StateBackend::Local {
@@ -887,7 +912,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("yard_destroy_{}", std::process::id()));
         let state_dir = dir.join(".yard/state");
 
-        let job = make_job("glue", json!({"type": "glue", "script_name": "doomed"}));
+        let job = make_job(JobType::Glue, json!({"type": "glue", "script_name": "doomed"}));
         let backend = StateBackend::Local {
             path: state_dir.clone(),
         };
@@ -945,11 +970,11 @@ mod tests {
             jobs: HashMap::from([
                 (
                     "job_a".to_string(),
-                    make_job("glue", json!({"type": "glue", "script_name": "a"})),
+                    make_job(JobType::Glue, json!({"type": "glue", "script_name": "a"})),
                 ),
                 (
                     "job_b".to_string(),
-                    make_job("glue", json!({"type": "glue", "script_name": "b"})),
+                    make_job(JobType::Glue, json!({"type": "glue", "script_name": "b"})),
                 ),
             ]),
             aws: serde_json::Value::Null,
@@ -977,34 +1002,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
-    async fn apply_rejects_invalid_jobs() {
-        let dir = std::env::temp_dir().join(format!("yard_invalid_{}", std::process::id()));
-        let state_dir = dir.join(".yard/state");
-
-        // Job with unsupported type — should fail validation
-        let bad_job = make_job("spark_streaming", json!({"type": "spark_streaming"}));
-        let manifest = ProjectManifest {
-            project: "test".to_string(),
-            state: StateBackend::Local {
-                path: state_dir.clone(),
-            },
-            providers: HashMap::new(),
-            jobs: HashMap::from([("bad_job".to_string(), bad_job)]),
-            aws: serde_json::Value::Null,
-        };
-
-        let result = apply(&manifest, &empty_state(), &dir, true, None).await;
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Validation failed")
-        );
-
-        // No state or scripts should have been created
-        assert!(!state_dir.exists());
-        assert!(!dir.join(".yard/generated").exists());
-    }
+    // Test `apply_rejects_invalid_jobs` was deleted in Phase 21 plan 21-01:
+    // Unknown job-type wire strings (e.g. "spark_streaming") are now rejected
+    // by serde at deserialize time via JobType's `unknown variant` error,
+    // which is structurally upstream of `apply` and cannot be exercised by
+    // constructing a JobDefinition directly. The behavior is covered by
+    // `yard-structs::config::tests::job_type_deserialize_unknown_rejects`.
 }

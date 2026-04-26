@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use yaml_rust2::YamlLoader;
-use yard_structs::{JobDefinition, ProjectManifest, ProjectState, StateBackend, YARDContext};
+use yard_structs::{
+    JobDefinition, JobType, ProjectManifest, ProjectState, StateBackend, YARDContext,
+};
 
 pub struct ResolvedProject {
     pub manifest: ProjectManifest,
@@ -176,7 +178,7 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
             .flatten()
             .collect::<Vec<_>>()
             .join("-");
-        let job_type = job_doc["type"]
+        let job_type: JobType = job_doc["type"]
             .as_str()
             .ok_or_else(|| {
                 anyhow!(
@@ -184,7 +186,8 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
                     job_name
                 )
             })?
-            .to_string();
+            .parse()
+            .with_context(|| format!("invalid job type for job '{job_name}'"))?;
         let config = yaml_to_json(job_doc);
         let imports = crate::parse_imports(&config);
         let body = crate::parse_body(&config);
@@ -257,15 +260,18 @@ fn cascade_provider_defaults(
 ) -> HashMap<String, JobDefinition> {
     for job in jobs.values_mut() {
         // --- providers.<type> cascade ---
+        // The providers HashMap is keyed by wire-string job type ("glue",
+        // "emr", "bash"); JobType::to_string() gives the canonical wire form.
+        let job_type_key = job.job_type.to_string();
         let root_provider = providers
-            .get(&job.job_type)
+            .get(&job_type_key)
             .cloned()
             .unwrap_or(Value::Null);
-        let account_provider = context_field(&job.dir, "account.yaml", &job.job_type);
-        let region_provider = context_field(&job.dir, "region.yaml", &job.job_type);
+        let account_provider = context_field(&job.dir, "account.yaml", &job_type_key);
+        let region_provider = context_field(&job.dir, "region.yaml", &job_type_key);
         let job_inline_provider = job
             .config
-            .get(&job.job_type)
+            .get(&job_type_key)
             .cloned()
             .unwrap_or(Value::Null);
 
@@ -276,7 +282,7 @@ fn cascade_provider_defaults(
             &job_inline_provider,
         ]);
         if let Some(obj) = job.config.as_object_mut() {
-            obj.insert(job.job_type.clone(), merged);
+            obj.insert(job_type_key, merged);
         }
 
         // --- aws cascade ---
@@ -417,7 +423,7 @@ mod tests {
             cfg.as_object_mut().unwrap().insert("aws".into(), aws);
         }
         JobDefinition {
-            job_type: "glue".to_string(),
+            job_type: JobType::Glue,
             config: cfg,
             dir: dir.to_path_buf(),
             ..Default::default()

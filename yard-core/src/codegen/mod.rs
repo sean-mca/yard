@@ -5,7 +5,7 @@ mod transform;
 
 use anyhow::{Context as AnyhowContext, Result, anyhow};
 use tera::{Context, Tera};
-use yard_structs::JobDefinition;
+use yard_structs::{JobDefinition, JobType};
 
 // Re-import sub-module items so they are in scope for generate_python_script
 // and for `use super::*` in the test module
@@ -160,7 +160,7 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
     // they participate in Airflow DAG codegen instead. Return an empty string so
     // callers that blindly hash/write the script output continue to work -- the
     // apply path skips deploy for these types via `is_task_only`.
-    if crate::is_task_only(&job_def.job_type) {
+    if crate::is_task_only(job_def.job_type) {
         return Ok(String::new());
     }
 
@@ -170,10 +170,14 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
             .with_context(|| format!("Failed to read job_file: {path}"));
     }
 
-    let template = match job_def.job_type.as_str() {
-        "glue" => GLUE_TEMPLATE,
-        "emr" => EMR_TEMPLATE,
-        other => return Err(anyhow!("Unsupported job type: {}", other)),
+    let template = match job_def.job_type {
+        JobType::Glue => GLUE_TEMPLATE,
+        JobType::Emr => EMR_TEMPLATE,
+        JobType::Bash => {
+            return Err(anyhow!(
+                "bash jobs are task-only and have no Spark template"
+            ));
+        }
     };
 
     let mut tera = Tera::default();
@@ -312,7 +316,7 @@ mod tests {
 
     fn base_job() -> JobDefinition {
         JobDefinition {
-            job_type: "glue".to_string(),
+            job_type: JobType::Glue,
             config: json!({"type": "glue"}),
             ..Default::default()
         }
@@ -334,12 +338,12 @@ mod tests {
 
     // --- Routing ---
 
-    #[test]
-    fn unsupported_job_type_errors() {
-        let mut job = base_job();
-        job.job_type = "unknown".to_string();
-        assert!(generate_python_script("test", &job).is_err());
-    }
+    // The `unsupported_job_type_errors` test was deleted in Phase 21 plan 21-01.
+    // Unknown job-type wire strings are now rejected at deserialize time by
+    // serde via JobType's `unknown variant` error (see
+    // `yard_structs::config::tests::job_type_deserialize_unknown_rejects`).
+    // Constructing a JobDefinition with an invalid job_type is no longer
+    // expressible — JobType is a closed three-variant enum.
 
     // --- Template basics ---
 
@@ -1492,7 +1496,7 @@ mod tests {
     #[test]
     fn bash_job_generates_empty_script() {
         let job = JobDefinition {
-            job_type: "bash".to_string(),
+            job_type: JobType::Bash,
             config: json!({"type": "bash", "command": "echo hi"}),
             ..Default::default()
         };

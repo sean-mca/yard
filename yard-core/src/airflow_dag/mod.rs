@@ -104,7 +104,9 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use yard_structs::{AirflowJobBlock, Deployment, ProjectManifest, Resource, StateBackend};
+    use yard_structs::{
+        AirflowJobBlock, Deployment, JobType, ProjectManifest, Resource, StateBackend,
+    };
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -150,7 +152,7 @@ mod tests {
 
     fn bash_job(command: &str, dir: &Path) -> JobDefinition {
         JobDefinition {
-            job_type: "bash".to_string(),
+            job_type: JobType::Bash,
             config: json!({"type": "bash", "command": command}),
             dir: dir.to_path_buf(),
             ..Default::default()
@@ -159,7 +161,7 @@ mod tests {
 
     fn glue_job(dir: &Path) -> JobDefinition {
         JobDefinition {
-            job_type: "glue".to_string(),
+            job_type: JobType::Glue,
             config: json!({
                 "type": "glue",
                 "role": "arn:aws:iam::123456789:role/TestGlueRole",
@@ -500,7 +502,7 @@ mod tests {
 
     fn prefixed_bash_job(base_name: &str, command: &str, dir: &Path) -> JobDefinition {
         JobDefinition {
-            job_type: "bash".to_string(),
+            job_type: JobType::Bash,
             config: json!({"type": "bash", "command": command}),
             dir: dir.to_path_buf(),
             base_name: base_name.to_string(),
@@ -744,7 +746,7 @@ mod tests {
 
     fn glue_job_with_assume_role(dir: &Path, role_arn: &str) -> JobDefinition {
         JobDefinition {
-            job_type: "glue".to_string(),
+            job_type: JobType::Glue,
             config: json!({
                 "type": "glue",
                 "role": "arn:aws:iam::123456789:role/TestGlueRole",
@@ -930,7 +932,7 @@ mod tests {
         manifest.jobs.insert(
             "orders".to_string(),
             JobDefinition {
-                job_type: "glue".to_string(),
+                job_type: JobType::Glue,
                 config: json!({
                     "type": "glue",
                     // role intentionally omitted

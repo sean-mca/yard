@@ -173,9 +173,9 @@ pub struct Transform {
     pub order_by: Vec<OrderBySpec>, // window: order spec
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct JobDefinition {
-    pub job_type: String,
+    pub job_type: JobType,
     pub imports: Vec<Import>,
     pub body: Option<String>,
     /// Path to an external Python file that replaces YARD's generated script entirely.
@@ -210,6 +210,34 @@ pub struct JobDefinition {
     /// `depends_on`.
     #[serde(skip, default)]
     pub base_name: String,
+}
+
+/// Hand-written `Default` because `JobType` deliberately has no `Default` impl
+/// (D-08): the only sensible default for a JobDefinition's `job_type` is
+/// `JobType::Glue` (most-tested type, least-surprising default for the
+/// non-deployable empty default), but a default at the JobType level would
+/// invite accidental `JobType::default()` calls in code that should always
+/// pick deliberately. The default JobDefinition itself stays non-deployable —
+/// empty body, no sources, no sink — same as before this refactor.
+impl Default for JobDefinition {
+    fn default() -> Self {
+        Self {
+            job_type: JobType::Glue,
+            imports: Vec::new(),
+            body: None,
+            job_file: None,
+            sources: Vec::new(),
+            sink: None,
+            transforms: Vec::new(),
+            airflow: None,
+            partition_by: Vec::new(),
+            partition_timestamp_column: None,
+            create_timestamp: false,
+            config: serde_json::Value::Null,
+            dir: PathBuf::new(),
+            base_name: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]

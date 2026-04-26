@@ -15,6 +15,7 @@ use aws_sdk_emr::Client as EmrClient;
 use aws_sdk_s3::Client as S3Client;
 use serde_json::json;
 use yard_core::providers::get_provider;
+use yard_structs::JobType;
 
 const ENDPOINT: &str = "http://localhost:4566";
 const REGION: &str = "us-east-1";
@@ -111,7 +112,7 @@ async fn emr_s3_upload_script() {
 
     let cluster_id = create_test_cluster(&emr).await;
 
-    let provider = get_provider("emr", &test_provider_config(&cluster_id))
+    let provider = get_provider(JobType::Emr, &test_provider_config(&cluster_id))
         .await
         .expect("Failed to create provider");
 
@@ -170,7 +171,7 @@ async fn emr_submit_step() {
 
     let cluster_id = create_test_cluster(&emr).await;
 
-    let provider = get_provider("emr", &test_provider_config(&cluster_id))
+    let provider = get_provider(JobType::Emr, &test_provider_config(&cluster_id))
         .await
         .expect("Failed to create provider");
 
@@ -219,7 +220,7 @@ async fn emr_destroy_cleans_up() {
 
     let cluster_id = create_test_cluster(&emr).await;
 
-    let provider = get_provider("emr", &test_provider_config(&cluster_id))
+    let provider = get_provider(JobType::Emr, &test_provider_config(&cluster_id))
         .await
         .expect("Failed to create provider");
 
@@ -257,7 +258,7 @@ async fn emr_missing_cluster_id_errors() {
         // no cluster_id
     });
 
-    let result = get_provider("emr", &config).await;
+    let result = get_provider(JobType::Emr, &config).await;
     let err = match result {
         Err(e) => e.to_string(),
         Ok(_) => panic!("Should fail without cluster_id"),
@@ -277,7 +278,7 @@ async fn emr_missing_script_bucket_errors() {
         // no script_bucket
     });
 
-    let result = get_provider("emr", &config).await;
+    let result = get_provider(JobType::Emr, &config).await;
     let err = match result {
         Err(e) => e.to_string(),
         Ok(_) => panic!("Should fail without script_bucket"),
@@ -299,7 +300,7 @@ async fn emr_deploy_twice_creates_new_step() {
 
     let cluster_id = create_test_cluster(&emr).await;
 
-    let provider = get_provider("emr", &test_provider_config(&cluster_id))
+    let provider = get_provider(JobType::Emr, &test_provider_config(&cluster_id))
         .await
         .expect("Failed to create provider");
 

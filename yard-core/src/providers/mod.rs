@@ -7,7 +7,7 @@ use aws_sdk_s3::Client as S3Client;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
-use yard_structs::{Resource, ResourceStatus, ValidationError};
+use yard_structs::{JobType, Resource, ResourceStatus, ValidationError};
 
 /// Build a standard AWS SDK config with region, retry policy, and optional
 /// STS `AssumeRole` wrapped around the default credential provider chain.
@@ -180,10 +180,12 @@ pub trait Provider: Send + Sync {
 }
 
 /// Construct a provider from the job type and its provider-level config.
-pub async fn get_provider(job_type: &str, provider_config: &Value) -> Result<Box<dyn Provider>> {
+pub async fn get_provider(job_type: JobType, provider_config: &Value) -> Result<Box<dyn Provider>> {
     match job_type {
-        "glue" => Ok(Box::new(glue::GlueProvider::new(provider_config).await?)),
-        "emr" => Ok(Box::new(emr::EmrProvider::new(provider_config).await?)),
-        other => Err(anyhow!("No provider for job type: {other}")),
+        JobType::Glue => Ok(Box::new(glue::GlueProvider::new(provider_config).await?)),
+        JobType::Emr => Ok(Box::new(emr::EmrProvider::new(provider_config).await?)),
+        JobType::Bash => Err(anyhow!(
+            "No provider for job type: {job_type} (bash is task-only — should not reach get_provider)"
+        )),
     }
 }
