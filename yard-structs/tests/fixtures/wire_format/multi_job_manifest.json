@@ -1,0 +1,91 @@
+{
+  "project": "wire-fmt-regression",
+  "state": {
+    "type": "s3",
+    "bucket": "yard-state-fixtures",
+    "region": "us-east-1",
+    "key": "state/",
+    "aws": {
+      "assume_role": "arn:aws:iam::111111111111:role/StateAccess",
+      "external_id": "xid-1"
+    }
+  },
+  "providers": {
+    "airflow": {
+      "schedule": "@daily",
+      "owner": "data-eng",
+      "retries": null,
+      "dags_bucket": "fixture-dags",
+      "dags_prefix": "dags/",
+      "triggered_by": [],
+      "aws": {
+        "assume_role": "arn:aws:iam::222222222222:role/DagUpload"
+      }
+    },
+    "emr": {
+      "application_id": "00abcdef0123",
+      "execution_role_arn": "arn:aws:iam::222222222222:role/EmrRunner"
+    },
+    "glue": {
+      "iam_role_name": "GlueRunner",
+      "script_bucket": "fixture-scripts"
+    }
+  },
+  "jobs": {
+    "compute-emr": {
+      "job_type": "emr",
+      "imports": [],
+      "body": null,
+      "job_file": null,
+      "sources": [],
+      "sink": null,
+      "transforms": [],
+      "airflow": null,
+      "partition_by": [],
+      "partition_timestamp_column": null,
+      "create_timestamp": false,
+      "config": {
+        "type": "emr"
+      }
+    },
+    "ingest-glue": {
+      "job_type": "glue",
+      "imports": [],
+      "body": null,
+      "job_file": null,
+      "sources": [],
+      "sink": null,
+      "transforms": [],
+      "airflow": null,
+      "partition_by": [],
+      "partition_timestamp_column": null,
+      "create_timestamp": false,
+      "config": {
+        "type": "glue",
+        "glue": { "worker_type": "G.1X" },
+        "_aws": { "assume_role": "arn:aws:iam::333333333333:role/PerJobOverride" }
+      }
+    },
+    "trigger-bash": {
+      "job_type": "bash",
+      "imports": [],
+      "body": null,
+      "job_file": null,
+      "sources": [],
+      "sink": null,
+      "transforms": [],
+      "airflow": null,
+      "partition_by": [],
+      "partition_timestamp_column": null,
+      "create_timestamp": false,
+      "config": {
+        "type": "bash",
+        "command": "echo hi"
+      }
+    }
+  },
+  "aws": {
+    "assume_role": "arn:aws:iam::444444444444:role/RootAws",
+    "region": "us-east-1"
+  }
+}

@@ -6,6 +6,44 @@ fn default_path_buf() -> PathBuf {
     PathBuf::new()
 }
 
+/// Discriminator for `JobDefinition.job_type` (TYPE-01). Wire format is the
+/// lowercase variant name — `"glue"`, `"emr"`, `"bash"`. Adding a fourth job
+/// type requires (1) a new variant here, (2) a `FromStr` arm below, (3) a new
+/// provider impl in `yard-core/src/providers/`, and (4) a new validation arm
+/// in `yard-core/src/validation/rules.rs`.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum JobType {
+    Glue,
+    Emr,
+    Bash,
+}
+
+impl std::fmt::Display for JobType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            JobType::Glue => "glue",
+            JobType::Emr => "emr",
+            JobType::Bash => "bash",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::str::FromStr for JobType {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "glue" => Ok(JobType::Glue),
+            "emr" => Ok(JobType::Emr),
+            "bash" => Ok(JobType::Bash),
+            other => Err(anyhow::anyhow!(
+                "invalid job type '{other}' (expected: glue, emr, bash)"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum StateBackend {
@@ -319,5 +357,54 @@ mod tests {
             parsed.aws.get("session_name").and_then(|v| v.as_str()),
             Some("yard-dag")
         );
+    }
+
+    // --- JobType (TYPE-01) ---
+
+    #[test]
+    fn job_type_serialize_lowercase() {
+        assert_eq!(serde_json::to_value(JobType::Glue).unwrap(), json!("glue"));
+        assert_eq!(serde_json::to_value(JobType::Emr).unwrap(), json!("emr"));
+        assert_eq!(serde_json::to_value(JobType::Bash).unwrap(), json!("bash"));
+    }
+
+    #[test]
+    fn job_type_deserialize_lowercase() {
+        let g: JobType = serde_json::from_value(json!("glue")).unwrap();
+        assert_eq!(g, JobType::Glue);
+        let e: JobType = serde_json::from_value(json!("emr")).unwrap();
+        assert_eq!(e, JobType::Emr);
+        let b: JobType = serde_json::from_value(json!("bash")).unwrap();
+        assert_eq!(b, JobType::Bash);
+    }
+
+    #[test]
+    fn job_type_deserialize_unknown_rejects() {
+        let err = serde_json::from_value::<JobType>(json!("sprk")).unwrap_err();
+        assert!(format!("{err}").contains("unknown variant"), "got: {err}");
+    }
+
+    #[test]
+    fn job_type_from_str_round_trip() {
+        use std::str::FromStr;
+        for variant in [JobType::Glue, JobType::Emr, JobType::Bash] {
+            let s = variant.to_string();
+            let back = JobType::from_str(&s).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn job_type_from_str_invalid() {
+        use std::str::FromStr;
+        let err = JobType::from_str("sprk").unwrap_err();
+        assert!(format!("{err}").contains("invalid job type"), "got: {err}");
+    }
+
+    #[test]
+    fn job_type_display_matches_wire_format() {
+        assert_eq!(format!("{}", JobType::Glue), "glue");
+        assert_eq!(format!("{}", JobType::Emr), "emr");
+        assert_eq!(format!("{}", JobType::Bash), "bash");
     }
 }
