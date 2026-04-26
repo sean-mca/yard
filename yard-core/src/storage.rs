@@ -840,6 +840,7 @@ pub async fn get_storage(backend: &StateBackend) -> Result<Storage> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use yard_structs::{DagDeployment, Deployment};
 
     fn test_job_state(job_name: &str) -> JobState {
@@ -1374,5 +1375,186 @@ mod tests {
         let result = get_storage(&backend).await;
         assert!(result.is_ok());
         // matches!() variant check removed — Storage is now a struct, not an enum.
+    }
+
+    // --- SC #4 demonstration: a third backend implemented in ONE impl block,
+    //     ZERO edits to existing LocalStorage / S3Storage / Storage code ---
+    //
+    // This block lives entirely inside `#[cfg(test)] mod tests`; nothing in the
+    // production-side `impl StorageBackend for LocalStorage` or
+    // `impl StorageBackend for S3Storage` blocks had to change to admit it.
+    // That structural property is what SC #4 protects.
+
+    #[derive(Default)]
+    struct InMemoryStorage {
+        jobs: tokio::sync::Mutex<HashMap<String, JobState>>,
+        dags: tokio::sync::Mutex<HashMap<String, DagState>>,
+        locks: tokio::sync::Mutex<HashMap<String, LockInfo>>,
+    }
+
+    impl StorageBackend for InMemoryStorage {
+        fn read_job(
+            &self,
+            job_name: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<JobState>>> + Send + '_>> {
+            let job_name = job_name.to_string();
+            Box::pin(async move { Ok(self.jobs.lock().await.get(&job_name).cloned()) })
+        }
+
+        fn write_job(
+            &self,
+            job_name: &str,
+            state: &JobState,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            let job_name = job_name.to_string();
+            let state = state.clone();
+            Box::pin(async move {
+                self.jobs.lock().await.insert(job_name, state);
+                Ok(())
+            })
+        }
+
+        fn delete_job(
+            &self,
+            job_name: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            let job_name = job_name.to_string();
+            Box::pin(async move {
+                self.jobs.lock().await.remove(&job_name);
+                Ok(())
+            })
+        }
+
+        fn list_jobs(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
+            Box::pin(async move {
+                let mut names: Vec<String> = self.jobs.lock().await.keys().cloned().collect();
+                names.sort();
+                Ok(names)
+            })
+        }
+
+        fn read_dag(
+            &self,
+            dag_name: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<DagState>>> + Send + '_>> {
+            let dag_name = dag_name.to_string();
+            Box::pin(async move { Ok(self.dags.lock().await.get(&dag_name).cloned()) })
+        }
+
+        fn write_dag(
+            &self,
+            dag_name: &str,
+            state: &DagState,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            let dag_name = dag_name.to_string();
+            let state = state.clone();
+            Box::pin(async move {
+                self.dags.lock().await.insert(dag_name, state);
+                Ok(())
+            })
+        }
+
+        fn delete_dag(
+            &self,
+            dag_name: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            let dag_name = dag_name.to_string();
+            Box::pin(async move {
+                self.dags.lock().await.remove(&dag_name);
+                Ok(())
+            })
+        }
+
+        fn list_dags(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
+            Box::pin(async move {
+                let mut names: Vec<String> = self.dags.lock().await.keys().cloned().collect();
+                names.sort();
+                Ok(names)
+            })
+        }
+
+        fn lock(
+            &self,
+            job_name: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<LockInfo>> + Send + '_>> {
+            let job_name = job_name.to_string();
+            Box::pin(async move {
+                let info = lock_info();
+                let mut locks = self.locks.lock().await;
+                if locks.contains_key(&job_name) {
+                    return Err(anyhow!(
+                        "Job \"{job_name}\" is already locked (in-memory test backend)"
+                    ));
+                }
+                locks.insert(job_name, info.clone());
+                Ok(info)
+            })
+        }
+
+        fn force_unlock(
+            &self,
+            job_name: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            let job_name = job_name.to_string();
+            Box::pin(async move {
+                self.locks.lock().await.remove(&job_name);
+                Ok(())
+            })
+        }
+
+        fn get_lock(
+            &self,
+            job_name: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<LockInfo>>> + Send + '_>> {
+            let job_name = job_name.to_string();
+            Box::pin(async move { Ok(self.locks.lock().await.get(&job_name).cloned()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_backend_full_cycle() {
+        // SC #4 demonstration: construct Storage from a third backend (the
+        // InMemoryStorage above) and exercise the full primitive API. Proves
+        // adding a backend = (1) one impl block, (2) zero edits to existing
+        // prod-side LocalStorage / S3Storage / Storage code.
+        let storage = Storage::new(InMemoryStorage::default());
+
+        let state = test_job_state("imem_job");
+
+        // write -> read -> list (job)
+        storage.write_job("imem_job", &state).await.unwrap();
+        let loaded = storage.read_job("imem_job").await.unwrap();
+        assert!(loaded.is_some(), "InMemoryStorage round-trip JobState");
+        assert_eq!(loaded.unwrap().job_name, "imem_job");
+
+        let jobs = storage.list_jobs().await.unwrap();
+        assert_eq!(jobs, vec!["imem_job".to_string()]);
+
+        // lock -> get_lock -> force_unlock
+        let info = storage.lock("imem_job").await.unwrap();
+        let held = storage.get_lock("imem_job").await.unwrap();
+        assert!(held.is_some(), "InMemoryStorage lock round-trip");
+        assert_eq!(held.unwrap().who, info.who);
+
+        let double = storage.lock("imem_job").await;
+        assert!(double.is_err(), "InMemoryStorage double-lock contention");
+
+        storage.force_unlock("imem_job").await.unwrap();
+        let after = storage.get_lock("imem_job").await.unwrap();
+        assert!(after.is_none(), "InMemoryStorage force_unlock removes lock");
+
+        // write -> read -> list (dag)
+        let dag_state = test_dag_state("imem_dag");
+        storage.write_dag("imem_dag", &dag_state).await.unwrap();
+        let dag_loaded = storage.read_dag("imem_dag").await.unwrap();
+        assert!(dag_loaded.is_some(), "InMemoryStorage round-trip DagState");
+
+        let dags = storage.list_dags().await.unwrap();
+        assert_eq!(dags, vec!["imem_dag".to_string()]);
+
+        // delete (job)
+        storage.delete_job("imem_job").await.unwrap();
+        let after_del = storage.read_job("imem_job").await.unwrap();
+        assert!(after_del.is_none(), "InMemoryStorage delete_job");
     }
 }
