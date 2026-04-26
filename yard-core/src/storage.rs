@@ -52,10 +52,7 @@ pub trait StorageBackend: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 
     /// Delete a job's state file. No-op if the file doesn't exist.
-    fn delete_job(
-        &self,
-        job_name: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+    fn delete_job(&self, job_name: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 
     /// List all job names with state files (excluding lock files and DAG files).
     fn list_jobs(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>>;
@@ -76,10 +73,7 @@ pub trait StorageBackend: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 
     /// Delete a DAG's state file. No-op if the file doesn't exist.
-    fn delete_dag(
-        &self,
-        dag_name: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+    fn delete_dag(&self, dag_name: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 
     /// List all DAG names with state files.
     fn list_dags(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>>;
@@ -88,16 +82,11 @@ pub trait StorageBackend: Send + Sync {
 
     /// Acquire a lock for a job. Returns the lock info on success.
     /// Errors if the job is already locked.
-    fn lock(
-        &self,
-        job_name: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<LockInfo>> + Send + '_>>;
+    fn lock(&self, job_name: &str) -> Pin<Box<dyn Future<Output = Result<LockInfo>> + Send + '_>>;
 
     /// Remove the lock regardless of who holds it.
-    fn force_unlock(
-        &self,
-        job_name: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+    fn force_unlock(&self, job_name: &str)
+    -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 
     /// Get the current lock info for a job, or None if not locked.
     fn get_lock(
@@ -143,10 +132,7 @@ impl StorageBackend for LocalStorage {
         })
     }
 
-    fn delete_job(
-        &self,
-        job_name: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+    fn delete_job(&self, job_name: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         let job_name = job_name.to_string();
         Box::pin(async move {
             let path = self.path.join(format!("{job_name}.json"));
@@ -213,10 +199,7 @@ impl StorageBackend for LocalStorage {
         })
     }
 
-    fn delete_dag(
-        &self,
-        dag_name: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+    fn delete_dag(&self, dag_name: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         let dag_name = dag_name.to_string();
         Box::pin(async move {
             let key = format!("{DAG_STATE_PREFIX}{dag_name}");
@@ -248,10 +231,7 @@ impl StorageBackend for LocalStorage {
         })
     }
 
-    fn lock(
-        &self,
-        job_name: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<LockInfo>> + Send + '_>> {
+    fn lock(&self, job_name: &str) -> Pin<Box<dyn Future<Output = Result<LockInfo>> + Send + '_>> {
         let job_name = job_name.to_string();
         Box::pin(async move {
             let info = lock_info();
@@ -375,10 +355,7 @@ impl StorageBackend for S3Storage {
         })
     }
 
-    fn delete_job(
-        &self,
-        job_name: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+    fn delete_job(&self, job_name: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         let job_name = job_name.to_string();
         Box::pin(async move {
             let key = format!("{}{job_name}.json", self.prefix);
@@ -464,10 +441,7 @@ impl StorageBackend for S3Storage {
         })
     }
 
-    fn delete_dag(
-        &self,
-        dag_name: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+    fn delete_dag(&self, dag_name: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         let dag_name = dag_name.to_string();
         Box::pin(async move {
             let key = format!("{DAG_STATE_PREFIX}{dag_name}");
@@ -496,10 +470,7 @@ impl StorageBackend for S3Storage {
         })
     }
 
-    fn lock(
-        &self,
-        job_name: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<LockInfo>> + Send + '_>> {
+    fn lock(&self, job_name: &str) -> Pin<Box<dyn Future<Output = Result<LockInfo>> + Send + '_>> {
         let job_name = job_name.to_string();
         Box::pin(async move {
             let info = lock_info();
@@ -1036,7 +1007,10 @@ mod tests {
 
         // "a" should have been rolled back (unlocked)
         let a_lock = storage.get_lock("a").await.unwrap();
-        assert!(a_lock.is_none(), "lock for 'a' should have been rolled back");
+        assert!(
+            a_lock.is_none(),
+            "lock for 'a' should have been rolled back"
+        );
 
         // "c" was never attempted
         let c_lock = storage.get_lock("c").await.unwrap();
@@ -1263,8 +1237,8 @@ mod tests {
                 ("YARD_STATE_AWS_EXTERNAL_ID", None),
             ],
             || {
-                let merged = merge_state_aws_with_env(None)
-                    .expect("env is set so merged must be Some");
+                let merged =
+                    merge_state_aws_with_env(None).expect("env is set so merged must be Some");
                 assert_eq!(
                     merged.assume_role.as_deref(),
                     Some("arn:aws:iam::222222222222:role/Env")
@@ -1387,8 +1361,10 @@ mod tests {
         // but tightens the assertion from `to_value` (structural) to `to_string_pretty`
         // (byte-identical) because SC #3 protects on-disk byte fidelity, not just
         // structural shape.
-        let dir = std::env::temp_dir()
-            .join(format!("yard_test_byte_identical_job_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "yard_test_byte_identical_job_{}",
+            std::process::id()
+        ));
         let storage = Storage::new(LocalStorage { path: dir.clone() });
 
         let state = JobState {
@@ -1438,8 +1414,10 @@ mod tests {
         // Parallel SC #3 verification for DagState. write_dag uses the same
         // serde_json::to_string_pretty serialization path as write_job, but
         // writes to `{DAG_STATE_PREFIX}{dag_name}.json` per DAG_STATE_PREFIX.
-        let dir = std::env::temp_dir()
-            .join(format!("yard_test_byte_identical_dag_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "yard_test_byte_identical_dag_{}",
+            std::process::id()
+        ));
         let storage = Storage::new(LocalStorage { path: dir.clone() });
 
         let state = test_dag_state("byte_dag");

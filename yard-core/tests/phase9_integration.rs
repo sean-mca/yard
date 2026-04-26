@@ -97,7 +97,10 @@ async fn state_backend_s3_null_aws_roundtrip() {
         .expect("get_storage must succeed for aws: Null");
 
     let job = sample_job_state("job_null_aws");
-    storage.write_job(&job.job_name, &job).await.expect("write_job");
+    storage
+        .write_job(&job.job_name, &job)
+        .await
+        .expect("write_job");
 
     let readback = storage
         .read_job(&job.job_name)
@@ -197,9 +200,7 @@ async fn state_backend_s3_assume_role_s3_write_attempt() {
                 "read_job must succeed after successful write through AssumeRole"
             );
             storage.delete_job(&job.job_name).await.ok();
-            eprintln!(
-                "[phase9] AssumeRole S3 write SUCCEEDED — STS honored AWS_ENDPOINT_URL"
-            );
+            eprintln!("[phase9] AssumeRole S3 write SUCCEEDED — STS honored AWS_ENDPOINT_URL");
         }
         Err(e) => {
             // Known LocalStack gotcha: AssumeRoleProvider may not respect
