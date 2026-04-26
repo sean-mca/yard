@@ -319,6 +319,272 @@ impl StorageBackend for LocalStorage {
     }
 }
 
+// --- S3Storage trait impl ---
+
+impl StorageBackend for S3Storage {
+    fn read_job(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<JobState>>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        Box::pin(async move {
+            let key = format!("{}{job_name}.json", self.prefix);
+            let result = self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) => {
+                    let data = resp.body.collect().await?.into_bytes();
+                    let state: JobState = serde_json::from_slice(&data)?;
+                    Ok(Some(state))
+                }
+                Err(e) => {
+                    if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
+                        Ok(None)
+                    } else {
+                        Err(e.into())
+                    }
+                }
+            }
+        })
+    }
+
+    fn write_job(
+        &self,
+        job_name: &str,
+        state: &JobState,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        let json_result = serde_json::to_string_pretty(state);
+        Box::pin(async move {
+            let json = json_result?;
+            let key = format!("{}{job_name}.json", self.prefix);
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .body(json.into_bytes().into())
+                .content_type("application/json")
+                .send()
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn delete_job(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        Box::pin(async move {
+            let key = format!("{}{job_name}.json", self.prefix);
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn list_jobs(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
+        Box::pin(async move {
+            list_s3_filtered(&self.client, &self.bucket, &self.prefix, |relative| {
+                let job_name = relative.strip_suffix(".json")?;
+                if job_name.ends_with(".lock")
+                    || job_name.starts_with(DAG_STATE_PREFIX)
+                    || job_name.contains('/')
+                {
+                    return None;
+                }
+                Some(job_name.to_string())
+            })
+            .await
+        })
+    }
+
+    fn read_dag(
+        &self,
+        dag_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<DagState>>> + Send + '_>> {
+        let dag_name = dag_name.to_string();
+        Box::pin(async move {
+            let key = format!("{DAG_STATE_PREFIX}{dag_name}");
+            let s3_key = format!("{}{key}.json", self.prefix);
+            let result = self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&s3_key)
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) => {
+                    let data = resp.body.collect().await?.into_bytes();
+                    let state: DagState = serde_json::from_slice(&data)?;
+                    Ok(Some(state))
+                }
+                Err(e) => {
+                    if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
+                        Ok(None)
+                    } else {
+                        Err(e.into())
+                    }
+                }
+            }
+        })
+    }
+
+    fn write_dag(
+        &self,
+        dag_name: &str,
+        state: &DagState,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let dag_name = dag_name.to_string();
+        let json_result = serde_json::to_string_pretty(state);
+        Box::pin(async move {
+            let key = format!("{DAG_STATE_PREFIX}{dag_name}");
+            let json = json_result?;
+            let s3_key = format!("{}{key}.json", self.prefix);
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&s3_key)
+                .body(json.into_bytes().into())
+                .content_type("application/json")
+                .send()
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn delete_dag(
+        &self,
+        dag_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let dag_name = dag_name.to_string();
+        Box::pin(async move {
+            let key = format!("{DAG_STATE_PREFIX}{dag_name}");
+            let s3_key = format!("{}{key}.json", self.prefix);
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(&s3_key)
+                .send()
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn list_dags(&self) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + '_>> {
+        Box::pin(async move {
+            list_s3_filtered(&self.client, &self.bucket, &self.prefix, |relative| {
+                let base = relative.strip_suffix(".json")?;
+                if base.ends_with(".lock") || base.contains('/') {
+                    return None;
+                }
+                let dag_name = base.strip_prefix(DAG_STATE_PREFIX)?;
+                Some(dag_name.to_string())
+            })
+            .await
+        })
+    }
+
+    fn lock(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<LockInfo>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        Box::pin(async move {
+            let info = lock_info();
+            let json = serde_json::to_string_pretty(&info)?;
+            let key = format!("{}{job_name}.json.lock", self.prefix);
+            let result = self
+                .client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .body(json.into_bytes().into())
+                .content_type("application/json")
+                .if_none_match("*")
+                .send()
+                .await;
+
+            match result {
+                Ok(_) => Ok(info),
+                Err(e) => {
+                    // Object already exists — someone holds the lock
+                    let existing = self.get_lock(&job_name).await.ok().flatten();
+                    match existing {
+                        Some(held) => Err(anyhow!(
+                            "Job \"{job_name}\" is locked by {} (since {}). \
+                             Use `yard force-unlock` to override.",
+                            held.who,
+                            held.created_at
+                        )),
+                        None => Err(e.into()),
+                    }
+                }
+            }
+        })
+    }
+
+    fn force_unlock(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        Box::pin(async move {
+            let key = format!("{}{job_name}.json.lock", self.prefix);
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn get_lock(
+        &self,
+        job_name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<LockInfo>>> + Send + '_>> {
+        let job_name = job_name.to_string();
+        Box::pin(async move {
+            let key = format!("{}{job_name}.json.lock", self.prefix);
+            let result = self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await;
+            match result {
+                Ok(resp) => {
+                    let data = resp.body.collect().await?.into_bytes();
+                    let info: LockInfo = serde_json::from_slice(&data)?;
+                    Ok(Some(info))
+                }
+                Err(e) => {
+                    if e.as_service_error().is_some_and(|se| se.is_no_such_key()) {
+                        Ok(None)
+                    } else {
+                        Err(e.into())
+                    }
+                }
+            }
+        })
+    }
+}
+
 // --- Helpers ---
 
 fn lock_info() -> LockInfo {
