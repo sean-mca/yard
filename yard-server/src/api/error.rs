@@ -12,6 +12,7 @@ pub enum ApiError {
     #[allow(dead_code)]
     NotFound(String),
     BadRequest(String),
+    Unauthorized(String),
     CacheUnavailable(String),
     Internal(String),
 }
@@ -23,6 +24,7 @@ impl ApiError {
             ApiError::GitHubError(_) => StatusCode::BAD_GATEWAY,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ApiError::CacheUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -34,6 +36,7 @@ impl ApiError {
             | ApiError::GitHubError(m)
             | ApiError::NotFound(m)
             | ApiError::BadRequest(m)
+            | ApiError::Unauthorized(m)
             | ApiError::CacheUnavailable(m)
             | ApiError::Internal(m) => m,
         }
@@ -97,6 +100,17 @@ mod tests {
         let (status, body) = error_response(ApiError::BadRequest("invalid input".into())).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["status"], 400);
+    }
+
+    #[tokio::test]
+    async fn test_unauthorized_returns_401() {
+        let (status, body) = error_response(ApiError::Unauthorized(
+            "missing or malformed Authorization header".into(),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["status"], 401);
+        assert_eq!(body["error"], "missing or malformed Authorization header");
     }
 
     #[tokio::test]
