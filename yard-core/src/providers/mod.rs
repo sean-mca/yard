@@ -194,12 +194,11 @@ pub async fn get_provider(job_type: JobType, provider_config: &Value) -> Result<
 /// `validation::rules::validate_job` — the only validation-side site
 /// where `JobType` is matched in the workspace.
 ///
-/// Note the asymmetry between the Glue and EMR arms (Phase 24 D-08): Glue
-/// receives the full `job_config` because the Glue `role` check (in
-/// `glue::validate_config`) reads from the top level of the job config,
-/// not from the inner `glue` block. EMR's arm preserves the inner-block
-/// extraction since `emr::validate_config` reads only from the inner
-/// `emr` block.
+/// Note the asymmetry between the Glue and EMR arms: Glue receives the full
+/// `job_config` because the Glue `role` check (in `glue::validate_config`)
+/// reads from the top level of the job config, not from the inner `glue`
+/// block. EMR's arm preserves the inner-block extraction since
+/// `emr::validate_config` reads only from the inner `emr` block.
 pub fn validate_provider_config(
     job_type: JobType,
     job_config: &Value,

@@ -378,8 +378,8 @@ const VALID_BOOKMARK_VALUES: &[&str] = &["enabled", "disabled"];
 
 pub(crate) fn validate_config(config: &serde_json::Value, errors: &mut Vec<ValidationError>) {
     // Glue-specific top-level requirement: a `role` (execution role ARN) must be set.
-    // Moved from `validation/rules.rs:415-426` per Phase 24 D-09 — Glue-specific rules
-    // belong in the Glue module, not in the workspace-wide rule dispatcher.
+    // Glue-specific rules live in the Glue module rather than in the workspace-wide
+    // rule dispatcher so each provider owns its own validation surface.
     let has_role = config
         .get("role")
         .and_then(|v| v.as_str())
