@@ -14,7 +14,7 @@ v1.5 Phase 25 (auth middleware + Slack webhook secret store).
 | `YARD_REPO_OWNER` | yes | Repo owner. Used by webhook routing. |
 | `YARD_REPO_NAME` | yes | Repo name. Used by webhook routing. |
 | `YARD_API_TOKEN` | yes (unless bypass) | Bearer token required on every `Authorization: Bearer <token>` header for `/api/*` requests (SRV-01). |
-| `YARD_API_AUTH_DISABLED` | no | Dev-only escape hatch. Set to `1` / `true` / `TRUE` to skip the bearer check on `/api/*`. **Off by default.** When on, the server logs a `tracing::warn!` event and prints `[WARN] /api/* AUTH DISABLED (YARD_API_AUTH_DISABLED=1)` to stderr at startup. Do not use in production. |
+| `YARD_API_AUTH_DISABLED` | no | Dev-only escape hatch. Set to a truthy value (`1`, `true`, `yes`, `on` — case-insensitive, surrounding whitespace ignored) to skip the bearer check on `/api/*`. **Off by default.** When on, the server logs a `tracing::warn!` event and prints `[WARN] /api/* AUTH DISABLED (YARD_API_AUTH_DISABLED=1)` to stderr at startup. Do not use in production. |
 | `YARD_PORT` | no | Listen port. Defaults to `3001`. |
 | `YARD_DB_TABLE_PREFIX` | no | DynamoDB table-name prefix. Defaults to `yard`. |
 | `YARD_DB_REGION` / `AWS_REGION` | no | AWS region for the DynamoDB and Secrets Manager clients. |
@@ -43,7 +43,7 @@ constant time, so timing attacks against the token contents are mitigated.
 The constant-time compare is hand-rolled (`yard-server/src/auth/mod.rs`);
 no external crypto crate is involved.
 
-When `YARD_API_AUTH_DISABLED=1` (or `true` / `TRUE`):
+When `YARD_API_AUTH_DISABLED` is set to a truthy value (`1`, `true`, `yes`, or `on` — case-insensitive, surrounding whitespace ignored):
 
 - The server boots without `YARD_API_TOKEN`.
 - A warning event lands in the structured log (`tracing::warn!`).

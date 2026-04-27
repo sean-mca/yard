@@ -81,10 +81,17 @@ fn start_api_server() {
             let repo_name = required_env("YARD_REPO_NAME")?;
 
             // SRV-01 / D-07: explicit, off-by-default dev bypass.
-            // Truthy values are "1" / "true" / "TRUE" exactly. Anything else
-            // (including unset and empty) keeps the bypass off.
+            // Trim whitespace + ASCII-lowercase before matching so common
+            // operator inputs ("True", "YES", " 1\n" from a heredoc, etc.)
+            // disable auth predictably. Anything else (including unset and
+            // empty) keeps the bypass off — fail-secure bias preserved.
             let auth_disabled = std::env::var("YARD_API_AUTH_DISABLED")
-                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
+                .map(|v| {
+                    matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
                 .unwrap_or(false);
 
             let api_token: Option<String> = if auth_disabled {
