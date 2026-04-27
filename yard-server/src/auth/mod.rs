@@ -1,18 +1,26 @@
 //! Bearer-token authentication middleware for /api/* endpoints (SRV-01).
 //!
 //! `AuthConfig::token = Some(s)` requires every request to carry an
-//! `Authorization: Bearer <s>` header (constant-time compared). `None` means
-//! the dev bypass is on (gated upstream by the `YARD_API_AUTH_DISABLED`
-//! env var, off by default). The bypass short-circuits BEFORE any header
-//! inspection — no `Authorization` parsing on the bypass path.
+//! `Authorization: Bearer <s>` header (constant-time compared). When the
+//! `bypass_loopback` flag is set AND the caller's source SocketAddr is
+//! loopback (127.0.0.0/8 or ::1), the bearer check is skipped. Non-loopback
+//! callers ALWAYS go through the standard bearer path even when the flag
+//! is on.
+//!
+//! **REVERSES CONTEXT D-08 by deliberate gap-closure decision.** The
+//! prior shipped implementation made `YARD_API_AUTH_DISABLED=1` skip the
+//! check independent of the source address; this module now enforces the
+//! "localhost-only dev bypass" reading of ROADMAP SC #2. Verify-phase MUST
+//! NOT re-flag this as a regression.
 //!
 //! The `/api/webhook/github` route is HMAC-secured separately and is
 //! merged at the parent router level so this middleware does NOT see it.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::header::AUTHORIZATION,
     middleware::Next,
     response::Response,
@@ -22,27 +30,61 @@ use crate::api::error::ApiError;
 
 /// Configuration for the bearer-token middleware.
 ///
-/// `token = None` means the dev bypass is enabled — every request is
-/// allowed through without inspection (per D-06). The bypass MUST be
-/// off by default (per D-07/D-11 — main.rs only constructs `None` when
-/// `YARD_API_AUTH_DISABLED` is set to a truthy value).
+/// `token` holds the expected bearer token. `bypass_loopback`, when true,
+/// allows the middleware to skip the bearer check ONLY for callers whose
+/// source SocketAddr is loopback (127.0.0.0/8 or ::1). Non-loopback
+/// callers always go through the standard bearer path.
+///
+/// REVERSES CONTEXT D-08: the prior shipped behaviour made the bypass
+/// independent of the bind address. This struct's `bypass_loopback` flag
+/// implements the "localhost-only dev bypass" reading of ROADMAP SC #2,
+/// closing the gap surfaced by 25-VERIFICATION.md human-verification
+/// item #2. The `bypass_loopback` bool is set from `YARD_API_AUTH_DISABLED`
+/// at startup; never flipped at runtime (per threat model T-25-G2-03 —
+/// no per-request env reads, no TOCTOU window).
 pub struct AuthConfig {
     pub token: Option<String>,
+    /// When true, requests whose source SocketAddr is loopback
+    /// (127.0.0.0/8 or ::1) skip the bearer check. When false,
+    /// the bearer check applies to every request regardless of
+    /// source. Set from YARD_API_AUTH_DISABLED at startup; never
+    /// flipped at runtime.
+    pub bypass_loopback: bool,
 }
 
 /// Axum middleware that requires `Authorization: Bearer <YARD_API_TOKEN>`
-/// on every request unless the dev bypass is on.
+/// on every request unless the dev bypass is on AND the source SocketAddr
+/// is loopback.
 ///
 /// Returns 401 with `{error, status: 401}` body via the
 /// `ApiError::Unauthorized` variant on missing/malformed/invalid header.
+///
+/// The `ConnectInfo<SocketAddr>` extractor reflects the OS-reported peer
+/// address (NOT any X-Forwarded-For / Forwarded header — see threat model
+/// T-25-G2-02). This is the only signal consulted for loopback enforcement.
 pub async fn require_bearer(
     State(cfg): State<Arc<AuthConfig>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    // Dev bypass: skip all checks (D-06). No header inspection on this path.
-    let Some(expected) = cfg.token.as_deref() else {
+    // Loopback-only bypass (REVERSES CONTEXT D-08 per gap-closure
+    // decision). When the operator opts into bypass via
+    // YARD_API_AUTH_DISABLED, only loopback callers skip the check;
+    // non-loopback callers fall through to the standard bearer path.
+    if cfg.bypass_loopback && is_loopback(&addr) {
         return Ok(next.run(req).await);
+    }
+
+    // Bearer check. With the new shape, an operator who sets
+    // YARD_API_AUTH_DISABLED=1 but forgets YARD_API_TOKEN correctly sees
+    // non-loopback callers get 401 (fail-closed). The "no token configured
+    // = bypass enabled" behaviour from the original implementation is
+    // replaced by the explicit `bypass_loopback` flag.
+    let Some(expected) = cfg.token.as_deref() else {
+        return Err(ApiError::Unauthorized(
+            "missing or malformed Authorization header".into(),
+        ));
     };
 
     let header = req
@@ -59,6 +101,14 @@ pub async fn require_bearer(
     }
 
     Ok(next.run(req).await)
+}
+
+/// True if the SocketAddr's IP is loopback (covers 127.0.0.0/8 and ::1).
+///
+/// Uses `IpAddr::is_loopback`, the stdlib helper that already covers both
+/// IPv4 and IPv6 loopback ranges — no hand-rolled IP matching required.
+fn is_loopback(addr: &SocketAddr) -> bool {
+    addr.ip().is_loopback()
 }
 
 /// Constant-time byte equality. Avoids early-return on first mismatch
@@ -89,6 +139,19 @@ mod tests {
     use axum::routing::get;
     use tower::ServiceExt;
 
+    /// Convenience loopback SocketAddr used by every test that wants to
+    /// assert "bearer check still applies because source is loopback only
+    /// matters when bypass_loopback is true".
+    fn loopback_addr() -> SocketAddr {
+        "127.0.0.1:5555".parse().unwrap()
+    }
+
+    /// Convenience non-loopback SocketAddr used by the gap-B tests that
+    /// assert "bypass is gated on source IP".
+    fn remote_addr() -> SocketAddr {
+        "10.0.0.5:54321".parse().unwrap()
+    }
+
     async fn ok_handler() -> impl IntoResponse {
         (StatusCode::OK, "ok")
     }
@@ -102,20 +165,43 @@ mod tests {
             ))
     }
 
-    // -- Existing 5 tests (unchanged from prior plan revision) --
+    /// Build a request with a `ConnectInfo<SocketAddr>` extension injected
+    /// so the middleware's extractor finds it. axum's `from_fn_with_state`
+    /// extracts ConnectInfo from the request's extensions — without
+    /// injection, the extractor errors at runtime (500). This helper is
+    /// the standard tower-test idiom for axum middleware that consumes
+    /// `ConnectInfo`.
+    fn req_with_addr(uri: &str, addr: SocketAddr) -> Request<Body> {
+        let mut req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        req.extensions_mut().insert(ConnectInfo::<SocketAddr>(addr));
+        req
+    }
+
+    fn req_with_header_and_addr(
+        uri: &str,
+        header_name: &str,
+        header_value: &str,
+        addr: SocketAddr,
+    ) -> Request<Body> {
+        let mut req = Request::builder()
+            .uri(uri)
+            .header(header_name, header_value)
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo::<SocketAddr>(addr));
+        req
+    }
+
+    // -- Existing tests, re-anchored on ConnectInfo --
 
     #[tokio::test]
     async fn missing_authorization_header_returns_401() {
         let app = build_router(AuthConfig {
             token: Some("s3cret".into()),
+            bypass_loopback: false,
         });
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/protected")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(req_with_addr("/api/protected", loopback_addr()))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -125,15 +211,15 @@ mod tests {
     async fn wrong_bearer_returns_401() {
         let app = build_router(AuthConfig {
             token: Some("s3cret".into()),
+            bypass_loopback: false,
         });
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/protected")
-                    .header("Authorization", "Bearer wrong")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(req_with_header_and_addr(
+                "/api/protected",
+                "Authorization",
+                "Bearer wrong",
+                loopback_addr(),
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -143,30 +229,31 @@ mod tests {
     async fn correct_bearer_returns_200() {
         let app = build_router(AuthConfig {
             token: Some("s3cret".into()),
+            bypass_loopback: false,
         });
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/protected")
-                    .header("Authorization", "Bearer s3cret")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(req_with_header_and_addr(
+                "/api/protected",
+                "Authorization",
+                "Bearer s3cret",
+                loopback_addr(),
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// Re-anchored bypass test: source is loopback, bypass_loopback is on,
+    /// no token configured → 200. Test intent (bypass-on skips the check)
+    /// preserved by the new loopback gate.
     #[tokio::test]
     async fn bypass_skips_check() {
-        let app = build_router(AuthConfig { token: None });
+        let app = build_router(AuthConfig {
+            token: None,
+            bypass_loopback: true,
+        });
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/protected")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(req_with_addr("/api/protected", loopback_addr()))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -181,26 +268,21 @@ mod tests {
         assert!(ct_eq(b"", b""));
     }
 
-    // -- New tests added per CHECKER B4 / W1 / W2 (2026-04-27) --
-
     /// CHECKER B4: SC #2 "bypass OFF by default" runtime test.
-    /// Mechanically the same as `missing_authorization_header_returns_401` but
-    /// explicitly named to match VALIDATION.md row 25-01-06 and to make the
-    /// SC #2 contract trivially greppable in the test output. When
-    /// AuthConfig::token = Some(...) (the default path when the operator has
-    /// not set YARD_API_AUTH_DISABLED), an unauthenticated request is rejected.
+    /// Mechanically the same as `missing_authorization_header_returns_401`
+    /// but explicitly named to make the SC #2 contract trivially greppable
+    /// in the test output. When AuthConfig::token = Some(...) and
+    /// bypass_loopback = false (the default path when the operator has not
+    /// set YARD_API_AUTH_DISABLED), an unauthenticated request is rejected
+    /// regardless of source.
     #[tokio::test]
     async fn bypass_off_by_default() {
         let app = build_router(AuthConfig {
             token: Some("test-token".into()),
+            bypass_loopback: false,
         });
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/protected")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(req_with_addr("/api/protected", loopback_addr()))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -213,14 +295,6 @@ mod tests {
     /// BEFORE the WebSocketUpgrade extractor (axum middleware order), so the
     /// upgrade handshake is rejected with 401 — never returns 101 Switching
     /// Protocols.
-    ///
-    /// This test does NOT pull in the real events_router (which requires
-    /// ApiState construction with broadcast::Sender + InMemoryDb + ...) —
-    /// instead it mounts a /api/ws/events GET handler under the same
-    /// auth layer. The auth-layer's behavior is identical regardless of
-    /// downstream handler shape; what matters is that the middleware short-
-    /// circuits with 401 before any extractor (including WebSocketUpgrade)
-    /// runs.
     #[tokio::test]
     async fn ws_upgrade_requires_auth() {
         let app = Router::new()
@@ -228,26 +302,23 @@ mod tests {
             .layer(axum::middleware::from_fn_with_state(
                 Arc::new(AuthConfig {
                     token: Some("s3cret".into()),
+                    bypass_loopback: false,
                 }),
                 require_bearer,
             ));
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/api/ws/events")
-                    .header("Connection", "Upgrade")
-                    .header("Upgrade", "websocket")
-                    .header("Sec-WebSocket-Version", "13")
-                    .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/api/ws/events")
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .body(Body::empty())
             .unwrap();
-        // Must be 401 — NEVER 101 Switching Protocols. The bearer middleware
-        // runs before any extractor; absent a valid Authorization header the
-        // upgrade handshake never happens.
+        req.extensions_mut()
+            .insert(ConnectInfo::<SocketAddr>(loopback_addr()));
+        let resp = app.oneshot(req).await.unwrap();
+        // Must be 401 — NEVER 101 Switching Protocols.
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert_ne!(resp.status().as_u16(), 101);
     }
@@ -260,17 +331,9 @@ mod tests {
     ///
     /// Two-arm test:
     ///   (a) GET /api/webhook/github with no Authorization MUST NOT return 401.
-    ///       (The github HMAC layer will return its own 4xx — likely 400 for
-    ///       missing signature header — but the status must be DIFFERENT from
-    ///       the bearer-layer 401, proving the auth-layer is not in the path.)
     ///   (b) GET /api/dashboard with no Authorization MUST return 401.
-    ///       (Confirms the auth-layer IS in the api_routes path.)
     #[tokio::test]
     async fn webhook_route_skips_bearer_auth() {
-        // Stand-in for the github_router: a /api/webhook/github route that
-        // returns 400 on every request (mimicking "missing HMAC signature").
-        // The point of the test is what status the AUTH layer would return
-        // (401) vs. what the webhook handler returns (anything except 401).
         async fn fake_github_webhook() -> impl IntoResponse {
             (StatusCode::BAD_REQUEST, "missing signature")
         }
@@ -280,6 +343,7 @@ mod tests {
 
         let auth_cfg = Arc::new(AuthConfig {
             token: Some("s3cret".into()),
+            bypass_loopback: false,
         });
 
         let github_router_stub =
@@ -294,7 +358,9 @@ mod tests {
 
         let parent = Router::new().merge(github_router_stub).merge(api_routes);
 
-        // Arm (a): webhook with no auth — must NOT be 401.
+        // Arm (a): webhook with no auth — must NOT be 401. The github_router
+        // arm does NOT go through the auth layer, so no ConnectInfo
+        // injection is required for it.
         let resp_webhook = parent
             .clone()
             .oneshot(
@@ -311,18 +377,14 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "webhook route must NOT be gated by the bearer auth layer (T-25-03)"
         );
-        // Sanity: it should be the github stub's 400.
         assert_eq!(resp_webhook.status(), StatusCode::BAD_REQUEST);
 
-        // Arm (b): dashboard with no auth — MUST be 401.
+        // Arm (b): dashboard with no auth — MUST be 401. The api_routes
+        // arm DOES go through the auth layer, so ConnectInfo MUST be
+        // injected on the request (loopback source — bypass off, so 401
+        // is expected regardless of source IP).
         let resp_dashboard = parent
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/api/dashboard")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(req_with_addr("/api/dashboard", loopback_addr()))
             .await
             .unwrap();
         assert_eq!(
@@ -330,5 +392,59 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "api dashboard route must be gated by the bearer auth layer"
         );
+    }
+
+    // -- New gap-B tests (loopback-only bypass enforcement) --
+
+    /// Gap B / SC #2 broad reading: bypass takes effect ONLY for loopback callers.
+    /// AuthConfig.bypass_loopback=true + source 127.0.0.1 + no Authorization header → 200.
+    #[tokio::test]
+    async fn bypass_with_loopback_source_skips_check() {
+        let app = build_router(AuthConfig {
+            token: None,
+            bypass_loopback: true,
+        });
+        let resp = app
+            .oneshot(req_with_addr("/api/protected", loopback_addr()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Gap B / SC #2 broad reading: bypass does NOT cover non-loopback callers.
+    /// AuthConfig.bypass_loopback=true + source 10.0.0.5 + no Authorization header → 401.
+    /// (Even with bypass on, a non-loopback caller without a valid bearer is rejected.)
+    #[tokio::test]
+    async fn bypass_with_remote_source_falls_through_to_bearer_check_missing_header_returns_401() {
+        let app = build_router(AuthConfig {
+            token: Some("s3cret".into()),
+            bypass_loopback: true,
+        });
+        let resp = app
+            .oneshot(req_with_addr("/api/protected", remote_addr()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Gap B / SC #2 broad reading: bypass-on + non-loopback source + valid bearer → 200.
+    /// Operator who runs with bypass on AND configures YARD_API_TOKEN can still serve
+    /// non-loopback callers via the standard bearer path.
+    #[tokio::test]
+    async fn bypass_with_remote_source_and_correct_bearer_returns_200() {
+        let app = build_router(AuthConfig {
+            token: Some("s3cret".into()),
+            bypass_loopback: true,
+        });
+        let resp = app
+            .oneshot(req_with_header_and_addr(
+                "/api/protected",
+                "Authorization",
+                "Bearer s3cret",
+                remote_addr(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

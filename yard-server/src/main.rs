@@ -105,8 +105,13 @@ fn start_api_server() {
                 Some(required_env("YARD_API_TOKEN")?)
             };
 
-            let auth_config =
-                std::sync::Arc::new(crate::auth::AuthConfig { token: api_token });
+            let auth_config = std::sync::Arc::new(crate::auth::AuthConfig {
+                token: api_token,
+                // Task 2 will wire this to the YARD_API_AUTH_DISABLED env var.
+                // Defaulting to false here keeps behaviour fail-closed during
+                // the per-task commit interleave.
+                bypass_loopback: false,
+            });
 
             // SRV-02 / D-18: shared aws_config provider chain. Built once and
             // reused for the SecretsManager client so credentials and region
