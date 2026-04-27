@@ -266,54 +266,47 @@ async fn drift_poll_loop(state: std::sync::Arc<api::dashboard::ApiState>) {
                 // ---- Phase 8: drift threshold alerting ----
                 // Disabled-by-default short-circuit (D-07): check cheap settings
                 // before reading cooldown state.
-                let slack_enabled = matches!(
-                    state
-                        .db
-                        .get_setting("slack_enabled")
-                        .await
-                        .ok()
-                        .flatten()
-                        .as_deref(),
-                    Some("true")
-                );
-                let arn = state
+                //
+                // Read all five alert-related settings in a single snapshot so
+                // an operator flipping `slack_enabled` to false mid-tick can't
+                // race the per-key reads and trigger an alert after Disable.
+                let settings: std::collections::HashMap<String, String> = state
                     .db
-                    .get_setting("slack_webhook_secret_arn")
+                    .list_settings()
                     .await
                     .ok()
-                    .flatten()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|s| (s.key, s.value))
+                    .collect();
+
+                let slack_enabled = settings
+                    .get("slack_enabled")
+                    .map(|v| v == "true")
+                    .unwrap_or(false);
+                let arn = settings
+                    .get("slack_webhook_secret_arn")
+                    .cloned()
                     .unwrap_or_default();
-                let threshold_opt = state
-                    .db
-                    .get_setting("alert_drift_threshold")
-                    .await
-                    .ok()
-                    .flatten()
+                let threshold_opt = settings
+                    .get("alert_drift_threshold")
                     .and_then(|s| s.parse::<u32>().ok());
 
                 if slack_enabled
                     && !arn.is_empty()
                     && let Some(threshold) = threshold_opt
                 {
-                    let cooldown_mins = state
-                        .db
-                        .get_setting("alert_cooldown_minutes")
-                        .await
-                        .ok()
-                        .flatten()
+                    let cooldown_mins = settings
+                        .get("alert_cooldown_minutes")
                         .and_then(|s| s.parse::<u64>().ok())
                         .unwrap_or(10);
                     // Saturating multiply prevents overflow for attacker-set u64::MAX (T-08-03-01).
                     let cooldown =
                         std::time::Duration::from_secs(cooldown_mins.saturating_mul(60));
 
-                    let last_sent = state
-                        .db
-                        .get_setting("alert_last_sent_at")
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                    let last_sent = settings
+                        .get("alert_last_sent_at")
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                         .map(|dt| dt.with_timezone(&chrono::Utc));
 
                     let cfg = alerting::threshold::AlertConfig {
