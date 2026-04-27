@@ -120,7 +120,30 @@ fn start_api_server() {
             // YARD_API_TOKEN is now ALWAYS required (even when bypass is on) so that
             // non-loopback callers can authenticate via the standard bearer path
             // when the bypass is enabled. Boot fails fast if it's unset.
-            let api_token: Option<String> = Some(required_env("YARD_API_TOKEN")?);
+            let api_token_raw = required_env("YARD_API_TOKEN")?;
+            // WR-02: validate the token charset at BOOT, not at first
+            // login. The token is interpolated into a `Set-Cookie` header
+            // value (yard-server/src/api/auth_session.rs::session_cookie_value),
+            // and `HeaderValue::from_str` rejects non-visible-ASCII at
+            // runtime. Worse, RFC 6265 cookie-value syntax forbids `;`,
+            // `,`, whitespace, double-quote, and control chars; a token
+            // containing `;` would silently parse on the way in (the
+            // cookie parser splits on `;`) but produce a truncated /
+            // attribute-injectable Set-Cookie on the way out.
+            //
+            // Reject anything outside printable ASCII excluding the
+            // cookie-syntax forbidden set. Error message must NOT echo
+            // the token.
+            if api_token_raw.bytes().any(|b| {
+                !(0x21..=0x7E).contains(&b) || matches!(b, b';' | b',' | b'"' | b'\\')
+            }) {
+                anyhow::bail!(
+                    "YARD_API_TOKEN must contain only printable ASCII (0x21..=0x7E) \
+                     excluding `;`, `,`, `\"`, and `\\` — current value contains a \
+                     forbidden character. See docs/server.md for the allowed charset."
+                );
+            }
+            let api_token: Option<String> = Some(api_token_raw);
 
             let auth_config = std::sync::Arc::new(crate::auth::AuthConfig {
                 token: api_token,
