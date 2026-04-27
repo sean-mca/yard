@@ -2,11 +2,60 @@ use super::{Provider, S3ScriptOps, aws_config, validation_err};
 use anyhow::{Context, Result, anyhow};
 use aws_sdk_glue::Client as GlueClient;
 use aws_sdk_s3::Client as S3Client;
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use yard_structs::{Resource, ResourceStatus, ValidationError};
+
+fn default_region() -> String {
+    "us-east-1".to_string()
+}
+
+fn default_script_prefix() -> String {
+    "yard-scripts/".to_string()
+}
+
+fn default_glue_version() -> String {
+    "4.0".to_string()
+}
+
+fn default_worker_type() -> String {
+    "G.1X".to_string()
+}
+
+fn default_number_of_workers() -> i32 {
+    2
+}
+
+#[derive(Deserialize)]
+struct GlueRawConfig {
+    #[serde(default = "default_region")]
+    region: String,
+    #[serde(default = "default_script_prefix")]
+    script_prefix: String,
+    #[serde(default = "default_glue_version")]
+    glue_version: String,
+    #[serde(default = "default_worker_type")]
+    worker_type: String,
+    #[serde(default = "default_number_of_workers")]
+    number_of_workers: i32,
+    #[serde(default)]
+    timeout: Option<i32>,
+    #[serde(default)]
+    max_retries: Option<i32>,
+    #[serde(default)]
+    max_concurrent_runs: Option<i32>,
+    #[serde(default)]
+    bookmark: Option<String>,
+    #[serde(default)]
+    connections: Vec<String>,
+    #[serde(default)]
+    default_arguments: HashMap<String, String>,
+    #[serde(default, rename = "_aws")]
+    aws: Option<serde_json::Value>,
+}
 
 pub struct GlueProvider {
     glue_client: GlueClient,
@@ -25,82 +74,18 @@ pub struct GlueProvider {
 
 impl GlueProvider {
     pub async fn new(config: &Value) -> Result<Self> {
-        let region = config
-            .get("region")
-            .and_then(|v| v.as_str())
-            .unwrap_or("us-east-1");
-
+        // Pre-extract script_bucket BEFORE serde deserialization so the
+        // legacy error string survives byte-for-byte (SC #4, D-06 option a).
         let script_bucket = config
             .get("script_bucket")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("providers.glue.script_bucket is required"))?
             .to_string();
 
-        let script_prefix = config
-            .get("script_prefix")
-            .and_then(|v| v.as_str())
-            .unwrap_or("yard-scripts/")
-            .to_string();
+        let cfg: GlueRawConfig = serde_json::from_value(config.clone())
+            .context("invalid providers.glue config")?;
 
-        let glue_version = config
-            .get("glue_version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("4.0")
-            .to_string();
-
-        let worker_type = config
-            .get("worker_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("G.1X")
-            .to_string();
-
-        let number_of_workers = config
-            .get("number_of_workers")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(2) as i32;
-
-        let timeout = config
-            .get("timeout")
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32);
-
-        let max_retries = config
-            .get("max_retries")
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32);
-
-        let max_concurrent_runs = config
-            .get("max_concurrent_runs")
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32);
-
-        let bookmark = config
-            .get("bookmark")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let connections = config
-            .get("connections")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let default_arguments = config
-            .get("default_arguments")
-            .and_then(|v| v.as_object())
-            .map(|m| {
-                m.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let aws_cfg = config.get("_aws");
-        let sdk_config = aws_config(region, aws_cfg).await;
+        let sdk_config = aws_config(&cfg.region, cfg.aws.as_ref()).await;
         let glue_client = GlueClient::new(&sdk_config);
         let s3_client = S3Client::new(&sdk_config);
 
@@ -109,17 +94,17 @@ impl GlueProvider {
             s3: S3ScriptOps {
                 s3_client,
                 script_bucket,
-                script_prefix,
+                script_prefix: cfg.script_prefix,
             },
-            glue_version,
-            worker_type,
-            number_of_workers,
-            timeout,
-            max_retries,
-            max_concurrent_runs,
-            bookmark,
-            connections,
-            default_arguments,
+            glue_version: cfg.glue_version,
+            worker_type: cfg.worker_type,
+            number_of_workers: cfg.number_of_workers,
+            timeout: cfg.timeout,
+            max_retries: cfg.max_retries,
+            max_concurrent_runs: cfg.max_concurrent_runs,
+            bookmark: cfg.bookmark,
+            connections: cfg.connections,
+            default_arguments: cfg.default_arguments,
         })
     }
 
@@ -470,5 +455,73 @@ pub fn validate_config(config: &serde_json::Value, errors: &mut Vec<ValidationEr
             "glue.default_arguments",
             "must be a map of string keys to string values",
         ));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn missing_script_bucket_preserves_legacy_error_string() {
+        let config = json!({
+            "region": "us-east-1",
+            // script_bucket intentionally omitted
+        });
+        // GlueProvider does not implement Debug, so we can't use unwrap_err();
+        // match the result instead to extract the error.
+        let err = match GlueProvider::new(&config).await {
+            Ok(_) => panic!("expected error for missing script_bucket"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("providers.glue.script_bucket is required"),
+            "expected legacy error string, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn type_confused_script_bucket_preserves_legacy_error_string() {
+        let config = json!({
+            "region": "us-east-1",
+            "script_bucket": 42, // type-confused — pre-extraction's .as_str() returns None
+        });
+        let err = match GlueProvider::new(&config).await {
+            Ok(_) => panic!("expected error for type-confused script_bucket"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("providers.glue.script_bucket is required"),
+            "expected legacy error string, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_field_silently_ignored() {
+        // D-15: typos like `glue_versoin` are silently ignored — no deny_unknown_fields.
+        let config = json!({
+            "region": "us-east-1",
+            "script_bucket": "my-bucket",
+            "glue_versoin": "4.0", // typo — must NOT cause an error
+        });
+        // Note: this will still try to construct an SDK client; we only assert
+        // that deserialization itself doesn't reject the unknown key. If the
+        // SDK init succeeds (depends on test environment), the call returns Ok;
+        // if SDK init fails for environmental reasons, the error must NOT be
+        // about the unknown field.
+        let result = GlueProvider::new(&config).await;
+        if let Err(e) = result {
+            let msg = format!("{e:#}");
+            assert!(
+                !msg.contains("glue_versoin")
+                    && !msg.contains("unknown field")
+                    && !msg.contains("invalid providers.glue config"),
+                "unknown field must be silently ignored, got: {msg}"
+            );
+        }
     }
 }
