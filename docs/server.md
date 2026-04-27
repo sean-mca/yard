@@ -21,9 +21,15 @@ v1.5 Phase 25 (auth middleware + Slack webhook secret store).
 | `YARD_DB_ENDPOINT_URL` | no | Override the DynamoDB endpoint (e.g., for LocalStack tests). |
 
 The `Authorization: Bearer ...` header applies to every endpoint under `/api/*`
-including the WebSocket upgrade at `/api/ws/events`. The GitHub webhook route
+including the WebSocket upgrade at `/api/ws/events`. The bundled Dioxus UI uses
+a same-origin `yard_session` cookie carrying the same `YARD_API_TOKEN` instead
+of the header — see "Cookie-based session login" below for the cookie endpoints
+and the HTTPS-only constraint. The GitHub webhook route
 (`POST /api/webhook/github`) is HMAC-secured separately via
-`YARD_WEBHOOK_SECRET` and does **not** require a bearer token.
+`YARD_WEBHOOK_SECRET` and does **not** require a bearer token. The
+`/api/auth/session` and `/api/auth/logout` endpoints are also OUTSIDE the
+bearer layer (chicken-and-egg — login can't require login) but are still
+rate-limited.
 
 Example `curl`:
 
@@ -53,6 +59,50 @@ When `YARD_API_AUTH_DISABLED` is set to a truthy value (`1`, `true`, `yes`, or `
 The loopback-only enforcement is based on the OS-reported peer SocketAddr (via axum's `ConnectInfo<SocketAddr>` extractor). The middleware does NOT consult `X-Forwarded-For`, `Forwarded`, or any other client-controlled header — only the immutable peer address from the kernel-level socket. If a reverse proxy terminates connections on `127.0.0.1`, the proxy itself becomes the loopback caller. **Do not terminate untrusted traffic on a loopback-bound proxy when the bypass is enabled.**
 
 This is a deliberate gap-closure for ROADMAP SC #2 ("localhost-only dev bypass") and supersedes the prior "bypass is independent of bind address" behaviour documented in earlier revisions of this file.
+
+## Cookie-based session login (`/api/auth/session` + `/api/auth/logout`)
+
+In addition to the `Authorization: Bearer ...` header, the bearer middleware also accepts the same `YARD_API_TOKEN` carried in a `yard_session` cookie. Two unauthenticated endpoints sit OUTSIDE the bearer-auth layer (mounted at the parent router level alongside the GitHub webhook router) so the bundled Dioxus UI can establish a session without the chicken-and-egg of "login requires login":
+
+- `POST /api/auth/session` — body `{ "token": "<YARD_API_TOKEN>" }`. On match returns `200 OK` + `Set-Cookie: yard_session=<token>; HttpOnly; SameSite=Strict; Path=/; Secure`. On mismatch returns `401`, no `Set-Cookie` header.
+- `POST /api/auth/logout` — returns `204 No Content` + `Set-Cookie: yard_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`. Always clears the cookie; no auth required.
+
+Both endpoints are still rate-limited by the parent-router `tower-governor` layer (30 req/sec, burst=60), which provides brute-force defence even though the endpoints are unauthenticated.
+
+The cookie value IS the `YARD_API_TOKEN` — same security level as the bearer header (forging the cookie requires guessing the token). There is no separate session id, no session storage, no rotation. `HttpOnly` prevents XSS from reading the cookie via `document.cookie`; `SameSite=Strict` prevents CSRF.
+
+When both a valid `Authorization: Bearer` header AND a `yard_session` cookie are present on a request, the header takes precedence (CLI / automation wins over the browser's automatic cookie inclusion). Failure messages do not distinguish which credential type was attempted.
+
+### Why the cookie path exists
+
+Browsers do not let a WASM bundle set arbitrary `Authorization` headers on cross-origin or WebSocket-upgrade requests. They DO automatically include same-origin cookies on every fetch and on the WebSocket handshake. Carrying the token via a `HttpOnly` cookie lets the bundled UI authenticate without ever materialising the token in JS-readable memory.
+
+### HTTPS is required for the cookie path
+
+The `yard_session` cookie's `Set-Cookie` header **always** includes `Secure`. yard-server does NOT attempt to detect whether the inbound request was HTTPS — that heuristic is broken behind a TLS-terminating proxy that talks plain HTTP to the application (axum sees `http://` even when the operator's browser used HTTPS). Failing closed (always-Secure) is the right direction: it guarantees the browser only sends the cookie back on HTTPS connections.
+
+**Practical consequence for operators:**
+
+- **Production / staging:** terminate TLS upstream (ALB, CloudFront, nginx, Traefik, etc.) and point yard-server at the resulting HTTPS origin. The cookie path works as expected. This is the recommended deployment shape.
+- **Local-dev over `http://127.0.0.1:3001`:** the browser will accept the `Set-Cookie` response but will NOT send the cookie back on subsequent HTTP requests (because of the `Secure` flag). Local-dev callers must use the `Authorization: Bearer $YARD_API_TOKEN` header instead. The `yard_session` cookie path is intentionally unsupported on plain HTTP. Combine with `YARD_API_AUTH_DISABLED=1` (loopback-only bypass) if even the bearer header is friction during dev.
+
+### Example: log in via cookie, then call /api/dashboard
+
+```bash
+# 1. Establish the cookie (HTTPS required for the browser to send it back).
+curl -i -c jar.txt \
+     -H "Content-Type: application/json" \
+     -X POST https://yard.example.com/api/auth/session \
+     -d "{\"token\":\"$YARD_API_TOKEN\"}"
+# 200 OK
+# Set-Cookie: yard_session=...; HttpOnly; SameSite=Strict; Path=/; Secure
+
+# 2. Subsequent requests automatically include the cookie.
+curl -b jar.txt https://yard.example.com/api/dashboard
+
+# 3. Log out (clears the cookie; 204 No Content).
+curl -X POST -b jar.txt https://yard.example.com/api/auth/logout
+```
 
 ## Slack webhook secret migration
 
