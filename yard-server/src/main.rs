@@ -80,12 +80,12 @@ fn start_api_server() {
             let repo_owner = required_env("YARD_REPO_OWNER")?;
             let repo_name = required_env("YARD_REPO_NAME")?;
 
-            // SRV-01 / D-07: explicit, off-by-default dev bypass.
-            // Trim whitespace + ASCII-lowercase before matching so common
-            // operator inputs ("True", "YES", " 1\n" from a heredoc, etc.)
-            // disable auth predictably. Anything else (including unset and
-            // empty) keeps the bypass off — fail-secure bias preserved.
-            let auth_disabled = std::env::var("YARD_API_AUTH_DISABLED")
+            // SRV-01 / D-07 (REVISED by Phase 25 gap-closure plan 03 — REVERSES D-08):
+            // explicit, off-by-default dev bypass that takes effect ONLY for loopback
+            // callers. Trim whitespace + ASCII-lowercase before matching so common
+            // operator inputs ("True", "YES", " 1\n" from a heredoc, etc.) disable
+            // auth predictably.
+            let bypass_loopback = std::env::var("YARD_API_AUTH_DISABLED")
                 .map(|v| {
                     matches!(
                         v.trim().to_ascii_lowercase().as_str(),
@@ -94,23 +94,27 @@ fn start_api_server() {
                 })
                 .unwrap_or(false);
 
-            let api_token: Option<String> = if auth_disabled {
+            if bypass_loopback {
                 tracing::warn!(
-                    "YARD_API_AUTH_DISABLED=1 — /api/* endpoints are unauthenticated. \
-                     DO NOT use in production."
+                    "YARD_API_AUTH_DISABLED=1 — /api/* endpoints skip the bearer check \
+                     for LOOPBACK callers (127.0.0.1, ::1) only; non-loopback callers \
+                     still require Authorization: Bearer. DO NOT use in production."
                 );
-                eprintln!("[WARN] /api/* AUTH DISABLED (YARD_API_AUTH_DISABLED=1)");
-                None
-            } else {
-                Some(required_env("YARD_API_TOKEN")?)
-            };
+                eprintln!(
+                    "[WARN] /api/* AUTH BYPASS ENABLED FOR LOOPBACK CALLERS \
+                     (YARD_API_AUTH_DISABLED=1). Non-loopback callers still require \
+                     Authorization: Bearer."
+                );
+            }
+
+            // YARD_API_TOKEN is now ALWAYS required (even when bypass is on) so that
+            // non-loopback callers can authenticate via the standard bearer path
+            // when the bypass is enabled. Boot fails fast if it's unset.
+            let api_token: Option<String> = Some(required_env("YARD_API_TOKEN")?);
 
             let auth_config = std::sync::Arc::new(crate::auth::AuthConfig {
                 token: api_token,
-                // Task 2 will wire this to the YARD_API_AUTH_DISABLED env var.
-                // Defaulting to false here keeps behaviour fail-closed during
-                // the per-task commit interleave.
-                bypass_loopback: false,
+                bypass_loopback,
             });
 
             // SRV-02 / D-18: shared aws_config provider chain. Built once and
@@ -232,6 +236,9 @@ fn start_api_server() {
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to bind to {addr}: {e}"))?;
+            // ConnectInfo<SocketAddr> is required by the auth middleware for the
+            // loopback-bypass enforcement (gap-closure plan 03). into_make_service_with_connect_info
+            // is the axum primitive that surfaces the peer SocketAddr to extractors.
             axum::serve(
                 listener,
                 router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
