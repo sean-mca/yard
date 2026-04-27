@@ -34,21 +34,24 @@ impl AwsSecretStore {
 #[async_trait]
 impl SecretStore for AwsSecretStore {
     async fn resolve(&self, secret_arn: &str) -> anyhow::Result<String> {
+        // The ARN is intentionally omitted from these error messages — callers
+        // log it as a structured `arn = %arn` field, so embedding it here
+        // would only produce duplicate ARN entries in every alert-resolve
+        // failure log line. Keep the ARN as a structural caller concern;
+        // keep the error string focused on what failed.
         let out = self
             .client
             .get_secret_value()
             .secret_id(secret_arn)
             .send()
             .await
-            .map_err(|e| {
-                anyhow::anyhow!("Secrets Manager GetSecretValue failed for {secret_arn}: {e}")
-            })?;
+            .map_err(|e| anyhow::anyhow!("Secrets Manager GetSecretValue failed: {e}"))?;
 
         out.secret_string()
             .map(|s| s.to_string())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Secret {secret_arn} has no string value (binary secrets are not supported)"
+                    "Secrets Manager secret has no string value (binary secrets are not supported)"
                 )
             })
     }
