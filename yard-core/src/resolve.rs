@@ -24,6 +24,7 @@ const ALLOWED_STATE_BLOCK: &[&str] = &["type", "bucket", "region", "key", "path"
 /// D-21 to keep this list in sync with TYPE-01.
 const STATIC_JOB_DOC_ALLOWED: &[&str] = &[
     "type",
+    "role",
     "imports",
     "body",
     "job_file",
@@ -821,5 +822,46 @@ mod tests {
         assert_eq!(provider_field(&out["j"], "glue", "from_account"), Some("account"));
         assert_eq!(provider_field(&out["j"], "glue", "from_region"), Some("region"));
         assert_eq!(provider_field(&out["j"], "glue", "from_job"), Some("job"));
+    }
+
+    // --- job-doc allow-list (regression for missing `role:` top-level key) ---
+
+    #[test]
+    fn job_doc_allow_list_admits_role_at_top_level() {
+        // Glue jobs put `role` at the top level of the job doc (sibling to
+        // `glue:`); this is the shape documented in README/GETTING-STARTED
+        // and required by `glue::validate_config`. The phase 21-03 typo
+        // gate must not reject it.
+        let tmp = TempDir::new();
+        fs::write(tmp.0.join("account.yaml"), "{}").unwrap();
+        fs::write(tmp.0.join("region.yaml"), "{}").unwrap();
+        fs::write(
+            tmp.0.join("my_job.yaml"),
+            "type: glue\nrole: arn:aws:iam::123456789012:role/GlueJob\nglue:\n  script_bucket: my-bucket\n",
+        )
+        .unwrap();
+        let jobs = discover_jobs(&tmp.0).expect("discover must accept role at top level");
+        assert_eq!(jobs.len(), 1, "got: {:?}", jobs.keys());
+        let (_, def) = jobs.iter().next().unwrap();
+        assert_eq!(
+            def.config.get("role").and_then(|v| v.as_str()),
+            Some("arn:aws:iam::123456789012:role/GlueJob"),
+        );
+    }
+
+    #[test]
+    fn job_doc_allow_list_still_rejects_typos() {
+        // Sanity: the gate still catches genuine typos at the job-doc level.
+        let tmp = TempDir::new();
+        fs::write(tmp.0.join("account.yaml"), "{}").unwrap();
+        fs::write(tmp.0.join("region.yaml"), "{}").unwrap();
+        fs::write(
+            tmp.0.join("my_job.yaml"),
+            "type: glue\nrolle: arn:aws:iam::123456789012:role/GlueJob\n",
+        )
+        .unwrap();
+        let err = discover_jobs(&tmp.0).expect_err("typo must reject");
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown field 'rolle'"), "got: {msg}");
     }
 }
