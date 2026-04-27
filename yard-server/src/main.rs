@@ -102,15 +102,18 @@ fn start_api_server() {
                 .unwrap_or(false);
 
             if bypass_loopback {
+                // WR-07: single canonical warn surface. Previously this
+                // branch also emitted an eprintln! banner with the same
+                // information, which broke JSON-formatted log shippers
+                // (Loki, CloudWatch, Datadog) that line-parse stderr —
+                // the tracing JSON line and the free-form eprintln!
+                // line shared the same stream. tracing::warn! is the
+                // canonical structured event; the operator's
+                // tracing-subscriber config decides the surface format.
                 tracing::warn!(
                     "YARD_API_AUTH_DISABLED=1 — /api/* endpoints skip the bearer check \
                      for LOOPBACK callers (127.0.0.1, ::1) only; non-loopback callers \
                      still require Authorization: Bearer. DO NOT use in production."
-                );
-                eprintln!(
-                    "[WARN] /api/* AUTH BYPASS ENABLED FOR LOOPBACK CALLERS \
-                     (YARD_API_AUTH_DISABLED=1). Non-loopback callers still require \
-                     Authorization: Bearer."
                 );
             }
 
