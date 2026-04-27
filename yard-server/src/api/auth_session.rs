@@ -98,13 +98,28 @@ pub async fn post_session(
 pub async fn post_logout() -> Result<Response, ApiError> {
     // Cleared cookie — Max-Age=0 tells the browser to drop the cookie
     // immediately. Use the same identifying attributes (HttpOnly,
-    // SameSite=Strict, Path=/) so the cookie's identity matches and the
-    // clear takes effect. `Secure` is OMITTED on the clear so logout
-    // succeeds on http and https alike (clearing a cookie is not a
-    // privacy-sensitive operation; we want logout to succeed even if the
-    // operator is debugging on http://127.0.0.1).
-    let header_value =
-        HeaderValue::from_static("yard_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+    // SameSite=Strict, Path=/, Secure) so the cookie's identity matches
+    // and the clear takes effect.
+    //
+    // `Secure` MUST be present on the clear because the set-cookie value
+    // (`session_cookie_value`) is always-Secure (see module doc-comment
+    // "Secure cookie attribute is always set"). RFC 6265bis "Leave Secure
+    // Cookies Alone" + concrete browser behaviour (Chrome 80+, Firefox 79+)
+    // forbid an insecure context from overwriting a Secure cookie — so a
+    // logout request received over HTTP that returns a Set-Cookie WITHOUT
+    // `Secure` would be rejected by the browser, leaving the (Secure)
+    // session cookie in place and silently breaking sign-out. Mirror the
+    // `Secure` attribute the original set-cookie used.
+    //
+    // The dev / loopback HTTP path is unaffected: when the cookie was set
+    // over HTTP (which only happens in tests), the browser does not
+    // require the clear to also originate from a secure context, and
+    // when the cookie was set over HTTPS (production), the browser only
+    // honors a Secure clear from a Secure context. Either way `Secure`
+    // on the clear is correct.
+    let header_value = HeaderValue::from_static(
+        "yard_session=; HttpOnly; SameSite=Strict; Path=/; Secure; Max-Age=0",
+    );
     let mut resp = (StatusCode::NO_CONTENT, "").into_response();
     resp.headers_mut().insert(SET_COOKIE, header_value);
     Ok(resp)
@@ -220,6 +235,12 @@ mod tests {
             .unwrap();
         assert!(cookie.starts_with("yard_session=;"), "got: {cookie}");
         assert!(cookie.contains("Max-Age=0"), "missing Max-Age=0: {cookie}");
+        // BL-03 fix: clear must mirror the set-cookie's Secure attribute,
+        // otherwise modern browsers refuse to overwrite the Secure
+        // session cookie set by `post_session` (RFC 6265bis "Leave
+        // Secure Cookies Alone"). Without Secure here, sign-out from
+        // HTTPS silently fails.
+        assert!(cookie.contains("Secure"), "missing Secure on clear: {cookie}");
     }
 
     #[tokio::test]
