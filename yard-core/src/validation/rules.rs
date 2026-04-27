@@ -18,12 +18,9 @@ const SUPPORTED_TRANSFORM_TYPES: &[&str] = &[
     "window",
 ];
 
-pub fn err(field: &str, message: &str) -> ValidationError {
-    ValidationError {
-        field: field.to_string(),
-        message: message.to_string(),
-    }
-}
+// Single canonical ValidationError constructor lives in `providers::validation_err`.
+// Re-exported here as `err` so the existing call sites in this module stay terse.
+pub use crate::providers::validation_err as err;
 
 pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
     let mut errors = Vec::new();
