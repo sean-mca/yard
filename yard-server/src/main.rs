@@ -49,6 +49,7 @@ fn required_env(name: &str) -> anyhow::Result<String> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn start_api_server() {
+    use api::auth_session::auth_session_router;
     use api::dashboard::{ApiState, dashboard_router};
     use api::drift::drift_router;
     use api::jobs::jobs_router;
@@ -219,6 +220,12 @@ fn start_api_server() {
 
             let router = axum::Router::new()
                 .merge(github_router(webhook_state))
+                // Plan 25-04 Gap A: /api/auth/session and /api/auth/logout sit
+                // OUTSIDE the bearer-auth layer (chicken-and-egg — login can't
+                // require login). Both endpoints are still rate-limited by the
+                // .layer(rate_limit) below since rate_limit is on the parent
+                // router.
+                .merge(auth_session_router(auth_config.clone()))
                 .merge(api_routes)
                 .layer(rate_limit)
                 .layer(cors)
