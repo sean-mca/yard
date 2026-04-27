@@ -25,11 +25,27 @@ struct SessionRequest<'a> {
 
 /// POST /api/auth/session with the typed token. Returns Ok(()) on 200,
 /// Err with a user-facing message on 401 / network error.
+///
+/// BL-02: the WASM build threads the request through
+/// `RequestBuilder::fetch_credentials_include()` so the browser
+/// stores the `Set-Cookie: yard_session=...` response on cross-origin
+/// dev shapes (`dx serve` on a different port from the API). Without
+/// `credentials: include`, the browser drops Set-Cookie on cross-
+/// origin responses, the cookie never lands in the cookie jar, and
+/// the user appears to authenticate successfully but the next /api/*
+/// call returns 401 — presenting as an "infinite login loop." On
+/// native builds (Dioxus fullstack SSR / prerender path), the
+/// `fetch_credentials_include` setter is not defined on the native
+/// `RequestBuilder`, so the call is gated by
+/// `#[cfg(target_arch = "wasm32")]`.
 async fn post_session(token: &str) -> Result<(), String> {
     let client = reqwest::Client::new();
-    let resp = client
+    let builder = client
         .post(format!("{}/api/auth/session", api_base()))
-        .json(&SessionRequest { token })
+        .json(&SessionRequest { token });
+    #[cfg(target_arch = "wasm32")]
+    let builder = builder.fetch_credentials_include();
+    let resp = builder
         .send()
         .await
         .map_err(|e| format!("Network error: {e}"))?;
