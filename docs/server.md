@@ -104,6 +104,75 @@ curl -b jar.txt https://yard.example.com/api/dashboard
 curl -X POST -b jar.txt https://yard.example.com/api/auth/logout
 ```
 
+## Browser-session login
+
+The bundled Dioxus dashboard (served from yard-server's root path, e.g.,
+`https://yard.example.com/`) authenticates via the `yard_session` cookie
+described in the section above. This subsection walks the operator-facing
+flow that the bundled UI implements and records the WASM-bundle leak
+verification step.
+
+### Operator flow
+
+1. Open the dashboard URL in a browser. The first call to any `/api/*`
+   endpoint (e.g., `/api/dashboard/cached`) returns 401 because no
+   `yard_session` cookie has been set yet.
+2. The UI's shared fetch helper (`yard-server/src/ui/fetch.rs`) detects
+   the 401 and pushes the browser to `/login` via the Dioxus router.
+3. Paste the `YARD_API_TOKEN` value into the password field on `/login`.
+   Click **Sign in**. The form POSTs `{ "token": "<typed value>" }` to
+   `/api/auth/session`.
+4. On match the server returns 200 + `Set-Cookie: yard_session=<token>;
+   HttpOnly; SameSite=Strict; Path=/; Secure`. The UI navigates to `/`
+   (the Dashboard route). On mismatch the page shows
+   `Invalid token — check the value and try again` inline.
+5. All subsequent fetches and the WebSocket upgrade automatically
+   include the cookie (browser default for same-origin requests).
+6. To sign out, open the **Settings** page and click **Sign out** under
+   the "Session" card. The UI POSTs `/api/auth/logout`, which clears the
+   cookie via `Set-Cookie: Max-Age=0`, then navigates back to `/login`.
+
+The typed token is held in a single `Signal<String>` for one submit cycle
+and cleared (`set(String::new())`) immediately after the POST resolves —
+success or failure. The bundled WASM has no `localStorage` /
+`sessionStorage` / `web_sys::Storage` access; the only post-login token
+store is the browser's `HttpOnly` cookie, which WASM cannot read.
+
+### CLI / automation callers
+
+Unchanged. CLI tools and CI pipelines continue to use the
+`Authorization: Bearer $YARD_API_TOKEN` header. The middleware accepts
+either credential, and the header takes precedence when both are present.
+
+### Verifying the WASM bundle does not leak the token
+
+The token is never compiled into the WASM bundle. Two layers of
+verification keep this honest:
+
+1. **Source-level invariant (enforced at code review).** No file under
+   `yard-server/src/` references `YARD_API_TOKEN` via `env!(...)` or
+   `option_env!(...)`:
+
+   ```bash
+   grep -rE 'option_env!\("YARD_API_TOKEN|env!\("YARD_API_TOKEN' yard-server/src/
+   # (should print nothing)
+   ```
+
+2. **Byte-scan after a fresh build.** Build the bundle and confirm a
+   sentinel token never appears in the WASM bytes:
+
+   ```bash
+   export YARD_API_TOKEN="leak-canary-7e2c4f"
+   # Build the WASM bundle (path may vary by Dioxus version).
+   dx build --release   # from yard-server/
+   strings yard-server/target/dx/yard-server/release/web/public/assets/*.wasm \
+     | grep "leak-canary-7e2c4f"
+   # (should print nothing)
+   ```
+
+The structural source-grep is the automated bound; the byte-scan is a
+one-off manual check the operator can re-run any time.
+
 ## Slack webhook secret migration
 
 Starting in v1.5, the Slack incoming-webhook URL is **not** stored in
