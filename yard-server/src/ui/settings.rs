@@ -70,7 +70,7 @@ async fn save_setting(key: &str, value: &str) -> Result<(), String> {
 #[component]
 pub fn Settings(theme: Signal<Theme>) -> Element {
     let mut drift_interval = use_signal(|| "3".to_string());
-    let mut slack_url = use_signal(String::new);
+    let mut slack_arn = use_signal(String::new);
     let mut slack_enabled = use_signal(|| false);
     let mut alert_threshold = use_signal(String::new);
     let mut alert_cooldown = use_signal(String::new);
@@ -86,8 +86,8 @@ pub fn Settings(theme: Signal<Theme>) -> Element {
                 if let Some(v) = settings.get("drift_interval") {
                     drift_interval.set(v.clone());
                 }
-                if let Some(v) = settings.get("slack_webhook_url") {
-                    slack_url.set(v.clone());
+                if let Some(v) = settings.get("slack_webhook_secret_arn") {
+                    slack_arn.set(v.clone());
                 }
                 if let Some(v) = settings.get("slack_enabled") {
                     slack_enabled.set(v == "true");
@@ -133,12 +133,12 @@ pub fn Settings(theme: Signal<Theme>) -> Element {
                 // Slack
                 NotificationCard {
                     label: "Slack",
-                    description: "Post to a Slack channel via incoming webhook.",
+                    description: "Post to a Slack channel via incoming webhook. The URL is loaded from AWS Secrets Manager — supply the secret ARN here. See docs/server.md.",
                     icon: "M14.5 10c-.83 0-1.5-.67-1.5-1.5v-5c0-.83.67-1.5 1.5-1.5s1.5.67 1.5 1.5v5c0 .83-.67 1.5-1.5 1.5zm-5 8c-.83 0-1.5-.67-1.5-1.5v-5c0-.83.67-1.5 1.5-1.5s1.5.67 1.5 1.5v5c0 .83-.67 1.5-1.5 1.5z",
                     enabled: slack_enabled,
-                    field_label: "Webhook URL",
-                    field_placeholder: "https://hooks.slack.com/services/...",
-                    field_value: slack_url,
+                    field_label: "Secret ARN",
+                    field_placeholder: "arn:aws:secretsmanager:us-east-1:123456789012:secret:yard/slack-webhook-AbCdEf",
+                    field_value: slack_arn,
                     loaded,
                 }
 
@@ -387,7 +387,7 @@ fn NotificationCard(
                         onchange: move |e| {
                             let val = e.value();
                             if loaded() {
-                                spawn(async move { let _ = save_setting("slack_webhook_url", &val).await; });
+                                spawn(async move { let _ = save_setting("slack_webhook_secret_arn", &val).await; });
                             }
                         },
                     }

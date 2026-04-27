@@ -255,15 +255,19 @@ mod tests {
         use crate::api::dashboard::ApiState;
         use crate::db::Database;
         use crate::db::test_support::InMemoryDb;
+        use crate::secrets::test_support::InMemorySecretStore;
         use std::sync::Arc;
         let db: Arc<dyn Database> = Arc::new(InMemoryDb::new());
         let (event_tx, _rx) = new_event_channel();
+        let secret_store: Arc<dyn crate::secrets::SecretStore> =
+            Arc::new(InMemorySecretStore::new(std::collections::HashMap::new()));
         let state = Arc::new(ApiState {
             github_token: "t".into(),
             repo_owner: "o".into(),
             repo_name: "r".into(),
             db,
             event_tx,
+            secret_store,
         });
         let _router: axum::Router = events_router(state);
         // If we got here, the router typechecked; success.

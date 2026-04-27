@@ -345,14 +345,18 @@ mod tests {
     use axum::response::IntoResponse;
 
     fn test_state() -> Arc<ApiState> {
+        use crate::secrets::test_support::InMemorySecretStore;
         let db = Arc::new(InMemoryDb::new());
         let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
+        let secret_store: Arc<dyn crate::secrets::SecretStore> =
+            Arc::new(InMemorySecretStore::new(std::collections::HashMap::new()));
         Arc::new(ApiState {
             github_token: "t".into(),
             repo_owner: "o".into(),
             repo_name: "r".into(),
             db: db as Arc<dyn Database>,
             event_tx,
+            secret_store,
         })
     }
 

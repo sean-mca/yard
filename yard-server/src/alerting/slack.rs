@@ -208,3 +208,105 @@ mod tests {
         assert!(result.is_err(), "expected Err on invalid URL, got Ok");
     }
 }
+
+#[cfg(test)]
+mod resolve_and_post_integration {
+    use super::*;
+    use crate::secrets::SecretStore;
+    use crate::secrets::test_support::InMemorySecretStore;
+    use crate::types::{DriftData, DriftItem, DriftType};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// SRV-02 SC #4: drift alert end-to-end. InMemorySecretStore holds an
+    /// ARN→URL mapping pointing at a handcrafted TcpListener that responds
+    /// HTTP/1.1 200 OK. The test asserts the resolved URL flowed through
+    /// post_slack_alert and the Slack Blocks payload arrived at the fake
+    /// endpoint with the expected header text.
+    #[tokio::test]
+    async fn drift_alert_resolves_secret_and_posts_to_slack() {
+        // Bind a kernel-chosen port on 127.0.0.1.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/test-webhook");
+
+        // Capture the request bytes the responder receives, so the test can
+        // verify the Slack Blocks payload was POSTed.
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let captured_clone = captured.clone();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _peer) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap();
+            captured_clone.lock().await.extend_from_slice(&buf[..n]);
+            // Respond with a minimal HTTP/1.1 200 OK; body=ok.
+            let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+            stream.write_all(resp).await.unwrap();
+            stream.shutdown().await.ok();
+        });
+
+        // Populate InMemorySecretStore with the ARN→URL mapping.
+        let arn =
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:yard/slack-webhook-Test"
+                .to_string();
+        let mut entries = HashMap::new();
+        entries.insert(arn.clone(), url.clone());
+        let secret_store = InMemorySecretStore::new(entries);
+
+        // Resolve through the trait, then post — same shape as drift_poll_loop.
+        let resolved = secret_store.resolve(&arn).await.unwrap();
+        assert_eq!(resolved, url, "InMemorySecretStore must round-trip the URL");
+
+        let drift = DriftData {
+            items: vec![
+                DriftItem {
+                    name: "job-a".into(),
+                    environment: "dev".into(),
+                    region: "us-east-1".into(),
+                    drift_type: DriftType::Modified,
+                    fields_changed: vec![],
+                    old_config: None,
+                    new_config: None,
+                },
+                DriftItem {
+                    name: "job-b".into(),
+                    environment: "dev".into(),
+                    region: "us-east-1".into(),
+                    drift_type: DriftType::Modified,
+                    fields_changed: vec![],
+                    old_config: None,
+                    new_config: None,
+                },
+            ],
+            in_sync: 1,
+            drifted: 2,
+        };
+        let result = post_slack_alert(&resolved, &drift, 1).await;
+        assert!(
+            result.is_ok(),
+            "post_slack_alert should succeed against the fake endpoint: {:?}",
+            result
+        );
+
+        // Wait for the listener task to finish capturing.
+        server.await.unwrap();
+
+        let captured_bytes = captured.lock().await.clone();
+        let captured_str = String::from_utf8_lossy(&captured_bytes);
+
+        // Sanity: it was a POST hitting our path.
+        assert!(
+            captured_str.starts_with("POST /test-webhook"),
+            "expected POST /test-webhook, got: {}",
+            &captured_str[..captured_str.len().min(120)]
+        );
+        // Slack Blocks header text from build_slack_payload.
+        assert!(
+            captured_str.contains("yard drift alert"),
+            "captured request must contain Slack Blocks payload header text"
+        );
+    }
+}

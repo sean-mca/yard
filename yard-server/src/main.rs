@@ -8,6 +8,8 @@ mod db;
 mod github;
 #[cfg(not(target_arch = "wasm32"))]
 mod alerting;
+#[cfg(not(target_arch = "wasm32"))]
+mod secrets;
 mod types;
 mod ui;
 
@@ -76,6 +78,14 @@ fn start_api_server() {
             let repo_owner = required_env("YARD_REPO_OWNER")?;
             let repo_name = required_env("YARD_REPO_NAME")?;
 
+            // SRV-02 / D-18: shared aws_config provider chain. Built once and
+            // reused for the SecretsManager client so credentials and region
+            // resolve consistently with the existing DynamoDB client.
+            let sdk_config = aws_config::load_from_env().await;
+
+            let secret_store: std::sync::Arc<dyn crate::secrets::SecretStore> =
+                std::sync::Arc::new(crate::secrets::AwsSecretStore::new(&sdk_config));
+
             // Initialize DynamoDB persistence
             let db_config = DbConfig::from_env();
             let dynamo_db = db::DynamoDatabase::connect(
@@ -90,6 +100,33 @@ fn start_api_server() {
                 .map_err(|e| anyhow::anyhow!("Failed to run DynamoDB migrations: {e}"))?;
             let db: std::sync::Arc<dyn db::Database> = std::sync::Arc::new(dynamo_db);
 
+            // SRV-02 / D-22: refuse to boot if the legacy plaintext
+            // slack_webhook_url row exists. Operator must migrate manually —
+            // see docs/server.md.
+            if db
+                .get_setting("slack_webhook_url")
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to check legacy slack_webhook_url: {e}"))?
+                .is_some()
+            {
+                anyhow::bail!(
+                    "Legacy plaintext slack_webhook_url detected in DynamoDB Settings.\n\
+                     yard-server v1.5+ requires Slack webhook URLs to live in AWS Secrets Manager.\n\
+                     Migrate manually:\n  \
+                     1) Copy the URL out of DynamoDB:\n     \
+                        aws dynamodb get-item --table-name <yard_table> \\\n       \
+                          --key '{{\"PK\":{{\"S\":\"SETTING#slack_webhook_url\"}},\"SK\":{{\"S\":\"SETTING#slack_webhook_url\"}}}}'\n  \
+                     2) Create a Secrets Manager secret holding that URL:\n     \
+                        aws secretsmanager create-secret --name yard/slack-webhook \\\n       \
+                          --secret-string <THE_URL>\n  \
+                     3) Delete the legacy row from DynamoDB:\n     \
+                        aws dynamodb delete-item --table-name <yard_table> \\\n       \
+                          --key '{{\"PK\":{{\"S\":\"SETTING#slack_webhook_url\"}},\"SK\":{{\"S\":\"SETTING#slack_webhook_url\"}}}}'\n  \
+                     4) POST slack_webhook_secret_arn to /api/settings (or set via the UI).\n\
+                     See docs/server.md for full instructions."
+                );
+            }
+
             let github_client: std::sync::Arc<dyn GitHubApi> = std::sync::Arc::new(
                 GitHubClient::new(&github_token)
                     .map_err(|e| anyhow::anyhow!("Failed to create GitHub client: {e}"))?,
@@ -103,6 +140,7 @@ fn start_api_server() {
                 repo_name,
                 db: db.clone(),
                 event_tx,
+                secret_store: secret_store.clone(),
             });
 
             let webhook_state = Arc::new(AppState {
@@ -203,9 +241,9 @@ async fn drift_poll_loop(state: std::sync::Arc<api::dashboard::ApiState>) {
                         .as_deref(),
                     Some("true")
                 );
-                let webhook_url = state
+                let arn = state
                     .db
-                    .get_setting("slack_webhook_url")
+                    .get_setting("slack_webhook_secret_arn")
                     .await
                     .ok()
                     .flatten()
@@ -219,7 +257,7 @@ async fn drift_poll_loop(state: std::sync::Arc<api::dashboard::ApiState>) {
                     .and_then(|s| s.parse::<u32>().ok());
 
                 if slack_enabled
-                    && !webhook_url.is_empty()
+                    && !arn.is_empty()
                     && let Some(threshold) = threshold_opt
                 {
                     let cooldown_mins = state
@@ -251,6 +289,20 @@ async fn drift_poll_loop(state: std::sync::Arc<api::dashboard::ApiState>) {
                     let now = chrono::Utc::now();
                     match alerting::threshold::evaluate(&data, &cfg, now) {
                         alerting::threshold::AlertDecision::Send => {
+                            // SRV-02 / D-25: resolve the secret only when we're
+                            // about to send. On resolve failure log + skip; do
+                            // NOT log the resolved URL anywhere (D-17 / T-25-07).
+                            let webhook_url = match state.secret_store.resolve(&arn).await {
+                                Ok(url) => url,
+                                Err(e) => {
+                                    warn!(
+                                        arn = %arn,
+                                        error = %e,
+                                        "Failed to resolve Slack webhook secret; skipping alert"
+                                    );
+                                    continue;
+                                }
+                            };
                             match alerting::slack::post_slack_alert(
                                 &webhook_url,
                                 &data,

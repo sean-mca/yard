@@ -24,6 +24,7 @@ pub struct ApiState {
     // shape are locked before downstream waves land.
     #[allow(dead_code)]
     pub event_tx: tokio::sync::broadcast::Sender<crate::api::events::Event>,
+    pub secret_store: Arc<dyn crate::secrets::SecretStore>,
 }
 
 pub fn dashboard_router(state: Arc<ApiState>) -> Router {
@@ -320,14 +321,18 @@ mod tests {
     use axum::response::IntoResponse;
 
     fn test_state() -> Arc<ApiState> {
+        use crate::secrets::test_support::InMemorySecretStore;
         let db = Arc::new(InMemoryDb::new());
         let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
+        let secret_store: Arc<dyn crate::secrets::SecretStore> =
+            Arc::new(InMemorySecretStore::new(std::collections::HashMap::new()));
         Arc::new(ApiState {
             github_token: "t".into(),
             repo_owner: "o".into(),
             repo_name: "r".into(),
             db: db as Arc<dyn Database>,
             event_tx,
+            secret_store,
         })
     }
 
