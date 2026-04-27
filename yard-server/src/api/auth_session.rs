@@ -77,9 +77,24 @@ pub async fn post_session(
     Json(req): Json<SessionRequest>,
 ) -> Result<Response, ApiError> {
     let Some(expected) = cfg.token.as_deref() else {
-        return Err(ApiError::Unauthorized(
-            "YARD_API_TOKEN is not configured on this server".into(),
-        ));
+        // WR-04: do NOT tell an unauthenticated caller that the server is
+        // misconfigured (no token at all → no auth) — that's a useful
+        // signal for internet scanning to map "yard-servers with auth
+        // turned off". Return the same generic "invalid token" the
+        // mismatch branch returns. Operator-facing visibility into the
+        // misconfiguration goes through tracing::error! on the server
+        // side, not the response body.
+        //
+        // In production this branch is effectively dead code:
+        // main.rs::start_api_server reads YARD_API_TOKEN via
+        // required_env, so cfg.token is always Some at boot. The branch
+        // is reachable only in tests / future configurations that allow
+        // None — fail closed and don't leak the configuration state.
+        tracing::error!(
+            "/api/auth/session called but YARD_API_TOKEN is not configured; \
+             returning generic Unauthorized to caller"
+        );
+        return Err(ApiError::Unauthorized("invalid token".into()));
     };
 
     if !ct_eq(req.token.as_bytes(), expected.as_bytes()) {
