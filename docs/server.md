@@ -13,8 +13,8 @@ v1.5 Phase 25 (auth middleware + Slack webhook secret store).
 | `YARD_WEBHOOK_SECRET` | yes | Shared secret for the GitHub webhook HMAC signature. |
 | `YARD_REPO_OWNER` | yes | Repo owner. Used by webhook routing. |
 | `YARD_REPO_NAME` | yes | Repo name. Used by webhook routing. |
-| `YARD_API_TOKEN` | yes (unless bypass) | Bearer token required on every `Authorization: Bearer <token>` header for `/api/*` requests (SRV-01). |
-| `YARD_API_AUTH_DISABLED` | no | Dev-only escape hatch. Set to a truthy value (`1`, `true`, `yes`, `on` — case-insensitive, surrounding whitespace ignored) to skip the bearer check on `/api/*`. **Off by default.** When on, the server logs a `tracing::warn!` event and prints `[WARN] /api/* AUTH DISABLED (YARD_API_AUTH_DISABLED=1)` to stderr at startup. Do not use in production. |
+| `YARD_API_TOKEN` | yes (always) | Bearer token required on every `Authorization: Bearer <token>` header for `/api/*` requests (SRV-01). Required even when `YARD_API_AUTH_DISABLED` is set, because non-loopback callers still go through the standard bearer check (see `YARD_API_AUTH_DISABLED`). |
+| `YARD_API_AUTH_DISABLED` | no | Dev-only escape hatch. Set to a truthy value (`1`, `true`, `yes`, `on` — case-insensitive, surrounding whitespace ignored) to skip the bearer check **for loopback callers only** (`127.0.0.1`, `::1`). Non-loopback callers ALWAYS go through the standard bearer check. **Off by default.** When on, the server logs a `tracing::warn!` event and prints `[WARN] /api/* AUTH BYPASS ENABLED FOR LOOPBACK CALLERS (YARD_API_AUTH_DISABLED=1)` to stderr at startup. `YARD_API_TOKEN` is required even when this is set, so non-loopback callers can authenticate via header. Do not use in production. |
 | `YARD_PORT` | no | Listen port. Defaults to `3001`. |
 | `YARD_DB_TABLE_PREFIX` | no | DynamoDB table-name prefix. Defaults to `yard`. |
 | `YARD_DB_REGION` / `AWS_REGION` | no | AWS region for the DynamoDB and Secrets Manager clients. |
@@ -45,15 +45,14 @@ no external crypto crate is involved.
 
 When `YARD_API_AUTH_DISABLED` is set to a truthy value (`1`, `true`, `yes`, or `on` — case-insensitive, surrounding whitespace ignored):
 
-- The server boots without `YARD_API_TOKEN`.
+- The bearer check is skipped **only for callers whose source IP address is loopback** (`127.0.0.1` for IPv4 or `::1` for IPv6). Non-loopback callers still go through the standard bearer check and must present a valid `Authorization: Bearer <YARD_API_TOKEN>` header.
+- `YARD_API_TOKEN` is still required at startup so non-loopback callers can authenticate via the bearer header. Boot fails fast with the standard required-env error if `YARD_API_TOKEN` is unset.
 - A warning event lands in the structured log (`tracing::warn!`).
-- `[WARN] /api/* AUTH DISABLED (YARD_API_AUTH_DISABLED=1)` is printed to
-  stderr next to the listening banner.
-- Every `/api/*` request bypasses the bearer check.
+- `[WARN] /api/* AUTH BYPASS ENABLED FOR LOOPBACK CALLERS (YARD_API_AUTH_DISABLED=1)` is printed to stderr next to the listening banner (loopback = the same `127.0.0.1` / `::1` set the env-var table describes).
 
-The bypass is independent of the bind address — the server still listens on
-whatever `YARD_PORT` resolves to. Network exposure is the operator's
-concern (firewall, security group, container network).
+The loopback-only enforcement is based on the OS-reported peer SocketAddr (via axum's `ConnectInfo<SocketAddr>` extractor). The middleware does NOT consult `X-Forwarded-For`, `Forwarded`, or any other client-controlled header — only the immutable peer address from the kernel-level socket. If a reverse proxy terminates connections on `127.0.0.1`, the proxy itself becomes the loopback caller. **Do not terminate untrusted traffic on a loopback-bound proxy when the bypass is enabled.**
+
+This is a deliberate gap-closure for ROADMAP SC #2 ("localhost-only dev bypass") and supersedes the prior "bypass is independent of bind address" behaviour documented in earlier revisions of this file.
 
 ## Slack webhook secret migration
 
