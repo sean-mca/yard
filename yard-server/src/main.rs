@@ -378,13 +378,37 @@ async fn drift_poll_loop(state: std::sync::Arc<api::dashboard::ApiState>) {
                             // SRV-02 / D-25: resolve the secret only when we're
                             // about to send. On resolve failure log + skip; do
                             // NOT log the resolved URL anywhere (D-17 / T-25-07).
-                            let webhook_url = match state.secret_store.resolve(&arn).await {
-                                Ok(url) => url,
-                                Err(e) => {
+                            //
+                            // WR-06: cap the resolve at 5 seconds. The AWS SDK's
+                            // default standard retry mode allows up to ~3 attempts
+                            // with retries — a transient SecretsManager outage
+                            // can stall a single resolve for ~30s. While stalled,
+                            // the entire drift_poll_loop is blocked: no new drift
+                            // checks fire, no other Slack alerts are sent. A
+                            // 5-second hard ceiling bounds the pipeline-stall
+                            // surface and is enough headroom for a healthy AWS
+                            // region. Uses the already-pulled-in tokio::time —
+                            // no new dep.
+                            let webhook_url = match tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                state.secret_store.resolve(&arn),
+                            )
+                            .await
+                            {
+                                Ok(Ok(url)) => url,
+                                Ok(Err(e)) => {
                                     warn!(
                                         arn = %arn,
                                         error = %e,
                                         "Failed to resolve Slack webhook secret; skipping alert"
+                                    );
+                                    continue;
+                                }
+                                Err(_) => {
+                                    warn!(
+                                        arn = %arn,
+                                        timeout_secs = 5,
+                                        "Slack webhook secret resolve timed out; skipping alert"
                                     );
                                     continue;
                                 }
