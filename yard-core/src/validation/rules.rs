@@ -409,32 +409,8 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
         ));
     }
 
-    // Provider-specific config validation — dispatched to provider modules
-    match job.job_type {
-        JobType::Glue => {
-            let has_role = job
-                .config
-                .get("role")
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| !s.is_empty());
-            if !has_role {
-                errors.push(err(
-                    "role",
-                    "Glue jobs require a \"role\" (execution role ARN)",
-                ));
-            }
-
-            if let Some(config) = job.config.get("glue") {
-                crate::providers::glue::validate_config(config, &mut errors);
-            }
-        }
-        JobType::Emr => {
-            if let Some(config) = job.config.get("emr") {
-                crate::providers::emr::validate_config(config, &mut errors);
-            }
-        }
-        JobType::Bash => {}
-    }
+    // Provider-specific config validation — dispatched to the provider registry.
+    crate::providers::validate_provider_config(job.job_type, &job.config, &mut errors);
 
     errors
 }

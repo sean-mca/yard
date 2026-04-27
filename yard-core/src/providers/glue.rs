@@ -377,7 +377,27 @@ const VALID_WORKER_TYPES: &[&str] = &["G.025X", "G.1X", "G.2X", "G.4X", "G.8X", 
 const VALID_BOOKMARK_VALUES: &[&str] = &["enabled", "disabled"];
 
 pub fn validate_config(config: &serde_json::Value, errors: &mut Vec<ValidationError>) {
-    if let Some(wt) = config.get("worker_type").and_then(|v| v.as_str())
+    // Glue-specific top-level requirement: a `role` (execution role ARN) must be set.
+    // Moved from `validation/rules.rs:415-426` per Phase 24 D-09 — Glue-specific rules
+    // belong in the Glue module, not in the workspace-wide rule dispatcher.
+    let has_role = config
+        .get("role")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty());
+    if !has_role {
+        errors.push(validation_err(
+            "role",
+            "Glue jobs require a \"role\" (execution role ARN)",
+        ));
+    }
+
+    // Inner-block validation — the dispatcher (providers::validate_provider_config)
+    // now passes the full job_config, so we extract the `glue` block here.
+    let Some(inner) = config.get("glue") else {
+        return;
+    };
+
+    if let Some(wt) = inner.get("worker_type").and_then(|v| v.as_str())
         && !VALID_WORKER_TYPES.contains(&wt)
     {
         errors.push(validation_err(
@@ -390,7 +410,7 @@ pub fn validate_config(config: &serde_json::Value, errors: &mut Vec<ValidationEr
         ));
     }
 
-    if let Some(n) = config.get("number_of_workers").and_then(|v| v.as_i64())
+    if let Some(n) = inner.get("number_of_workers").and_then(|v| v.as_i64())
         && n < 1
     {
         errors.push(validation_err(
@@ -399,7 +419,7 @@ pub fn validate_config(config: &serde_json::Value, errors: &mut Vec<ValidationEr
         ));
     }
 
-    if let Some(v) = config.get("glue_version").and_then(|v| v.as_str())
+    if let Some(v) = inner.get("glue_version").and_then(|v| v.as_str())
         && !["3.0", "4.0", "5.0"].contains(&v)
     {
         errors.push(validation_err(
@@ -411,7 +431,7 @@ pub fn validate_config(config: &serde_json::Value, errors: &mut Vec<ValidationEr
         ));
     }
 
-    if let Some(t) = config.get("timeout").and_then(|v| v.as_i64())
+    if let Some(t) = inner.get("timeout").and_then(|v| v.as_i64())
         && t < 1
     {
         errors.push(validation_err(
@@ -420,13 +440,13 @@ pub fn validate_config(config: &serde_json::Value, errors: &mut Vec<ValidationEr
         ));
     }
 
-    if let Some(r) = config.get("max_retries").and_then(|v| v.as_i64())
+    if let Some(r) = inner.get("max_retries").and_then(|v| v.as_i64())
         && r < 0
     {
         errors.push(validation_err("glue.max_retries", "cannot be negative"));
     }
 
-    if let Some(b) = config.get("bookmark").and_then(|v| v.as_str())
+    if let Some(b) = inner.get("bookmark").and_then(|v| v.as_str())
         && !VALID_BOOKMARK_VALUES.contains(&b)
     {
         errors.push(validation_err(
@@ -439,7 +459,7 @@ pub fn validate_config(config: &serde_json::Value, errors: &mut Vec<ValidationEr
         ));
     }
 
-    if let Some(conns) = config.get("connections")
+    if let Some(conns) = inner.get("connections")
         && !conns.is_array()
     {
         errors.push(validation_err(
@@ -448,7 +468,7 @@ pub fn validate_config(config: &serde_json::Value, errors: &mut Vec<ValidationEr
         ));
     }
 
-    if let Some(args) = config.get("default_arguments")
+    if let Some(args) = inner.get("default_arguments")
         && !args.is_object()
     {
         errors.push(validation_err(
