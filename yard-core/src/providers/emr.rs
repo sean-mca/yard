@@ -235,7 +235,7 @@ impl Provider for EmrProvider {
 const VALID_ACTION_ON_FAILURE: &[&str] =
     &["CONTINUE", "CANCEL_AND_WAIT", "TERMINATE_CLUSTER"];
 
-pub fn validate_config(config: &Value, errors: &mut Vec<ValidationError>) {
+pub(crate) fn validate_config(config: &Value, errors: &mut Vec<ValidationError>) {
     if let Some(aof) = config.get("action_on_failure").and_then(|v| v.as_str())
         && !VALID_ACTION_ON_FAILURE.contains(&aof)
     {

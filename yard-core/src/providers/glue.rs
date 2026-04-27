@@ -376,7 +376,7 @@ impl Provider for GlueProvider {
 const VALID_WORKER_TYPES: &[&str] = &["G.025X", "G.1X", "G.2X", "G.4X", "G.8X", "Z.2X"];
 const VALID_BOOKMARK_VALUES: &[&str] = &["enabled", "disabled"];
 
-pub fn validate_config(config: &serde_json::Value, errors: &mut Vec<ValidationError>) {
+pub(crate) fn validate_config(config: &serde_json::Value, errors: &mut Vec<ValidationError>) {
     // Glue-specific top-level requirement: a `role` (execution role ARN) must be set.
     // Moved from `validation/rules.rs:415-426` per Phase 24 D-09 — Glue-specific rules
     // belong in the Glue module, not in the workspace-wide rule dispatcher.
