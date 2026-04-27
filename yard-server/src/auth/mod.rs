@@ -1,11 +1,29 @@
 //! Bearer-token authentication middleware for /api/* endpoints (SRV-01).
 //!
-//! `AuthConfig::token = Some(s)` requires every request to carry an
-//! `Authorization: Bearer <s>` header (constant-time compared). When the
-//! `bypass_loopback` flag is set AND the caller's source SocketAddr is
-//! loopback (127.0.0.0/8 or ::1), the bearer check is skipped. Non-loopback
-//! callers ALWAYS go through the standard bearer path even when the flag
-//! is on.
+//! `AuthConfig::token = Some(s)` requires every request to carry EITHER an
+//! `Authorization: Bearer <s>` header OR a `yard_session=<s>` cookie
+//! (constant-time compared). When the `bypass_loopback` flag is set AND
+//! the caller's source SocketAddr is loopback (127.0.0.0/8 or ::1), the
+//! credential check is skipped. Non-loopback callers ALWAYS go through
+//! the standard credential path even when the flag is on.
+//!
+//! ## Two transports, one credential (Plan 25-04 Gap A)
+//!
+//! Both transports carry the SAME single operator token (`YARD_API_TOKEN`).
+//! The header path serves CLI / automation callers (curl, scripts, CI). The
+//! cookie path serves the browser-bundled Dioxus UI: browsers do NOT let a
+//! WASM bundle set arbitrary `Authorization` headers on cross-origin or
+//! WebSocket-upgrade requests, but they automatically include same-origin
+//! cookies on every fetch and on the WebSocket handshake. Carrying the
+//! token via a `HttpOnly` cookie lets the UI authenticate without ever
+//! materialising the token in JS-readable memory. The cookie value IS the
+//! `YARD_API_TOKEN` — same security level as the bearer header (forging
+//! either requires guessing the token); no separate session table.
+//!
+//! When both credentials are present on a single request, the header takes
+//! precedence over the cookie. Failure messages do NOT distinguish which
+//! credential type was attempted — the standard fail-undifferentiated
+//! pattern.
 //!
 //! **REVERSES CONTEXT D-08 by deliberate gap-closure decision.** The
 //! prior shipped implementation made `YARD_API_AUTH_DISABLED=1` skip the
@@ -21,12 +39,20 @@ use std::sync::Arc;
 
 use axum::{
     extract::{ConnectInfo, Request, State},
-    http::header::AUTHORIZATION,
+    http::HeaderMap,
+    http::header::{AUTHORIZATION, COOKIE},
     middleware::Next,
     response::Response,
 };
 
 use crate::api::error::ApiError;
+
+/// Name of the HttpOnly session cookie that the bundled Dioxus UI uses to
+/// transport the `YARD_API_TOKEN` to /api/* requests (including the
+/// WebSocket upgrade handshake). Single source of truth shared between
+/// the auth middleware here and the `/api/auth/session` + `/api/auth/logout`
+/// endpoints in `crate::api::auth_session`.
+pub const COOKIE_NAME: &str = "yard_session";
 
 /// Configuration for the bearer-token middleware.
 ///
@@ -53,11 +79,11 @@ pub struct AuthConfig {
 }
 
 /// Axum middleware that requires `Authorization: Bearer <YARD_API_TOKEN>`
-/// on every request unless the dev bypass is on AND the source SocketAddr
-/// is loopback.
+/// OR `Cookie: yard_session=<YARD_API_TOKEN>` on every request unless the
+/// dev bypass is on AND the source SocketAddr is loopback.
 ///
 /// Returns 401 with `{error, status: 401}` body via the
-/// `ApiError::Unauthorized` variant on missing/malformed/invalid header.
+/// `ApiError::Unauthorized` variant on missing/malformed/invalid credential.
 ///
 /// The `ConnectInfo<SocketAddr>` extractor reflects the OS-reported peer
 /// address (NOT any X-Forwarded-For / Forwarded header — see threat model
@@ -71,36 +97,93 @@ pub async fn require_bearer(
     // Loopback-only bypass (REVERSES CONTEXT D-08 per gap-closure
     // decision). When the operator opts into bypass via
     // YARD_API_AUTH_DISABLED, only loopback callers skip the check;
-    // non-loopback callers fall through to the standard bearer path.
+    // non-loopback callers fall through to the standard credential path.
     if cfg.bypass_loopback && is_loopback(&addr) {
         return Ok(next.run(req).await);
     }
 
-    // Bearer check. With the new shape, an operator who sets
+    // Single source of truth: header-OR-cookie credential check (Plan 25-04
+    // Gap A). With the new shape, an operator who sets
     // YARD_API_AUTH_DISABLED=1 but forgets YARD_API_TOKEN correctly sees
     // non-loopback callers get 401 (fail-closed). The "no token configured
     // = bypass enabled" behaviour from the original implementation is
     // replaced by the explicit `bypass_loopback` flag.
     let Some(expected) = cfg.token.as_deref() else {
         return Err(ApiError::Unauthorized(
-            "missing or malformed Authorization header".into(),
+            "missing Authorization header and yard_session cookie".into(),
         ));
     };
 
-    let header = req
-        .headers()
+    check_credential(req.headers(), expected.as_bytes())?;
+
+    Ok(next.run(req).await)
+}
+
+/// Resolve "is one of header-bearer / cookie-token valid against `expected`?"
+/// in a single place. Future rotation, audit, per-route policy lands here.
+///
+/// Header takes precedence over cookie when both are present (CLI /
+/// automation should win over the browser's automatic cookie inclusion).
+/// Failure messages do NOT distinguish which credential type was attempted
+/// — the standard fail-undifferentiated pattern.
+///
+/// Returns `Ok(())` when one credential matches; `Err(ApiError::Unauthorized)`
+/// on missing-both or invalid.
+fn check_credential(headers: &HeaderMap, expected: &[u8]) -> Result<(), ApiError> {
+    // Try the Authorization: Bearer header first (CLI / automation /
+    // explicit-credential callers).
+    let header_token: Option<Vec<u8>> = headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
-        .ok_or_else(|| {
-            ApiError::Unauthorized("missing or malformed Authorization header".into())
-        })?;
+        .map(|s| s.as_bytes().to_vec());
 
-    if !ct_eq(header.as_bytes(), expected.as_bytes()) {
-        return Err(ApiError::Unauthorized("invalid bearer token".into()));
+    // Fall back to the yard_session cookie (browser callers — the WASM
+    // bundle's reqwest fetch() + the WebSocket upgrade both include the
+    // same-origin cookie automatically; browsers don't let WASM set
+    // arbitrary headers on those calls).
+    let cookie_token: Option<Vec<u8>> = extract_cookie_token(headers);
+
+    let presented = match (header_token, cookie_token) {
+        (Some(h), _) => h,
+        (None, Some(c)) => c,
+        (None, None) => {
+            return Err(ApiError::Unauthorized(
+                "missing Authorization header and yard_session cookie".into(),
+            ));
+        }
+    };
+
+    if !ct_eq(&presented, expected) {
+        return Err(ApiError::Unauthorized("invalid credential".into()));
     }
 
-    Ok(next.run(req).await)
+    Ok(())
+}
+
+/// Extract the value of the `yard_session` cookie from the request headers.
+/// Returns `Some(value_bytes)` if present, `None` otherwise.
+///
+/// Cookie parsing is intentionally minimal — split on `;`, trim whitespace,
+/// match the literal prefix `yard_session=`. Does NOT URL-decode or
+/// percent-decode the value (the value is the operator's `YARD_API_TOKEN`
+/// which is opaque bytes; if the operator chose a token containing reserved
+/// cookie characters that's their problem and the encoded form would not
+/// match the constant-time compare anyway). No `cookie` crate dep — PRES-03.
+///
+/// Returns `Vec<u8>` rather than `&[u8]` to avoid lifetime entanglement
+/// with `req.headers()` across the subsequent `next.run(req).await`
+/// suspension point if a caller wants to hold onto the value.
+fn extract_cookie_token(headers: &HeaderMap) -> Option<Vec<u8>> {
+    let raw = headers.get(COOKIE)?.to_str().ok()?;
+    let prefix = format!("{COOKIE_NAME}=");
+    for piece in raw.split(';') {
+        let piece = piece.trim();
+        if let Some(value) = piece.strip_prefix(prefix.as_str()) {
+            return Some(value.as_bytes().to_vec());
+        }
+    }
+    None
 }
 
 /// True if the SocketAddr's IP is loopback (covers 127.0.0.0/8 and ::1).
@@ -118,7 +201,11 @@ fn is_loopback(addr: &SocketAddr) -> bool {
 /// token length and the attacker has to guess 2^N bits per byte once
 /// the length is known — content equality is the dominant attack
 /// surface). Closes T-25-06.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+///
+/// `pub(crate)` so `crate::api::auth_session::post_session` can constant-time
+/// compare the inbound request body's `token` field against `AuthConfig.token`
+/// without re-implementing the helper.
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -442,6 +529,87 @@ mod tests {
                 "Authorization",
                 "Bearer s3cret",
                 remote_addr(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // -- New gap-A tests (cookie-based auth — Plan 25-04) --
+
+    /// Gap A: cookie-based auth — yard_session cookie alone is sufficient.
+    #[tokio::test]
+    async fn cookie_only_returns_200() {
+        let app = build_router(AuthConfig {
+            token: Some("s3cret".into()),
+            bypass_loopback: false,
+        });
+        let resp = app
+            .oneshot(req_with_header_and_addr(
+                "/api/protected",
+                "Cookie",
+                "yard_session=s3cret",
+                loopback_addr(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Gap A: invalid cookie value → 401 (does not silently fall back to "no auth").
+    #[tokio::test]
+    async fn invalid_cookie_returns_401() {
+        let app = build_router(AuthConfig {
+            token: Some("s3cret".into()),
+            bypass_loopback: false,
+        });
+        let resp = app
+            .oneshot(req_with_header_and_addr(
+                "/api/protected",
+                "Cookie",
+                "yard_session=wrong",
+                loopback_addr(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Gap A: header takes precedence over cookie when both are present.
+    /// Valid header + invalid cookie → 200 (header wins).
+    #[tokio::test]
+    async fn header_takes_precedence_over_cookie_valid_header_wins() {
+        let app = build_router(AuthConfig {
+            token: Some("s3cret".into()),
+            bypass_loopback: false,
+        });
+        let mut req = Request::builder()
+            .uri("/api/protected")
+            .header("Authorization", "Bearer s3cret")
+            .header("Cookie", "yard_session=wrong")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo::<SocketAddr>(loopback_addr()));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Gap A: cookie among multiple cookies on the same Cookie header.
+    /// Server-side cookie parsing handles `; `-separated lists — exercise it
+    /// to prove the helper works against real browser-emitted Cookie shape.
+    #[tokio::test]
+    async fn cookie_alongside_other_cookies_returns_200() {
+        let app = build_router(AuthConfig {
+            token: Some("s3cret".into()),
+            bypass_loopback: false,
+        });
+        let resp = app
+            .oneshot(req_with_header_and_addr(
+                "/api/protected",
+                "Cookie",
+                "theme=dark; yard_session=s3cret; locale=en",
+                loopback_addr(),
             ))
             .await
             .unwrap();
