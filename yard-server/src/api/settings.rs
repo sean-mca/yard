@@ -46,9 +46,9 @@ fn validate_setting(key: &str, value: &str) -> Result<(), String> {
         ),
         "slack_webhook_secret_arn" => {
             // Empty value is the documented "operator may clear" path.
-            if value.is_empty() {
-                Ok(())
-            } else if value.starts_with("arn:aws:secretsmanager:") {
+            // Otherwise require a Secrets Manager ARN prefix; reject the
+            // common mistake of pasting a Slack URL directly.
+            if value.is_empty() || value.starts_with("arn:aws:secretsmanager:") {
                 Ok(())
             } else if value.starts_with("https://hooks.slack.com/") {
                 Err("slack_webhook_secret_arn must be a Secrets Manager ARN, not a Slack URL. \
