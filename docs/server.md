@@ -19,6 +19,7 @@ v1.5 Phase 25 (auth middleware + Slack webhook secret store).
 | `YARD_DB_TABLE_PREFIX` | no | DynamoDB table-name prefix. Defaults to `yard`. |
 | `YARD_DB_REGION` / `AWS_REGION` | no | AWS region for the DynamoDB and Secrets Manager clients. |
 | `YARD_DB_ENDPOINT_URL` | no | Override the DynamoDB endpoint (e.g., for LocalStack tests). |
+| `YARD_CORS_ORIGIN` | no | A single allowed origin (e.g. `https://dashboard.example.com`) for the CORS preflight. When set, only that origin's `fetch()` requests succeed CORS preflight against `/api/*`. When unset, the server falls back to `AllowOrigin::any()` for dev convenience — set this in production to scope cross-origin reachability of `/api/auth/session` and friends to a single known origin. The CORS layer is incompatible with credentials regardless of this knob (per the CORS spec), so the cookie-auth attack surface is unaffected; this knob narrows drive-by preflight reachability. |
 
 The `Authorization: Bearer ...` header applies to every endpoint under `/api/*`
 including the WebSocket upgrade at `/api/ws/events`. The bundled Dioxus UI uses

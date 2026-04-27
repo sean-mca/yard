@@ -65,7 +65,8 @@ fn start_api_server() {
     use std::sync::Arc;
     use tower_governor::GovernorLayer;
     use tower_governor::governor::GovernorConfigBuilder;
-    use tower_http::cors::{Any, CorsLayer};
+    use axum::http::{Method, header::{AUTHORIZATION, CONTENT_TYPE}};
+    use tower_http::cors::{AllowOrigin, CorsLayer};
     use tower_http::trace::TraceLayer;
 
     // Initialize structured logging (controlled via RUST_LOG env var)
@@ -222,10 +223,44 @@ fn start_api_server() {
                 api_state: api_state.clone(),
             });
 
+            // BL-01: scope CORS to the cookie-auth model's same-origin
+            // assumption. Previously this layer was open (allow_origin(Any)
+            // + allow_methods(Any) + allow_headers(Any)) which (a) let any
+            // origin drive-by probe /api/auth/session at 30 RPS via a
+            // victim's browser, and (b) prevented future CSRF-token-style
+            // mitigations because the server lost the same-origin signal.
+            //
+            // Operator opts in via YARD_CORS_ORIGIN (a single origin, e.g.
+            // `https://dashboard.example.com`). When set, only that origin
+            // gets a successful CORS preflight. When unset, fall back to
+            // AllowOrigin::any() to preserve the current open-by-default
+            // dev-friendly behaviour — but with tighter methods / headers
+            // so the preflight grants only what the UI actually uses.
+            //
+            // Methods: GET (read endpoints, dashboard / drift / settings,
+            // EventSource, WebSocket upgrade), POST (auth/session,
+            // auth/logout, settings writes, GitHub webhook).
+            //
+            // Headers: Content-Type (JSON bodies on POSTs), Authorization
+            // (CLI / automation Bearer header path; the cookie path does
+            // not need a CORS-allowed header since cookies are not
+            // request headers from the application's perspective).
+            //
+            // SameSite=Strict on yard_session still prevents the cookie
+            // from riding cross-origin requests, and AllowOrigin::any()
+            // is incompatible with credentials per the CORS spec, so the
+            // cookie-auth attack surface is unchanged. This fix narrows
+            // the preflight surface and gives operators a knob to scope
+            // origins explicitly.
+            let allow_origin = std::env::var("YARD_CORS_ORIGIN")
+                .ok()
+                .and_then(|s| s.parse::<axum::http::HeaderValue>().ok())
+                .map(AllowOrigin::exact)
+                .unwrap_or_else(AllowOrigin::any);
             let cors = CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any);
+                .allow_origin(allow_origin)
+                .allow_methods([Method::GET, Method::POST])
+                .allow_headers([CONTENT_TYPE, AUTHORIZATION]);
 
             let rate_limit_config = GovernorConfigBuilder::default()
                 .per_second(30)
