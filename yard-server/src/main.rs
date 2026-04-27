@@ -9,6 +9,8 @@ mod github;
 #[cfg(not(target_arch = "wasm32"))]
 mod alerting;
 #[cfg(not(target_arch = "wasm32"))]
+mod auth;
+#[cfg(not(target_arch = "wasm32"))]
 mod secrets;
 mod types;
 mod ui;
@@ -77,6 +79,27 @@ fn start_api_server() {
             let webhook_secret = required_env("YARD_WEBHOOK_SECRET")?;
             let repo_owner = required_env("YARD_REPO_OWNER")?;
             let repo_name = required_env("YARD_REPO_NAME")?;
+
+            // SRV-01 / D-07: explicit, off-by-default dev bypass.
+            // Truthy values are "1" / "true" / "TRUE" exactly. Anything else
+            // (including unset and empty) keeps the bypass off.
+            let auth_disabled = std::env::var("YARD_API_AUTH_DISABLED")
+                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
+                .unwrap_or(false);
+
+            let api_token: Option<String> = if auth_disabled {
+                tracing::warn!(
+                    "YARD_API_AUTH_DISABLED=1 — /api/* endpoints are unauthenticated. \
+                     DO NOT use in production."
+                );
+                eprintln!("[WARN] /api/* AUTH DISABLED (YARD_API_AUTH_DISABLED=1)");
+                None
+            } else {
+                Some(required_env("YARD_API_TOKEN")?)
+            };
+
+            let auth_config =
+                std::sync::Arc::new(crate::auth::AuthConfig { token: api_token });
 
             // SRV-02 / D-18: shared aws_config provider chain. Built once and
             // reused for the SecretsManager client so credentials and region
@@ -162,13 +185,25 @@ fn start_api_server() {
                 .expect("Failed to build rate limiter config");
             let rate_limit = GovernorLayer::new(Arc::new(rate_limit_config));
 
-            let router = axum::Router::new()
-                .merge(github_router(webhook_state))
+            // SRV-01 / D-05: api routes (everything except the GitHub webhook,
+            // which is HMAC-secured separately) sit behind the bearer layer.
+            // Build them as a sub-router, layer auth, then merge into the
+            // parent. The webhook router is merged at the parent level so its
+            // `POST /api/webhook/github` path bypasses the bearer check.
+            let api_routes = axum::Router::new()
                 .merge(dashboard_router(api_state.clone()))
                 .merge(jobs_router(api_state.clone()))
                 .merge(drift_router(api_state.clone()))
                 .merge(settings_router(api_state.clone()))
                 .merge(api::events::events_router(api_state.clone()))
+                .layer(axum::middleware::from_fn_with_state(
+                    auth_config.clone(),
+                    crate::auth::require_bearer,
+                ));
+
+            let router = axum::Router::new()
+                .merge(github_router(webhook_state))
+                .merge(api_routes)
                 .layer(rate_limit)
                 .layer(cors)
                 .layer(TraceLayer::new_for_http());
