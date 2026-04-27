@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use super::api_base;
+use super::fetch::{get_json, post_json, post_no_body};
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Theme {
@@ -21,25 +22,16 @@ impl Theme {
     }
 }
 
+#[derive(Deserialize, Default)]
+struct SettingsResponse {
+    settings: HashMap<String, String>,
+}
+
 async fn fetch_settings() -> Result<HashMap<String, String>, String> {
-    let resp = reqwest::get(format!("{}/api/settings", api_base()))
-        .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Server error: {}", resp.status()));
-    }
-
-    #[derive(Deserialize)]
-    struct SettingsResponse {
-        settings: HashMap<String, String>,
-    }
-
-    let body = resp
-        .json::<SettingsResponse>()
-        .await
-        .map_err(|e| format!("Parse failed: {e}"))?;
-
+    // 401-redirect, status, and parse-error handling are centralised in
+    // ui::fetch::get_json (Plan 25-05 Gap A).
+    let body =
+        get_json::<SettingsResponse>(&format!("{}/api/settings", api_base())).await?;
     Ok(body.settings)
 }
 
@@ -51,20 +43,21 @@ struct SettingsPayload {
 async fn save_setting(key: &str, value: &str) -> Result<(), String> {
     let mut settings = HashMap::new();
     settings.insert(key.to_string(), value.to_string());
+    // 401-redirect, status handling are centralised in
+    // ui::fetch::post_json (Plan 25-05 Gap A).
+    post_json(
+        &format!("{}/api/settings", api_base()),
+        &SettingsPayload { settings },
+    )
+    .await
+}
 
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{}/api/settings", api_base()))
-        .json(&SettingsPayload { settings })
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Server error: {}", resp.status()));
-    }
-
-    Ok(())
+/// POST /api/auth/logout to clear the yard_session cookie. Server returns
+/// 204 + Set-Cookie: yard_session=; Max-Age=0, which the browser uses to
+/// drop the cookie immediately. Caller is responsible for navigating to
+/// /login afterwards.
+async fn post_logout() -> Result<(), String> {
+    post_no_body(&format!("{}/api/auth/logout", api_base())).await
 }
 
 #[component]
@@ -186,6 +179,60 @@ pub fn Settings(theme: Signal<Theme>) -> Element {
                     }
                 }
 
+                Divider {}
+
+                // Sign Out (Plan 25-05 Gap A — closes "no Sign Out button"
+                // tech-debt). POSTs /api/auth/logout (clears yard_session
+                // cookie via Set-Cookie: Max-Age=0), then navigates the
+                // browser to /login on WASM target.
+                SettingsSection {
+                    title: "Session",
+                    description: "Sign out of the dashboard. CLI / automation callers using Authorization: Bearer are unaffected.",
+                }
+                SignOutButton {}
+
+            }
+        }
+    }
+}
+
+#[component]
+fn SignOutButton() -> Element {
+    let mut signing_out = use_signal(|| false);
+    let mut error = use_signal(String::new);
+
+    rsx! {
+        div { class: "mt-3",
+            button {
+                r#type: "button",
+                disabled: signing_out(),
+                class: "px-3 py-1.5 text-sm font-medium rounded-md border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800 disabled:opacity-50 cursor-pointer disabled:cursor-not-allowed transition-colors",
+                onclick: move |_| {
+                    signing_out.set(true);
+                    error.set(String::new());
+                    spawn(async move {
+                        match post_logout().await {
+                            Ok(()) => {
+                                #[cfg(target_arch = "wasm32")]
+                                {
+                                    use crate::Route;
+                                    use dioxus::prelude::navigator;
+                                    navigator().push(Route::Login {});
+                                }
+                            }
+                            Err(msg) => {
+                                error.set(format!("Sign out failed: {msg}"));
+                            }
+                        }
+                        signing_out.set(false);
+                    });
+                },
+                if signing_out() { "Signing out..." } else { "Sign out" }
+            }
+            if !error().is_empty() {
+                div { class: "mt-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700",
+                    "{error}"
+                }
             }
         }
     }

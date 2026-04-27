@@ -2,6 +2,7 @@ use dioxus::prelude::*;
 use dioxus_query::prelude::*;
 use std::time::Duration;
 
+use super::fetch::get_json;
 use super::sheet::Sheet;
 use crate::types::*;
 
@@ -21,19 +22,9 @@ impl QueryCapability for DriftQuery {
     type Keys = ();
 
     async fn run(&self, _: &Self::Keys) -> Result<Self::Ok, Self::Err> {
-        let resp = reqwest::get(format!("{}/api/drift/cached", api_base()))
-            .await
-            .map_err(|e| format!("Request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Server error ({status}): {body}"));
-        }
-
-        resp.json::<DriftData>()
-            .await
-            .map_err(|e| format!("Failed to parse response: {e}"))
+        // 401-redirect, status, and parse-error handling are centralised in
+        // ui::fetch::get_json (Plan 25-05 Gap A).
+        get_json::<DriftData>(&format!("{}/api/drift/cached", api_base())).await
     }
 }
 

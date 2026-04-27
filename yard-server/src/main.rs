@@ -28,6 +28,12 @@ enum Route {
     Drift {},
     #[route("/settings")]
     Settings {},
+    // Plan 25-05 Gap A: /login is reachable WITHOUT auth (it's the page that
+    // enables auth). The Shell component below short-circuits on
+    // `Route::Login {}` and renders just the bare Login page (no sidebar /
+    // top-bar chrome) so the login page is visually unambiguous.
+    #[route("/login")]
+    Login {},
 }
 
 fn main() {
@@ -494,6 +500,13 @@ fn Shell() -> Element {
     let route: Route = use_route();
     let theme: Signal<ui::settings::Theme> = use_context();
 
+    // Plan 25-05 Gap A: /login renders bare (no sidebar/topbar). Short-
+    // circuit BEFORE we set up ConnectionCtx / spawn the WS task so the
+    // login page makes no API calls and has no auth dependencies.
+    if matches!(route, Route::Login {}) {
+        return rsx! { Outlet::<Route> {} };
+    }
+
     let is_dark = matches!(theme(), ui::settings::Theme::Dark);
 
     let title = match &route {
@@ -501,6 +514,9 @@ fn Shell() -> Element {
         Route::Jobs {} => "Jobs",
         Route::Drift {} => "Drift",
         Route::Settings {} => "Settings",
+        // Unreachable: short-circuited above. Kept exhaustive so adding a
+        // future Route::* arm doesn't silently break the title bar.
+        Route::Login {} => "",
     };
 
     // Phase 7: provide ConnectionCtx + spawn the WS task (wasm32 only).
@@ -577,6 +593,11 @@ fn Drift() -> Element {
 fn Settings() -> Element {
     let theme: Signal<ui::settings::Theme> = use_context();
     rsx! { ui::settings::Settings { theme } }
+}
+
+#[component]
+fn Login() -> Element {
+    rsx! { ui::login::Login {} }
 }
 
 #[cfg(test)]
