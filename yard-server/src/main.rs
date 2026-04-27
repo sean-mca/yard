@@ -373,7 +373,31 @@ async fn drift_poll_loop(state: std::sync::Arc<api::dashboard::ApiState>) {
                                     }
                                 }
                                 Err(e) => {
-                                    warn!(error = %e, "Slack alert POST failed");
+                                    // SRV-02 / D-17 / T-25-07: do NOT use the
+                                    // reqwest::Error Display impl directly —
+                                    // it embeds the request URL (the resolved
+                                    // Slack webhook secret) for connect /
+                                    // timeout / error_for_status variants.
+                                    // Log structured fields that never include
+                                    // the URL.
+                                    let kind = if e.is_timeout() {
+                                        "timeout"
+                                    } else if e.is_connect() {
+                                        "connect"
+                                    } else if e.is_request() {
+                                        "request"
+                                    } else if e.is_body() {
+                                        "body"
+                                    } else if e.is_decode() {
+                                        "decode"
+                                    } else {
+                                        "other"
+                                    };
+                                    warn!(
+                                        kind = kind,
+                                        status = e.status().map(|s| s.as_u16()),
+                                        "Slack alert POST failed"
+                                    );
                                 }
                             }
                         }
