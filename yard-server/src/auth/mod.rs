@@ -180,6 +180,21 @@ fn extract_cookie_token(headers: &HeaderMap) -> Option<Vec<u8>> {
     for piece in raw.split(';') {
         let piece = piece.trim();
         if let Some(value) = piece.strip_prefix(prefix.as_str()) {
+            // WR-03: an empty cookie value (`Cookie: yard_session=`) is "no
+            // credential present", not "presented an invalid credential".
+            // Treating it as the latter (a) leaks to the caller which
+            // credential they attempted (the failure message differs from
+            // the missing-both case), violating the doc-comment's
+            // fail-undifferentiated promise, and (b) is benignly reachable
+            // immediately after /api/auth/logout where the Max-Age=0 clear
+            // can briefly surface an empty-valued cookie on subsequent
+            // requests in some browsers. Return None so the caller falls
+            // through to the missing-both branch and emits the standard
+            // "missing Authorization header and yard_session cookie"
+            // message.
+            if value.is_empty() {
+                return None;
+            }
             return Some(value.as_bytes().to_vec());
         }
     }
@@ -614,5 +629,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// WR-03: empty `yard_session=` cookie is treated as "no credential",
+    /// not "invalid credential". Reachable benignly right after logout
+    /// (Max-Age=0 cookies surface as empty-valued in some browsers
+    /// before the cookie store garbage-collects them).
+    #[tokio::test]
+    async fn empty_cookie_value_treated_as_missing_credential() {
+        let app = build_router(AuthConfig {
+            token: Some("s3cret".into()),
+            bypass_loopback: false,
+        });
+        let resp = app
+            .oneshot(req_with_header_and_addr(
+                "/api/protected",
+                "Cookie",
+                "yard_session=",
+                loopback_addr(),
+            ))
+            .await
+            .unwrap();
+        // Still a 401 (no valid credential), but the failure path is now
+        // the missing-both branch, not the invalid-credential branch.
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }
