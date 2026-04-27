@@ -18,12 +18,9 @@ const SUPPORTED_TRANSFORM_TYPES: &[&str] = &[
     "window",
 ];
 
-pub fn err(field: &str, message: &str) -> ValidationError {
-    ValidationError {
-        field: field.to_string(),
-        message: message.to_string(),
-    }
-}
+// Single canonical ValidationError constructor lives in `providers::validation_err`.
+// Re-exported here as `err` so the existing call sites in this module stay terse.
+pub use crate::providers::validation_err as err;
 
 pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
     let mut errors = Vec::new();
@@ -409,32 +406,8 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
         ));
     }
 
-    // Provider-specific config validation — dispatched to provider modules
-    match job.job_type {
-        JobType::Glue => {
-            let has_role = job
-                .config
-                .get("role")
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| !s.is_empty());
-            if !has_role {
-                errors.push(err(
-                    "role",
-                    "Glue jobs require a \"role\" (execution role ARN)",
-                ));
-            }
-
-            if let Some(config) = job.config.get("glue") {
-                crate::providers::glue::validate_config(config, &mut errors);
-            }
-        }
-        JobType::Emr => {
-            if let Some(config) = job.config.get("emr") {
-                crate::providers::emr::validate_config(config, &mut errors);
-            }
-        }
-        JobType::Bash => {}
-    }
+    // Provider-specific config validation — dispatched to the provider registry.
+    crate::providers::validate_provider_config(job.job_type, &job.config, &mut errors);
 
     errors
 }

@@ -2,10 +2,41 @@ use super::{Provider, S3ScriptOps, aws_config, validation_err};
 use anyhow::{Context, Result, anyhow};
 use aws_sdk_emr::Client as EmrClient;
 use aws_sdk_s3::Client as S3Client;
+use serde::Deserialize;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 use yard_structs::{Resource, ResourceStatus, ValidationError};
+
+fn default_region() -> String {
+    "us-east-1".to_string()
+}
+
+fn default_script_prefix() -> String {
+    "yard-scripts/".to_string()
+}
+
+fn default_deploy_mode() -> String {
+    "cluster".to_string()
+}
+
+fn default_action_on_failure() -> String {
+    "CONTINUE".to_string()
+}
+
+#[derive(Deserialize)]
+struct EmrRawConfig {
+    #[serde(default = "default_region")]
+    region: String,
+    #[serde(default = "default_script_prefix")]
+    script_prefix: String,
+    #[serde(default = "default_deploy_mode")]
+    deploy_mode: String,
+    #[serde(default = "default_action_on_failure")]
+    action_on_failure: String,
+    #[serde(default, rename = "_aws")]
+    aws: Option<serde_json::Value>,
+}
 
 pub struct EmrProvider {
     emr_client: EmrClient,
@@ -17,21 +48,12 @@ pub struct EmrProvider {
 
 impl EmrProvider {
     pub async fn new(config: &Value) -> Result<Self> {
-        let region = config
-            .get("region")
-            .and_then(|v| v.as_str())
-            .unwrap_or("us-east-1");
-
+        // Pre-extract script_bucket and cluster_id BEFORE serde deserialization
+        // so the legacy error strings survive byte-for-byte (SC #4, D-06 option a).
         let script_bucket = config
             .get("script_bucket")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("providers.emr.script_bucket is required"))?
-            .to_string();
-
-        let script_prefix = config
-            .get("script_prefix")
-            .and_then(|v| v.as_str())
-            .unwrap_or("yard-scripts/")
             .to_string();
 
         let cluster_id = config
@@ -40,20 +62,10 @@ impl EmrProvider {
             .ok_or_else(|| anyhow!("providers.emr.cluster_id is required"))?
             .to_string();
 
-        let deploy_mode = config
-            .get("deploy_mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("cluster")
-            .to_string();
+        let cfg: EmrRawConfig = serde_json::from_value(config.clone())
+            .context("invalid providers.emr config")?;
 
-        let action_on_failure = config
-            .get("action_on_failure")
-            .and_then(|v| v.as_str())
-            .unwrap_or("CONTINUE")
-            .to_string();
-
-        let aws_cfg = config.get("_aws");
-        let sdk_config = aws_config(region, aws_cfg).await;
+        let sdk_config = aws_config(&cfg.region, cfg.aws.as_ref()).await;
         let emr_client = EmrClient::new(&sdk_config);
         let s3_client = S3Client::new(&sdk_config);
 
@@ -62,11 +74,11 @@ impl EmrProvider {
             s3: S3ScriptOps {
                 s3_client,
                 script_bucket,
-                script_prefix,
+                script_prefix: cfg.script_prefix,
             },
             cluster_id,
-            deploy_mode,
-            action_on_failure,
+            deploy_mode: cfg.deploy_mode,
+            action_on_failure: cfg.action_on_failure,
         })
     }
 
@@ -223,7 +235,7 @@ impl Provider for EmrProvider {
 const VALID_ACTION_ON_FAILURE: &[&str] =
     &["CONTINUE", "CANCEL_AND_WAIT", "TERMINATE_CLUSTER"];
 
-pub fn validate_config(config: &Value, errors: &mut Vec<ValidationError>) {
+pub(crate) fn validate_config(config: &Value, errors: &mut Vec<ValidationError>) {
     if let Some(aof) = config.get("action_on_failure").and_then(|v| v.as_str())
         && !VALID_ACTION_ON_FAILURE.contains(&aof)
     {
@@ -244,5 +256,71 @@ pub fn validate_config(config: &Value, errors: &mut Vec<ValidationError>) {
             "emr.deploy_mode",
             &format!("\"{}\" is not valid (expected: cluster, client)", dm),
         ));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn missing_cluster_id_preserves_legacy_error_string() {
+        let config = json!({
+            "region": "us-east-1",
+            "script_bucket": "my-bucket",
+            // cluster_id intentionally omitted
+        });
+        // EmrProvider does not implement Debug, so we can't use unwrap_err();
+        // match the result instead to extract the error.
+        let err = match EmrProvider::new(&config).await {
+            Ok(_) => panic!("expected error for missing cluster_id"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("providers.emr.cluster_id is required"),
+            "expected legacy error string, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_script_bucket_preserves_legacy_error_string() {
+        let config = json!({
+            "region": "us-east-1",
+            "cluster_id": "j-test",
+            // script_bucket intentionally omitted
+        });
+        let err = match EmrProvider::new(&config).await {
+            Ok(_) => panic!("expected error for missing script_bucket"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("providers.emr.script_bucket is required"),
+            "expected legacy error string, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_field_silently_ignored() {
+        // D-15: typos are silently ignored — no deny_unknown_fields.
+        let config = json!({
+            "region": "us-east-1",
+            "script_bucket": "my-bucket",
+            "cluster_id": "j-test",
+            "cluster_idd": "j-typo", // typo — must NOT cause a deserialize error
+        });
+        let result = EmrProvider::new(&config).await;
+        if let Err(e) = result {
+            let msg = format!("{e:#}");
+            assert!(
+                !msg.contains("cluster_idd")
+                    && !msg.contains("unknown field")
+                    && !msg.contains("invalid providers.emr config"),
+                "unknown field must be silently ignored, got: {msg}"
+            );
+        }
     }
 }
