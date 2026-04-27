@@ -44,7 +44,22 @@ fn validate_setting(key: &str, value: &str) -> Result<(), String> {
             "slack_webhook_url is read-only; configure slack_webhook_secret_arn (a Secrets Manager ARN) instead. See docs/server.md."
                 .to_string(),
         ),
-        "slack_webhook_secret_arn" => Ok(()),
+        "slack_webhook_secret_arn" => {
+            // Empty value is the documented "operator may clear" path.
+            if value.is_empty() {
+                Ok(())
+            } else if value.starts_with("arn:aws:secretsmanager:") {
+                Ok(())
+            } else if value.starts_with("https://hooks.slack.com/") {
+                Err("slack_webhook_secret_arn must be a Secrets Manager ARN, not a Slack URL. \
+                     Create a secret holding the URL and supply its ARN. See docs/server.md."
+                    .to_string())
+            } else {
+                Err(format!(
+                    "invalid slack_webhook_secret_arn '{value}': must be an arn:aws:secretsmanager:* ARN"
+                ))
+            }
+        }
         "alert_drift_threshold" => match value.parse::<u32>() {
             Ok(n) if n >= 1 => Ok(()),
             _ => Err(format!(
@@ -268,6 +283,35 @@ mod tests {
         assert!(result.is_ok());
         // Empty value also accepted — operator may clear the setting.
         assert!(validate_setting("slack_webhook_secret_arn", "").is_ok());
+    }
+
+    #[test]
+    fn rejects_slack_url_pasted_as_secret_arn_with_redirect_message() {
+        // Operator pastes a Slack hooks URL into the field labeled "Secret ARN".
+        // Reject with a clear redirect message rather than persisting garbage.
+        let result = validate_setting(
+            "slack_webhook_secret_arn",
+            "https://hooks.slack.com/services/T0/B0/abc",
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("must be a Secrets Manager ARN"),
+            "expected 'must be a Secrets Manager ARN' in: {msg}"
+        );
+        assert!(msg.contains("docs/server.md"), "expected docs link in: {msg}");
+    }
+
+    #[test]
+    fn rejects_garbage_slack_webhook_secret_arn() {
+        // A plain identifier (secret name without the full ARN), random text,
+        // or any non-ARN value is rejected so the failure surfaces at write
+        // time rather than hours later in the drift poll loop.
+        assert!(validate_setting("slack_webhook_secret_arn", "yard/slack-webhook").is_err());
+        assert!(validate_setting("slack_webhook_secret_arn", "random text").is_err());
+        // ARNs for other AWS services are also rejected — the field must be a
+        // Secrets Manager ARN specifically.
+        assert!(validate_setting("slack_webhook_secret_arn", "arn:aws:s3:::bucket").is_err());
     }
 
     #[test]
