@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
 
 use super::components::Pagination;
+use super::fetch::{get_json, get_text};
 use super::sheet::Sheet;
 use crate::types::*;
 
@@ -9,36 +10,15 @@ const PER_PAGE: usize = 15;
 use super::api_base;
 
 async fn fetch_job_file(path: String) -> Result<String, String> {
-    let url = format!("{}/api/jobs/file?path={path}", api_base());
-    let resp = reqwest::get(&url)
-        .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Server error ({status}): {body}"));
-    }
-
-    resp.text()
-        .await
-        .map_err(|e| format!("Failed to read response: {e}"))
+    // 401-redirect, status, and read-error handling are centralised in
+    // ui::fetch::get_text (Plan 25-05 Gap A).
+    get_text(&format!("{}/api/jobs/file?path={path}", api_base())).await
 }
 
 async fn fetch_jobs() -> Result<JobsData, String> {
-    let resp = reqwest::get(format!("{}/api/jobs", api_base()))
-        .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Server error ({status}): {body}"));
-    }
-
-    resp.json::<JobsData>()
-        .await
-        .map_err(|e| format!("Failed to parse response: {e}"))
+    // 401-redirect, status, and parse-error handling are centralised in
+    // ui::fetch::get_json (Plan 25-05 Gap A).
+    get_json::<JobsData>(&format!("{}/api/jobs", api_base())).await
 }
 
 #[component]
