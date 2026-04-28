@@ -11,15 +11,10 @@
 //! the process-wide COLOR_MODE atomic — terminal-presentation code belongs
 //! in the CLI layer (CONTEXT D-14).
 //!
-//! Deterministic stabilization (Phase 20 / Plan 04 revision Blocker 1):
-//! `yard_structs::DiffType::Modify` holds `changes: HashMap<String, (String,
-//! String)>`. HashMap iteration is unordered. The pre-helper code in plan.rs
-//! and apply.rs iterated this HashMap directly, producing non-deterministic
-//! line ordering between runs for multi-key Modify diffs. This helper sorts
-//! `changes` entries by key before iterating — closing the latent ordering
-//! bug. SC #3's "byte-identical output" guarantee thus becomes
-//! "byte-identical for the previously deterministic subset, AND deterministic
-//! across runs for the previously non-deterministic Modify rendering".
+//! Deterministic Modify rendering: `yard_structs::DiffType::Modify::changes` is
+//! a `BTreeMap<String, (String, String)>` (Phase 28 / D-16), so iteration is
+//! sorted by key without per-site sort logic. Direct `for (key, val) in changes`
+//! is correct here.
 
 use crate::utils::{bold, color_create, color_delete, color_modify};
 use std::io;
@@ -32,9 +27,8 @@ use yard_structs::{DagDiff, DiffType, JobDiff};
 /// The empty-state branch (no jobs, no dags) is the caller's
 /// responsibility — this helper assumes at least one diff present.
 ///
-/// `Modify { changes }` entries are sorted by key before printing so output
-/// is deterministic across runs (HashMap iteration would otherwise be
-/// unordered — see module-level rustdoc).
+/// `Modify { changes }` entries iterate in key-sorted order via the BTreeMap
+/// field type (Phase 28 / D-16).
 pub fn print_plan_summary(
     out: &mut impl io::Write,
     project_name: &str,
@@ -68,12 +62,7 @@ pub fn print_plan_summary(
                     "{}",
                     color_modify(&format!("  ~ Modify job [{}]", diff.name))
                 )?;
-                // Deterministic stabilization (revision Blocker 1): sort by key
-                // before iterating; HashMap iteration order is otherwise unspecified.
-                let mut sorted: Vec<(&String, &(String, String))> =
-                    changes.iter().collect();
-                sorted.sort_by(|a, b| a.0.cmp(b.0));
-                for (key, (old, new)) in sorted {
+                for (key, (old, new)) in changes {
                     writeln!(out, "      {} : {} -> {}", key, old, new)?;
                 }
             }
@@ -102,11 +91,7 @@ pub fn print_plan_summary(
                     "{}",
                     color_modify(&format!("  ~ Modify DAG [{}]", diff.name))
                 )?;
-                // Same sort-by-key transform as the job Modify branch above.
-                let mut sorted: Vec<(&String, &(String, String))> =
-                    changes.iter().collect();
-                sorted.sort_by(|a, b| a.0.cmp(b.0));
-                for (key, (old, new)) in sorted {
+                for (key, (old, new)) in changes {
                     writeln!(out, "      {} : {} -> {}", key, old, new)?;
                 }
             }
@@ -127,7 +112,7 @@ pub fn print_plan_summary(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
     use yard_structs::{DagDiff, DiffType, JobDiff};
 
     // Tiny inline fixture builders. Every field of JobDiff / DagDiff is
@@ -144,7 +129,7 @@ mod tests {
         }
     }
     fn job_modify(name: &str, changes: Vec<(&str, &str, &str)>) -> JobDiff {
-        let mut map: HashMap<String, (String, String)> = HashMap::new();
+        let mut map: BTreeMap<String, (String, String)> = BTreeMap::new();
         for (k, old, new) in changes {
             map.insert(k.to_string(), (old.to_string(), new.to_string()));
         }
@@ -172,7 +157,7 @@ mod tests {
         }
     }
     fn dag_modify(name: &str, changes: Vec<(&str, &str, &str)>) -> DagDiff {
-        let mut map: HashMap<String, (String, String)> = HashMap::new();
+        let mut map: BTreeMap<String, (String, String)> = BTreeMap::new();
         for (k, old, new) in changes {
             map.insert(k.to_string(), (old.to_string(), new.to_string()));
         }
@@ -209,10 +194,11 @@ mod tests {
 
     #[test]
     fn modify_job_with_multiple_changes_sorted_by_key() {
-        // Helper sorts HashMap entries by key: memory < script.
-        // This assertion would have been flaky against the pre-refactor
-        // plan.rs/apply.rs (HashMap iter order randomized per run); the
-        // helper's sort step makes it stable. (Revision Blocker 1.)
+        // BTreeMap iterates entries by key: memory < script. This assertion
+        // would have been flaky against the pre-refactor plan.rs/apply.rs
+        // (HashMap iter order randomized per run); under Phase 28's
+        // BTreeMap-typed `DiffType::Modify::changes` (D-16) iteration is
+        // sorted at the type level.
         let s = run(
             None,
             &[job_modify(
