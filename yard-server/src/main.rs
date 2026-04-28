@@ -12,6 +12,8 @@ mod alerting;
 mod auth;
 #[cfg(not(target_arch = "wasm32"))]
 mod secrets;
+#[cfg(not(target_arch = "wasm32"))]
+mod polling;
 mod types;
 mod ui;
 
@@ -101,6 +103,41 @@ fn start_api_server() {
                     )
                 })
                 .unwrap_or(false);
+
+            // SRV-03 / D-03 / D-04: optional override for the polling-loop
+            // iteration timeout. Default 60s. Out-of-range or non-numeric
+            // values fall back to default with a tracing::warn!.
+            const POLL_ITERATION_TIMEOUT_SECS_DEFAULT: u64 = 60;
+            const POLL_ITERATION_TIMEOUT_SECS_MIN: u64 = 1;
+            const POLL_ITERATION_TIMEOUT_SECS_MAX: u64 = 600;
+            let poll_timeout_secs: u64 = match std::env::var("YARD_POLL_TIMEOUT_SECS") {
+                Ok(raw) => match raw.trim().parse::<u64>() {
+                    Ok(n)
+                        if (POLL_ITERATION_TIMEOUT_SECS_MIN..=POLL_ITERATION_TIMEOUT_SECS_MAX)
+                            .contains(&n) =>
+                    {
+                        // D-07: log only when set to a non-default valid value.
+                        if n != POLL_ITERATION_TIMEOUT_SECS_DEFAULT {
+                            tracing::info!(
+                                timeout_secs = n,
+                                "Polling loop iteration timeout"
+                            );
+                        }
+                        n
+                    }
+                    _ => {
+                        tracing::warn!(
+                            provided = %raw,
+                            default_secs = POLL_ITERATION_TIMEOUT_SECS_DEFAULT,
+                            min_secs = POLL_ITERATION_TIMEOUT_SECS_MIN,
+                            max_secs = POLL_ITERATION_TIMEOUT_SECS_MAX,
+                            "invalid YARD_POLL_TIMEOUT_SECS, falling back to default"
+                        );
+                        POLL_ITERATION_TIMEOUT_SECS_DEFAULT
+                    }
+                },
+                Err(_) => POLL_ITERATION_TIMEOUT_SECS_DEFAULT,
+            };
 
             if bypass_loopback {
                 // WR-07: single canonical warn surface. Previously this
@@ -299,8 +336,8 @@ fn start_api_server() {
                 .layer(TraceLayer::new_for_http());
 
             // Spawn background polling tasks
-            tokio::spawn(drift_poll_loop(api_state.clone()));
-            tokio::spawn(dashboard_poll_loop(api_state));
+            tokio::spawn(drift_poll_loop(api_state.clone(), poll_timeout_secs));
+            tokio::spawn(dashboard_poll_loop(api_state, poll_timeout_secs));
 
             let port = std::env::var("YARD_PORT").unwrap_or_else(|_| "3001".to_string());
             let addr: std::net::SocketAddr = format!("0.0.0.0:{port}")
@@ -327,245 +364,317 @@ fn start_api_server() {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-async fn drift_poll_loop(state: std::sync::Arc<api::dashboard::ApiState>) {
+async fn run_drift_iteration(
+    state: &std::sync::Arc<api::dashboard::ApiState>,
+) -> Result<(), String> {
     use tracing::{info, warn};
 
-    const DEFAULT_INTERVAL_MINS: u64 = 3;
+    info!("Running scheduled drift check");
 
-    // Wait for server to be ready before first check
-    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    match api::drift::run_drift_check(state).await {
+        Ok(data) => {
+            info!(
+                drifted = data.drifted,
+                in_sync = data.in_sync,
+                "Scheduled drift check complete"
+            );
+            let _ = state.event_tx.send(api::events::Event::DriftRefreshed);
 
-    loop {
-        // Read interval from settings (stored as minutes string)
-        let interval_mins = match state.db.get_setting("drift_interval").await {
-            Ok(Some(val)) => val.parse::<u64>().unwrap_or(DEFAULT_INTERVAL_MINS),
-            _ => DEFAULT_INTERVAL_MINS,
-        };
+            // ---- Phase 8: drift threshold alerting ----
+            // Disabled-by-default short-circuit (D-07): check cheap settings
+            // before reading cooldown state.
+            //
+            // Read all five alert-related settings in a single snapshot so
+            // an operator flipping `slack_enabled` to false mid-tick can't
+            // race the per-key reads and trigger an alert after Disable.
+            let settings: std::collections::HashMap<String, String> = state
+                .db
+                .list_settings()
+                .await
+                .ok()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| (s.key, s.value))
+                .collect();
 
-        info!(
-            interval_mins = interval_mins,
-            "Running scheduled drift check"
-        );
+            let slack_enabled = settings
+                .get("slack_enabled")
+                .map(|v| v == "true")
+                .unwrap_or(false);
+            let arn = settings
+                .get("slack_webhook_secret_arn")
+                .cloned()
+                .unwrap_or_default();
+            let threshold_opt = settings
+                .get("alert_drift_threshold")
+                .and_then(|s| s.parse::<u32>().ok());
 
-        match api::drift::run_drift_check(&state).await {
-            Ok(data) => {
-                info!(
-                    drifted = data.drifted,
-                    in_sync = data.in_sync,
-                    "Scheduled drift check complete"
-                );
-                let _ = state.event_tx.send(api::events::Event::DriftRefreshed);
+            if slack_enabled
+                && !arn.is_empty()
+                && let Some(threshold) = threshold_opt
+            {
+                let cooldown_mins = settings
+                    .get("alert_cooldown_minutes")
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(10);
+                // Saturating multiply prevents overflow for attacker-set u64::MAX (T-08-03-01).
+                let cooldown =
+                    std::time::Duration::from_secs(cooldown_mins.saturating_mul(60));
 
-                // ---- Phase 8: drift threshold alerting ----
-                // Disabled-by-default short-circuit (D-07): check cheap settings
-                // before reading cooldown state.
-                //
-                // Read all five alert-related settings in a single snapshot so
-                // an operator flipping `slack_enabled` to false mid-tick can't
-                // race the per-key reads and trigger an alert after Disable.
-                let settings: std::collections::HashMap<String, String> = state
-                    .db
-                    .list_settings()
-                    .await
-                    .ok()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|s| (s.key, s.value))
-                    .collect();
+                let last_sent = settings
+                    .get("alert_last_sent_at")
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc));
 
-                let slack_enabled = settings
-                    .get("slack_enabled")
-                    .map(|v| v == "true")
-                    .unwrap_or(false);
-                let arn = settings
-                    .get("slack_webhook_secret_arn")
-                    .cloned()
-                    .unwrap_or_default();
-                let threshold_opt = settings
-                    .get("alert_drift_threshold")
-                    .and_then(|s| s.parse::<u32>().ok());
-
-                if slack_enabled
-                    && !arn.is_empty()
-                    && let Some(threshold) = threshold_opt
-                {
-                    let cooldown_mins = settings
-                        .get("alert_cooldown_minutes")
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(10);
-                    // Saturating multiply prevents overflow for attacker-set u64::MAX (T-08-03-01).
-                    let cooldown =
-                        std::time::Duration::from_secs(cooldown_mins.saturating_mul(60));
-
-                    let last_sent = settings
-                        .get("alert_last_sent_at")
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                        .map(|dt| dt.with_timezone(&chrono::Utc));
-
-                    let cfg = alerting::threshold::AlertConfig {
-                        threshold,
-                        cooldown,
-                        last_sent,
-                    };
-                    let now = chrono::Utc::now();
-                    match alerting::threshold::evaluate(&data, &cfg, now) {
-                        alerting::threshold::AlertDecision::Send => {
-                            // SRV-02 / D-25: resolve the secret only when we're
-                            // about to send. On resolve failure log + skip; do
-                            // NOT log the resolved URL anywhere (D-17 / T-25-07).
-                            //
-                            // WR-06: cap the resolve at 5 seconds. The AWS SDK's
-                            // default standard retry mode allows up to ~3 attempts
-                            // with retries — a transient SecretsManager outage
-                            // can stall a single resolve for ~30s. While stalled,
-                            // the entire drift_poll_loop is blocked: no new drift
-                            // checks fire, no other Slack alerts are sent. A
-                            // 5-second hard ceiling bounds the pipeline-stall
-                            // surface and is enough headroom for a healthy AWS
-                            // region. Uses the already-pulled-in tokio::time —
-                            // no new dep.
-                            let webhook_url = match tokio::time::timeout(
-                                std::time::Duration::from_secs(5),
-                                state.secret_store.resolve(&arn),
-                            )
-                            .await
-                            {
-                                Ok(Ok(url)) => url,
-                                Ok(Err(e)) => {
-                                    warn!(
-                                        arn = %arn,
-                                        error = %e,
-                                        "Failed to resolve Slack webhook secret; skipping alert"
-                                    );
-                                    continue;
-                                }
-                                Err(_) => {
-                                    warn!(
-                                        arn = %arn,
-                                        timeout_secs = 5,
-                                        "Slack webhook secret resolve timed out; skipping alert"
-                                    );
-                                    continue;
-                                }
-                            };
-                            match alerting::slack::post_slack_alert(
-                                &webhook_url,
-                                &data,
-                                threshold,
-                            )
-                            .await
-                            {
-                                Ok(()) => {
-                                    let ts = now.to_rfc3339();
-                                    match state
-                                        .db
-                                        .set_setting("alert_last_sent_at", &ts)
-                                        .await
-                                    {
-                                        Ok(()) => {
-                                            info!(
-                                                drifted = data.drifted,
-                                                threshold = threshold,
-                                                "Drift alert sent"
-                                            );
-                                            let _ = state.event_tx.send(
-                                                api::events::Event::AlertSent {
-                                                    drifted_count: data.drifted,
-                                                },
-                                            );
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                error = %e,
-                                                "Failed to persist alert_last_sent_at after successful Slack POST"
-                                            );
-                                        }
+                let cfg = alerting::threshold::AlertConfig {
+                    threshold,
+                    cooldown,
+                    last_sent,
+                };
+                let now = chrono::Utc::now();
+                match alerting::threshold::evaluate(&data, &cfg, now) {
+                    alerting::threshold::AlertDecision::Send => {
+                        // SRV-02 / D-25: resolve the secret only when we're
+                        // about to send. On resolve failure log + skip; do
+                        // NOT log the resolved URL anywhere (D-17 / T-25-07).
+                        //
+                        // WR-06: cap the resolve at 5 seconds. The AWS SDK's
+                        // default standard retry mode allows up to ~3 attempts
+                        // with retries — a transient SecretsManager outage
+                        // can stall a single resolve for ~30s. While stalled,
+                        // the entire drift_poll_loop is blocked: no new drift
+                        // checks fire, no other Slack alerts are sent. A
+                        // 5-second hard ceiling bounds the pipeline-stall
+                        // surface and is enough headroom for a healthy AWS
+                        // region. Uses the already-pulled-in tokio::time —
+                        // no new dep.
+                        let webhook_url = match tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            state.secret_store.resolve(&arn),
+                        )
+                        .await
+                        {
+                            Ok(Ok(url)) => url,
+                            Ok(Err(e)) => {
+                                warn!(
+                                    arn = %arn,
+                                    error = %e,
+                                    "Failed to resolve Slack webhook secret; skipping alert"
+                                );
+                                return Ok(());
+                            }
+                            Err(_) => {
+                                warn!(
+                                    arn = %arn,
+                                    timeout_secs = 5,
+                                    "Slack webhook secret resolve timed out; skipping alert"
+                                );
+                                return Ok(());
+                            }
+                        };
+                        match alerting::slack::post_slack_alert(
+                            &webhook_url,
+                            &data,
+                            threshold,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                let ts = now.to_rfc3339();
+                                match state
+                                    .db
+                                    .set_setting("alert_last_sent_at", &ts)
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        info!(
+                                            drifted = data.drifted,
+                                            threshold = threshold,
+                                            "Drift alert sent"
+                                        );
+                                        let _ = state.event_tx.send(
+                                            api::events::Event::AlertSent {
+                                                drifted_count: data.drifted,
+                                            },
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            error = %e,
+                                            "Failed to persist alert_last_sent_at after successful Slack POST"
+                                        );
                                     }
                                 }
-                                Err(e) => {
-                                    // SRV-02 / D-17 / T-25-07: do NOT use the
-                                    // reqwest::Error Display impl directly —
-                                    // it embeds the request URL (the resolved
-                                    // Slack webhook secret) for connect /
-                                    // timeout / error_for_status variants.
-                                    // Log structured fields that never include
-                                    // the URL.
-                                    let kind = if e.is_timeout() {
-                                        "timeout"
-                                    } else if e.is_connect() {
-                                        "connect"
-                                    } else if e.is_request() {
-                                        "request"
-                                    } else if e.is_body() {
-                                        "body"
-                                    } else if e.is_decode() {
-                                        "decode"
-                                    } else {
-                                        "other"
-                                    };
-                                    warn!(
-                                        kind = kind,
-                                        status = e.status().map(|s| s.as_u16()),
-                                        "Slack alert POST failed"
-                                    );
-                                }
+                            }
+                            Err(e) => {
+                                // SRV-02 / D-17 / T-25-07: do NOT use the
+                                // reqwest::Error Display impl directly —
+                                // it embeds the request URL (the resolved
+                                // Slack webhook secret) for connect /
+                                // timeout / error_for_status variants.
+                                // Log structured fields that never include
+                                // the URL.
+                                let kind = if e.is_timeout() {
+                                    "timeout"
+                                } else if e.is_connect() {
+                                    "connect"
+                                } else if e.is_request() {
+                                    "request"
+                                } else if e.is_body() {
+                                    "body"
+                                } else if e.is_decode() {
+                                    "decode"
+                                } else {
+                                    "other"
+                                };
+                                warn!(
+                                    kind = kind,
+                                    status = e.status().map(|s| s.as_u16()),
+                                    "Slack alert POST failed"
+                                );
                             }
                         }
-                        alerting::threshold::AlertDecision::Cooldown => {
-                            info!("Drift alert skipped (cooldown)");
-                        }
-                        alerting::threshold::AlertDecision::BelowThreshold => {}
                     }
+                    alerting::threshold::AlertDecision::Cooldown => {
+                        info!("Drift alert skipped (cooldown)");
+                    }
+                    alerting::threshold::AlertDecision::BelowThreshold => {}
                 }
-                // ---- End Phase 8 alert block ----
             }
-            Err(e) => {
-                warn!("Scheduled drift check failed: {e}");
-                let _ = state.event_tx.send(api::events::Event::DriftFailed {
-                    reason: api::events::sanitize_reason(&e),
-                });
-            }
+            // ---- End Phase 8 alert block ----
+            Ok(())
         }
-
-        tokio::time::sleep(std::time::Duration::from_secs(interval_mins * 60)).await;
+        Err(e) => {
+            warn!("Scheduled drift check failed: {e}");
+            let _ = state.event_tx.send(api::events::Event::DriftFailed {
+                reason: api::events::sanitize_reason(&e),
+            });
+            Err(e)
+        }
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-async fn dashboard_poll_loop(state: std::sync::Arc<api::dashboard::ApiState>) {
+async fn drift_poll_loop(
+    state: std::sync::Arc<api::dashboard::ApiState>,
+    poll_timeout_secs: u64,
+) {
+    use crate::polling::{SupervisedResult, compute_backoff_sleep, supervised_iteration};
+    use tracing::warn;
+
+    const DEFAULT_INTERVAL_MINS: u64 = 3;
+
+    // Wait for server to be ready before first check.
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+    let timeout_dur = std::time::Duration::from_secs(poll_timeout_secs);
+    let mut consecutive_errors: u32 = 0;
+
+    loop {
+        // Read interval from settings (stored as minutes string).
+        let interval_mins = match state.db.get_setting("drift_interval").await {
+            Ok(Some(val)) => val.parse::<u64>().unwrap_or(DEFAULT_INTERVAL_MINS),
+            _ => DEFAULT_INTERVAL_MINS,
+        };
+        let interval = std::time::Duration::from_secs(interval_mins * 60);
+
+        // Wrap the full iteration body (drift check + alert leg + event emit,
+        // factored into run_drift_iteration) in the per-iteration timeout. The
+        // inner 5s WR-06 timeout on secret_store.resolve INSIDE
+        // run_drift_iteration stays — outer + inner compose cleanly
+        // (CONTEXT.md D-02).
+        let iteration_outcome: SupervisedResult<(), String> =
+            supervised_iteration(timeout_dur, run_drift_iteration(&state)).await;
+
+        consecutive_errors = match iteration_outcome {
+            SupervisedResult::Ok(()) => 0,
+            SupervisedResult::IterationFailed(_e) => {
+                // run_drift_iteration already logged via warn! and emitted
+                // DriftFailed before returning Err. Just bump the counter.
+                consecutive_errors.saturating_add(1)
+            }
+            SupervisedResult::IterationTimedOut => {
+                warn!(
+                    timeout_secs = poll_timeout_secs,
+                    "Drift poll iteration timed out"
+                );
+                let _ = state.event_tx.send(api::events::Event::DriftFailed {
+                    reason: format!("iteration timed out after {poll_timeout_secs}s"),
+                });
+                consecutive_errors.saturating_add(1)
+            }
+        };
+
+        let backoff = compute_backoff_sleep(interval, consecutive_errors);
+        tokio::time::sleep(backoff).await;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn dashboard_poll_loop(
+    state: std::sync::Arc<api::dashboard::ApiState>,
+    poll_timeout_secs: u64,
+) {
+    use crate::polling::{SupervisedResult, compute_backoff_sleep, supervised_iteration};
     use tracing::{info, warn};
 
     const DEFAULT_INTERVAL_MINS: u64 = 5;
 
-    // Wait for server to be ready before first refresh
+    // Wait for server to be ready before first refresh.
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    let timeout_dur = std::time::Duration::from_secs(poll_timeout_secs);
+    let mut consecutive_errors: u32 = 0;
 
     loop {
         info!("Refreshing dashboard cache");
 
-        match api::dashboard::refresh_dashboard_cache(&state).await {
-            Ok(cache) => {
-                info!(
-                    total_prs = cache.prs.len(),
-                    open_prs = cache.open_prs,
-                    "Dashboard cache refreshed"
-                );
-                let _ = state.event_tx.send(api::events::Event::DashboardRefreshed);
-            }
-            Err(e) => {
-                warn!("Dashboard cache refresh failed: {e}");
-                let _ = state.event_tx.send(api::events::Event::DashboardFailed {
-                    reason: api::events::sanitize_reason(&e),
-                });
-            }
-        }
+        let iteration_outcome: SupervisedResult<(), String> =
+            supervised_iteration(timeout_dur, async {
+                match api::dashboard::refresh_dashboard_cache(&state).await {
+                    Ok(cache) => {
+                        info!(
+                            total_prs = cache.prs.len(),
+                            open_prs = cache.open_prs,
+                            "Dashboard cache refreshed"
+                        );
+                        let _ = state.event_tx.send(api::events::Event::DashboardRefreshed);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        warn!("Dashboard cache refresh failed: {e}");
+                        let _ = state.event_tx.send(api::events::Event::DashboardFailed {
+                            reason: api::events::sanitize_reason(&e),
+                        });
+                        Err(e)
+                    }
+                }
+            })
+            .await;
 
         let interval_mins = match state.db.get_setting("dashboard_interval").await {
             Ok(Some(val)) => val.parse::<u64>().unwrap_or(DEFAULT_INTERVAL_MINS),
             _ => DEFAULT_INTERVAL_MINS,
         };
+        let interval = std::time::Duration::from_secs(interval_mins * 60);
 
-        tokio::time::sleep(std::time::Duration::from_secs(interval_mins * 60)).await;
+        consecutive_errors = match iteration_outcome {
+            SupervisedResult::Ok(()) => 0,
+            SupervisedResult::IterationFailed(_e) => consecutive_errors.saturating_add(1),
+            SupervisedResult::IterationTimedOut => {
+                warn!(
+                    timeout_secs = poll_timeout_secs,
+                    "Dashboard poll iteration timed out"
+                );
+                let _ = state.event_tx.send(api::events::Event::DashboardFailed {
+                    reason: format!("iteration timed out after {poll_timeout_secs}s"),
+                });
+                consecutive_errors.saturating_add(1)
+            }
+        };
+
+        let backoff = compute_backoff_sleep(interval, consecutive_errors);
+        tokio::time::sleep(backoff).await;
     }
 }
 
