@@ -283,6 +283,30 @@ impl Serialize for Trigger {
     }
 }
 
+impl Trigger {
+    /// Extract dataset URIs from a Trigger for v1.5-compat dataset-trigger
+    /// codegen. Returns empty Vec if no Dataset variants are present
+    /// (e.g., schedule-only, s3, sqs, api triggers — those route through
+    /// Phase 30 codegen which emits sensor tasks instead of `schedule=[Dataset(...)]`).
+    ///
+    /// Used by `yard-core/src/airflow_dag/generation.rs` to preserve the
+    /// existing v1.5 dataset-trigger schedule-rendering behavior after
+    /// the typed Trigger model lands.
+    pub fn dataset_uris(&self) -> Vec<&str> {
+        match self {
+            Trigger::Single(SingleSource::Dataset(d)) => vec![d.uri.as_str()],
+            Trigger::All(sources) | Trigger::Any(sources) => sources
+                .iter()
+                .filter_map(|s| match s {
+                    SingleSource::Dataset(d) => Some(d.uri.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -505,5 +529,52 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("unknown field"), "got: {msg}");
         assert!(msg.contains("extra"), "got: {msg}");
+    }
+
+    // --- Trigger::dataset_uris (Phase 28 v1.5-compat helper) ---
+
+    #[test]
+    fn dataset_uris_extracts_from_single_dataset() {
+        let t = Trigger::Single(SingleSource::Dataset(DatasetTrigger {
+            uri: "s3://x".into(),
+        }));
+        assert_eq!(t.dataset_uris(), vec!["s3://x"]);
+    }
+
+    #[test]
+    fn dataset_uris_extracts_from_composite_all_dataset() {
+        let t = Trigger::All(vec![
+            SingleSource::Dataset(DatasetTrigger {
+                uri: "s3://a".into(),
+            }),
+            SingleSource::Dataset(DatasetTrigger {
+                uri: "s3://b".into(),
+            }),
+        ]);
+        let mut uris = t.dataset_uris();
+        uris.sort();
+        assert_eq!(uris, vec!["s3://a", "s3://b"]);
+    }
+
+    #[test]
+    fn dataset_uris_empty_for_non_dataset_trigger() {
+        let t = Trigger::Single(SingleSource::Schedule(ScheduleTrigger {
+            value: "@daily".into(),
+        }));
+        assert_eq!(t.dataset_uris(), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn dataset_uris_filters_heterogeneous_composite() {
+        let t = Trigger::Any(vec![
+            SingleSource::Dataset(DatasetTrigger {
+                uri: "s3://a".into(),
+            }),
+            SingleSource::S3(S3Trigger {
+                bucket: "b".into(),
+                ..Default::default()
+            }),
+        ]);
+        assert_eq!(t.dataset_uris(), vec!["s3://a"]);
     }
 }

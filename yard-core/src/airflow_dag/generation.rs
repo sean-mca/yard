@@ -48,14 +48,20 @@ pub fn generate_dag(
         }
     }
     // Determine if any task produces datasets, or if the DAG is dataset-triggered.
-    let has_datasets = !dag.config.triggered_by.is_empty()
+    let has_datasets = dag
+        .config
+        .trigger
+        .as_ref()
+        .is_some_and(|t| !t.dataset_uris().is_empty())
         || task_types
             .iter()
-            .any(|(_, _, j)| j.airflow.as_ref().is_some_and(|a| !a.produces.is_empty()));
+            .any(|(_, _, j)| j.airflow.as_ref().is_some_and(|a| !a.publishes.is_empty()));
 
-    // `triggered_by` takes precedence over an inherited `schedule` -- a
-    // dataset-triggered DAG doesn't use a cron schedule even if one was
-    // inherited from the project or account level.
+    // `trigger.dataset_uris()` takes precedence over an inherited `schedule` --
+    // a dataset-triggered DAG doesn't use a cron schedule even if one was
+    // inherited from the project or account level. Non-dataset triggers
+    // (s3/sqs/api) currently render schedule=None here; Phase 30 will adapt
+    // those paths to emit sensor tasks instead.
 
     let mut import_lines = Vec::new();
     if needs_bash {
@@ -76,10 +82,16 @@ pub fn generate_dag(
 
     // schedule: dataset-triggered DAGs get `[Dataset(...), ...]`;
     // cron DAGs get a quoted string; unscheduled DAGs get None.
-    let schedule = if !dag.config.triggered_by.is_empty() {
-        let datasets = dag
-            .config
-            .triggered_by
+    // Non-dataset triggers (s3/sqs/api) currently render schedule=None here —
+    // Phase 30 owns their codegen (sensor task emission).
+    let dataset_uris: Vec<&str> = dag
+        .config
+        .trigger
+        .as_ref()
+        .map(|t| t.dataset_uris())
+        .unwrap_or_default();
+    let schedule = if !dataset_uris.is_empty() {
+        let datasets = dataset_uris
             .iter()
             .map(|uri| format!("Dataset({})", python_string_literal(uri)))
             .collect::<Vec<_>>()
@@ -236,7 +248,7 @@ fn render_task(
 fn render_outlets(job: &JobDefinition) -> String {
     job.airflow
         .as_ref()
-        .map(|a| &a.produces)
+        .map(|a| &a.publishes)
         .filter(|p| !p.is_empty())
         .map(|uris| {
             let items = uris
