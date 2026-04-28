@@ -664,7 +664,13 @@ mod tests {
     fn job_hash(name: &str, job: &JobDefinition) -> String {
         let script = crate::codegen::generate_python_script(name, job).unwrap();
         let config_str = serde_json::to_string(&job.config).unwrap_or_default();
-        let combined = format!("{script}\n{config_str}");
+        let trigger_str = job
+            .airflow
+            .as_ref()
+            .and_then(|a| a.overrides.trigger.as_ref())
+            .map(|t| serde_json::to_string(t).unwrap_or_default())
+            .unwrap_or_default();
+        let combined = format!("{script}\n{config_str}\n{trigger_str}");
         crate::utils::calculate_hash(&combined)
     }
 

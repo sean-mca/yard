@@ -22,11 +22,18 @@ pub fn calculate_diff(manifest: &ProjectManifest, state: &ProjectState) -> Resul
         let script_content = codegen::generate_python_script(name, job_def)
             .with_context(|| format!("Failed to generate script for job \"{name}\""))?;
 
-        // Hash both the script and the full job config so config-only changes
-        // (e.g. worker_type, timeout) are detected even if the script is unchanged
+        // Hash script + config + trigger so changes to any of them produce a
+        // different state hash. Trigger flows through here because Bash jobs
+        // generate empty script content and trigger-only changes still need
+        // to fire drift detection (HASH-01).
         let config_str = serde_json::to_string(&job_def.config)
             .with_context(|| format!("Failed to serialize config for job \"{name}\""))?;
-        let combined = format!("{script_content}\n{config_str}");
+        let trigger_str = match job_def.airflow.as_ref().and_then(|a| a.overrides.trigger.as_ref()) {
+            Some(t) => serde_json::to_string(t)
+                .with_context(|| format!("Failed to serialize trigger for job \"{name}\""))?,
+            None => String::new(),
+        };
+        let combined = format!("{script_content}\n{config_str}\n{trigger_str}");
         let current_proposed_hash = utils::calculate_hash(&combined);
 
         if let Some(existing) = state.deployments.get(name) {
