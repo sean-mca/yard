@@ -91,13 +91,13 @@ fn airflow_job_block_with_depends_on_and_typo() {
 #[test]
 fn airflow_job_block_depends_on_is_accepted() {
     // Confirms the wider allow-list at the per-job airflow site lets
-    // `depends_on` and `produces` through (these are NOT in
+    // `depends_on` and `publishes` through (these are NOT in
     // `ALLOWED_AIRFLOW_SECTION` — the wider list at the per-job block
     // is the only place that admits them).
     let v = json!({
         "airflow": {
             "depends_on": ["upstream"],
-            "produces": ["s3://bucket/dataset"],
+            "publishes": ["s3://bucket/dataset"],
             "schedule": "@daily"
         }
     });
@@ -105,7 +105,7 @@ fn airflow_job_block_depends_on_is_accepted() {
         .unwrap()
         .expect("block parses");
     assert_eq!(block.depends_on, vec!["upstream"]);
-    assert_eq!(block.produces, vec!["s3://bucket/dataset"]);
+    assert_eq!(block.publishes, vec!["s3://bucket/dataset"]);
     assert_eq!(block.overrides.schedule.as_deref(), Some("@daily"));
 }
 

@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
 use yard_structs::{
-    AirflowJobBlock, AirflowSection, AwsCredentialConfig, Import, Sink, Source, Transform,
+    AirflowJobBlock, AirflowSection, AwsCredentialConfig, Import, Sink, Source, Transform, Trigger,
 };
 
 /// Validate that a JSON object has no keys outside `allowed`. Used by every
@@ -51,24 +51,25 @@ const ALLOWED_AIRFLOW_SECTION: &[&str] = &[
     "retries",
     "dags_bucket",
     "dags_prefix",
-    "triggered_by",
+    "trigger",
+    "publishes",
     "aws",
 ];
 
 /// Allowed keys on a per-job `airflow:` block (`AirflowJobBlock` —
 /// includes the AirflowSection-flattened fields plus job-specific
-/// `depends_on` and `produces`). `AirflowJobBlock` is excluded from
+/// `depends_on` and `publishes`). `AirflowJobBlock` is excluded from
 /// `deny_unknown_fields` because of `#[serde(flatten)]`; this validator
 /// covers its user-yaml typo path per D-CTX:177.
 const ALLOWED_AIRFLOW_JOB_BLOCK: &[&str] = &[
     "depends_on",
-    "produces",
+    "publishes",
     "schedule",
     "owner",
     "retries",
     "dags_bucket",
     "dags_prefix",
-    "triggered_by",
+    "trigger",
     "aws",
 ];
 
@@ -147,15 +148,15 @@ pub fn parse_job_file(config: &Value) -> Option<String> {
 /// allow-list for their structural context — `parse_airflow_section` uses
 /// the strict `ALLOWED_AIRFLOW_SECTION` list, while `parse_airflow_job_block`
 /// uses the wider `ALLOWED_AIRFLOW_JOB_BLOCK` list (which adds `depends_on`
-/// and `produces`). Without this split the per-job validator would reject
+/// and `publishes`). Without this split the per-job validator would reject
 /// `depends_on` as unknown when delegating, or the standalone path would
 /// silently accept those keys.
-fn parse_airflow_section_inner(value: &Value) -> AirflowSection {
+fn parse_airflow_section_inner(value: &Value) -> Result<AirflowSection> {
     let retries = value
         .get("retries")
         .and_then(|v| v.as_i64())
         .map(|v| v as i32);
-    AirflowSection {
+    Ok(AirflowSection {
         schedule: value
             .get("schedule")
             .and_then(|v| v.as_str())
@@ -173,7 +174,8 @@ fn parse_airflow_section_inner(value: &Value) -> AirflowSection {
             .get("dags_prefix")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
-        triggered_by: str_array_field(value, "triggered_by"),
+        trigger: parse_trigger_field(value, "trigger")?,
+        publishes: str_array_field(value, "publishes"),
         // Optional per-DAG-bucket AWS creds sub-block (Phase 9 D-05).
         // Best-effort typed parse — malformed `aws:` blocks fall through
         // silently to None, preserving today's permissive behavior here.
@@ -183,7 +185,23 @@ fn parse_airflow_section_inner(value: &Value) -> AirflowSection {
             .get("aws")
             .cloned()
             .and_then(|v| serde_json::from_value::<AwsCredentialConfig>(v).ok()),
-    }
+    })
+}
+
+/// Parse a `trigger:` field from a YAML/JSON object into Option<Trigger>.
+/// Returns None if the key is absent. Errors if present-but-malformed.
+///
+/// Used by `parse_airflow_section_inner` to deserialize the typed Trigger
+/// model (Phase 28). Forwards to the hand-rolled `Trigger::Deserialize`
+/// impl in yard-structs/src/trigger.rs which emits the actionable
+/// `unknown trigger source 'X' — valid: ...` error on typos.
+fn parse_trigger_field(value: &Value, key: &str) -> Result<Option<Trigger>> {
+    let Some(v) = value.get(key) else {
+        return Ok(None);
+    };
+    let parsed: Option<Trigger> = serde_json::from_value(v.clone())
+        .map_err(|e| anyhow::anyhow!("invalid 'trigger:' shape: {e}"))?;
+    Ok(parsed)
 }
 
 /// Parse an `airflow:` section body into an [`AirflowSection`]. The same
@@ -197,8 +215,20 @@ fn parse_airflow_section_inner(value: &Value) -> AirflowSection {
 /// when the section contains an unknown key (TYPE-03 D-19). Returns
 /// `Err` on the first unknown field; otherwise returns the parsed section.
 pub fn parse_airflow_section(value: &Value, path: &str) -> Result<AirflowSection> {
+    // Rename-pointer migration UX (D-21): legacy v1.5 field names get
+    // actionable error messages pointing users at the new shape, before
+    // the generic unknown-key validator fires. Mirrors the wording of the
+    // typed serde Deserialize path on `AirflowSection` in yard-structs.
+    if let Some(obj) = value.as_object()
+        && obj.contains_key("triggered_by")
+    {
+        return Err(anyhow::anyhow!(
+            "unknown field 'triggered_by' at {path} — use 'trigger: {{ dataset: {{ uri: \"...\" }} }}' instead. \
+             For multiple URIs, use 'trigger: {{ all: [{{ dataset: ... }}, ...] }}'. See migration guide."
+        ));
+    }
     validate_unknown_keys(value, ALLOWED_AIRFLOW_SECTION, path)?;
-    Ok(parse_airflow_section_inner(value))
+    parse_airflow_section_inner(value)
 }
 
 /// Parse the per-job `airflow:` block, if present. Returns `Ok(None)` if
@@ -215,14 +245,30 @@ pub fn parse_airflow_job_block(config: &Value, path: &str) -> Result<Option<Airf
         return Ok(None);
     };
     let block_path = format!("{path}.airflow");
+    // Rename-pointer migration UX (D-21): legacy v1.5 field names get
+    // actionable error messages pointing users at the new shape, before
+    // the generic unknown-key validator fires.
+    if let Some(obj) = block.as_object() {
+        if obj.contains_key("produces") {
+            return Err(anyhow::anyhow!(
+                "unknown field 'produces' at {block_path} — use 'publishes: [...]' instead. See migration guide."
+            ));
+        }
+        if obj.contains_key("triggered_by") {
+            return Err(anyhow::anyhow!(
+                "unknown field 'triggered_by' at {block_path} — use 'trigger: {{ dataset: {{ uri: \"...\" }} }}' instead. \
+                 For multiple URIs, use 'trigger: {{ all: [{{ dataset: ... }}, ...] }}'. See migration guide."
+            ));
+        }
+    }
     validate_unknown_keys(block, ALLOWED_AIRFLOW_JOB_BLOCK, &block_path)?;
     Ok(Some(AirflowJobBlock {
         depends_on: str_array_field(block, "depends_on"),
-        produces: str_array_field(block, "produces"),
+        publishes: str_array_field(block, "publishes"),
         // Use the inner extractor so we don't double-validate against the
-        // stricter ALLOWED_AIRFLOW_SECTION list — `depends_on`/`produces`
+        // stricter ALLOWED_AIRFLOW_SECTION list — `depends_on`/`publishes`
         // would be rejected as unknowns there.
-        overrides: parse_airflow_section_inner(block),
+        overrides: parse_airflow_section_inner(block)?,
     }))
 }
 
@@ -243,10 +289,18 @@ pub fn merge_airflow_sections(base: &AirflowSection, overlay: &AirflowSection) -
             .dags_prefix
             .clone()
             .or_else(|| base.dags_prefix.clone()),
-        triggered_by: if overlay.triggered_by.is_empty() {
-            base.triggered_by.clone()
+        // Trigger is Option<_> — overlay's Some wins; both None means None.
+        // Mirrors the v1.5 semantic where `triggered_by: [a, b]` merged with
+        // overlay `triggered_by: [c]` produced `[c]` (overlay wins entirely
+        // if non-empty). With Option<Trigger>, "overlay's Some wins" is the
+        // direct equivalent.
+        trigger: overlay.trigger.clone().or_else(|| base.trigger.clone()),
+        // Publishes mirrors the old triggered_by/produces vec-merge: overlay
+        // wins entirely when non-empty.
+        publishes: if overlay.publishes.is_empty() {
+            base.publishes.clone()
         } else {
-            overlay.triggered_by.clone()
+            overlay.publishes.clone()
         },
         // Overlay wins when Some; None means "not set" so fall back to base.
         aws: overlay.aws.clone().or_else(|| base.aws.clone()),
@@ -693,7 +747,7 @@ mod tests {
 
     #[test]
     fn allowed_airflow_section_has_expected_keys() {
-        for k in ["schedule", "owner", "retries", "dags_bucket", "dags_prefix", "triggered_by", "aws"] {
+        for k in ["schedule", "owner", "retries", "dags_bucket", "dags_prefix", "trigger", "publishes", "aws"] {
             assert!(
                 ALLOWED_AIRFLOW_SECTION.contains(&k),
                 "ALLOWED_AIRFLOW_SECTION missing '{k}'"
@@ -702,9 +756,9 @@ mod tests {
     }
 
     #[test]
-    fn allowed_airflow_job_block_extends_section_with_depends_on_and_produces() {
+    fn allowed_airflow_job_block_extends_section_with_depends_on_and_publishes() {
         assert!(ALLOWED_AIRFLOW_JOB_BLOCK.contains(&"depends_on"));
-        assert!(ALLOWED_AIRFLOW_JOB_BLOCK.contains(&"produces"));
+        assert!(ALLOWED_AIRFLOW_JOB_BLOCK.contains(&"publishes"));
         // every section key is also valid on the per-job block
         for k in ALLOWED_AIRFLOW_SECTION {
             assert!(
