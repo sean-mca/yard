@@ -248,7 +248,17 @@ pub async fn apply(
                     let config_str = serde_json::to_string(&job_def.config).with_context(|| {
                         format!("Failed to serialize config for job \"{}\"", diff.name)
                     })?;
-                    let combined = format!("{script_content}\n{config_str}");
+                    let trigger_str = match job_def
+                        .airflow
+                        .as_ref()
+                        .and_then(|a| a.overrides.trigger.as_ref())
+                    {
+                        Some(t) => serde_json::to_string(t).with_context(|| {
+                            format!("Failed to serialize trigger for job \"{}\"", diff.name)
+                        })?,
+                        None => String::new(),
+                    };
+                    let combined = format!("{script_content}\n{config_str}\n{trigger_str}");
                     let script_hash = utils::calculate_hash(&combined);
 
                     // Write generated script locally
@@ -664,7 +674,13 @@ mod tests {
     fn job_hash(name: &str, job: &JobDefinition) -> String {
         let script = crate::codegen::generate_python_script(name, job).unwrap();
         let config_str = serde_json::to_string(&job.config).unwrap_or_default();
-        let combined = format!("{script}\n{config_str}");
+        let trigger_str = job
+            .airflow
+            .as_ref()
+            .and_then(|a| a.overrides.trigger.as_ref())
+            .map(|t| serde_json::to_string(t).unwrap_or_default())
+            .unwrap_or_default();
+        let combined = format!("{script}\n{config_str}\n{trigger_str}");
         crate::utils::calculate_hash(&combined)
     }
 

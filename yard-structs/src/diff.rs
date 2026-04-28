@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum DiffType {
     Create,
     Modify {
-        changes: HashMap<String, (String, String)>,
+        changes: BTreeMap<String, (String, String)>,
     },
     Delete,
 }
@@ -33,7 +33,7 @@ mod tests {
         // D-10 case 1: JobDiff (alias for Diff) with DiffType::Modify { changes }
         // populated + old_hash + new_hash. Round-trip JSON; assert exactly four
         // top-level fields and no spurious `_phantom`-style noise.
-        let mut changes: HashMap<String, (String, String)> = HashMap::new();
+        let mut changes: BTreeMap<String, (String, String)> = BTreeMap::new();
         changes.insert(
             "config".to_string(),
             ("old-value".to_string(), "new-value".to_string()),
@@ -124,5 +124,30 @@ mod tests {
             job_json, dag_json,
             "JobDiff and DagDiff must serialize identically (they are aliases for Diff)"
         );
+    }
+
+    #[test]
+    fn job_diff_modify_changes_emits_sorted_keys() {
+        // Phase 28 / D-16: `DiffType::Modify::changes` is a `BTreeMap`, so
+        // iteration is sorted by key at the type level. This test locks the
+        // invariant by deliberately inserting B, A, C out-of-order and
+        // asserting the serialized JSON has them in A, B, C order.
+        let mut changes: BTreeMap<String, (String, String)> = BTreeMap::new();
+        // Deliberately-out-of-order inserts; BTreeMap normalizes.
+        changes.insert("B".to_string(), ("old_b".into(), "new_b".into()));
+        changes.insert("A".to_string(), ("old_a".into(), "new_a".into()));
+        changes.insert("C".to_string(), ("old_c".into(), "new_c".into()));
+        let diff = Diff {
+            name: "demo".to_string(),
+            old_hash: None,
+            new_hash: Some("h".to_string()),
+            diff_type: DiffType::Modify { changes },
+        };
+        let s = serde_json::to_string(&diff).unwrap();
+        let pos_a = s.find("\"A\"").expect("key A in serialized output");
+        let pos_b = s.find("\"B\"").expect("key B in serialized output");
+        let pos_c = s.find("\"C\"").expect("key C in serialized output");
+        assert!(pos_a < pos_b, "expected A before B in {s}");
+        assert!(pos_b < pos_c, "expected B before C in {s}");
     }
 }

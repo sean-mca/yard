@@ -417,7 +417,7 @@ mod tests {
         let mut b = bash_job("echo b", &dag_dir);
         a.airflow = Some(AirflowJobBlock {
             depends_on: vec![],
-            produces: vec![],
+            publishes: vec![],
             overrides: AirflowSection {
                 schedule: Some("@hourly".to_string()),
                 ..Default::default()
@@ -425,7 +425,7 @@ mod tests {
         });
         b.airflow = Some(AirflowJobBlock {
             depends_on: vec![],
-            produces: vec![],
+            publishes: vec![],
             overrides: AirflowSection {
                 retries: Some(3),
                 ..Default::default()
@@ -1096,7 +1096,7 @@ mod tests {
     // ---- Airflow Datasets ----
 
     #[test]
-    fn task_with_produces_emits_outlets() {
+    fn task_with_publishes_emits_outlets() {
         let tmp = setup_project_tree();
         let root = tmp.path();
         let dag_dir = root.join("pipeline");
@@ -1105,7 +1105,7 @@ mod tests {
         let mut manifest = empty_manifest("test");
         let mut job = glue_job(&dag_dir);
         job.airflow = Some(AirflowJobBlock {
-            produces: vec!["s3://warehouse/sales/orders".to_string()],
+            publishes: vec!["s3://warehouse/sales/orders".to_string()],
             ..Default::default()
         });
         manifest.jobs.insert("orders".into(), job);
@@ -1124,7 +1124,7 @@ mod tests {
     }
 
     #[test]
-    fn task_without_produces_omits_outlets() {
+    fn task_without_publishes_omits_outlets() {
         let tmp = setup_project_tree();
         let root = tmp.path();
         let dag_dir = root.join("pipeline");
@@ -1146,13 +1146,13 @@ mod tests {
     }
 
     #[test]
-    fn dag_triggered_by_datasets_emits_schedule_list() {
+    fn dag_trigger_datasets_emits_schedule_list() {
         let tmp = setup_project_tree();
         let root = tmp.path();
         let dag_dir = root.join("pipeline");
         write_yaml(
             &dag_dir.join("dag.yaml"),
-            "triggered_by:\n  - s3://warehouse/sales/orders\n  - s3://warehouse/sales/shipments\n",
+            "trigger:\n  all:\n    - dataset:\n        uri: s3://warehouse/sales/orders\n    - dataset:\n        uri: s3://warehouse/sales/shipments\n",
         );
 
         let mut manifest = empty_manifest("test");
@@ -1171,13 +1171,13 @@ mod tests {
     }
 
     #[test]
-    fn triggered_by_overrides_inherited_schedule() {
+    fn trigger_overrides_inherited_schedule() {
         let tmp = setup_project_tree();
         let root = tmp.path();
         let dag_dir = root.join("pipeline");
         write_yaml(
             &dag_dir.join("dag.yaml"),
-            "schedule: \"@daily\"\ntriggered_by:\n  - s3://warehouse/foo\n",
+            "schedule: \"@daily\"\ntrigger:\n  dataset:\n    uri: s3://warehouse/foo\n",
         );
 
         let mut manifest = empty_manifest("test");
@@ -1193,7 +1193,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_produces_on_one_task() {
+    fn multiple_publishes_on_one_task() {
         let tmp = setup_project_tree();
         let root = tmp.path();
         let dag_dir = root.join("pipeline");
@@ -1202,7 +1202,7 @@ mod tests {
         let mut manifest = empty_manifest("test");
         let mut job = bash_job("echo done", &dag_dir);
         job.airflow = Some(AirflowJobBlock {
-            produces: vec![
+            publishes: vec![
                 "s3://warehouse/a".to_string(),
                 "s3://warehouse/b".to_string(),
             ],
