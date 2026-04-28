@@ -1,3 +1,4 @@
+use crate::trigger::Trigger;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -314,19 +315,30 @@ pub struct YARDContext {
 /// Airflow config shared across inheritance layers (yard.yaml, region.yaml,
 /// account.yaml, dag.yaml, and the per-job `airflow:` block). Every layer has
 /// the same shape; later layers override earlier ones via shallow merge.
-#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
-#[serde(deny_unknown_fields)]
+///
+/// Phase 28: `triggered_by: Vec<String>` was removed in favor of the typed
+/// `trigger: Option<Trigger>` field, and `publishes: Vec<String>` now carries
+/// what `triggered_by` used to before the rename. The hand-rolled Deserialize
+/// impl below intercepts legacy `triggered_by:` keys and emits an actionable
+/// rename-pointer error (D-21).
+#[derive(Debug, Serialize, Clone, Default, PartialEq)]
 pub struct AirflowSection {
     pub schedule: Option<String>,
     pub owner: Option<String>,
     pub retries: Option<i32>,
     pub dags_bucket: Option<String>,
     pub dags_prefix: Option<String>,
-    /// Dataset URIs that trigger this DAG. When set, the DAG's schedule
-    /// becomes `[Dataset("uri"), ...]` instead of a cron string. Mutually
-    /// exclusive with `schedule`.
-    #[serde(default)]
-    pub triggered_by: Vec<String>,
+    /// Typed event-driven trigger (S3 file drop, Airflow Dataset, SQS,
+    /// manual API, or `all:` / `any:` composite). Mutually exclusive with
+    /// `schedule:` — validation enforced in Phase 29. `None` means
+    /// "schedule-only DAG" (existing behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<Trigger>,
+    /// Dataset URIs published by THIS DAG (DAG-level outlets). Drives
+    /// downstream Dataset-triggered DAGs. Empty by default; rendered only
+    /// when non-empty. Per-task `publishes:` lives on `AirflowJobBlock`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub publishes: Vec<String>,
     /// Optional per-airflow-provider `aws:` sub-block for the DAG upload bucket.
     /// When set, takes priority over the root `aws:` + nearest `account.yaml`
     /// cascade used elsewhere in codegen. `None` preserves today's
@@ -335,18 +347,113 @@ pub struct AirflowSection {
     pub aws: Option<AwsCredentialConfig>,
 }
 
+/// Private mirror of `AirflowSection` used by the hand-rolled `Deserialize`
+/// impl below. Carries `#[serde(deny_unknown_fields)]` so unknown keys (other
+/// than the explicitly-intercepted `triggered_by:` rename pointer) still
+/// surface as serde "unknown field" errors. This preserves the
+/// `airflow_section_deny_unknown_fields` test contract.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct _AirflowSectionRaw {
+    #[serde(default)]
+    schedule: Option<String>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    retries: Option<i32>,
+    #[serde(default)]
+    dags_bucket: Option<String>,
+    #[serde(default)]
+    dags_prefix: Option<String>,
+    #[serde(default)]
+    trigger: Option<Trigger>,
+    #[serde(default)]
+    publishes: Vec<String>,
+    #[serde(default)]
+    aws: Option<AwsCredentialConfig>,
+}
+
+impl<'de> serde::Deserialize<'de> for AirflowSection {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v: serde_json::Value = serde_json::Value::deserialize(d)?;
+        if let Some(obj) = v.as_object()
+            && obj.contains_key("triggered_by")
+        {
+            return Err(serde::de::Error::custom(
+                "unknown field 'triggered_by' — use 'trigger: { dataset: { uri: \"...\" } }' instead. \
+                 For multiple URIs, use 'trigger: { all: [{ dataset: ... }, ...] }'. See migration guide.",
+            ));
+        }
+        let raw: _AirflowSectionRaw =
+            serde_json::from_value(v).map_err(serde::de::Error::custom)?;
+        Ok(AirflowSection {
+            schedule: raw.schedule,
+            owner: raw.owner,
+            retries: raw.retries,
+            dags_bucket: raw.dags_bucket,
+            dags_prefix: raw.dags_prefix,
+            trigger: raw.trigger,
+            publishes: raw.publishes,
+            aws: raw.aws,
+        })
+    }
+}
+
 /// Per-job Airflow metadata lifted out of the `airflow:` block on a job file.
 /// Includes the shared [`AirflowSection`] overrides plus job-specific fields
 /// like `depends_on`.
-#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
+///
+/// Phase 28: `produces: Vec<String>` was renamed to `publishes: Vec<String>`.
+/// The hand-rolled Deserialize impl below intercepts legacy `produces:` keys
+/// and emits an actionable rename-pointer error (D-21).
+#[derive(Debug, Serialize, Clone, Default, PartialEq)]
 pub struct AirflowJobBlock {
-    pub depends_on: Vec<String>,
-    /// Dataset URIs this task produces. Emitted as `outlets=[Dataset(...)]`
-    /// on the Airflow operator so downstream DAGs are triggered on completion.
     #[serde(default)]
-    pub produces: Vec<String>,
+    pub depends_on: Vec<String>,
+    /// Dataset URIs this task publishes. Emitted as `outlets=[Dataset(...)]`
+    /// on the Airflow operator so downstream DAGs are triggered on completion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub publishes: Vec<String>,
     #[serde(flatten, default)]
     pub overrides: AirflowSection,
+}
+
+/// Private mirror of `AirflowJobBlock` used by the hand-rolled `Deserialize`
+/// impl below. Does NOT carry `#[serde(deny_unknown_fields)]` because
+/// `#[serde(flatten)]` is incompatible with the deny gate at the same struct
+/// level. Unknown fields not adjacent to `flatten` flow THROUGH the flatten
+/// into `_AirflowSectionRaw`'s `deny_unknown_fields`, where they surface as
+/// serde "unknown field" errors. The
+/// `airflow_job_block_unrelated_unknown_field_still_rejected` test locks
+/// this invariant.
+#[derive(Deserialize)]
+struct _AirflowJobBlockRaw {
+    #[serde(default)]
+    depends_on: Vec<String>,
+    #[serde(default)]
+    publishes: Vec<String>,
+    #[serde(flatten, default)]
+    overrides: AirflowSection,
+}
+
+impl<'de> serde::Deserialize<'de> for AirflowJobBlock {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v: serde_json::Value = serde_json::Value::deserialize(d)?;
+        if let Some(obj) = v.as_object()
+            && obj.contains_key("produces")
+        {
+            return Err(serde::de::Error::custom(
+                "unknown field 'produces' — use 'publishes: [...]' instead. See migration guide.",
+            ));
+        }
+        let raw: _AirflowJobBlockRaw =
+            serde_json::from_value(v).map_err(serde::de::Error::custom)?;
+        Ok(AirflowJobBlock {
+            depends_on: raw.depends_on,
+            publishes: raw.publishes,
+            overrides: raw.overrides,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -413,8 +520,7 @@ mod tests {
             "owner": "data-eng",
             "retries": 2,
             "dags_bucket": null,
-            "dags_prefix": null,
-            "triggered_by": []
+            "dags_prefix": null
         });
         let parsed: AirflowSection = serde_json::from_value(input).unwrap();
         let reserialized = serde_json::to_value(&parsed).unwrap();
@@ -678,5 +784,204 @@ mod tests {
         let parsed: AirflowSection = serde_json::from_value(input).unwrap();
         assert_eq!(parsed.schedule.as_deref(), Some("@hourly"));
         assert!(parsed.owner.is_none());
+    }
+
+    // --- Phase 28: typed Trigger model rewire (TRIG-01..TRIG-03) ---
+
+    #[test]
+    fn airflow_section_schedule_only_byte_equal_v1_5_fixture() {
+        // PRES-05: a representative v1.5 schedule-only DAG (no `trigger:`,
+        // no `publishes:`) must round-trip byte-identically post-Phase-28.
+        // NOTE: AirflowSection's existing Option fields (schedule, owner,
+        // retries, dags_bucket, dags_prefix) do NOT have skip_serializing_if,
+        // so unset values serialize as `null` — preserving the v1.5 wire
+        // format that wire_format_compat.rs locks. This test mirrors that
+        // shape: input includes explicit nulls for the unset Option fields
+        // so round-trip is byte-equal.
+        let input = json!({
+            "schedule": "@daily",
+            "owner": "data-eng",
+            "retries": 2,
+            "dags_bucket": null,
+            "dags_prefix": null
+        });
+        let parsed: AirflowSection = serde_json::from_value(input.clone()).unwrap();
+        let reser = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(reser, input, "schedule-only AirflowSection wire format drift");
+        // Phase 28 invariants: trigger is None, publishes is empty, both
+        // skipped on serialize.
+        assert!(parsed.trigger.is_none());
+        assert!(parsed.publishes.is_empty());
+        assert!(reser.get("trigger").is_none());
+        assert!(reser.get("publishes").is_none());
+    }
+
+    #[test]
+    fn airflow_section_with_trigger_s3_round_trip() {
+        let input = json!({
+            "schedule": null,
+            "owner": null,
+            "retries": null,
+            "dags_bucket": null,
+            "dags_prefix": null,
+            "trigger": {"s3": {"bucket": "x", "prefix": "y"}}
+        });
+        let parsed: AirflowSection = serde_json::from_value(input.clone()).unwrap();
+        match &parsed.trigger {
+            Some(crate::trigger::Trigger::Single(crate::trigger::SingleSource::S3(s3))) => {
+                assert_eq!(s3.bucket, "x");
+                assert_eq!(s3.prefix.as_deref(), Some("y"));
+                assert!(s3.key.is_none());
+            }
+            other => panic!("expected Trigger::Single(S3 {{...}}), got {other:?}"),
+        }
+        let reser = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(reser, input);
+    }
+
+    #[test]
+    fn airflow_section_with_trigger_all_dataset_round_trip_sorted() {
+        // HASH-02: composite all/any lists serialize in sorted-by-element
+        // canonical-JSON-string order regardless of input order.
+        let input = json!({
+            "trigger": {"all": [
+                {"dataset": {"uri": "b"}},
+                {"dataset": {"uri": "a"}}
+            ]}
+        });
+        let parsed: AirflowSection = serde_json::from_value(input).unwrap();
+        let reser = serde_json::to_value(&parsed).unwrap();
+        // Expect sorted output: a, b. The Option fields serialize as null
+        // (no skip_serializing_if on schedule/owner/retries/dags_bucket/
+        // dags_prefix per existing v1.5 wire format).
+        let expected_sorted = json!({
+            "schedule": null,
+            "owner": null,
+            "retries": null,
+            "dags_bucket": null,
+            "dags_prefix": null,
+            "trigger": {"all": [
+                {"dataset": {"uri": "a"}},
+                {"dataset": {"uri": "b"}}
+            ]}
+        });
+        assert_eq!(
+            reser, expected_sorted,
+            "Trigger::All must serialize in sorted order"
+        );
+    }
+
+    #[test]
+    fn airflow_section_with_publishes_round_trip() {
+        let input = json!({
+            "schedule": "@daily",
+            "owner": null,
+            "retries": null,
+            "dags_bucket": null,
+            "dags_prefix": null,
+            "publishes": ["s3://x/y", "s3://a/b"]
+        });
+        let parsed: AirflowSection = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(parsed.publishes, vec!["s3://x/y", "s3://a/b"]);
+        let reser = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(reser, input, "publishes preserves input order (no sort)");
+    }
+
+    #[test]
+    fn airflow_section_publishes_empty_skipped() {
+        let input = json!({"schedule": "@daily"});
+        let parsed: AirflowSection = serde_json::from_value(input).unwrap();
+        assert!(parsed.publishes.is_empty());
+        let reser = serde_json::to_value(&parsed).unwrap();
+        assert!(
+            reser.get("publishes").is_none(),
+            "empty publishes must be skipped on serialize"
+        );
+    }
+
+    #[test]
+    fn airflow_section_trigger_none_skipped() {
+        let input = json!({"schedule": "@daily"});
+        let parsed: AirflowSection = serde_json::from_value(input).unwrap();
+        assert!(parsed.trigger.is_none());
+        let reser = serde_json::to_value(&parsed).unwrap();
+        assert!(
+            reser.get("trigger").is_none(),
+            "None trigger must be skipped on serialize (PRES-05)"
+        );
+    }
+
+    #[test]
+    fn airflow_section_triggered_by_returns_rename_error() {
+        let input = json!({"triggered_by": ["s3://x"]});
+        let err = serde_json::from_value::<AirflowSection>(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown field 'triggered_by'"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("use 'trigger:"), "got: {msg}");
+    }
+
+    #[test]
+    fn airflow_job_block_produces_returns_rename_error() {
+        let input = json!({"depends_on": [], "produces": ["s3://x"]});
+        let err = serde_json::from_value::<AirflowJobBlock>(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown field 'produces'"), "got: {msg}");
+        assert!(msg.contains("use 'publishes:"), "got: {msg}");
+    }
+
+    #[test]
+    fn airflow_job_block_publishes_round_trip() {
+        // The flatten-overrides path means AirflowSection's Option fields
+        // (schedule/owner/retries/dags_bucket/dags_prefix) flatten into the
+        // AirflowJobBlock JSON shape and serialize as null when unset (no
+        // skip_serializing_if on those fields — preserves v1.5 wire format).
+        let input = json!({
+            "depends_on": ["t1"],
+            "publishes": ["s3://x/y"],
+            "schedule": null,
+            "owner": null,
+            "retries": null,
+            "dags_bucket": null,
+            "dags_prefix": null
+        });
+        let parsed: AirflowJobBlock = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(parsed.publishes, vec!["s3://x/y"]);
+        assert_eq!(parsed.depends_on, vec!["t1"]);
+        let reser = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(reser, input);
+    }
+
+    #[test]
+    fn airflow_job_block_publishes_empty_skipped() {
+        let input = json!({"depends_on": []});
+        let parsed: AirflowJobBlock = serde_json::from_value(input).unwrap();
+        let reser = serde_json::to_value(&parsed).unwrap();
+        assert!(
+            reser.get("publishes").is_none(),
+            "empty publishes on AirflowJobBlock must be skipped"
+        );
+    }
+
+    #[test]
+    fn airflow_job_block_unrelated_unknown_field_still_rejected() {
+        // Locks T-28-01-05: deny_unknown_fields path through _AirflowSectionRaw
+        // survives the custom-Deserialize rewrite. Typos at the per-job airflow
+        // block scope still surface as serde "unknown field" errors, not silently
+        // swallowed by the new custom Deserialize.
+        //
+        // Note: serde's actual error format uses backticks (`typo_field`),
+        // not single quotes. The plan's locked invariant is "the substring
+        // 'unknown field' AND the field name 'typo_field' both appear" —
+        // we assert both substrings without quote-style coupling. This
+        // mirrors the existing `airflow_section_deny_unknown_fields` and
+        // `project_manifest_deny_unknown_fields` test idiom.
+        let input = json!({"depends_on": [], "typo_field": 1});
+        let err = serde_json::from_value::<AirflowJobBlock>(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown field"), "got: {msg}");
+        assert!(msg.contains("typo_field"), "got: {msg}");
     }
 }
