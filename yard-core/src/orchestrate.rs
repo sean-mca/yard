@@ -248,7 +248,17 @@ pub async fn apply(
                     let config_str = serde_json::to_string(&job_def.config).with_context(|| {
                         format!("Failed to serialize config for job \"{}\"", diff.name)
                     })?;
-                    let combined = format!("{script_content}\n{config_str}");
+                    let trigger_str = match job_def
+                        .airflow
+                        .as_ref()
+                        .and_then(|a| a.overrides.trigger.as_ref())
+                    {
+                        Some(t) => serde_json::to_string(t).with_context(|| {
+                            format!("Failed to serialize trigger for job \"{}\"", diff.name)
+                        })?,
+                        None => String::new(),
+                    };
+                    let combined = format!("{script_content}\n{config_str}\n{trigger_str}");
                     let script_hash = utils::calculate_hash(&combined);
 
                     // Write generated script locally
