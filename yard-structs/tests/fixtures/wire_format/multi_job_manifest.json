@@ -17,7 +17,6 @@
       "retries": null,
       "dags_bucket": "fixture-dags",
       "dags_prefix": "dags/",
-      "triggered_by": [],
       "aws": {
         "assume_role": "arn:aws:iam::222222222222:role/DagUpload"
       }
