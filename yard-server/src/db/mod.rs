@@ -35,12 +35,17 @@ impl PlanStatus {
             PlanStatus::Failure => "failure",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Self {
+impl std::str::FromStr for PlanStatus {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "success" => PlanStatus::Success,
-            "failure" => PlanStatus::Failure,
-            _ => PlanStatus::Pending,
+            "pending" => Ok(PlanStatus::Pending),
+            "success" => Ok(PlanStatus::Success),
+            "failure" => Ok(PlanStatus::Failure),
+            other => anyhow::bail!("unknown PlanStatus value: {other:?}"),
         }
     }
 }
@@ -411,5 +416,74 @@ mod tests {
         let db = InMemoryDb::new();
         let result = db.get_cache("nonexistent").await.unwrap();
         assert!(result.is_none());
+    }
+
+    // SRV-05 / D-21: PlanStatus FromStr coverage.
+
+    #[test]
+    fn parse_pending_succeeds() {
+        use std::str::FromStr;
+        assert!(matches!(PlanStatus::from_str("pending"), Ok(PlanStatus::Pending)));
+    }
+
+    #[test]
+    fn parse_success_succeeds() {
+        use std::str::FromStr;
+        assert!(matches!(PlanStatus::from_str("success"), Ok(PlanStatus::Success)));
+    }
+
+    #[test]
+    fn parse_failure_succeeds() {
+        use std::str::FromStr;
+        assert!(matches!(PlanStatus::from_str("failure"), Ok(PlanStatus::Failure)));
+    }
+
+    #[test]
+    fn parse_unknown_returns_err() {
+        use std::str::FromStr;
+        let err = PlanStatus::from_str("bogus")
+            .expect_err("unknown values must return Err, not silently default to Pending");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("bogus"),
+            "error message must include the corrupt value, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_empty_string_returns_err() {
+        use std::str::FromStr;
+        // Empty-string is treated as unknown, not as default Pending.
+        let err = PlanStatus::from_str("")
+            .expect_err("empty string must return Err");
+        // Debug-formatted "" appears as `""` in the error message.
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("\"\""),
+            "error message must include the corrupt empty value, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_uppercase_returns_err() {
+        use std::str::FromStr;
+        // Case-sensitive match; "Pending" / "PENDING" / "Success" all return Err.
+        assert!(PlanStatus::from_str("Pending").is_err());
+        assert!(PlanStatus::from_str("PENDING").is_err());
+        assert!(PlanStatus::from_str("Success").is_err());
+    }
+
+    #[test]
+    fn plan_status_as_str_round_trips_via_parse() {
+        use std::str::FromStr;
+        // as_str (write) ↔ FromStr (read) round-trip — proves DDB rows written
+        // with as_str are accepted by FromStr (PRES-05 / D-25).
+        for variant in [PlanStatus::Pending, PlanStatus::Success, PlanStatus::Failure] {
+            let written = variant.as_str();
+            let read = PlanStatus::from_str(written)
+                .expect("as_str output must round-trip via FromStr");
+            // Re-encode and compare to ensure semantic identity.
+            assert_eq!(read.as_str(), written);
+        }
     }
 }

@@ -17,6 +17,27 @@ use crate::db::DriftSnapshot;
 use crate::github::git_ops::{WorkdirGuard, clone_at_sha};
 use crate::types::*;
 
+// SRV-05 / D-11: byte-stable canonical encoding of DriftType for the
+// DriftSnapshot.state_hash column. Returns the EXISTING Debug-derived
+// strings (PRES-05 / D-24) — DDB rows are byte-identical pre/post.
+impl DriftType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DriftType::Modified => "Modified",
+            DriftType::New => "New",
+            DriftType::Deleted => "Deleted",
+            DriftType::ResourceMissing => "ResourceMissing",
+        }
+    }
+}
+
+/// state_hash sentinel value for in-sync drift snapshot rows.
+///
+/// Distinct from `DriftType::as_str()` because in-sync rows are an absence of
+/// drift, not a drift kind. Promoting "in_sync" to a const (D-13) prevents
+/// typo regressions and gives the value a single source of truth.
+pub const STATE_HASH_IN_SYNC: &str = "in_sync";
+
 pub fn drift_router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/api/drift", get(get_drift))
@@ -142,7 +163,7 @@ pub async fn run_drift_check(state: &ApiState) -> Result<DriftData, String> {
             id: uuid::Uuid::new_v4().to_string(),
             job_name: item.name.clone(),
             repo_hash: sha.clone(),
-            state_hash: format!("{:?}", item.drift_type),
+            state_hash: item.drift_type.as_str().to_string(),
             drifted: true,
             checked_at: Utc::now(),
         };
@@ -158,7 +179,7 @@ pub async fn run_drift_check(state: &ApiState) -> Result<DriftData, String> {
                 id: uuid::Uuid::new_v4().to_string(),
                 job_name: name.clone(),
                 repo_hash: sha.clone(),
-                state_hash: "in_sync".to_string(),
+                state_hash: STATE_HASH_IN_SYNC.to_string(),
                 drifted: false,
                 checked_at: Utc::now(),
             };
@@ -400,5 +421,63 @@ mod tests {
         let result = get_drift_summary(State(state)).await.unwrap();
         assert_eq!(result.0.drifted, 0);
         assert_eq!(result.0.in_sync, 0);
+    }
+
+    // SRV-05 / D-16: literal-table determinism for DriftType::as_str.
+    // Future variants force a test edit (correctness over silence).
+    #[test]
+    fn drift_type_as_str_is_stable() {
+        use crate::types::DriftType;
+        assert_eq!(DriftType::Modified.as_str(), "Modified");
+        assert_eq!(DriftType::New.as_str(), "New");
+        assert_eq!(DriftType::Deleted.as_str(), "Deleted");
+        assert_eq!(DriftType::ResourceMissing.as_str(), "ResourceMissing");
+    }
+
+    #[test]
+    fn state_hash_in_sync_const_is_stable() {
+        assert_eq!(STATE_HASH_IN_SYNC, "in_sync");
+    }
+
+    // SRV-05 / D-15: machine-enforced grep gate to prevent regression of
+    // format!("{:?}", ...) writes into DDB state_hash columns.
+    //
+    // Implementation note: yard-server does NOT depend on `regex` (PRES-03
+    // forbids adding crate deps). This gate uses stdlib line-by-line
+    // `.contains` filtering only.
+    //
+    // Filter rule: cordon off everything from `#[cfg(test)]` onward (the
+    // test module is, by definition, not production code). Inside the
+    // production region, skip pure-comment lines (lines whose first
+    // non-whitespace bytes are `//`).
+    #[test]
+    fn no_debug_format_in_state_hash_path() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let target = format!("{manifest_dir}/src/api/drift.rs");
+        let contents = std::fs::read_to_string(&target)
+            .expect("failed to read api/drift.rs for grep gate");
+
+        let production_only: String = contents
+            .lines()
+            .take_while(|line| !line.trim_start().starts_with("#[cfg(test)]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let offending: Vec<(usize, &str)> = production_only
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .filter(|(_, line)| line.contains("format!(\"{:?}\""))
+            .collect();
+
+        assert!(
+            offending.is_empty(),
+            "regression: format!(\"{{:?}}\", ...) reintroduced in state_hash production path:\n{}",
+            offending
+                .iter()
+                .map(|(n, l)| format!("  line {}: {}", n + 1, l))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
     }
 }
