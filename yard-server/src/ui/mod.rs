@@ -1,7 +1,9 @@
 pub mod components;
 pub mod dashboard;
 pub mod drift;
+pub mod fetch;
 pub mod jobs;
+pub mod login;
 pub mod metrics;
 pub mod settings;
 pub mod sheet;

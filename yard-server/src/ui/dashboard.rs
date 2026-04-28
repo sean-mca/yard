@@ -3,6 +3,7 @@ use dioxus_query::prelude::*;
 use std::time::Duration;
 
 use super::components::Pagination;
+use super::fetch::{get_json, get_json_or_default};
 use super::metrics::{DriftStatus, MetricsBar};
 use crate::types::*;
 
@@ -22,29 +23,21 @@ impl QueryCapability for DashboardQuery {
     type Keys = u32; // page number
 
     async fn run(&self, page: &Self::Keys) -> Result<Self::Ok, Self::Err> {
-        let resp = reqwest::get(format!(
+        // 401-redirect, status, and parse-error handling are centralised in
+        // ui::fetch::get_json (Plan 25-05 Gap A). On 401 the helper pushes
+        // Route::Login {} and returns Err.
+        get_json::<DashboardData>(&format!(
             "{}/api/dashboard/cached?page={page}&per_page=15",
             api_base()
         ))
         .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Server error ({status}): {body}"));
-        }
-
-        resp.json::<DashboardData>()
-            .await
-            .map_err(|e| format!("Failed to parse response: {e}"))
     }
 }
 
 #[derive(Clone, PartialEq, Hash, Eq)]
 struct DriftSummaryQuery;
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Default)]
 struct DriftSummaryResponse {
     drifted: u32,
 }
@@ -55,19 +48,14 @@ impl QueryCapability for DriftSummaryQuery {
     type Keys = ();
 
     async fn run(&self, _: &Self::Keys) -> Result<Self::Ok, Self::Err> {
-        let resp = reqwest::get(format!("{}/api/drift/summary", api_base()))
-            .await
-            .map_err(|e| format!("Request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            return Ok(0);
-        }
-
-        let data = resp
-            .json::<DriftSummaryResponse>()
-            .await
-            .map_err(|e| format!("Parse failed: {e}"))?;
-
+        // ui::fetch::get_json_or_default preserves the historical "swallow
+        // non-success as 0" semantics for the metrics-bar header while still
+        // routing 401 through the redirect path (Plan 25-05 Gap A).
+        let data = get_json_or_default::<DriftSummaryResponse>(&format!(
+            "{}/api/drift/summary",
+            api_base()
+        ))
+        .await?;
         Ok(data.drifted)
     }
 }

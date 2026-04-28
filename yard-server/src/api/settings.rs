@@ -40,7 +40,26 @@ fn validate_setting(key: &str, value: &str) -> Result<(), String> {
                 "invalid slack_enabled '{value}': must be true or false"
             )),
         },
-        "slack_webhook_url" => Ok(()),
+        "slack_webhook_url" => Err(
+            "slack_webhook_url is read-only; configure slack_webhook_secret_arn (a Secrets Manager ARN) instead. See docs/server.md."
+                .to_string(),
+        ),
+        "slack_webhook_secret_arn" => {
+            // Empty value is the documented "operator may clear" path.
+            // Otherwise require a Secrets Manager ARN prefix; reject the
+            // common mistake of pasting a Slack URL directly.
+            if value.is_empty() || value.starts_with("arn:aws:secretsmanager:") {
+                Ok(())
+            } else if value.starts_with("https://hooks.slack.com/") {
+                Err("slack_webhook_secret_arn must be a Secrets Manager ARN, not a Slack URL. \
+                     Create a secret holding the URL and supply its ARN. See docs/server.md."
+                    .to_string())
+            } else {
+                Err(format!(
+                    "invalid slack_webhook_secret_arn '{value}': must be an arn:aws:secretsmanager:* ARN"
+                ))
+            }
+        }
         "alert_drift_threshold" => match value.parse::<u32>() {
             Ok(n) if n >= 1 => Ok(()),
             _ => Err(format!(
@@ -121,14 +140,18 @@ mod tests {
     use axum::response::IntoResponse;
 
     fn test_api_state() -> Arc<ApiState> {
+        use crate::secrets::test_support::InMemorySecretStore;
         let db = Arc::new(InMemoryDb::new());
         let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
+        let secret_store: Arc<dyn crate::secrets::SecretStore> =
+            Arc::new(InMemorySecretStore::new(std::collections::HashMap::new()));
         Arc::new(ApiState {
             github_token: "t".into(),
             repo_owner: "o".into(),
             repo_name: "r".into(),
             db: db as Arc<dyn Database>,
             event_tx,
+            secret_store,
         })
     }
 
@@ -236,9 +259,59 @@ mod tests {
     }
 
     #[test]
-    fn accepts_any_slack_webhook_url() {
-        assert!(validate_setting("slack_webhook_url", "https://hooks.slack.com/services/foo").is_ok());
-        assert!(validate_setting("slack_webhook_url", "").is_ok());
+    fn rejects_slack_webhook_url_with_redirect_message() {
+        let result = validate_setting("slack_webhook_url", "https://hooks.slack.com/services/foo");
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("is read-only"), "expected 'is read-only' in: {msg}");
+        assert!(
+            msg.contains("slack_webhook_secret_arn"),
+            "expected 'slack_webhook_secret_arn' in: {msg}"
+        );
+        assert!(
+            msg.contains("docs/server.md"),
+            "expected 'docs/server.md' in: {msg}"
+        );
+    }
+
+    #[test]
+    fn accepts_slack_webhook_secret_arn() {
+        let result = validate_setting(
+            "slack_webhook_secret_arn",
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:yard/slack-webhook-AbCdEf",
+        );
+        assert!(result.is_ok());
+        // Empty value also accepted — operator may clear the setting.
+        assert!(validate_setting("slack_webhook_secret_arn", "").is_ok());
+    }
+
+    #[test]
+    fn rejects_slack_url_pasted_as_secret_arn_with_redirect_message() {
+        // Operator pastes a Slack hooks URL into the field labeled "Secret ARN".
+        // Reject with a clear redirect message rather than persisting garbage.
+        let result = validate_setting(
+            "slack_webhook_secret_arn",
+            "https://hooks.slack.com/services/T0/B0/abc",
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("must be a Secrets Manager ARN"),
+            "expected 'must be a Secrets Manager ARN' in: {msg}"
+        );
+        assert!(msg.contains("docs/server.md"), "expected docs link in: {msg}");
+    }
+
+    #[test]
+    fn rejects_garbage_slack_webhook_secret_arn() {
+        // A plain identifier (secret name without the full ARN), random text,
+        // or any non-ARN value is rejected so the failure surfaces at write
+        // time rather than hours later in the drift poll loop.
+        assert!(validate_setting("slack_webhook_secret_arn", "yard/slack-webhook").is_err());
+        assert!(validate_setting("slack_webhook_secret_arn", "random text").is_err());
+        // ARNs for other AWS services are also rejected — the field must be a
+        // Secrets Manager ARN specifically.
+        assert!(validate_setting("slack_webhook_secret_arn", "arn:aws:s3:::bucket").is_err());
     }
 
     #[test]
@@ -291,5 +364,77 @@ mod tests {
         let err = result.unwrap_err();
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn post_settings_rejects_legacy_slack_webhook_url_with_400() {
+        let state = test_api_state();
+        let payload = SettingsPayload {
+            settings: [(
+                "slack_webhook_url".to_string(),
+                "https://hooks.slack.com/services/T0/B0/abc".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let result = post_settings(State(state), Json(payload)).await;
+        assert!(result.is_err());
+        let resp = result.unwrap_err().into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn post_settings_accepts_slack_webhook_secret_arn() {
+        let state = test_api_state();
+        let payload = SettingsPayload {
+            settings: [(
+                "slack_webhook_secret_arn".to_string(),
+                "arn:aws:secretsmanager:us-east-1:123456789012:secret:yard/slack-webhook-AbCdEf"
+                    .to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let result = post_settings(State(state.clone()), Json(payload)).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), StatusCode::OK);
+
+        // Round-trip: GET returns the ARN, never a URL.
+        let got = get_settings(State(state)).await.unwrap();
+        let arn = got
+            .0
+            .settings
+            .get("slack_webhook_secret_arn")
+            .expect("slack_webhook_secret_arn must be present in GET response");
+        assert!(
+            arn.starts_with("arn:aws:secretsmanager:"),
+            "expected ARN, got: {arn}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_settings_response_excludes_plaintext_slack_url() {
+        // SC #3 hard contract: serialized response payload must NEVER contain
+        // a Slack hooks URL. Canonical happy-path: only ARN flows through GET.
+        let state = test_api_state();
+        // Write the canonical ARN.
+        state
+            .db
+            .set_setting(
+                "slack_webhook_secret_arn",
+                "arn:aws:secretsmanager:us-east-1:000000000000:secret:yard/slack-webhook-X",
+            )
+            .await
+            .unwrap();
+        let resp = get_settings(State(state)).await.unwrap();
+        let serialized = serde_json::to_string(&resp.0).unwrap();
+        assert!(
+            !serialized.contains("https://hooks.slack.com/"),
+            "GET response leaked plaintext Slack URL: {serialized}"
+        );
+        assert!(
+            serialized.contains("slack_webhook_secret_arn"),
+            "GET response must include the ARN reference: {serialized}"
+        );
     }
 }

@@ -275,7 +275,10 @@ impl Database for DynamoDatabase {
             .await
             .context("get latest plan result")?;
 
-        Ok(resp.items().first().and_then(parse_plan_result))
+        match resp.items().first() {
+            Some(item) => Ok(Some(parse_plan_result(item)?)),
+            None => Ok(None),
+        }
     }
 
     async fn list_plan_results(&self, limit: u32) -> Result<Vec<PlanResultRow>> {
@@ -292,7 +295,8 @@ impl Database for DynamoDatabase {
             .await
             .context("list plan results")?;
 
-        Ok(resp.items().iter().filter_map(parse_plan_result).collect())
+        let items: Vec<PlanResultRow> = resp.items().iter().map(parse_plan_result).collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(items)
     }
 
     // ---- Drift Snapshots ----
@@ -524,18 +528,37 @@ fn parse_webhook_event(item: &HashMap<String, AttributeValue>) -> Option<Webhook
     })
 }
 
-fn parse_plan_result(item: &HashMap<String, AttributeValue>) -> Option<PlanResultRow> {
+/// Parse a DDB attribute map into a `PlanResultRow`.
+///
+/// Returns `Err` on:
+/// - missing required fields (id, pr_number, sha, status, raw_output, created_at)
+/// - corrupt PlanStatus value (unknown enum variant; D-20 fail-fast semantics)
+///
+/// `diff_summary` remains tolerant of missing/malformed JSON (existing behavior;
+/// it's an optional analytical field, not a row-validity gate).
+fn parse_plan_result(item: &HashMap<String, AttributeValue>) -> anyhow::Result<PlanResultRow> {
     let diff_summary = get_s(item, "diff_summary")
         .and_then(|s| serde_json::from_str(&s).ok());
 
-    Some(PlanResultRow {
-        id: get_s(item, "id")?,
-        pr_number: get_n_u64(item, "pr_number")?,
-        sha: get_s(item, "sha")?,
-        status: PlanStatus::from_str(&get_s(item, "status")?),
-        raw_output: get_s(item, "raw_output")?,
+    let status_raw = get_s(item, "status")
+        .ok_or_else(|| anyhow::anyhow!("plan_result row missing status field"))?;
+    let status: PlanStatus = status_raw
+        .parse()
+        .with_context(|| "parsing PlanStatus for plan_result row".to_string())?;
+
+    Ok(PlanResultRow {
+        id: get_s(item, "id")
+            .ok_or_else(|| anyhow::anyhow!("plan_result row missing id field"))?,
+        pr_number: get_n_u64(item, "pr_number")
+            .ok_or_else(|| anyhow::anyhow!("plan_result row missing pr_number field"))?,
+        sha: get_s(item, "sha")
+            .ok_or_else(|| anyhow::anyhow!("plan_result row missing sha field"))?,
+        status,
+        raw_output: get_s(item, "raw_output")
+            .ok_or_else(|| anyhow::anyhow!("plan_result row missing raw_output field"))?,
         diff_summary,
-        created_at: get_dt(item, "created_at")?,
+        created_at: get_dt(item, "created_at")
+            .ok_or_else(|| anyhow::anyhow!("plan_result row missing created_at field"))?,
     })
 }
 
