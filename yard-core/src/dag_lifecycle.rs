@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use yard_structs::{
     AwsCredentialConfig, DagDeployment, DagDiff, DagState, DiffType, JobState, ProjectManifest,
@@ -117,11 +117,17 @@ pub fn calculate_dag_diffs(
 }
 
 /// Compare old DAG deployment config with new resolved DAG to produce change map.
+///
+/// Phase 28 / D-16: returns `BTreeMap<String, (String, String)>` matching
+/// `DiffType::Modify::changes`'s new BTreeMap field type — sibling of
+/// `compare_json` in `diff.rs`. BTreeMap iterates in key-sorted order
+/// natively, so downstream consumers (display.rs, github/router.rs,
+/// api/drift.rs) iterate without per-site sort logic.
 fn compare_dag_config(
     old: &DagDeployment,
     new: &airflow_dag::ResolvedDag,
-) -> HashMap<String, (String, String)> {
-    let mut changes = HashMap::new();
+) -> BTreeMap<String, (String, String)> {
+    let mut changes = BTreeMap::new();
     let new_config = serde_json::to_value(&new.config).unwrap_or_default();
     if let (Value::Object(old_obj), Value::Object(new_obj)) = (&old.config, &new_config) {
         for (k, v) in new_obj {
