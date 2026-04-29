@@ -75,10 +75,31 @@ pub fn calculate_dag_diffs(
     dag_deployments: &HashMap<String, DagDeployment>,
     script_locations: &HashMap<String, String>,
 ) -> Result<Vec<DagDiff>> {
+    // Diff-time render must succeed even when a referenced Glue job has no
+    // JobState yet (fresh deploy, new Glue job, or state wiped between runs).
+    // The actual apply path re-renders with the real URI after jobs are
+    // applied; the hash computed here only drives Create/Modify selection.
+    let mut script_locations = script_locations.clone();
+    for dag in dags {
+        for task_id in &dag.tasks {
+            if !script_locations.contains_key(task_id)
+                && manifest
+                    .jobs
+                    .get(task_id)
+                    .is_some_and(|j| matches!(j.job_type, yard_structs::JobType::Glue))
+            {
+                script_locations.insert(
+                    task_id.clone(),
+                    "s3://__yard_pending__/__pending__.py".to_string(),
+                );
+            }
+        }
+    }
+
     let mut diffs = Vec::new();
 
     for dag in dags {
-        let content = airflow_dag::generate_dag(manifest, dag, script_locations)?;
+        let content = airflow_dag::generate_dag(manifest, dag, &script_locations)?;
         let current_hash = utils::calculate_hash(&content);
 
         if let Some(existing) = dag_deployments.get(&dag.name) {
