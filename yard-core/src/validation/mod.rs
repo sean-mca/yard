@@ -1568,4 +1568,91 @@ mod tests {
         assert_eq!(errs[1].field, "airflow.max_active_runs"); // CONC-02 last (Phase 30 appended rules)
         assert_eq!(errs[1].message, "must be >= 1");
     }
+
+    // --- Phase 30 plan 30-02: S3-02 knob validation (poke_interval >= 10) ---
+
+    #[test]
+    fn validate_dag_full_rejects_s3_poke_interval_below_10() {
+        // S3-02: deferrable sensors hot-loop the triggerer below 10s. Reject
+        // at validate_dag_full so codegen never emits a footgun config.
+        let dag = dag_with(AirflowSection {
+            trigger: Some(Trigger::Single(SingleSource::S3(S3Trigger {
+                bucket: "b".into(),
+                prefix: Some("p".into()),
+                poke_interval: Some(5),
+                ..Default::default()
+            }))),
+            ..Default::default()
+        });
+        let errs = validate_dag_full(&dag);
+        assert_eq!(errs.len(), 1, "expected exactly one S3-02 error: {errs:?}");
+        assert_eq!(errs[0].field, "airflow.trigger.s3.poke_interval");
+        assert_eq!(
+            errs[0].message,
+            "must be >= 10 (lower values trigger the Airflow triggerer hot-loop)"
+        );
+    }
+
+    #[test]
+    fn validate_dag_full_passes_s3_poke_interval_exactly_10() {
+        // 10 is the floor, not below — must pass.
+        let dag = dag_with(AirflowSection {
+            trigger: Some(Trigger::Single(SingleSource::S3(S3Trigger {
+                bucket: "b".into(),
+                prefix: Some("p".into()),
+                poke_interval: Some(10),
+                ..Default::default()
+            }))),
+            ..Default::default()
+        });
+        assert!(validate_dag_full(&dag).is_empty());
+    }
+
+    #[test]
+    fn validate_dag_full_passes_s3_poke_interval_default_none() {
+        // Unset poke_interval falls back to render-time default of 60.
+        let dag = dag_with(AirflowSection {
+            trigger: Some(Trigger::Single(SingleSource::S3(S3Trigger {
+                bucket: "b".into(),
+                prefix: Some("p".into()),
+                poke_interval: None,
+                ..Default::default()
+            }))),
+            ..Default::default()
+        });
+        assert!(validate_dag_full(&dag).is_empty());
+    }
+
+    #[test]
+    fn validate_dag_full_rejects_s3_poke_interval_in_composite_all() {
+        // Knob validation must walk composite trigger lists too — an S3 leaf
+        // inside a heterogeneous all: list should still trip the rule.
+        let dag = dag_with(AirflowSection {
+            trigger: Some(Trigger::All(vec![
+                SingleSource::S3(S3Trigger {
+                    bucket: "b".into(),
+                    prefix: Some("p".into()),
+                    poke_interval: Some(3),
+                    ..Default::default()
+                }),
+                sqs_src(),
+            ])),
+            ..Default::default()
+        });
+        let errs = validate_dag_full(&dag);
+        // Filter to just the S3-02 error to avoid coupling to other rule output.
+        let s3_errs: Vec<_> = errs
+            .iter()
+            .filter(|e| e.field == "airflow.trigger.s3.poke_interval")
+            .collect();
+        assert_eq!(
+            s3_errs.len(),
+            1,
+            "expected one S3-02 error from composite all walk: got {errs:?}"
+        );
+        assert_eq!(
+            s3_errs[0].message,
+            "must be >= 10 (lower values trigger the Airflow triggerer hot-loop)"
+        );
+    }
 }
