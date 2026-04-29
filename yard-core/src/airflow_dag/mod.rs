@@ -1436,6 +1436,155 @@ mod tests {
         );
     }
 
+    // --- Phase 30 plan 30-03: end-to-end SQS sensor render fixtures (SQS-01, SQS-02) ---
+
+    #[test]
+    fn dag_trigger_sqs_emits_long_poll_sensor() {
+        // SQS-01 + SQS-02 end-to-end: trigger: { sqs: { queue_url } } with one
+        // bash task. Verify deterministic task_id, knob defaults (long-poll
+        // wait_time_seconds=20 saves SQS API costs), and the
+        // _yard_wait_sqs >> t_<root> edge wire through generation.rs +
+        // template render. Generated Python must parse cleanly.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  sqs:\n    queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/myqueue\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("worker".into(), bash_job("echo work", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("from airflow.providers.amazon.aws.sensors.sqs import SqsSensor"),
+            "expected SqsSensor import line: {script}"
+        );
+        assert!(
+            script.contains("_yard_wait_sqs = SqsSensor("),
+            "expected _yard_wait_sqs task assignment: {script}"
+        );
+        assert!(
+            script.contains("task_id=\"_yard_wait_sqs\""),
+            "expected deterministic task_id: {script}"
+        );
+        assert!(
+            script.contains(
+                "sqs_queue=\"https://sqs.us-east-1.amazonaws.com/123456789012/myqueue\""
+            ),
+            "expected sqs_queue kwarg: {script}"
+        );
+        assert!(
+            script.contains("wait_time_seconds=20"),
+            "long-poll default knob: {script}"
+        );
+        assert!(script.contains("max_messages=5"), "default knob: {script}");
+        assert!(
+            script.contains("delete_message_on_reception=True"),
+            "default knob: {script}"
+        );
+        assert!(
+            script.contains("deferrable=True"),
+            "SQS deferrable default: {script}"
+        );
+        assert!(
+            script.contains("_yard_wait_sqs >> t_worker"),
+            "expected sensor edge to root task: {script}"
+        );
+        assert!(
+            script.contains("schedule=None"),
+            "SQS sensor-driven DAG must render schedule=None: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_trigger_sqs_with_user_knob_overrides_renders_overrides() {
+        // SQS-02 end-to-end: wait_time_seconds, max_messages,
+        // delete_message_on_reception overrides propagate through to the
+        // rendered Python verbatim. delete=false renders Python's `False`.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  sqs:\n    queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/myqueue\n    wait_time_seconds: 10\n    max_messages: 1\n    delete_message_on_reception: false\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("worker".into(), bash_job("echo work", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("wait_time_seconds=10"),
+            "user override propagates: {script}"
+        );
+        assert!(
+            script.contains("max_messages=1"),
+            "user override propagates: {script}"
+        );
+        assert!(
+            script.contains("delete_message_on_reception=False"),
+            "user override propagates as Python False: {script}"
+        );
+        assert!(
+            !script.contains("delete_message_on_reception=True"),
+            "must not also emit True: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_trigger_sqs_inherits_aws_conn_id_from_assume_role() {
+        // SQS aws_conn_id end-to-end: SqsTrigger has no per-trigger
+        // override field, so the DAG-level default from
+        // manifest.aws.assume_role flows in via derive_aws_conn_id —
+        // same plumbing that powers Glue tasks and the S3 sensor.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  sqs:\n    queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/myqueue\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest.aws = Some(AwsCredentialConfig {
+            assume_role: Some("arn:aws:iam::123456789012:role/MyRole".to_string()),
+            ..Default::default()
+        });
+        manifest
+            .jobs
+            .insert("worker".into(), bash_job("echo work", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("aws_conn_id=\"yard_123456789012_MyRole\""),
+            "SQS sensor must inherit DAG-level aws_conn_id from assume_role: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
     #[test]
     fn trigger_overrides_inherited_schedule() {
         let tmp = setup_project_tree();

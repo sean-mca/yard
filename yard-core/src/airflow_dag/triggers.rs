@@ -110,6 +110,12 @@ pub(super) fn render_trigger(
 /// defaults (poke_interval=60, timeout=86400, deferrable=True), the
 /// per-trigger > DAG-level > None aws_conn_id precedence (S3-04, D-08),
 /// and the legacy `deferrable=False` escape hatch (S3-03).
+///
+/// SQS (plan 30-03) — emits `_yard_wait_sqs = SqsSensor(...)` with knob
+/// defaults (wait_time_seconds=20 long-poll, max_messages=5,
+/// delete_message_on_reception=True, deferrable=True). SqsTrigger has no
+/// per-trigger aws_conn_id field (Phase 28 omission); plumbing flows from
+/// `default_aws_conn_id` directly with the same omit-when-None contract.
 fn render_single(
     s: &SingleSource,
     default_aws_conn_id: Option<&str>,
@@ -199,10 +205,70 @@ fn render_single(
                 max_active_runs: None,
             }
         }
-        // SQS / API render branches land in plans 30-03 / 30-04. Until then,
-        // fall back to schedule=None placeholder so existing fixtures keep
-        // passing byte-identical. PRES-02 protects this contract.
-        SingleSource::Sqs(_) | SingleSource::Api(_) => TriggerRender {
+        SingleSource::Sqs(sqs) => {
+            // Knob defaults (SQS-02): wait_time_seconds=20 (long-poll, saves
+            // SQS API costs vs. the SDK's 0-second default), max_messages=5,
+            // delete_message_on_reception=True. deferrable=True is locked
+            // unconditionally — Phase 28 didn't add a `deferrable` field to
+            // SqsTrigger, and the locked CONTEXT decision is to render as
+            // deferrable always. A future SqsTrigger.deferrable field would be
+            // a non-breaking addition that mirrors the S3 escape hatch.
+            let wait = sqs.wait_time_seconds.unwrap_or(20);
+            let max_msgs = sqs.max_messages.unwrap_or(5);
+            let del_on_recv = sqs.delete_message_on_reception.unwrap_or(true);
+
+            // SqsTrigger has NO per-trigger aws_conn_id field (Phase 28
+            // omitted it). Use DAG-level default directly. None means
+            // Airflow's `aws_default` applies by absence — same PRES-02
+            // pattern as the S3 arm when both override and default are unset.
+            let conn = default_aws_conn_id;
+
+            // Build the sensor task lines. 4-space indent = inside the
+            // `with DAG(...) as dag:` block. Kwarg order matches the S3 arm
+            // for diff-churn minimization: task_id, queue, knobs, conn.
+            let mut sensor = String::new();
+            sensor.push_str("    _yard_wait_sqs = SqsSensor(\n");
+            sensor.push_str("        task_id=\"_yard_wait_sqs\",\n");
+            sensor.push_str(&format!(
+                "        sqs_queue={},\n",
+                python_string_literal(&sqs.queue_url)
+            ));
+            sensor.push_str(&format!("        wait_time_seconds={wait},\n"));
+            sensor.push_str(&format!("        max_messages={max_msgs},\n"));
+            sensor.push_str(&format!(
+                "        delete_message_on_reception={},\n",
+                if del_on_recv { "True" } else { "False" }
+            ));
+            sensor.push_str("        deferrable=True,\n");
+            if let Some(c) = conn {
+                sensor.push_str(&format!(
+                    "        aws_conn_id={},\n",
+                    python_string_literal(c)
+                ));
+            }
+            sensor.push_str("    )");
+
+            // One edge per root in input order — generation.rs computes
+            // `roots` deterministically (DAG task list filter + cloned).
+            let deps: Vec<String> = roots
+                .iter()
+                .map(|r| format!("_yard_wait_sqs >> {}", python_var_name(r)))
+                .collect();
+
+            TriggerRender {
+                schedule_expr: "None".to_string(),
+                sensor_tasks: vec![sensor],
+                sensor_deps: deps,
+                extra_imports: vec![
+                    "from airflow.providers.amazon.aws.sensors.sqs import SqsSensor".to_string(),
+                ],
+                max_active_runs: None,
+            }
+        }
+        // API render branch lands in plan 30-04. Until then, fall back to
+        // schedule=None placeholder so existing fixtures keep passing
+        // byte-identical. PRES-02 protects this contract.
+        SingleSource::Api(_) => TriggerRender {
             schedule_expr: "None".to_string(),
             sensor_tasks: Vec::new(),
             sensor_deps: Vec::new(),
@@ -265,7 +331,7 @@ fn render_composite(t: &Trigger) -> TriggerRender {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use yard_structs::{DatasetTrigger, S3Trigger, ScheduleTrigger};
+    use yard_structs::{DatasetTrigger, S3Trigger, ScheduleTrigger, SqsTrigger};
 
     fn ds(uri: &str) -> SingleSource {
         SingleSource::Dataset(DatasetTrigger {
@@ -279,6 +345,18 @@ mod tests {
             bucket: bucket.to_string(),
             prefix: prefix.map(|s| s.to_string()),
             ..Default::default()
+        })
+    }
+
+    /// Default-knob bare SQS trigger fixture for the render_trigger_sqs_* tests.
+    /// SqsTrigger does not derive Default (no `..Default::default()`); enumerate
+    /// every Option field explicitly.
+    fn sqs(queue_url: &str) -> SingleSource {
+        SingleSource::Sqs(SqsTrigger {
+            queue_url: queue_url.to_string(),
+            wait_time_seconds: None,
+            max_messages: None,
+            delete_message_on_reception: None,
         })
     }
 
@@ -535,6 +613,109 @@ mod tests {
             vec![
                 "_yard_wait_s3 >> t_a".to_string(),
                 "_yard_wait_s3 >> t_b".to_string(),
+            ]
+        );
+    }
+
+    // --- Phase 30 plan 30-03: SQS single-source render branch (SQS-01, SQS-02) ---
+
+    #[test]
+    fn render_trigger_sqs_default_knobs_emits_long_poll_sensor() {
+        // SQS-01 + SQS-02 single-account default — knob defaults
+        // (wait_time_seconds=20 long-poll, max_messages=5,
+        // delete_message_on_reception=True, deferrable=True), no aws_conn_id
+        // (Airflow's aws_default applies by absence), one >> edge per root.
+        let t = Trigger::Single(sqs(
+            "https://sqs.us-east-1.amazonaws.com/123456789012/myqueue",
+        ));
+        let out = render_trigger(Some(&t), None, None, &["root_task".to_string()]);
+        assert_eq!(out.schedule_expr, "None");
+        assert_eq!(out.sensor_tasks.len(), 1);
+        let st = &out.sensor_tasks[0];
+        assert!(st.contains("_yard_wait_sqs = SqsSensor("), "got: {st}");
+        assert!(st.contains("task_id=\"_yard_wait_sqs\""), "got: {st}");
+        assert!(
+            st.contains(
+                "sqs_queue=\"https://sqs.us-east-1.amazonaws.com/123456789012/myqueue\""
+            ),
+            "got: {st}"
+        );
+        assert!(st.contains("wait_time_seconds=20"), "got: {st}");
+        assert!(st.contains("max_messages=5"), "got: {st}");
+        assert!(st.contains("delete_message_on_reception=True"), "got: {st}");
+        assert!(st.contains("deferrable=True"), "got: {st}");
+        assert!(
+            !st.contains("aws_conn_id="),
+            "no override + no default = no conn line: {st}"
+        );
+        assert_eq!(
+            out.sensor_deps,
+            vec!["_yard_wait_sqs >> t_root_task".to_string()]
+        );
+        assert_eq!(
+            out.extra_imports,
+            vec!["from airflow.providers.amazon.aws.sensors.sqs import SqsSensor".to_string()]
+        );
+        assert_eq!(out.max_active_runs, None);
+    }
+
+    #[test]
+    fn render_trigger_sqs_user_override_knobs_propagate() {
+        // SQS-02: user values override the render defaults verbatim.
+        let t = Trigger::Single(SingleSource::Sqs(SqsTrigger {
+            queue_url: "q".into(),
+            wait_time_seconds: Some(10),
+            max_messages: Some(1),
+            delete_message_on_reception: Some(false),
+        }));
+        let out = render_trigger(Some(&t), None, None, &["r".to_string()]);
+        let st = &out.sensor_tasks[0];
+        assert!(st.contains("wait_time_seconds=10"), "got: {st}");
+        assert!(st.contains("max_messages=1"), "got: {st}");
+        assert!(
+            st.contains("delete_message_on_reception=False"),
+            "got: {st}"
+        );
+        assert!(
+            !st.contains("delete_message_on_reception=True"),
+            "got: {st}"
+        );
+    }
+
+    #[test]
+    fn render_trigger_sqs_with_dag_default_aws_conn_id_threads_into_sensor() {
+        // SqsTrigger has no per-trigger aws_conn_id field (Phase 28 omitted it).
+        // The DAG-level default flows in directly; absence on both sides means
+        // no kwarg line at all (Airflow's aws_default applies).
+        let t = Trigger::Single(sqs("q"));
+        let out = render_trigger(
+            Some(&t),
+            None,
+            Some("yard_123456789012_MyRole"),
+            &["r".to_string()],
+        );
+        let st = &out.sensor_tasks[0];
+        assert!(
+            st.contains("aws_conn_id=\"yard_123456789012_MyRole\""),
+            "got: {st}"
+        );
+    }
+
+    #[test]
+    fn render_trigger_sqs_multiple_roots_emit_multiple_dep_edges() {
+        // SQS-01: one >> edge per root, in input order — mirrors S3 fan-out.
+        let t = Trigger::Single(sqs("q"));
+        let out = render_trigger(
+            Some(&t),
+            None,
+            None,
+            &["a".to_string(), "b".to_string()],
+        );
+        assert_eq!(
+            out.sensor_deps,
+            vec![
+                "_yard_wait_sqs >> t_a".to_string(),
+                "_yard_wait_sqs >> t_b".to_string(),
             ]
         );
     }
