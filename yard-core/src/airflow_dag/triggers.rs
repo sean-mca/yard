@@ -82,27 +82,36 @@ pub(super) fn render_trigger(
     };
 
     // Branch 1: bare-single (or collapsed single-element composite).
-    if let Some(single) = normalized {
-        return render_single(single, default_aws_conn_id, roots);
-    }
+    let mut result = if let Some(single) = normalized {
+        render_single(single, default_aws_conn_id, roots)
+    } else if let Some(t) = trigger {
+        // Branch 2: composite (>= 2 elements).
+        render_composite(t, default_aws_conn_id, roots)
+    } else {
+        // Branch 3: no trigger — render top-level schedule literal or None.
+        TriggerRender {
+            schedule_expr: match schedule {
+                Some(s) => python_string_literal(s),
+                None => "None".to_string(),
+            },
+            sensor_tasks: Vec::new(),
+            sensor_deps: Vec::new(),
+            extra_imports: Vec::new(),
+            max_active_runs: None,
+            header_docstring: String::new(),
+        }
+    };
 
-    // Branch 2: composite (>= 2 elements).
-    if let Some(t) = trigger {
-        return render_composite(t);
+    // CONC-01: any DAG with a `trigger:` block defaults to max_active_runs=1
+    // when neither a per-arm value nor a user override has set it. Schedule-only
+    // DAGs (`trigger.is_none()`) preserve Airflow's implicit default of 16 — no
+    // `max_active_runs=` line emitted (PRES-02 byte-identical guarantee).
+    // User overrides via `AirflowSection.max_active_runs` always win — applied
+    // later in generation.rs by overlaying onto `result.max_active_runs`.
+    if trigger.is_some() && result.max_active_runs.is_none() {
+        result.max_active_runs = Some(1);
     }
-
-    // Branch 3: no trigger — render top-level schedule literal or None.
-    TriggerRender {
-        schedule_expr: match schedule {
-            Some(s) => python_string_literal(s),
-            None => "None".to_string(),
-        },
-        sensor_tasks: Vec::new(),
-        sensor_deps: Vec::new(),
-        extra_imports: Vec::new(),
-        max_active_runs: None,
-        header_docstring: String::new(),
-    }
+    result
 }
 
 /// Bare-single render branch.
@@ -274,23 +283,71 @@ fn render_single(
                 header_docstring: String::new(),
             }
         }
-        // API render branch lands in plan 30-04. Until then, fall back to
-        // schedule=None placeholder so existing fixtures keep passing
-        // byte-identical. PRES-02 protects this contract.
-        SingleSource::Api(_) => TriggerRender {
-            schedule_expr: "None".to_string(),
-            sensor_tasks: Vec::new(),
-            sensor_deps: Vec::new(),
-            extra_imports: Vec::new(),
-            max_active_runs: None,
-            header_docstring: String::new(),
-        },
+        SingleSource::Api(api) => {
+            // API-01..API-03 (plan 30-04). API triggers have no Airflow sensor
+            // — they fire on manual REST/CLI invocation. The render contribution
+            // is a header docstring documenting curl/CLI snippets with placeholder
+            // env vars (no hardcoded URLs — CLAUDE.md "Never hardcode personal
+            // info" precedent applies to AIRFLOW URLs too) and an auth-management
+            // callout (yard does NOT manage Airflow REST auth). payload_schema
+            // is doc-only in v1.6 — Airflow's typed Params landed in 3.x.
+            let mut header = String::new();
+            header.push_str("# Trigger: API (manual / external invocation)\n");
+            if let Some(desc) = &api.description {
+                header.push_str(&format!("# {desc}\n"));
+            }
+            header.push_str("#\n");
+            header.push_str("# This DAG is triggered manually via Airflow's REST API or CLI.\n");
+            header.push_str("# yard does NOT manage Airflow REST auth — configure JWT, Basic,\n");
+            header.push_str("# or IAM SigV4 credentials in your Airflow deployment.\n");
+            header.push_str("#\n");
+            header.push_str("# Invoke via REST:\n");
+            header.push_str("#   curl -X POST \"$AIRFLOW_URL/api/v1/dags/<dag_id>/dagRuns\" \\\n");
+            header.push_str("#        -u \"$AIRFLOW_USER:$AIRFLOW_PASS\" \\\n");
+            header.push_str("#        -H \"Content-Type: application/json\" \\\n");
+            header.push_str("#        -d '{\"conf\": {\"key\": \"value\"}}'\n");
+            header.push_str("#\n");
+            header.push_str("# Invoke via CLI:\n");
+            header.push_str(
+                "#   airflow dags trigger <dag_id> --conf '{\"key\": \"value\"}'\n",
+            );
+            if let Some(schema) = &api.payload_schema {
+                header.push_str("#\n");
+                header.push_str(
+                    "# Expected payload fields (doc-only — no runtime enforcement in v1.6):\n",
+                );
+                // BTreeMap iteration is sorted by key already, locking deterministic
+                // header ordering across runs.
+                for (field, ty) in schema {
+                    header.push_str(&format!("#   {field}: {ty}\n"));
+                }
+            }
+            TriggerRender {
+                schedule_expr: "None".to_string(),
+                sensor_tasks: Vec::new(),
+                sensor_deps: Vec::new(),
+                extra_imports: Vec::new(),
+                // CONC-01 auto-default applied centrally in render_trigger.
+                max_active_runs: None,
+                header_docstring: header,
+            }
+        }
     }
 }
 
 /// Composite render branch — Datasets-only homogeneous all/any (DS-02, DS-03).
-/// Heterogeneous all + max_active_runs default land in plan 30-04.
-fn render_composite(t: &Trigger) -> TriggerRender {
+/// Heterogeneous all (DS-04) + mixed Dataset+sensor split (D-11) land in plan
+/// 30-04. `default_aws_conn_id` and `roots` flow through to the per-source
+/// render arms via recursive `render_single` calls for non-Dataset items.
+fn render_composite(
+    t: &Trigger,
+    default_aws_conn_id: Option<&str>,
+    roots: &[String],
+) -> TriggerRender {
+    // Suppress unused-args until plan 30-04 task 2 wires the heterogeneous-all
+    // branch. Both are forwarded to render_single inside that branch.
+    let _ = default_aws_conn_id;
+    let _ = roots;
     let (items, separator) = match t {
         Trigger::All(v) => (v, " & "),
         Trigger::Any(v) => (v, " | "),
@@ -475,13 +532,14 @@ mod tests {
     }
 
     #[test]
-    fn render_trigger_max_active_runs_field_is_none_for_datasets_only_in_this_plan() {
-        // Plan 30-01 stakes the field shape but does not yet wire CONC-01
-        // auto-default-to-Some(1). That lands in plan 30-04. Lock the
-        // current behavior so plan 30-04 can flip it intentionally.
+    fn render_trigger_max_active_runs_field_is_some_one_for_dataset_trigger() {
+        // CONC-01 (plan 30-04 flipped this): any DAG with a `trigger:` block
+        // defaults to max_active_runs=Some(1). Plan 30-01 staked the field
+        // shape with None; plan 30-04 wires the auto-default centrally in
+        // render_trigger. Schedule-only DAGs still preserve None (PRES-02).
         let t = Trigger::Single(ds("s3://x"));
         let out = render_trigger(Some(&t), None, None, &[]);
-        assert_eq!(out.max_active_runs, None);
+        assert_eq!(out.max_active_runs, Some(1));
     }
 
     #[test]
@@ -525,7 +583,8 @@ mod tests {
                 "from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor".to_string()
             ]
         );
-        assert_eq!(out.max_active_runs, None);
+        // CONC-01 (plan 30-04): any trigger DAG defaults to max_active_runs=1.
+        assert_eq!(out.max_active_runs, Some(1));
     }
 
     #[test]
@@ -679,7 +738,8 @@ mod tests {
             out.extra_imports,
             vec!["from airflow.providers.amazon.aws.sensors.sqs import SqsSensor".to_string()]
         );
-        assert_eq!(out.max_active_runs, None);
+        // CONC-01 (plan 30-04): any trigger DAG defaults to max_active_runs=1.
+        assert_eq!(out.max_active_runs, Some(1));
     }
 
     #[test]
