@@ -596,6 +596,100 @@ mod tests {
 
     // --- SingleSource::source_kind (Phase 29 wire-key helper, D-19) ---
 
+    // --- Single-element composite collapse (Phase 30, plan 30-01, D-12) ---
+
+    #[test]
+    fn trigger_serialize_collapses_single_element_all_to_bare_single() {
+        // D-12: Trigger::All([x]) must serialize byte-identical to
+        // Trigger::Single(x) so `all: [x]` and `<x>` produce same wire form
+        // (and therefore same blake3 hash via diff.rs).
+        let collapsed = Trigger::All(vec![SingleSource::Dataset(DatasetTrigger {
+            uri: "s3://x".into(),
+        })]);
+        let bare = Trigger::Single(SingleSource::Dataset(DatasetTrigger {
+            uri: "s3://x".into(),
+        }));
+        assert_eq!(
+            serde_json::to_string(&collapsed).unwrap(),
+            r#"{"dataset":{"uri":"s3://x"}}"#,
+            "Trigger::All([x]) must collapse to bare single on serialize"
+        );
+        assert_eq!(
+            serde_json::to_string(&collapsed).unwrap(),
+            serde_json::to_string(&bare).unwrap(),
+            "single-element all and bare-single must serialize byte-identical"
+        );
+    }
+
+    #[test]
+    fn trigger_serialize_collapses_single_element_any_to_bare_single() {
+        let collapsed = Trigger::Any(vec![SingleSource::Dataset(DatasetTrigger {
+            uri: "s3://x".into(),
+        })]);
+        let bare = Trigger::Single(SingleSource::Dataset(DatasetTrigger {
+            uri: "s3://x".into(),
+        }));
+        assert_eq!(
+            serde_json::to_string(&collapsed).unwrap(),
+            r#"{"dataset":{"uri":"s3://x"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&collapsed).unwrap(),
+            serde_json::to_string(&bare).unwrap(),
+            "single-element any and bare-single must serialize byte-identical"
+        );
+    }
+
+    #[test]
+    fn trigger_single_element_composite_blake3_matches_bare_single() {
+        // HASH-01 regression: byte-identical serialization is the necessary
+        // and sufficient condition for identical blake3 hashes (diff.rs hashes
+        // serde_json::to_string(trigger).as_bytes()). Testing string equality
+        // here proves the hash equality without pulling blake3 into yard-structs.
+        let ds_x = SingleSource::Dataset(DatasetTrigger { uri: "x".into() });
+        let single = serde_json::to_string(&Trigger::Single(ds_x.clone())).unwrap();
+        let all = serde_json::to_string(&Trigger::All(vec![ds_x.clone()])).unwrap();
+        let any = serde_json::to_string(&Trigger::Any(vec![ds_x])).unwrap();
+        assert_eq!(single, all, "Trigger::All([x]) bytes must match Single(x)");
+        assert_eq!(single, any, "Trigger::Any([x]) bytes must match Single(x)");
+        // Sanity check: same bytes -> same hash for any hasher.
+        assert_eq!(
+            single.as_bytes(),
+            all.as_bytes(),
+            "byte equality is the HASH-01 invariant precondition"
+        );
+    }
+
+    #[test]
+    fn trigger_serialize_two_element_composite_keeps_all_key() {
+        // Collapse must only fire at len==1. Two-element composites keep the
+        // `all:` / `any:` wrapper.
+        let t = Trigger::All(vec![
+            SingleSource::Dataset(DatasetTrigger { uri: "a".into() }),
+            SingleSource::Dataset(DatasetTrigger { uri: "b".into() }),
+        ]);
+        let s = serde_json::to_string(&t).unwrap();
+        assert!(
+            s.starts_with(r#"{"all":"#),
+            "two-element all must keep 'all' key, got: {s}"
+        );
+    }
+
+    #[test]
+    fn trigger_serialize_two_element_any_keeps_any_key() {
+        let t = Trigger::Any(vec![
+            SingleSource::Dataset(DatasetTrigger { uri: "a".into() }),
+            SingleSource::Dataset(DatasetTrigger { uri: "b".into() }),
+        ]);
+        let s = serde_json::to_string(&t).unwrap();
+        assert!(
+            s.starts_with(r#"{"any":"#),
+            "two-element any must keep 'any' key, got: {s}"
+        );
+    }
+
+    // --- SingleSource::source_kind (Phase 29 wire-key helper, D-19) ---
+
     #[test]
     fn single_source_kind_returns_wire_keys() {
         assert_eq!(

@@ -1415,4 +1415,103 @@ mod tests {
         assert_eq!(errs[0].field, "airflow.trigger"); // TRIG-04 first per D-08
         assert_eq!(errs[1].field, "airflow.trigger.any"); // TRIG-05b second
     }
+
+    // --- Phase 30 plan 30-01: TRIG-08 + CONC-02 ---
+
+    #[test]
+    fn validate_dag_full_rejects_max_active_runs_zero() {
+        let dag = dag_with(AirflowSection {
+            max_active_runs: Some(0),
+            ..Default::default()
+        });
+        let errs = validate_dag_full(&dag);
+        assert_eq!(errs.len(), 1, "expected exactly one CONC-02 error: {errs:?}");
+        assert_eq!(errs[0].field, "airflow.max_active_runs");
+        assert_eq!(errs[0].message, "must be >= 1");
+    }
+
+    #[test]
+    fn validate_dag_full_passes_max_active_runs_one() {
+        let dag = dag_with(AirflowSection {
+            max_active_runs: Some(1),
+            ..Default::default()
+        });
+        assert!(validate_dag_full(&dag).is_empty());
+    }
+
+    #[test]
+    fn validate_dag_full_passes_max_active_runs_none() {
+        let dag = dag_with(AirflowSection {
+            max_active_runs: None,
+            ..Default::default()
+        });
+        assert!(validate_dag_full(&dag).is_empty());
+    }
+
+    #[test]
+    fn validate_dag_full_rejects_reserved_task_id_yard_wait_dataset() {
+        let mut dag = dag_with(AirflowSection {
+            trigger: Some(Trigger::Single(ds_src("s3://x"))),
+            ..Default::default()
+        });
+        dag.tasks = vec!["_yard_wait_dataset".to_string()];
+        let errs = validate_dag_full(&dag);
+        assert_eq!(errs.len(), 1, "expected exactly one TRIG-08 error: {errs:?}");
+        assert_eq!(errs[0].field, "airflow.tasks");
+        assert_eq!(
+            errs[0].message,
+            "task_id '_yard_wait_dataset' is reserved for trigger codegen — rename your task"
+        );
+    }
+
+    #[test]
+    fn validate_dag_full_rejects_reserved_task_id_yard_join_for_heterogeneous_all() {
+        let mut dag = dag_with(AirflowSection {
+            trigger: Some(Trigger::All(vec![s3_src(), sqs_src()])),
+            ..Default::default()
+        });
+        dag.tasks = vec!["_yard_join".to_string()];
+        let errs = validate_dag_full(&dag);
+        assert_eq!(errs.len(), 1, "expected exactly one TRIG-08 error: {errs:?}");
+        assert_eq!(errs[0].field, "airflow.tasks");
+        assert_eq!(
+            errs[0].message,
+            "task_id '_yard_join' is reserved for trigger codegen — rename your task"
+        );
+    }
+
+    #[test]
+    fn validate_dag_full_passes_when_no_trigger_present_with_reserved_id_named_task() {
+        // TRIG-08 only fires when a trigger is present. Schedule-only DAGs
+        // can name a task `_yard_wait_s3` without conflict (we don't emit
+        // any reserved IDs in that codegen path).
+        let mut dag = dag_with(AirflowSection {
+            schedule: Some("@daily".into()),
+            trigger: None,
+            ..Default::default()
+        });
+        dag.tasks = vec!["_yard_wait_s3".to_string()];
+        assert!(validate_dag_full(&dag).is_empty());
+    }
+
+    #[test]
+    fn validate_dag_full_accumulates_phase29_and_phase30_errors() {
+        // Sanity-check rule independence: TRIG-04 (mutual exclusion) AND
+        // CONC-02 (max_active_runs >= 1) both fire — no short-circuit.
+        let dag = dag_with(AirflowSection {
+            schedule: Some("@daily".into()),
+            trigger: Some(Trigger::Single(s3_src())),
+            max_active_runs: Some(0),
+            ..Default::default()
+        });
+        let errs = validate_dag_full(&dag);
+        assert_eq!(
+            errs.len(),
+            2,
+            "expected TRIG-04 + CONC-02, got: {errs:?}"
+        );
+        assert_eq!(errs[0].field, "airflow.trigger"); // TRIG-04 first per locked order
+        assert_eq!(errs[1].field, "airflow.max_active_runs"); // CONC-02 last (Phase 30 appended rules)
+        assert_eq!(errs[1].message, "must be >= 1");
+    }
 }

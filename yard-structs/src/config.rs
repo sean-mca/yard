@@ -549,6 +549,31 @@ mod tests {
         assert_eq!(creds.session_name.as_deref(), Some("yard-dag"));
     }
 
+    // --- AirflowSection.max_active_runs (Phase 30, plan 30-01, D-13 / CONC-01) ---
+
+    #[test]
+    fn airflow_section_no_max_active_runs_roundtrip() {
+        // PRES-05: when max_active_runs is unset, it must NOT appear in
+        // serialized output (skip_serializing_if). Parses to None.
+        let input = json!({"schedule": "@daily"});
+        let parsed: AirflowSection = serde_json::from_value(input).unwrap();
+        assert_eq!(parsed.max_active_runs, None);
+        let reser = serde_json::to_value(&parsed).unwrap();
+        assert!(
+            reser.get("max_active_runs").is_none(),
+            "max_active_runs:None must be skipped on serialize, got: {reser}"
+        );
+    }
+
+    #[test]
+    fn airflow_section_with_max_active_runs() {
+        let input = json!({"schedule": "@daily", "max_active_runs": 4});
+        let parsed: AirflowSection = serde_json::from_value(input).unwrap();
+        assert_eq!(parsed.max_active_runs, Some(4));
+        let reser = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(reser.get("max_active_runs"), Some(&json!(4)));
+    }
+
     // --- AwsCredentialConfig (TYPE-02) ---
 
     #[test]
