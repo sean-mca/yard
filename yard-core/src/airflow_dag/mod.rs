@@ -10,6 +10,7 @@ mod connections;
 mod generation;
 mod helpers;
 mod resolve;
+mod triggers;
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -1147,6 +1148,9 @@ mod tests {
 
     #[test]
     fn dag_trigger_datasets_emits_schedule_list() {
+        // Phase 30 plan 30-01 (DS-02) updated: homogeneous all-Datasets now
+        // renders the Airflow 2.9 native `&` chain instead of Phase 28's
+        // interim flat list. URIs alpha-sorted per D-11.
         let tmp = setup_project_tree();
         let root = tmp.path();
         let dag_dir = root.join("pipeline");
@@ -1163,11 +1167,651 @@ mod tests {
         let dags = collect_dags(root, &manifest).unwrap();
         let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
         assert!(script.contains("from airflow.datasets import Dataset"));
-        assert!(script.contains(
-            "schedule=[Dataset(\"s3://warehouse/sales/orders\"), Dataset(\"s3://warehouse/sales/shipments\")]"
-        ));
+        assert!(
+            script.contains(
+                "schedule=(Dataset(\"s3://warehouse/sales/orders\") & Dataset(\"s3://warehouse/sales/shipments\"))"
+            ),
+            "DS-02 expects native `&` chain, alpha-sorted: {script}"
+        );
         assert!(!script.contains("@daily"));
         assert!(validate_python_syntax(&script).is_none(), "{script}");
+    }
+
+    #[test]
+    fn dag_schedule_only_omits_max_active_runs_pres_02_invariant() {
+        // PRES-02: schedule-only DAGs must render WITHOUT a max_active_runs=
+        // line (Airflow's implicit default of 16 applies by absence). Plan
+        // 30-04 wires CONC-01 auto-default-to-1 for trigger DAGs only.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("runit".into(), bash_job("echo hi", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+        assert!(
+            !script.contains("max_active_runs="),
+            "schedule-only DAG must NOT render max_active_runs= line: {script}"
+        );
+        assert!(validate_python_syntax(&script).is_none(), "{script}");
+    }
+
+    #[test]
+    fn dag_trigger_datasets_homogeneous_all_emits_amp_chain() {
+        // DS-02: trigger: { all: [dataset, dataset] } -> schedule=(Dataset(a) & Dataset(b)).
+        // URIs out-of-order in YAML; alpha-sort kicks in (D-11).
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  all:\n    - dataset:\n        uri: s3://warehouse/zzz\n    - dataset:\n        uri: s3://warehouse/aaa\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("agg".into(), bash_job("echo agg", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+        assert!(script.contains("from airflow.datasets import Dataset"));
+        assert!(
+            script.contains(
+                "schedule=(Dataset(\"s3://warehouse/aaa\") & Dataset(\"s3://warehouse/zzz\"))"
+            ),
+            "expected alpha-sorted & chain: {script}"
+        );
+        assert!(validate_python_syntax(&script).is_none(), "{script}");
+    }
+
+    #[test]
+    fn dag_trigger_datasets_homogeneous_any_emits_pipe_chain() {
+        // DS-03: trigger: { any: [dataset, dataset] } -> schedule=(Dataset(a) | Dataset(b)).
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  any:\n    - dataset:\n        uri: s3://warehouse/zzz\n    - dataset:\n        uri: s3://warehouse/aaa\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("agg".into(), bash_job("echo agg", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+        assert!(
+            script.contains(
+                "schedule=(Dataset(\"s3://warehouse/aaa\") | Dataset(\"s3://warehouse/zzz\"))"
+            ),
+            "expected alpha-sorted | chain: {script}"
+        );
+        assert!(validate_python_syntax(&script).is_none(), "{script}");
+    }
+
+    #[test]
+    fn dag_trigger_dataset_single_element_all_renders_same_as_bare_single_dataset() {
+        // D-12 end-to-end: { all: [dataset(x)] } and { dataset(x) } render
+        // byte-identical Python because Trigger::Serialize collapses on the
+        // hash side AND render_trigger normalizes on the codegen side.
+        let tmp_a = setup_project_tree();
+        let dir_a = tmp_a.path().join("pa");
+        write_yaml(
+            &dir_a.join("dag.yaml"),
+            "trigger:\n  all:\n    - dataset:\n        uri: s3://warehouse/foo\n",
+        );
+        let mut manifest_a = empty_manifest("test");
+        manifest_a
+            .jobs
+            .insert("agg".into(), bash_job("echo a", &dir_a));
+        let dags_a = collect_dags(tmp_a.path(), &manifest_a).unwrap();
+        let script_a = generate_dag(&manifest_a, &dags_a[0], &HashMap::new()).unwrap();
+
+        let tmp_b = setup_project_tree();
+        let dir_b = tmp_b.path().join("pa");
+        write_yaml(
+            &dir_b.join("dag.yaml"),
+            "trigger:\n  dataset:\n    uri: s3://warehouse/foo\n",
+        );
+        let mut manifest_b = empty_manifest("test");
+        manifest_b
+            .jobs
+            .insert("agg".into(), bash_job("echo a", &dir_b));
+        let dags_b = collect_dags(tmp_b.path(), &manifest_b).unwrap();
+        let script_b = generate_dag(&manifest_b, &dags_b[0], &HashMap::new()).unwrap();
+
+        assert_eq!(
+            script_a, script_b,
+            "single-element all must render byte-identical to bare-single Dataset (D-12)"
+        );
+    }
+
+    // --- Phase 30 plan 30-02: end-to-end S3 sensor render fixtures (S3-01..S3-04) ---
+
+    #[test]
+    fn dag_trigger_s3_emits_deferrable_sensor() {
+        // S3-01 end-to-end: trigger: { s3: { bucket, prefix } } with one
+        // bash task. Verify deterministic task_id, knob defaults, and the
+        // _yard_wait_s3 >> t_<root> edge wire through generation.rs +
+        // template render. Generated Python must parse cleanly.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  s3:\n    bucket: mybucket\n    prefix: \"input/\"\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("ingest".into(), bash_job("echo ingest", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor"),
+            "expected S3KeySensor import line: {script}"
+        );
+        assert!(
+            script.contains("_yard_wait_s3 = S3KeySensor("),
+            "expected _yard_wait_s3 task assignment: {script}"
+        );
+        assert!(
+            script.contains("task_id=\"_yard_wait_s3\""),
+            "expected deterministic task_id: {script}"
+        );
+        assert!(
+            script.contains("bucket_name=\"mybucket\""),
+            "expected bucket_name kwarg: {script}"
+        );
+        assert!(
+            script.contains("bucket_key=\"input/\""),
+            "expected bucket_key from prefix: {script}"
+        );
+        assert!(script.contains("poke_interval=60"), "default knob: {script}");
+        assert!(script.contains("timeout=86400"), "default knob: {script}");
+        assert!(
+            script.contains("deferrable=True"),
+            "S3-03 default: {script}"
+        );
+        assert!(
+            script.contains("_yard_wait_s3 >> t_ingest"),
+            "expected sensor edge to root task: {script}"
+        );
+        assert!(
+            script.contains("schedule=None"),
+            "S3 sensor-driven DAG must render schedule=None: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_trigger_s3_with_user_knob_overrides_renders_overrides() {
+        // S3-02 + S3-03 end-to-end: poke_interval, timeout, deferrable=false
+        // overrides propagate through to the rendered Python verbatim.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  s3:\n    bucket: b\n    prefix: \"p/\"\n    poke_interval: 120\n    timeout: 3600\n    deferrable: false\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("ingest".into(), bash_job("echo ingest", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("poke_interval=120"),
+            "user override propagates: {script}"
+        );
+        assert!(
+            script.contains("timeout=3600"),
+            "user override propagates: {script}"
+        );
+        assert!(
+            script.contains("deferrable=False"),
+            "S3-03 legacy escape hatch: {script}"
+        );
+        assert!(
+            !script.contains("deferrable=True"),
+            "must not also emit deferrable=True: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_trigger_s3_inherits_aws_conn_id_from_assume_role() {
+        // S3-04 end-to-end: when manifest.aws.assume_role is set, the S3
+        // sensor task inherits the derived aws_conn_id via the same
+        // derive_aws_conn_id plumbing that powers Glue tasks. No per-trigger
+        // override means the DAG-level default wins.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  s3:\n    bucket: b\n    prefix: \"p/\"\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest.aws = Some(AwsCredentialConfig {
+            assume_role: Some("arn:aws:iam::123456789012:role/MyRole".to_string()),
+            ..Default::default()
+        });
+        manifest
+            .jobs
+            .insert("ingest".into(), bash_job("echo ingest", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("aws_conn_id=\"yard_123456789012_MyRole\""),
+            "S3 sensor must inherit DAG-level aws_conn_id from assume_role: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
+    // --- Phase 30 plan 30-03: end-to-end SQS sensor render fixtures (SQS-01, SQS-02) ---
+
+    #[test]
+    fn dag_trigger_sqs_emits_long_poll_sensor() {
+        // SQS-01 + SQS-02 end-to-end: trigger: { sqs: { queue_url } } with one
+        // bash task. Verify deterministic task_id, knob defaults (long-poll
+        // wait_time_seconds=20 saves SQS API costs), and the
+        // _yard_wait_sqs >> t_<root> edge wire through generation.rs +
+        // template render. Generated Python must parse cleanly.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  sqs:\n    queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/myqueue\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("worker".into(), bash_job("echo work", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("from airflow.providers.amazon.aws.sensors.sqs import SqsSensor"),
+            "expected SqsSensor import line: {script}"
+        );
+        assert!(
+            script.contains("_yard_wait_sqs = SqsSensor("),
+            "expected _yard_wait_sqs task assignment: {script}"
+        );
+        assert!(
+            script.contains("task_id=\"_yard_wait_sqs\""),
+            "expected deterministic task_id: {script}"
+        );
+        assert!(
+            script.contains(
+                "sqs_queue=\"https://sqs.us-east-1.amazonaws.com/123456789012/myqueue\""
+            ),
+            "expected sqs_queue kwarg: {script}"
+        );
+        assert!(
+            script.contains("wait_time_seconds=20"),
+            "long-poll default knob: {script}"
+        );
+        assert!(script.contains("max_messages=5"), "default knob: {script}");
+        assert!(
+            script.contains("delete_message_on_reception=True"),
+            "default knob: {script}"
+        );
+        assert!(
+            script.contains("deferrable=True"),
+            "SQS deferrable default: {script}"
+        );
+        assert!(
+            script.contains("_yard_wait_sqs >> t_worker"),
+            "expected sensor edge to root task: {script}"
+        );
+        assert!(
+            script.contains("schedule=None"),
+            "SQS sensor-driven DAG must render schedule=None: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_trigger_sqs_with_user_knob_overrides_renders_overrides() {
+        // SQS-02 end-to-end: wait_time_seconds, max_messages,
+        // delete_message_on_reception overrides propagate through to the
+        // rendered Python verbatim. delete=false renders Python's `False`.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  sqs:\n    queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/myqueue\n    wait_time_seconds: 10\n    max_messages: 1\n    delete_message_on_reception: false\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("worker".into(), bash_job("echo work", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("wait_time_seconds=10"),
+            "user override propagates: {script}"
+        );
+        assert!(
+            script.contains("max_messages=1"),
+            "user override propagates: {script}"
+        );
+        assert!(
+            script.contains("delete_message_on_reception=False"),
+            "user override propagates as Python False: {script}"
+        );
+        assert!(
+            !script.contains("delete_message_on_reception=True"),
+            "must not also emit True: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_trigger_sqs_inherits_aws_conn_id_from_assume_role() {
+        // SQS aws_conn_id end-to-end: SqsTrigger has no per-trigger
+        // override field, so the DAG-level default from
+        // manifest.aws.assume_role flows in via derive_aws_conn_id —
+        // same plumbing that powers Glue tasks and the S3 sensor.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  sqs:\n    queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/myqueue\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest.aws = Some(AwsCredentialConfig {
+            assume_role: Some("arn:aws:iam::123456789012:role/MyRole".to_string()),
+            ..Default::default()
+        });
+        manifest
+            .jobs
+            .insert("worker".into(), bash_job("echo work", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("aws_conn_id=\"yard_123456789012_MyRole\""),
+            "SQS sensor must inherit DAG-level aws_conn_id from assume_role: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
+    // ---- Phase 30 plan 30-04: API trigger end-to-end ----
+
+    #[test]
+    fn dag_trigger_api_emits_schedule_none_with_header_docstring() {
+        // API-01..API-03 end-to-end: trigger: { api: { description } }
+        // emits schedule=None plus a header docstring with curl/CLI snippets,
+        // $AIRFLOW_URL placeholder, and the description verbatim. CONC-01:
+        // any trigger DAG renders max_active_runs=1 by default.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  api:\n    description: Manual replay\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("worker".into(), bash_job("echo work", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("schedule=None"),
+            "API trigger renders schedule=None: {script}"
+        );
+        assert!(
+            script.contains("# Manual replay"),
+            "description must appear in header: {script}"
+        );
+        assert!(
+            script.contains("$AIRFLOW_URL"),
+            "header must use $AIRFLOW_URL placeholder: {script}"
+        );
+        assert!(
+            script.contains("curl -X POST"),
+            "header must include curl snippet: {script}"
+        );
+        assert!(
+            script.contains("airflow dags trigger"),
+            "header must include CLI snippet: {script}"
+        );
+        assert!(
+            script.contains("max_active_runs=1"),
+            "CONC-01 default for trigger DAG: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_trigger_heterogeneous_all_emits_join_operator() {
+        // DS-04 + D-09 end-to-end: trigger: { all: [s3, sqs] } emits both
+        // sensors, _yard_join EmptyOperator with trigger_rule="all_success",
+        // sensor->join->root edges, EmptyOperator import, and CONC-01
+        // max_active_runs=1.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  all:\n    - s3:\n        bucket: mybucket\n        prefix: input/\n    - sqs:\n        queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/myqueue\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("worker".into(), bash_job("echo work", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("_yard_wait_s3 = S3KeySensor("),
+            "S3 sensor task: {script}"
+        );
+        assert!(
+            script.contains("_yard_wait_sqs = SqsSensor("),
+            "SQS sensor task: {script}"
+        );
+        assert!(
+            script.contains("_yard_join = EmptyOperator("),
+            "_yard_join task: {script}"
+        );
+        assert!(
+            script.contains("task_id=\"_yard_join\""),
+            "_yard_join task_id literal: {script}"
+        );
+        assert!(
+            script.contains("trigger_rule=\"all_success\""),
+            "_yard_join trigger_rule: {script}"
+        );
+        assert!(
+            script.contains("_yard_wait_s3 >> _yard_join"),
+            "S3 -> _yard_join edge: {script}"
+        );
+        assert!(
+            script.contains("_yard_wait_sqs >> _yard_join"),
+            "SQS -> _yard_join edge: {script}"
+        );
+        assert!(
+            script.contains("_yard_join >> t_worker"),
+            "_yard_join -> root edge: {script}"
+        );
+        assert!(
+            script.contains("from airflow.operators.empty import EmptyOperator"),
+            "EmptyOperator import: {script}"
+        );
+        assert!(
+            script.contains("max_active_runs=1"),
+            "CONC-01 default: {script}"
+        );
+        assert!(
+            script.contains("schedule=None"),
+            "no Datasets => schedule=None: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_trigger_max_active_runs_user_override_wins() {
+        // CONC-01 user-override-wins end-to-end: airflow.max_active_runs: 4 set
+        // alongside trigger: { s3: ... }. User value 4 wins over CONC-01
+        // auto-default of 1.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "max_active_runs: 4\ntrigger:\n  s3:\n    bucket: mybucket\n    prefix: input/\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("worker".into(), bash_job("echo work", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("max_active_runs=4"),
+            "user override (4) must beat CONC-01 auto-default (1): {script}"
+        );
+        assert!(
+            !script.contains("max_active_runs=1"),
+            "CONC-01 auto-default must not also leak when user overrides: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_schedule_only_with_explicit_max_active_runs_renders_user_value() {
+        // PRES-02 + CONC-01 user-override: schedule-only DAG with explicit
+        // airflow.max_active_runs: 8 — render the user value. Without the
+        // explicit field, schedule-only DAGs render no max_active_runs= line
+        // at all (locked by `dag_schedule_only_omits_max_active_runs_pres_02_invariant`
+        // from plan 30-01).
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "schedule: \"@daily\"\nmax_active_runs: 8\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("worker".into(), bash_job("echo work", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("max_active_runs=8"),
+            "explicit user value renders: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_trigger_api_with_payload_schema_documents_fields() {
+        // API-02 doc-only end-to-end: payload_schema fields appear in the
+        // header docstring. No runtime enforcement — just docs for the user
+        // assembling the curl/CLI invocation.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  api:\n    payload_schema:\n      customer_id: string\n      event_id: string\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("worker".into(), bash_job("echo work", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("customer_id"),
+            "payload_schema field customer_id must appear in header: {script}"
+        );
+        assert!(
+            script.contains("event_id"),
+            "payload_schema field event_id must appear in header: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
     }
 
     #[test]

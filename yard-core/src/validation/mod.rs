@@ -12,7 +12,7 @@ use rules::err;
 
 use crate::airflow_dag::ResolvedDag;
 use std::collections::BTreeSet;
-use yard_structs::{SingleSource, Trigger};
+use yard_structs::{AirflowSection, SingleSource, Trigger};
 
 /// Validate a job definition and its generated script.
 /// Runs schema validation, then generates the script and checks Python syntax.
@@ -55,6 +55,16 @@ pub fn validate_dag_full(dag: &ResolvedDag) -> Vec<ValidationError> {
     if let Some(e) = check_heterogeneous_any(cfg.trigger.as_ref()) {
         errors.push(e);
     }
+
+    // Phase 30 plan 30-01 NEW rules (D-06 TRIG-08, D-14 CONC-02). Appended
+    // after the Phase 29 rules so existing test orderings stay byte-identical.
+    errors.extend(check_reserved_task_ids(dag));
+    if let Some(e) = check_max_active_runs(cfg) {
+        errors.push(e);
+    }
+
+    // Phase 30 plan 30-02 NEW rule (S3-02 knob validation).
+    errors.extend(check_s3_poke_interval(cfg.trigger.as_ref()));
 
     errors
 }
@@ -117,6 +127,82 @@ fn check_heterogeneous_any(trigger: Option<&Trigger>) -> Option<ValidationError>
             "'any:' supports only homogeneous Dataset sources (found: {joined}). Heterogeneous 'any:' has no clean Airflow primitive in v1.6 — split into separate DAGs per source, or use homogeneous Dataset triggers."
         ),
     ))
+}
+
+/// TRIG-08 (Phase 30, plan 30-01): reserved trigger task IDs cannot collide
+/// with user-declared task IDs. Reserved IDs emitted by
+/// `triggers.rs::render_trigger` are `_yard_wait_s3`, `_yard_wait_sqs`,
+/// `_yard_wait_dataset`, `_yard_wait_api`, and `_yard_join`. Caught at
+/// `validate_dag_full` pre-codegen so users get a clear actionable error
+/// before codegen produces an invalid DAG with two same-id tasks.
+///
+/// Only fires when a `trigger:` block is present — schedule-only DAGs do
+/// not emit any reserved IDs and may freely name a task `_yard_wait_s3`.
+fn check_reserved_task_ids(dag: &ResolvedDag) -> Vec<ValidationError> {
+    if dag.config.trigger.is_none() {
+        return Vec::new();
+    }
+    let reserved: BTreeSet<&'static str> = [
+        "_yard_wait_s3",
+        "_yard_wait_sqs",
+        "_yard_wait_dataset",
+        "_yard_wait_api",
+        "_yard_join",
+    ]
+    .into_iter()
+    .collect();
+    let mut out = Vec::new();
+    for task_id in &dag.tasks {
+        if reserved.contains(task_id.as_str()) {
+            out.push(err(
+                "airflow.tasks",
+                &format!(
+                    "task_id '{task_id}' is reserved for trigger codegen — rename your task"
+                ),
+            ));
+        }
+    }
+    out
+}
+
+/// CONC-02 (Phase 30, plan 30-01): `airflow.max_active_runs` must be >= 1
+/// when explicitly set. Reject 0 at parse with verbatim error
+/// `must be >= 1`. No upper bound. None (unset) is always valid —
+/// CONC-01's "event-driven default of 1" applies at codegen time.
+fn check_max_active_runs(cfg: &AirflowSection) -> Option<ValidationError> {
+    match cfg.max_active_runs {
+        Some(0) => Some(err("airflow.max_active_runs", "must be >= 1")),
+        _ => None,
+    }
+}
+
+/// S3-02 (Phase 30, plan 30-02): `S3Trigger.poke_interval < 10` triggers
+/// Airflow's triggerer hot-loop (deferrable sensors poll the loop too
+/// aggressively below 10s). Reject at validate_dag_full so codegen never
+/// emits a footgun config. None (unset) falls back to the render-time
+/// default of 60 and is always valid.
+///
+/// Walks both bare-single and composite (`all:` / `any:`) trigger lists so
+/// an S3 leaf nested in a heterogeneous-all composite still trips the rule.
+fn check_s3_poke_interval(trigger: Option<&Trigger>) -> Vec<ValidationError> {
+    let mut out = Vec::new();
+    let sources: Vec<&SingleSource> = match trigger {
+        Some(Trigger::Single(s)) => vec![s],
+        Some(Trigger::All(v)) | Some(Trigger::Any(v)) => v.iter().collect(),
+        None => return out,
+    };
+    for s in sources {
+        if let SingleSource::S3(s3) = s
+            && let Some(pi) = s3.poke_interval
+            && pi < 10
+        {
+            out.push(err(
+                "airflow.trigger.s3.poke_interval",
+                "must be >= 10 (lower values trigger the Airflow triggerer hot-loop)",
+            ));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1414,5 +1500,191 @@ mod tests {
         assert_eq!(errs.len(), 2, "expected TRIG-04 + TRIG-05b, got: {errs:?}");
         assert_eq!(errs[0].field, "airflow.trigger"); // TRIG-04 first per D-08
         assert_eq!(errs[1].field, "airflow.trigger.any"); // TRIG-05b second
+    }
+
+    // --- Phase 30 plan 30-01: TRIG-08 + CONC-02 ---
+
+    #[test]
+    fn validate_dag_full_rejects_max_active_runs_zero() {
+        let dag = dag_with(AirflowSection {
+            max_active_runs: Some(0),
+            ..Default::default()
+        });
+        let errs = validate_dag_full(&dag);
+        assert_eq!(errs.len(), 1, "expected exactly one CONC-02 error: {errs:?}");
+        assert_eq!(errs[0].field, "airflow.max_active_runs");
+        assert_eq!(errs[0].message, "must be >= 1");
+    }
+
+    #[test]
+    fn validate_dag_full_passes_max_active_runs_one() {
+        let dag = dag_with(AirflowSection {
+            max_active_runs: Some(1),
+            ..Default::default()
+        });
+        assert!(validate_dag_full(&dag).is_empty());
+    }
+
+    #[test]
+    fn validate_dag_full_passes_max_active_runs_none() {
+        let dag = dag_with(AirflowSection {
+            max_active_runs: None,
+            ..Default::default()
+        });
+        assert!(validate_dag_full(&dag).is_empty());
+    }
+
+    #[test]
+    fn validate_dag_full_rejects_reserved_task_id_yard_wait_dataset() {
+        let mut dag = dag_with(AirflowSection {
+            trigger: Some(Trigger::Single(ds_src("s3://x"))),
+            ..Default::default()
+        });
+        dag.tasks = vec!["_yard_wait_dataset".to_string()];
+        let errs = validate_dag_full(&dag);
+        assert_eq!(errs.len(), 1, "expected exactly one TRIG-08 error: {errs:?}");
+        assert_eq!(errs[0].field, "airflow.tasks");
+        assert_eq!(
+            errs[0].message,
+            "task_id '_yard_wait_dataset' is reserved for trigger codegen — rename your task"
+        );
+    }
+
+    #[test]
+    fn validate_dag_full_rejects_reserved_task_id_yard_join_for_heterogeneous_all() {
+        let mut dag = dag_with(AirflowSection {
+            trigger: Some(Trigger::All(vec![s3_src(), sqs_src()])),
+            ..Default::default()
+        });
+        dag.tasks = vec!["_yard_join".to_string()];
+        let errs = validate_dag_full(&dag);
+        assert_eq!(errs.len(), 1, "expected exactly one TRIG-08 error: {errs:?}");
+        assert_eq!(errs[0].field, "airflow.tasks");
+        assert_eq!(
+            errs[0].message,
+            "task_id '_yard_join' is reserved for trigger codegen — rename your task"
+        );
+    }
+
+    #[test]
+    fn validate_dag_full_passes_when_no_trigger_present_with_reserved_id_named_task() {
+        // TRIG-08 only fires when a trigger is present. Schedule-only DAGs
+        // can name a task `_yard_wait_s3` without conflict (we don't emit
+        // any reserved IDs in that codegen path).
+        let mut dag = dag_with(AirflowSection {
+            schedule: Some("@daily".into()),
+            trigger: None,
+            ..Default::default()
+        });
+        dag.tasks = vec!["_yard_wait_s3".to_string()];
+        assert!(validate_dag_full(&dag).is_empty());
+    }
+
+    #[test]
+    fn validate_dag_full_accumulates_phase29_and_phase30_errors() {
+        // Sanity-check rule independence: TRIG-04 (mutual exclusion) AND
+        // CONC-02 (max_active_runs >= 1) both fire — no short-circuit.
+        let dag = dag_with(AirflowSection {
+            schedule: Some("@daily".into()),
+            trigger: Some(Trigger::Single(s3_src())),
+            max_active_runs: Some(0),
+            ..Default::default()
+        });
+        let errs = validate_dag_full(&dag);
+        assert_eq!(
+            errs.len(),
+            2,
+            "expected TRIG-04 + CONC-02, got: {errs:?}"
+        );
+        assert_eq!(errs[0].field, "airflow.trigger"); // TRIG-04 first per locked order
+        assert_eq!(errs[1].field, "airflow.max_active_runs"); // CONC-02 last (Phase 30 appended rules)
+        assert_eq!(errs[1].message, "must be >= 1");
+    }
+
+    // --- Phase 30 plan 30-02: S3-02 knob validation (poke_interval >= 10) ---
+
+    #[test]
+    fn validate_dag_full_rejects_s3_poke_interval_below_10() {
+        // S3-02: deferrable sensors hot-loop the triggerer below 10s. Reject
+        // at validate_dag_full so codegen never emits a footgun config.
+        let dag = dag_with(AirflowSection {
+            trigger: Some(Trigger::Single(SingleSource::S3(S3Trigger {
+                bucket: "b".into(),
+                prefix: Some("p".into()),
+                poke_interval: Some(5),
+                ..Default::default()
+            }))),
+            ..Default::default()
+        });
+        let errs = validate_dag_full(&dag);
+        assert_eq!(errs.len(), 1, "expected exactly one S3-02 error: {errs:?}");
+        assert_eq!(errs[0].field, "airflow.trigger.s3.poke_interval");
+        assert_eq!(
+            errs[0].message,
+            "must be >= 10 (lower values trigger the Airflow triggerer hot-loop)"
+        );
+    }
+
+    #[test]
+    fn validate_dag_full_passes_s3_poke_interval_exactly_10() {
+        // 10 is the floor, not below — must pass.
+        let dag = dag_with(AirflowSection {
+            trigger: Some(Trigger::Single(SingleSource::S3(S3Trigger {
+                bucket: "b".into(),
+                prefix: Some("p".into()),
+                poke_interval: Some(10),
+                ..Default::default()
+            }))),
+            ..Default::default()
+        });
+        assert!(validate_dag_full(&dag).is_empty());
+    }
+
+    #[test]
+    fn validate_dag_full_passes_s3_poke_interval_default_none() {
+        // Unset poke_interval falls back to render-time default of 60.
+        let dag = dag_with(AirflowSection {
+            trigger: Some(Trigger::Single(SingleSource::S3(S3Trigger {
+                bucket: "b".into(),
+                prefix: Some("p".into()),
+                poke_interval: None,
+                ..Default::default()
+            }))),
+            ..Default::default()
+        });
+        assert!(validate_dag_full(&dag).is_empty());
+    }
+
+    #[test]
+    fn validate_dag_full_rejects_s3_poke_interval_in_composite_all() {
+        // Knob validation must walk composite trigger lists too — an S3 leaf
+        // inside a heterogeneous all: list should still trip the rule.
+        let dag = dag_with(AirflowSection {
+            trigger: Some(Trigger::All(vec![
+                SingleSource::S3(S3Trigger {
+                    bucket: "b".into(),
+                    prefix: Some("p".into()),
+                    poke_interval: Some(3),
+                    ..Default::default()
+                }),
+                sqs_src(),
+            ])),
+            ..Default::default()
+        });
+        let errs = validate_dag_full(&dag);
+        // Filter to just the S3-02 error to avoid coupling to other rule output.
+        let s3_errs: Vec<_> = errs
+            .iter()
+            .filter(|e| e.field == "airflow.trigger.s3.poke_interval")
+            .collect();
+        assert_eq!(
+            s3_errs.len(),
+            1,
+            "expected one S3-02 error from composite all walk: got {errs:?}"
+        );
+        assert_eq!(
+            s3_errs[0].message,
+            "must be >= 10 (lower values trigger the Airflow triggerer hot-loop)"
+        );
     }
 }

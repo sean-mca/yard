@@ -345,6 +345,13 @@ pub struct AirflowSection {
     /// account.yaml-cascade behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aws: Option<AwsCredentialConfig>,
+    /// CONC-01: DAG-level Airflow knob. None preserves Airflow's default of 16
+    /// for schedule-only DAGs. Event-driven DAGs (`trigger.is_some()`) auto-default
+    /// to 1 at codegen time when this is None — see triggers.rs::render_trigger.
+    /// User override via `airflow.max_active_runs: <N>` always wins.
+    /// CONC-02 enforces `>= 1` at validate_dag_full.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_active_runs: Option<u32>,
 }
 
 /// Private mirror of `AirflowSection` used by the hand-rolled `Deserialize`
@@ -371,6 +378,8 @@ struct _AirflowSectionRaw {
     publishes: Vec<String>,
     #[serde(default)]
     aws: Option<AwsCredentialConfig>,
+    #[serde(default)]
+    max_active_runs: Option<u32>,
 }
 
 impl<'de> serde::Deserialize<'de> for AirflowSection {
@@ -395,6 +404,7 @@ impl<'de> serde::Deserialize<'de> for AirflowSection {
             trigger: raw.trigger,
             publishes: raw.publishes,
             aws: raw.aws,
+            max_active_runs: raw.max_active_runs,
         })
     }
 }
@@ -547,6 +557,31 @@ mod tests {
             Some("arn:aws:iam::222222222222:role/DagUpload")
         );
         assert_eq!(creds.session_name.as_deref(), Some("yard-dag"));
+    }
+
+    // --- AirflowSection.max_active_runs (Phase 30, plan 30-01, D-13 / CONC-01) ---
+
+    #[test]
+    fn airflow_section_no_max_active_runs_roundtrip() {
+        // PRES-05: when max_active_runs is unset, it must NOT appear in
+        // serialized output (skip_serializing_if). Parses to None.
+        let input = json!({"schedule": "@daily"});
+        let parsed: AirflowSection = serde_json::from_value(input).unwrap();
+        assert_eq!(parsed.max_active_runs, None);
+        let reser = serde_json::to_value(&parsed).unwrap();
+        assert!(
+            reser.get("max_active_runs").is_none(),
+            "max_active_runs:None must be skipped on serialize, got: {reser}"
+        );
+    }
+
+    #[test]
+    fn airflow_section_with_max_active_runs() {
+        let input = json!({"schedule": "@daily", "max_active_runs": 4});
+        let parsed: AirflowSection = serde_json::from_value(input).unwrap();
+        assert_eq!(parsed.max_active_runs, Some(4));
+        let reser = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(reser.get("max_active_runs"), Some(&json!(4)));
     }
 
     // --- AwsCredentialConfig (TYPE-02) ---

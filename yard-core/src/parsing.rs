@@ -54,6 +54,7 @@ const ALLOWED_AIRFLOW_SECTION: &[&str] = &[
     "trigger",
     "publishes",
     "aws",
+    "max_active_runs",
 ];
 
 /// Allowed keys on a per-job `airflow:` block (`AirflowJobBlock` —
@@ -71,6 +72,7 @@ const ALLOWED_AIRFLOW_JOB_BLOCK: &[&str] = &[
     "dags_prefix",
     "trigger",
     "aws",
+    "max_active_runs",
 ];
 
 /// Allowed keys on a single source entry (or single-source `source:` block).
@@ -185,6 +187,14 @@ fn parse_airflow_section_inner(value: &Value) -> Result<AirflowSection> {
             .get("aws")
             .cloned()
             .and_then(|v| serde_json::from_value::<AwsCredentialConfig>(v).ok()),
+        // CONC-01 / D-13: optional DAG-level Airflow knob. None preserves
+        // Airflow's default of 16 for schedule-only DAGs; CONC-01's
+        // event-driven default-to-1 fires at codegen time when None.
+        // CONC-02 enforces `>= 1` at validate_dag_full.
+        max_active_runs: value
+            .get("max_active_runs")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok()),
     })
 }
 
@@ -304,6 +314,10 @@ pub fn merge_airflow_sections(base: &AirflowSection, overlay: &AirflowSection) -
         },
         // Overlay wins when Some; None means "not set" so fall back to base.
         aws: overlay.aws.clone().or_else(|| base.aws.clone()),
+        // Same overlay-wins-when-Some semantics as `aws` and `trigger` —
+        // most-specific layer's explicit setting takes precedence; None
+        // falls through to base.
+        max_active_runs: overlay.max_active_runs.or(base.max_active_runs),
     }
 }
 
