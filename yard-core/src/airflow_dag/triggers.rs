@@ -335,19 +335,27 @@ fn render_single(
     }
 }
 
-/// Composite render branch — Datasets-only homogeneous all/any (DS-02, DS-03).
-/// Heterogeneous all (DS-04) + mixed Dataset+sensor split (D-11) land in plan
-/// 30-04. `default_aws_conn_id` and `roots` flow through to the per-source
-/// render arms via recursive `render_single` calls for non-Dataset items.
+/// Composite render branch.
+///
+/// - DS-02 / DS-03: homogeneous Datasets all/any (alpha-sorted `&` / `|` chain
+///   at `schedule=` level).
+/// - DS-04: heterogeneous-all — non-Dataset items render as sensor tasks under
+///   `_yard_join` `EmptyOperator(trigger_rule="all_success")`.
+/// - D-11: mixed Dataset + non-Dataset all — Datasets at `schedule=` level
+///   AND non-Datasets as sensor tasks; `_yard_join` only when there are
+///   2+ sensor tasks (D-10).
+/// - D-07: sensor render order alphabetical by source kind (api < dataset <
+///   s3 < sqs). API has no sensor task — its `header_docstring` flows through
+///   the `combined_header` aggregator.
+///
+/// Phase 29 TRIG-06 already rejects heterogeneous-`any:` at validation, so
+/// the only composite shape that reaches the heterogeneous branch here is
+/// `Trigger::All(_)` with at least one non-Dataset item.
 fn render_composite(
     t: &Trigger,
     default_aws_conn_id: Option<&str>,
     roots: &[String],
 ) -> TriggerRender {
-    // Suppress unused-args until plan 30-04 task 2 wires the heterogeneous-all
-    // branch. Both are forwarded to render_single inside that branch.
-    let _ = default_aws_conn_id;
-    let _ = roots;
     let (items, separator) = match t {
         Trigger::All(v) => (v, " & "),
         Trigger::Any(v) => (v, " | "),
@@ -380,19 +388,126 @@ fn render_composite(
         };
     }
 
-    // Heterogeneous-all (DS-04) + non-Dataset composites land in plans
-    // 30-02 / 30-03 / 30-04. For now (plan 30-01), these return a
-    // placeholder that won't be exercised by 30-01 fixtures; Phase 29's
-    // TRIG-06 already rejects heterogeneous-`any:`, so the only composite
-    // shape that reaches this fall-through is heterogeneous-`all:` which
-    // 30-04 will own.
+    // DS-04 + D-11: heterogeneous-all (Phase 29 TRIG-06 rejects heterogeneous-any
+    // at validation, so the only composite shape reaching here is Trigger::All
+    // with at least one non-Dataset item).
+    debug_assert!(
+        matches!(t, Trigger::All(_)),
+        "heterogeneous Trigger::Any is rejected by Phase 29 validation; render_composite \
+         should only see Trigger::All for heterogeneous mixes"
+    );
+
+    // Split Datasets (-> schedule level) from non-Datasets (-> sensor tasks).
+    let mut dataset_uris: Vec<&str> = Vec::new();
+    let mut non_datasets: Vec<&SingleSource> = Vec::new();
+    for s in items {
+        match s {
+            SingleSource::Dataset(d) => dataset_uris.push(d.uri.as_str()),
+            _ => non_datasets.push(s),
+        }
+    }
+    dataset_uris.sort();
+
+    // schedule= level: alpha-sorted `&` chain when Datasets present, else None.
+    let schedule_expr = if dataset_uris.is_empty() {
+        "None".to_string()
+    } else if dataset_uris.len() == 1 {
+        format!("[Dataset({})]", python_string_literal(dataset_uris[0]))
+    } else {
+        let chain = dataset_uris
+            .iter()
+            .map(|u| format!("Dataset({})", python_string_literal(u)))
+            .collect::<Vec<_>>()
+            .join(" & ");
+        format!("({chain})")
+    };
+
+    // D-07: sensor render order alphabetical by source kind.
+    let mut non_dataset_sorted: Vec<&SingleSource> = non_datasets.clone();
+    non_dataset_sorted.sort_by_key(|s| s.source_kind());
+
+    // Recurse into render_single for each non-Dataset source. Pass empty roots
+    // so the per-source arms don't emit edges to user roots — we'll emit
+    // sensor->_yard_join + _yard_join->root edges explicitly below (or
+    // sensor->root if there's only one sensor).
+    let empty_roots: &[String] = &[];
+    let mut all_sensor_tasks: Vec<String> = Vec::new();
+    let mut combined_imports: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    if !dataset_uris.is_empty() {
+        combined_imports.insert("from airflow.datasets import Dataset".to_string());
+    }
+    let mut combined_header = String::new();
+    for s in &non_dataset_sorted {
+        let r = render_single(s, default_aws_conn_id, empty_roots);
+        all_sensor_tasks.extend(r.sensor_tasks);
+        combined_imports.extend(r.extra_imports);
+        // API contributes header docstring; collect verbatim.
+        if !r.header_docstring.is_empty() {
+            combined_header.push_str(&r.header_docstring);
+        }
+    }
+
+    // D-10: only emit _yard_join when there are 2+ sensor tasks.
+    let mut sensor_deps: Vec<String> = Vec::new();
+    if all_sensor_tasks.len() >= 2 {
+        // Append _yard_join AFTER all sensors. 4-space indent for the
+        // assignment + closing paren (inside the `with DAG:` block); 8-space
+        // indent for the kwargs to match the S3 / SQS sensor formatting.
+        let mut join_task = String::new();
+        join_task.push_str("    _yard_join = EmptyOperator(\n");
+        join_task.push_str("        task_id=\"_yard_join\",\n");
+        join_task.push_str("        trigger_rule=\"all_success\",\n");
+        join_task.push_str("    )");
+        all_sensor_tasks.push(join_task);
+        combined_imports.insert("from airflow.operators.empty import EmptyOperator".to_string());
+
+        // Sensor -> _yard_join edges (alpha-sorted by emission order).
+        for s in &non_dataset_sorted {
+            let sensor_id = match s {
+                SingleSource::S3(_) => Some("_yard_wait_s3"),
+                SingleSource::Sqs(_) => Some("_yard_wait_sqs"),
+                // API contributes no sensor task; skip for edge emission.
+                SingleSource::Api(_) => None,
+                // Dataset / Schedule cannot appear in non_datasets — Dataset
+                // was filtered out into dataset_uris above; Schedule is
+                // rejected at validation in heterogeneous composites.
+                SingleSource::Dataset(_) | SingleSource::Schedule(_) => None,
+            };
+            if let Some(id) = sensor_id {
+                sensor_deps.push(format!("{id} >> _yard_join"));
+            }
+        }
+        // _yard_join -> root edges, in user-declared root order.
+        for r in roots {
+            sensor_deps.push(format!("_yard_join >> {}", python_var_name(r)));
+        }
+    } else if all_sensor_tasks.len() == 1 {
+        // D-10: single-sensor mixed Dataset+sensor — connect the lone sensor
+        // directly to roots, no _yard_join. Find which sensor it is.
+        let sensor_id = non_dataset_sorted
+            .iter()
+            .find_map(|s| match s {
+                SingleSource::S3(_) => Some("_yard_wait_s3"),
+                SingleSource::Sqs(_) => Some("_yard_wait_sqs"),
+                _ => None,
+            })
+            .unwrap_or("_yard_wait_unknown");
+        for r in roots {
+            sensor_deps.push(format!("{sensor_id} >> {}", python_var_name(r)));
+        }
+    }
+    // If all_sensor_tasks.is_empty() (e.g. all-Datasets+API): no sensor_deps;
+    // Datasets fire at schedule level, API has no sensor.
+
     TriggerRender {
-        schedule_expr: "None".to_string(),
-        sensor_tasks: Vec::new(),
-        sensor_deps: Vec::new(),
-        extra_imports: Vec::new(),
+        schedule_expr,
+        sensor_tasks: all_sensor_tasks,
+        sensor_deps,
+        extra_imports: combined_imports.into_iter().collect(),
+        // CONC-01 auto-default applied centrally in render_trigger.
         max_active_runs: None,
-        header_docstring: String::new(),
+        header_docstring: combined_header,
     }
 }
 
