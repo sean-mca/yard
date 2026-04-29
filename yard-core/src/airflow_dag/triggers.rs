@@ -42,6 +42,10 @@ pub(super) struct TriggerRender {
     /// override. None when no trigger or schedule-only. Plan 30-04 wires the
     /// auto-default; plan 30-01 stakes the field shape only.
     pub max_active_runs: Option<u32>,
+    /// API-01: optional `# ...` comment block emitted near the top of the
+    /// rendered DAG file, documenting how to invoke the DAG via Airflow's
+    /// REST API or CLI. Empty string when the trigger is not API-driven.
+    pub header_docstring: String,
 }
 
 /// Render a resolved trigger into Python sensor tasks, schedule expression,
@@ -97,6 +101,7 @@ pub(super) fn render_trigger(
         sensor_deps: Vec::new(),
         extra_imports: Vec::new(),
         max_active_runs: None,
+        header_docstring: String::new(),
     }
 }
 
@@ -128,6 +133,7 @@ fn render_single(
             sensor_deps: Vec::new(),
             extra_imports: Vec::new(),
             max_active_runs: None,
+            header_docstring: String::new(),
         },
         SingleSource::Dataset(d) => TriggerRender {
             schedule_expr: format!("[Dataset({})]", python_string_literal(&d.uri)),
@@ -135,6 +141,7 @@ fn render_single(
             sensor_deps: Vec::new(),
             extra_imports: vec!["from airflow.datasets import Dataset".to_string()],
             max_active_runs: None,
+            header_docstring: String::new(),
         },
         SingleSource::S3(s3) => {
             // Knob defaults (S3-02): poke_interval=60, timeout=86400.
@@ -203,6 +210,7 @@ fn render_single(
                     "from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor".to_string(),
                 ],
                 max_active_runs: None,
+                header_docstring: String::new(),
             }
         }
         SingleSource::Sqs(sqs) => {
@@ -263,6 +271,7 @@ fn render_single(
                     "from airflow.providers.amazon.aws.sensors.sqs import SqsSensor".to_string(),
                 ],
                 max_active_runs: None,
+                header_docstring: String::new(),
             }
         }
         // API render branch lands in plan 30-04. Until then, fall back to
@@ -274,6 +283,7 @@ fn render_single(
             sensor_deps: Vec::new(),
             extra_imports: Vec::new(),
             max_active_runs: None,
+            header_docstring: String::new(),
         },
     }
 }
@@ -309,6 +319,7 @@ fn render_composite(t: &Trigger) -> TriggerRender {
             sensor_deps: Vec::new(),
             extra_imports: vec!["from airflow.datasets import Dataset".to_string()],
             max_active_runs: None,
+            header_docstring: String::new(),
         };
     }
 
@@ -324,6 +335,7 @@ fn render_composite(t: &Trigger) -> TriggerRender {
         sensor_deps: Vec::new(),
         extra_imports: Vec::new(),
         max_active_runs: None,
+        header_docstring: String::new(),
     }
 }
 
@@ -331,7 +343,8 @@ fn render_composite(t: &Trigger) -> TriggerRender {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use yard_structs::{DatasetTrigger, S3Trigger, ScheduleTrigger, SqsTrigger};
+    use std::collections::BTreeMap;
+    use yard_structs::{ApiTrigger, DatasetTrigger, S3Trigger, ScheduleTrigger, SqsTrigger};
 
     fn ds(uri: &str) -> SingleSource {
         SingleSource::Dataset(DatasetTrigger {
@@ -357,6 +370,16 @@ mod tests {
             wait_time_seconds: None,
             max_messages: None,
             delete_message_on_reception: None,
+        })
+    }
+
+    /// Bare API trigger fixture for the render_trigger_api_* tests.
+    /// ApiTrigger derives Default, so callers can override only the fields
+    /// they care about.
+    fn api(description: Option<&str>) -> SingleSource {
+        SingleSource::Api(ApiTrigger {
+            description: description.map(|s| s.to_string()),
+            payload_schema: None,
         })
     }
 
@@ -717,6 +740,106 @@ mod tests {
                 "_yard_wait_sqs >> t_a".to_string(),
                 "_yard_wait_sqs >> t_b".to_string(),
             ]
+        );
+    }
+
+    // --- Phase 30 plan 30-04: API single-source render branch (API-01..API-03) ---
+
+    #[test]
+    fn render_trigger_api_default_emits_schedule_none_and_header() {
+        // API-01: bare API trigger emits schedule=None, no sensor task, but a
+        // header docstring with curl/CLI snippets and placeholders. CONC-01:
+        // any trigger DAG defaults to max_active_runs=Some(1).
+        let t = Trigger::Single(api(None));
+        let out = render_trigger(Some(&t), None, None, &[]);
+        assert_eq!(out.schedule_expr, "None");
+        assert!(out.sensor_tasks.is_empty(), "API has no sensor task");
+        assert!(out.sensor_deps.is_empty(), "API has no sensor deps");
+        assert!(out.extra_imports.is_empty(), "API needs no provider imports");
+        assert_eq!(
+            out.max_active_runs,
+            Some(1),
+            "CONC-01 default fires for any trigger DAG: {out:?}"
+        );
+        let h = &out.header_docstring;
+        assert!(h.contains("$AIRFLOW_URL"), "header missing $AIRFLOW_URL: {h}");
+        assert!(h.contains("$AIRFLOW_USER"), "header missing $AIRFLOW_USER: {h}");
+        assert!(h.contains("$AIRFLOW_PASS"), "header missing $AIRFLOW_PASS: {h}");
+        assert!(h.contains("curl -X POST"), "header missing curl snippet: {h}");
+        assert!(
+            h.contains("airflow dags trigger"),
+            "header missing CLI snippet: {h}"
+        );
+    }
+
+    #[test]
+    fn render_trigger_api_with_description_includes_in_header() {
+        // API-02 doc-only: description threads into the header verbatim.
+        let t = Trigger::Single(api(Some("Replay failed S3 ingests")));
+        let out = render_trigger(Some(&t), None, None, &[]);
+        assert!(
+            out.header_docstring.contains("Replay failed S3 ingests"),
+            "header missing description: {}",
+            out.header_docstring
+        );
+    }
+
+    #[test]
+    fn render_trigger_api_with_payload_schema_documents_fields() {
+        // API-02 doc-only: payload_schema fields render into the header
+        // (sorted alphabetically — BTreeMap iteration is sorted).
+        let mut schema = BTreeMap::new();
+        schema.insert("customer_id".to_string(), "string".to_string());
+        schema.insert("event_id".to_string(), "string".to_string());
+        let t = Trigger::Single(SingleSource::Api(ApiTrigger {
+            description: None,
+            payload_schema: Some(schema),
+        }));
+        let out = render_trigger(Some(&t), None, None, &[]);
+        let h = &out.header_docstring;
+        assert!(h.contains("customer_id"), "header missing customer_id: {h}");
+        assert!(h.contains("event_id"), "header missing event_id: {h}");
+        // BTreeMap is sorted: customer_id appears BEFORE event_id.
+        let i_customer = h.find("customer_id").expect("customer_id present");
+        let i_event = h.find("event_id").expect("event_id present");
+        assert!(
+            i_customer < i_event,
+            "BTreeMap iteration must render alphabetically: customer_id before event_id: {h}"
+        );
+    }
+
+    #[test]
+    fn render_trigger_api_header_uses_placeholders_not_hardcoded_urls() {
+        // API-01: never hardcode URLs. Use $AIRFLOW_URL placeholder.
+        let t = Trigger::Single(api(None));
+        let out = render_trigger(Some(&t), None, None, &[]);
+        let h = &out.header_docstring;
+        assert!(
+            !h.contains("https://airflow.example.com"),
+            "header must not hardcode airflow.example.com: {h}"
+        );
+        assert!(
+            !h.contains("localhost:8080"),
+            "header must not hardcode localhost:8080: {h}"
+        );
+        assert!(h.contains("$AIRFLOW_URL"), "header must use $AIRFLOW_URL: {h}");
+    }
+
+    #[test]
+    fn render_trigger_api_header_includes_no_auth_management_callout() {
+        // API-03: yard does NOT manage Airflow REST auth. Header must say so.
+        let t = Trigger::Single(api(None));
+        let out = render_trigger(Some(&t), None, None, &[]);
+        let h = &out.header_docstring;
+        let mentions_no_auth = h.contains("does NOT manage")
+            || h.contains("does not manage")
+            || h.contains("wire JWT")
+            || h.contains("JWT")
+            || h.contains("Basic")
+            || h.contains("IAM SigV4");
+        assert!(
+            mentions_no_auth,
+            "header must call out that yard does not manage Airflow REST auth: {h}"
         );
     }
 }

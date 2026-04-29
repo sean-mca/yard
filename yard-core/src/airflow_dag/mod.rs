@@ -1585,6 +1585,95 @@ mod tests {
         );
     }
 
+    // ---- Phase 30 plan 30-04: API trigger end-to-end ----
+
+    #[test]
+    fn dag_trigger_api_emits_schedule_none_with_header_docstring() {
+        // API-01..API-03 end-to-end: trigger: { api: { description } }
+        // emits schedule=None plus a header docstring with curl/CLI snippets,
+        // $AIRFLOW_URL placeholder, and the description verbatim. CONC-01:
+        // any trigger DAG renders max_active_runs=1 by default.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  api:\n    description: Manual replay\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("worker".into(), bash_job("echo work", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("schedule=None"),
+            "API trigger renders schedule=None: {script}"
+        );
+        assert!(
+            script.contains("# Manual replay"),
+            "description must appear in header: {script}"
+        );
+        assert!(
+            script.contains("$AIRFLOW_URL"),
+            "header must use $AIRFLOW_URL placeholder: {script}"
+        );
+        assert!(
+            script.contains("curl -X POST"),
+            "header must include curl snippet: {script}"
+        );
+        assert!(
+            script.contains("airflow dags trigger"),
+            "header must include CLI snippet: {script}"
+        );
+        assert!(
+            script.contains("max_active_runs=1"),
+            "CONC-01 default for trigger DAG: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_trigger_api_with_payload_schema_documents_fields() {
+        // API-02 doc-only end-to-end: payload_schema fields appear in the
+        // header docstring. No runtime enforcement — just docs for the user
+        // assembling the curl/CLI invocation.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  api:\n    payload_schema:\n      customer_id: string\n      event_id: string\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("worker".into(), bash_job("echo work", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("customer_id"),
+            "payload_schema field customer_id must appear in header: {script}"
+        );
+        assert!(
+            script.contains("event_id"),
+            "payload_schema field event_id must appear in header: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
     #[test]
     fn trigger_overrides_inherited_schedule() {
         let tmp = setup_project_tree();
