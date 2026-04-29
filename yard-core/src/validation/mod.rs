@@ -12,7 +12,7 @@ use rules::err;
 
 use crate::airflow_dag::ResolvedDag;
 use std::collections::BTreeSet;
-use yard_structs::{SingleSource, Trigger};
+use yard_structs::{AirflowSection, SingleSource, Trigger};
 
 /// Validate a job definition and its generated script.
 /// Runs schema validation, then generates the script and checks Python syntax.
@@ -53,6 +53,13 @@ pub fn validate_dag_full(dag: &ResolvedDag) -> Vec<ValidationError> {
     }
     errors.extend(check_empty_composites(cfg.trigger.as_ref()));
     if let Some(e) = check_heterogeneous_any(cfg.trigger.as_ref()) {
+        errors.push(e);
+    }
+
+    // Phase 30 plan 30-01 NEW rules (D-06 TRIG-08, D-14 CONC-02). Appended
+    // after the Phase 29 rules so existing test orderings stay byte-identical.
+    errors.extend(check_reserved_task_ids(dag));
+    if let Some(e) = check_max_active_runs(cfg) {
         errors.push(e);
     }
 
@@ -117,6 +124,53 @@ fn check_heterogeneous_any(trigger: Option<&Trigger>) -> Option<ValidationError>
             "'any:' supports only homogeneous Dataset sources (found: {joined}). Heterogeneous 'any:' has no clean Airflow primitive in v1.6 — split into separate DAGs per source, or use homogeneous Dataset triggers."
         ),
     ))
+}
+
+/// TRIG-08 (Phase 30, plan 30-01): reserved trigger task IDs cannot collide
+/// with user-declared task IDs. Reserved IDs emitted by
+/// `triggers.rs::render_trigger` are `_yard_wait_s3`, `_yard_wait_sqs`,
+/// `_yard_wait_dataset`, `_yard_wait_api`, and `_yard_join`. Caught at
+/// `validate_dag_full` pre-codegen so users get a clear actionable error
+/// before codegen produces an invalid DAG with two same-id tasks.
+///
+/// Only fires when a `trigger:` block is present — schedule-only DAGs do
+/// not emit any reserved IDs and may freely name a task `_yard_wait_s3`.
+fn check_reserved_task_ids(dag: &ResolvedDag) -> Vec<ValidationError> {
+    if dag.config.trigger.is_none() {
+        return Vec::new();
+    }
+    let reserved: BTreeSet<&'static str> = [
+        "_yard_wait_s3",
+        "_yard_wait_sqs",
+        "_yard_wait_dataset",
+        "_yard_wait_api",
+        "_yard_join",
+    ]
+    .into_iter()
+    .collect();
+    let mut out = Vec::new();
+    for task_id in &dag.tasks {
+        if reserved.contains(task_id.as_str()) {
+            out.push(err(
+                "airflow.tasks",
+                &format!(
+                    "task_id '{task_id}' is reserved for trigger codegen — rename your task"
+                ),
+            ));
+        }
+    }
+    out
+}
+
+/// CONC-02 (Phase 30, plan 30-01): `airflow.max_active_runs` must be >= 1
+/// when explicitly set. Reject 0 at parse with verbatim error
+/// `must be >= 1`. No upper bound. None (unset) is always valid —
+/// CONC-01's "event-driven default of 1" applies at codegen time.
+fn check_max_active_runs(cfg: &AirflowSection) -> Option<ValidationError> {
+    match cfg.max_active_runs {
+        Some(0) => Some(err("airflow.max_active_runs", "must be >= 1")),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

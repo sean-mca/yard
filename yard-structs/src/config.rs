@@ -345,6 +345,13 @@ pub struct AirflowSection {
     /// account.yaml-cascade behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aws: Option<AwsCredentialConfig>,
+    /// CONC-01: DAG-level Airflow knob. None preserves Airflow's default of 16
+    /// for schedule-only DAGs. Event-driven DAGs (`trigger.is_some()`) auto-default
+    /// to 1 at codegen time when this is None — see triggers.rs::render_trigger.
+    /// User override via `airflow.max_active_runs: <N>` always wins.
+    /// CONC-02 enforces `>= 1` at validate_dag_full.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_active_runs: Option<u32>,
 }
 
 /// Private mirror of `AirflowSection` used by the hand-rolled `Deserialize`
@@ -371,6 +378,8 @@ struct _AirflowSectionRaw {
     publishes: Vec<String>,
     #[serde(default)]
     aws: Option<AwsCredentialConfig>,
+    #[serde(default)]
+    max_active_runs: Option<u32>,
 }
 
 impl<'de> serde::Deserialize<'de> for AirflowSection {
@@ -395,6 +404,7 @@ impl<'de> serde::Deserialize<'de> for AirflowSection {
             trigger: raw.trigger,
             publishes: raw.publishes,
             aws: raw.aws,
+            max_active_runs: raw.max_active_runs,
         })
     }
 }

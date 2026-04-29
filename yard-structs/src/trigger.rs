@@ -255,6 +255,14 @@ impl Serialize for Trigger {
         use serde::ser::SerializeMap;
         match self {
             Trigger::Single(s) => s.serialize(serializer),
+            // D-12 (Phase 30, plan 30-01): collapse single-element composites
+            // to bare-single so `all: [x]` / `any: [x]` and `<x>` produce
+            // byte-identical wire form AND blake3 hash (HASH-01). This sits
+            // BEFORE the multi-element sort branch so len==1 short-circuits
+            // through `s.serialize` directly without entering the map writer.
+            Trigger::All(items) | Trigger::Any(items) if items.len() == 1 => {
+                items[0].serialize(serializer)
+            }
             Trigger::All(items) | Trigger::Any(items) => {
                 // Sort by canonical-JSON-string of each element so
                 // Trigger::All([a, b]) and Trigger::All([b, a]) produce
