@@ -1,12 +1,14 @@
 use anyhow::{Context as AnyhowContext, Result, anyhow};
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use tera::{Context, Tera};
 use yard_structs::{AirflowSection, JobDefinition, JobType, ProjectManifest};
 
 use super::AIRFLOW_DAG_TEMPLATE;
 use super::ResolvedDag;
-use super::connections::{required_connections_for_dag, resolve_task_aws_conn_id};
+use super::connections::{derive_aws_conn_id, required_connections_for_dag, resolve_task_aws_conn_id};
 use super::helpers::{python_string_literal, python_var_name};
+use super::triggers::{self, TriggerRender};
 
 /// Render a resolved DAG into an Airflow Python file.
 pub fn generate_dag(
@@ -47,21 +49,12 @@ pub fn generate_dag(
             }
         }
     }
-    // Determine if any task produces datasets, or if the DAG is dataset-triggered.
-    let has_datasets = dag
-        .config
-        .trigger
-        .as_ref()
-        .is_some_and(|t| !t.dataset_uris().is_empty())
-        || task_types
-            .iter()
-            .any(|(_, _, j)| j.airflow.as_ref().is_some_and(|a| !a.publishes.is_empty()));
-
-    // `trigger.dataset_uris()` takes precedence over an inherited `schedule` --
-    // a dataset-triggered DAG doesn't use a cron schedule even if one was
-    // inherited from the project or account level. Non-dataset triggers
-    // (s3/sqs/api) currently render schedule=None here; Phase 30 will adapt
-    // those paths to emit sensor tasks instead.
+    // Per-task `publishes:` still needs the Dataset import; trigger-derived
+    // dataset imports flow in via `trender.extra_imports` (Phase 30 plan 30-01
+    // moved DAG-level dataset-trigger import emission into render_trigger).
+    let has_datasets_for_publishes = task_types
+        .iter()
+        .any(|(_, _, j)| j.airflow.as_ref().is_some_and(|a| !a.publishes.is_empty()));
 
     let mut import_lines = Vec::new();
     if needs_bash {
@@ -72,36 +65,74 @@ pub fn generate_dag(
             "from airflow.providers.amazon.aws.operators.glue import GlueJobOperator".to_string(),
         );
     }
-    if has_datasets {
+    if has_datasets_for_publishes {
         import_lines.push("from airflow.datasets import Dataset".to_string());
     }
-    let imports_block = import_lines.join("\n");
 
     // default_args dict. Only include fields we actually have.
     let default_args = render_default_args(&dag.config);
 
-    // schedule: dataset-triggered DAGs get `[Dataset(...), ...]`;
-    // cron DAGs get a quoted string; unscheduled DAGs get None.
-    // Non-dataset triggers (s3/sqs/api) currently render schedule=None here —
-    // Phase 30 owns their codegen (sensor task emission).
-    let dataset_uris: Vec<&str> = dag
-        .config
-        .trigger
+    // D-08 (Phase 30 plan 30-01): compute the DAG-level default aws_conn_id
+    // once via the existing `derive_aws_conn_id` helper, then pass to
+    // `render_trigger` as a primitive `&str`. Keeps triggers.rs free of
+    // yard-config types. The S3/SQS sensor branches in plans 30-02/03 will
+    // honor: per-trigger override > DAG-level default > None.
+    let default_aws_conn_id: Option<String> = manifest
+        .aws
         .as_ref()
-        .map(|t| t.dataset_uris())
-        .unwrap_or_default();
-    let schedule = if !dataset_uris.is_empty() {
-        let datasets = dataset_uris
-            .iter()
-            .map(|uri| format!("Dataset({})", python_string_literal(uri)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("[{datasets}]")
-    } else {
-        match &dag.config.schedule {
-            Some(s) => python_string_literal(s),
-            None => "None".to_string(),
-        }
+        .and_then(|a| a.assume_role.as_deref())
+        .filter(|s| !s.is_empty())
+        .map(derive_aws_conn_id)
+        .transpose()?;
+
+    // D-05 (Phase 30 plan 30-01): roots = user task IDs with no upstream
+    // edges. Sensor branches (plans 30-02/03/04) connect
+    // `_yard_wait_<source> >> root` for every root. Computed here in
+    // generation.rs and threaded as primitive `&[String]` into
+    // render_trigger so triggers.rs stays free of `BTreeMap` walking.
+    let roots: Vec<String> = dag
+        .tasks
+        .iter()
+        .filter(|t| {
+            dag.depends_on
+                .get(*t)
+                .map(|v| v.is_empty())
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+
+    // D-03: ALL schedule-expression resolution lives inside render_trigger now.
+    // Phase 29 mutual-exclusion validation guarantees only one of `trigger`
+    // or `schedule` is non-None at this point.
+    let trender: TriggerRender = triggers::render_trigger(
+        dag.config.trigger.as_ref(),
+        dag.config.schedule.as_deref(),
+        default_aws_conn_id.as_deref(),
+        &roots,
+    );
+    let schedule = trender.schedule_expr.clone();
+
+    // Merge trigger-derived imports (e.g. `from airflow.datasets import Dataset`,
+    // sensor providers in plans 30-02/03) with the per-task imports computed
+    // above. BTreeSet de-dups (so a DAG that BOTH trigger-on-Dataset AND
+    // per-task-publishes-Dataset emits the import line once) and gives
+    // deterministic ordering across runs.
+    let combined_imports: BTreeSet<String> = import_lines
+        .into_iter()
+        .chain(trender.extra_imports.iter().cloned())
+        .collect();
+    let imports_block = combined_imports.into_iter().collect::<Vec<_>>().join("\n");
+
+    // D-15 / D-16: max_active_runs_block is empty for schedule-only DAGs
+    // (PRES-02 byte-identical guarantee — no new kwarg leaks into existing
+    // fixtures), and `    max_active_runs={N},\n` when set. Plan 30-04 wires
+    // CONC-01 auto-default-to-Some(1) for any trigger DAG; plan 30-01 only
+    // stakes the field shape so the template insertion point + Tera context
+    // key exist for subsequent plans.
+    let max_active_runs_block = match trender.max_active_runs {
+        Some(n) => format!("    max_active_runs={n},\n"),
+        None => String::new(),
     };
 
     // Task definitions, one per line, indented one level for inside `with DAG:`.
@@ -115,7 +146,14 @@ pub fn generate_dag(
             script_locations,
         )?);
     }
-    let tasks_block = task_lines.join("\n");
+    // D-05 / D-07: sensor task lines prepend user task lines so the rendered
+    // DAG reads top-down: imports -> sensors -> user tasks. Empty for plan
+    // 30-01 (Datasets branch emits no sensors); plans 30-02/03/04 fill these.
+    // PRES-02 byte-identical for schedule-only DAGs: trender.sensor_tasks is
+    // an empty Vec, so the join below is a no-op vs. pre-Phase-30 behavior.
+    let mut all_task_lines: Vec<String> = trender.sensor_tasks.clone();
+    all_task_lines.extend(task_lines);
+    let tasks_block = all_task_lines.join("\n");
 
     // Cross-account connection docstring. Empty for single-account DAGs so we
     // don't clutter the header.
@@ -146,10 +184,16 @@ pub fn generate_dag(
             }
         }
     }
-    let deps_block = if dep_lines.is_empty() {
+    // D-05 / D-07: sensor edges (`_yard_wait_<source> >> root` / sensor edges
+    // to `_yard_join` / `_yard_join >> root`) precede user-task edges so the
+    // rendered deps section reads top-down. Empty for plan 30-01 (Datasets
+    // branch emits no sensor edges); plans 30-02/03/04 populate these.
+    let mut all_dep_lines: Vec<String> = trender.sensor_deps.clone();
+    all_dep_lines.extend(dep_lines);
+    let deps_block = if all_dep_lines.is_empty() {
         "# No task dependencies".to_string()
     } else {
-        dep_lines.join("\n")
+        all_dep_lines.join("\n")
     };
 
     let mut ctx = Context::new();
@@ -157,6 +201,7 @@ pub fn generate_dag(
     ctx.insert("imports_block", &imports_block);
     ctx.insert("default_args", &default_args);
     ctx.insert("schedule", &schedule);
+    ctx.insert("max_active_runs_block", &max_active_runs_block);
     ctx.insert("tasks_block", &tasks_block);
     ctx.insert("deps_block", &deps_block);
     ctx.insert("required_connections_block", &required_connections_block);

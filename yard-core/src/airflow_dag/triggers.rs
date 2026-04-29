@@ -25,10 +25,6 @@ use super::helpers::python_string_literal;
 ///
 /// Phase 31 (PAY-02) will add a non-breaking `op_kwargs:
 /// Vec<(String, String)>` field for sensor → user-task XCom plumbing.
-//
-// NOTE: `dead_code` allow lives only until Task 3 of plan 30-01 wires
-// `render_trigger` into `generation.rs`; the next commit removes this allow.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TriggerRender {
     /// Python expression for the `schedule=` kwarg on `with DAG(...)`:
@@ -64,9 +60,6 @@ pub(super) struct TriggerRender {
 /// In plan 30-01 the S3/SQS/API arms fall through to `schedule=None` —
 /// they get real implementations in subsequent plans. The skeleton + the
 /// Datasets branch ship here so `generation.rs` has something to call.
-///
-/// NOTE: `dead_code` allow removed in Task 3 once `generation.rs` calls in.
-#[allow(dead_code)]
 pub(super) fn render_trigger(
     trigger: Option<&Trigger>,
     schedule: Option<&str>,

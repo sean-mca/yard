@@ -1148,6 +1148,9 @@ mod tests {
 
     #[test]
     fn dag_trigger_datasets_emits_schedule_list() {
+        // Phase 30 plan 30-01 (DS-02) updated: homogeneous all-Datasets now
+        // renders the Airflow 2.9 native `&` chain instead of Phase 28's
+        // interim flat list. URIs alpha-sorted per D-11.
         let tmp = setup_project_tree();
         let root = tmp.path();
         let dag_dir = root.join("pipeline");
@@ -1164,11 +1167,131 @@ mod tests {
         let dags = collect_dags(root, &manifest).unwrap();
         let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
         assert!(script.contains("from airflow.datasets import Dataset"));
-        assert!(script.contains(
-            "schedule=[Dataset(\"s3://warehouse/sales/orders\"), Dataset(\"s3://warehouse/sales/shipments\")]"
-        ));
+        assert!(
+            script.contains(
+                "schedule=(Dataset(\"s3://warehouse/sales/orders\") & Dataset(\"s3://warehouse/sales/shipments\"))"
+            ),
+            "DS-02 expects native `&` chain, alpha-sorted: {script}"
+        );
         assert!(!script.contains("@daily"));
         assert!(validate_python_syntax(&script).is_none(), "{script}");
+    }
+
+    #[test]
+    fn dag_schedule_only_omits_max_active_runs_pres_02_invariant() {
+        // PRES-02: schedule-only DAGs must render WITHOUT a max_active_runs=
+        // line (Airflow's implicit default of 16 applies by absence). Plan
+        // 30-04 wires CONC-01 auto-default-to-1 for trigger DAGs only.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("runit".into(), bash_job("echo hi", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+        assert!(
+            !script.contains("max_active_runs="),
+            "schedule-only DAG must NOT render max_active_runs= line: {script}"
+        );
+        assert!(validate_python_syntax(&script).is_none(), "{script}");
+    }
+
+    #[test]
+    fn dag_trigger_datasets_homogeneous_all_emits_amp_chain() {
+        // DS-02: trigger: { all: [dataset, dataset] } -> schedule=(Dataset(a) & Dataset(b)).
+        // URIs out-of-order in YAML; alpha-sort kicks in (D-11).
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  all:\n    - dataset:\n        uri: s3://warehouse/zzz\n    - dataset:\n        uri: s3://warehouse/aaa\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("agg".into(), bash_job("echo agg", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+        assert!(script.contains("from airflow.datasets import Dataset"));
+        assert!(
+            script.contains(
+                "schedule=(Dataset(\"s3://warehouse/aaa\") & Dataset(\"s3://warehouse/zzz\"))"
+            ),
+            "expected alpha-sorted & chain: {script}"
+        );
+        assert!(validate_python_syntax(&script).is_none(), "{script}");
+    }
+
+    #[test]
+    fn dag_trigger_datasets_homogeneous_any_emits_pipe_chain() {
+        // DS-03: trigger: { any: [dataset, dataset] } -> schedule=(Dataset(a) | Dataset(b)).
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  any:\n    - dataset:\n        uri: s3://warehouse/zzz\n    - dataset:\n        uri: s3://warehouse/aaa\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("agg".into(), bash_job("echo agg", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+        assert!(
+            script.contains(
+                "schedule=(Dataset(\"s3://warehouse/aaa\") | Dataset(\"s3://warehouse/zzz\"))"
+            ),
+            "expected alpha-sorted | chain: {script}"
+        );
+        assert!(validate_python_syntax(&script).is_none(), "{script}");
+    }
+
+    #[test]
+    fn dag_trigger_dataset_single_element_all_renders_same_as_bare_single_dataset() {
+        // D-12 end-to-end: { all: [dataset(x)] } and { dataset(x) } render
+        // byte-identical Python because Trigger::Serialize collapses on the
+        // hash side AND render_trigger normalizes on the codegen side.
+        let tmp_a = setup_project_tree();
+        let dir_a = tmp_a.path().join("pa");
+        write_yaml(
+            &dir_a.join("dag.yaml"),
+            "trigger:\n  all:\n    - dataset:\n        uri: s3://warehouse/foo\n",
+        );
+        let mut manifest_a = empty_manifest("test");
+        manifest_a
+            .jobs
+            .insert("agg".into(), bash_job("echo a", &dir_a));
+        let dags_a = collect_dags(tmp_a.path(), &manifest_a).unwrap();
+        let script_a = generate_dag(&manifest_a, &dags_a[0], &HashMap::new()).unwrap();
+
+        let tmp_b = setup_project_tree();
+        let dir_b = tmp_b.path().join("pa");
+        write_yaml(
+            &dir_b.join("dag.yaml"),
+            "trigger:\n  dataset:\n    uri: s3://warehouse/foo\n",
+        );
+        let mut manifest_b = empty_manifest("test");
+        manifest_b
+            .jobs
+            .insert("agg".into(), bash_job("echo a", &dir_b));
+        let dags_b = collect_dags(tmp_b.path(), &manifest_b).unwrap();
+        let script_b = generate_dag(&manifest_b, &dags_b[0], &HashMap::new()).unwrap();
+
+        assert_eq!(
+            script_a, script_b,
+            "single-element all must render byte-identical to bare-single Dataset (D-12)"
+        );
     }
 
     #[test]
