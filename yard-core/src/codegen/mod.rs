@@ -132,10 +132,12 @@ def _yard_fill_nulls(df):
         elif isinstance(dt, MapType):
             if _yard_has_void(dt):
                 df = df.withColumn(name, _yard_coerce_voids(col, dt))
-        elif isinstance(dt, (DoubleType, FloatType, IntegerType, LongType)):
+        elif isinstance(dt, (DoubleType, FloatType, IntegerType, LongType, ShortType, ByteType)):
             df = df.withColumn(name, F.coalesce(col, F.lit(0).cast(dt)))
         elif isinstance(dt, BooleanType):
             df = df.withColumn(name, F.coalesce(col, F.lit(False)))
+        elif isinstance(dt, (TimestampType, DateType, DecimalType, BinaryType)):
+            pass
         else:
             df = df.withColumn(name, F.coalesce(col.cast("string"), F.lit("")))
     return df
@@ -217,7 +219,8 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
     if fill_nulls {
         extra_imports.push(
             "from pyspark.sql.types import (StructType, ArrayType, MapType, DoubleType, FloatType, \
-             IntegerType, LongType, TimestampType, DateType, BooleanType, NullType)"
+             IntegerType, LongType, ShortType, ByteType, TimestampType, DateType, DecimalType, \
+             BinaryType, BooleanType, NullType)"
                 .to_string(),
         );
     }
@@ -680,11 +683,25 @@ mod tests {
         let script = generate_python_script("test_job", &job).unwrap();
         assert!(script.contains("elif isinstance(dt, ArrayType):"));
         assert!(script.contains("F.array().cast(dt)"));
-        assert!(script.contains("elif isinstance(dt, (DoubleType, FloatType, IntegerType, LongType)):"));
+        assert!(script.contains("elif isinstance(dt, (DoubleType, FloatType, IntegerType, LongType, ShortType, ByteType)):"));
         assert!(script.contains("F.coalesce(col, F.lit(0).cast(dt))"));
         assert!(script.contains("elif isinstance(dt, BooleanType):"));
         assert!(script.contains("F.coalesce(col, F.lit(False))"));
+        assert!(script.contains("elif isinstance(dt, (TimestampType, DateType, DecimalType, BinaryType)):"));
         assert!(script.contains("else:\n            df = df.withColumn(name, F.coalesce(col.cast(\"string\"), F.lit(\"\")))"));
+    }
+
+    #[test]
+    fn fill_nulls_does_not_string_cast_timestamp_date_decimal_binary() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        let script = generate_python_script("test_job", &job).unwrap();
+        // Imports cover every type referenced in the helper body.
+        assert!(script.contains("ShortType, ByteType"));
+        assert!(script.contains("DecimalType, \\\n             BinaryType") || script.contains("DecimalType, BinaryType"));
+        // Pass-through branch exists and uses `pass` (no withColumn cast).
+        assert!(script.contains("elif isinstance(dt, (TimestampType, DateType, DecimalType, BinaryType)):\n            pass\n"));
     }
 
     #[test]
