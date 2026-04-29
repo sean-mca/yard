@@ -10,6 +10,10 @@ pub use syntax::validate_python_syntax;
 // Import for local use in validate_job_full
 use rules::err;
 
+use crate::airflow_dag::ResolvedDag;
+use std::collections::BTreeSet;
+use yard_structs::{SingleSource, Trigger};
+
 /// Validate a job definition and its generated script.
 /// Runs schema validation, then generates the script and checks Python syntax.
 pub fn validate_job_full(job_name: &str, job_def: &JobDefinition) -> Vec<ValidationError> {
@@ -36,13 +40,98 @@ pub fn validate_job_full(job_name: &str, job_def: &JobDefinition) -> Vec<Validat
     errors
 }
 
+/// Validate a resolved DAG's trigger configuration against TRIG-04..TRIG-06.
+/// Caller (orchestrate::plan / orchestrate::apply) iterates `pre_dags` and
+/// rolls up errors per DAG. Empty Vec means "DAG passed all four checks".
+pub fn validate_dag_full(dag: &ResolvedDag) -> Vec<ValidationError> {
+    let cfg = &dag.config;
+    let mut errors: Vec<ValidationError> = Vec::new();
+
+    // Rule order locked per CONTEXT D-08 — deterministic output for tests + rollup.
+    if let Some(e) = check_mutual_exclusion(cfg.schedule.as_deref(), cfg.trigger.as_ref()) {
+        errors.push(e);
+    }
+    errors.extend(check_empty_composites(cfg.trigger.as_ref()));
+    if let Some(e) = check_heterogeneous_any(cfg.trigger.as_ref()) {
+        errors.push(e);
+    }
+
+    errors
+}
+
+/// TRIG-04: top-level schedule and trigger are mutually exclusive.
+fn check_mutual_exclusion(
+    schedule: Option<&str>,
+    trigger: Option<&Trigger>,
+) -> Option<ValidationError> {
+    if schedule.is_some() && trigger.is_some() {
+        Some(err(
+            "airflow.trigger",
+            "cannot declare both top-level 'schedule:' and 'trigger:' — these are mutually exclusive. To schedule via the trigger block, use 'trigger: { schedule: \"<expr>\" }' and remove the top-level 'schedule:' field.",
+        ))
+    } else {
+        None
+    }
+}
+
+/// TRIG-05a / TRIG-05b: composite lists must be non-empty.
+fn check_empty_composites(trigger: Option<&Trigger>) -> Vec<ValidationError> {
+    let mut out: Vec<ValidationError> = Vec::new();
+    match trigger {
+        Some(Trigger::All(v)) if v.is_empty() => {
+            out.push(err(
+                "airflow.trigger.all",
+                "empty 'all: []' composite — must contain at least one trigger source.",
+            ));
+        }
+        Some(Trigger::Any(v)) if v.is_empty() => {
+            out.push(err(
+                "airflow.trigger.any",
+                "empty 'any: []' composite — must contain at least one trigger source.",
+            ));
+        }
+        _ => {}
+    }
+    out
+}
+
+/// TRIG-06: any: must contain only Dataset sources.
+/// Excludes Dataset from the rendered {kinds} list; sorts and dedupes via BTreeSet.
+fn check_heterogeneous_any(trigger: Option<&Trigger>) -> Option<ValidationError> {
+    let sources = match trigger {
+        Some(Trigger::Any(v)) if !v.is_empty() => v,
+        _ => return None,
+    };
+    let kinds: BTreeSet<&'static str> = sources
+        .iter()
+        .filter(|s| !matches!(s, SingleSource::Dataset(_)))
+        .map(|s| s.source_kind())
+        .collect();
+    if kinds.is_empty() {
+        return None;
+    }
+    let joined = kinds.into_iter().collect::<Vec<_>>().join(", ");
+    Some(err(
+        "airflow.trigger.any",
+        &format!(
+            "'any:' supports only homogeneous Dataset sources (found: {joined}). Heterogeneous 'any:' has no clean Airflow primitive in v1.6 — split into separate DAGs per source, or use homogeneous Dataset triggers."
+        ),
+    ))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::airflow_dag::ResolvedDag;
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::collections::HashMap;
-    use yard_structs::{JobType, Sink, Source, Transform};
+    use std::path::PathBuf;
+    use yard_structs::{
+        AirflowSection, DatasetTrigger, JobType, S3Trigger, ScheduleTrigger, Sink, SingleSource,
+        Source, SqsTrigger, Transform, Trigger,
+    };
 
     fn valid_glue_job() -> JobDefinition {
         JobDefinition {
@@ -1133,5 +1222,197 @@ mod tests {
                 .any(|e| e.field.starts_with("transforms[0]")),
             "unexpected errors: {errors:?}"
         );
+    }
+
+    // --- validate_dag_full (Phase 29 — TRIG-04..TRIG-06 trigger validation, D-23) ---
+
+    fn dag_with(section: AirflowSection) -> ResolvedDag {
+        // Construct a minimal ResolvedDag for validator unit tests.
+        // ResolvedDag derives ONLY #[derive(Debug, Clone)] — NOT Default — so every
+        // field is enumerated explicitly. validate_dag_full reads only `dag.name`
+        // and `dag.config`; the other fields are populated with empty values.
+        // AirflowSection DOES derive Default, so the caller may use
+        // `..Default::default()` when constructing the `section` argument.
+        ResolvedDag {
+            name: "test_dag".to_string(),
+            dir: PathBuf::new(),
+            config: section,
+            tasks: Vec::new(),
+            depends_on: BTreeMap::new(),
+        }
+    }
+
+    fn s3_src() -> SingleSource {
+        SingleSource::S3(S3Trigger {
+            bucket: "b".into(),
+            ..Default::default()
+        })
+    }
+    fn sqs_src() -> SingleSource {
+        SingleSource::Sqs(SqsTrigger {
+            queue_url: "q".into(),
+            wait_time_seconds: None,
+            max_messages: None,
+            delete_message_on_reception: None,
+        })
+    }
+    fn ds_src(uri: &str) -> SingleSource {
+        SingleSource::Dataset(DatasetTrigger { uri: uri.into() })
+    }
+
+    #[test]
+    fn validate_dag_full_passes_schedule_only() {
+        let dag = dag_with(AirflowSection {
+            schedule: Some("@daily".into()),
+            trigger: None,
+            ..Default::default()
+        });
+        assert!(validate_dag_full(&dag).is_empty());
+    }
+
+    #[test]
+    fn validate_dag_full_passes_trigger_only() {
+        let dag = dag_with(AirflowSection {
+            schedule: None,
+            trigger: Some(Trigger::Single(SingleSource::Schedule(ScheduleTrigger {
+                value: "@daily".into(),
+            }))),
+            ..Default::default()
+        });
+        assert!(validate_dag_full(&dag).is_empty());
+    }
+
+    #[test]
+    fn validate_dag_full_passes_homogeneous_dataset_any() {
+        let dag = dag_with(AirflowSection {
+            schedule: None,
+            trigger: Some(Trigger::Any(vec![ds_src("a"), ds_src("b")])),
+            ..Default::default()
+        });
+        assert!(validate_dag_full(&dag).is_empty());
+    }
+
+    #[test]
+    fn validate_dag_full_passes_heterogeneous_all() {
+        let dag = dag_with(AirflowSection {
+            schedule: None,
+            trigger: Some(Trigger::All(vec![s3_src(), sqs_src()])),
+            ..Default::default()
+        });
+        assert!(
+            validate_dag_full(&dag).is_empty(),
+            "heterogeneous all: must be allowed (DS-04)"
+        );
+    }
+
+    #[test]
+    fn validate_dag_full_rejects_schedule_and_trigger() {
+        let dag = dag_with(AirflowSection {
+            schedule: Some("@daily".into()),
+            trigger: Some(Trigger::Single(ds_src("u"))),
+            ..Default::default()
+        });
+        let errs = validate_dag_full(&dag);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, "airflow.trigger");
+        assert_eq!(
+            errs[0].message,
+            "cannot declare both top-level 'schedule:' and 'trigger:' — these are mutually exclusive. To schedule via the trigger block, use 'trigger: { schedule: \"<expr>\" }' and remove the top-level 'schedule:' field."
+        );
+    }
+
+    #[test]
+    fn validate_dag_full_rejects_empty_all() {
+        let dag = dag_with(AirflowSection {
+            schedule: None,
+            trigger: Some(Trigger::All(vec![])),
+            ..Default::default()
+        });
+        let errs = validate_dag_full(&dag);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, "airflow.trigger.all");
+        assert_eq!(
+            errs[0].message,
+            "empty 'all: []' composite — must contain at least one trigger source."
+        );
+    }
+
+    #[test]
+    fn validate_dag_full_rejects_empty_any() {
+        let dag = dag_with(AirflowSection {
+            schedule: None,
+            trigger: Some(Trigger::Any(vec![])),
+            ..Default::default()
+        });
+        let errs = validate_dag_full(&dag);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, "airflow.trigger.any");
+        assert_eq!(
+            errs[0].message,
+            "empty 'any: []' composite — must contain at least one trigger source."
+        );
+    }
+
+    #[test]
+    fn validate_dag_full_rejects_heterogeneous_any_single_source() {
+        let dag = dag_with(AirflowSection {
+            schedule: None,
+            trigger: Some(Trigger::Any(vec![s3_src()])),
+            ..Default::default()
+        });
+        let errs = validate_dag_full(&dag);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, "airflow.trigger.any");
+        assert_eq!(
+            errs[0].message,
+            "'any:' supports only homogeneous Dataset sources (found: s3). Heterogeneous 'any:' has no clean Airflow primitive in v1.6 — split into separate DAGs per source, or use homogeneous Dataset triggers."
+        );
+    }
+
+    #[test]
+    fn validate_dag_full_rejects_heterogeneous_any_multi_kind() {
+        let dag = dag_with(AirflowSection {
+            schedule: None,
+            trigger: Some(Trigger::Any(vec![s3_src(), sqs_src()])),
+            ..Default::default()
+        });
+        let errs = validate_dag_full(&dag);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, "airflow.trigger.any");
+        assert_eq!(
+            errs[0].message,
+            "'any:' supports only homogeneous Dataset sources (found: s3, sqs). Heterogeneous 'any:' has no clean Airflow primitive in v1.6 — split into separate DAGs per source, or use homogeneous Dataset triggers."
+        );
+    }
+
+    #[test]
+    fn validate_dag_full_rejects_heterogeneous_any_with_dataset() {
+        // Per D-18 example: Dataset is the allowed source — excluded from {kinds}.
+        let dag = dag_with(AirflowSection {
+            schedule: None,
+            trigger: Some(Trigger::Any(vec![s3_src(), ds_src("u")])),
+            ..Default::default()
+        });
+        let errs = validate_dag_full(&dag);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, "airflow.trigger.any");
+        assert_eq!(
+            errs[0].message,
+            "'any:' supports only homogeneous Dataset sources (found: s3). Heterogeneous 'any:' has no clean Airflow primitive in v1.6 — split into separate DAGs per source, or use homogeneous Dataset triggers."
+        );
+    }
+
+    #[test]
+    fn validate_dag_full_accumulates_multiple_errors() {
+        // Per D-09 + D-23: schedule + trigger { any: [] } -> exactly two errors.
+        let dag = dag_with(AirflowSection {
+            schedule: Some("@daily".into()),
+            trigger: Some(Trigger::Any(vec![])),
+            ..Default::default()
+        });
+        let errs = validate_dag_full(&dag);
+        assert_eq!(errs.len(), 2, "expected TRIG-04 + TRIG-05b, got: {errs:?}");
+        assert_eq!(errs[0].field, "airflow.trigger"); // TRIG-04 first per D-08
+        assert_eq!(errs[1].field, "airflow.trigger.any"); // TRIG-05b second
     }
 }
