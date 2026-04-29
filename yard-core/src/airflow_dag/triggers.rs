@@ -16,7 +16,7 @@
 
 use yard_structs::{SingleSource, Trigger};
 
-use super::helpers::python_string_literal;
+use super::helpers::{python_string_literal, python_var_name};
 
 /// Result of rendering a [`Trigger`] to Python codegen fragments.
 ///
@@ -63,8 +63,8 @@ pub(super) struct TriggerRender {
 pub(super) fn render_trigger(
     trigger: Option<&Trigger>,
     schedule: Option<&str>,
-    _default_aws_conn_id: Option<&str>,
-    _roots: &[String],
+    default_aws_conn_id: Option<&str>,
+    roots: &[String],
 ) -> TriggerRender {
     // D-12: collapse single-element composites to bare-single before branching.
     // The Trigger::Serialize impl already collapses for hashing (HASH-01); we
@@ -79,7 +79,7 @@ pub(super) fn render_trigger(
 
     // Branch 1: bare-single (or collapsed single-element composite).
     if let Some(single) = normalized {
-        return render_single(single);
+        return render_single(single, default_aws_conn_id, roots);
     }
 
     // Branch 2: composite (>= 2 elements).
@@ -100,8 +100,21 @@ pub(super) fn render_trigger(
     }
 }
 
-/// Bare-single render branch (DS-01 + 30.2/30.3/30.4 stubs).
-fn render_single(s: &SingleSource) -> TriggerRender {
+/// Bare-single render branch.
+///
+/// `default_aws_conn_id` and `roots` are consumed by sensor branches
+/// (S3 in plan 30-02; SQS in plan 30-03; API in plan 30-04). The Schedule
+/// and Dataset branches ignore them.
+///
+/// S3 (plan 30-02) — emits `_yard_wait_s3 = S3KeySensor(...)` with knob
+/// defaults (poke_interval=60, timeout=86400, deferrable=True), the
+/// per-trigger > DAG-level > None aws_conn_id precedence (S3-04, D-08),
+/// and the legacy `deferrable=False` escape hatch (S3-03).
+fn render_single(
+    s: &SingleSource,
+    default_aws_conn_id: Option<&str>,
+    roots: &[String],
+) -> TriggerRender {
     match s {
         SingleSource::Schedule(sched) => TriggerRender {
             schedule_expr: python_string_literal(&sched.value),
@@ -117,11 +130,79 @@ fn render_single(s: &SingleSource) -> TriggerRender {
             extra_imports: vec!["from airflow.datasets import Dataset".to_string()],
             max_active_runs: None,
         },
-        // S3 / SQS / API render branches land in plans 30-02 / 30-03 / 30-04.
-        // Until then, fall back to schedule=None — this code path is never
-        // actually hit by tests until those plans ship, because no fixture
-        // declares a non-Dataset single-source trigger in plan 30-01.
-        SingleSource::S3(_) | SingleSource::Sqs(_) | SingleSource::Api(_) => TriggerRender {
+        SingleSource::S3(s3) => {
+            // Knob defaults (S3-02): poke_interval=60, timeout=86400.
+            // Deferrable default (S3-03): true. User override
+            // `deferrable: false` emits the legacy non-deferrable form for
+            // old `apache-airflow-providers-amazon < 8.0.0` deployments.
+            let poke = s3.poke_interval.unwrap_or(60);
+            let timeout = s3.timeout.unwrap_or(86400);
+            let deferrable = s3.deferrable.unwrap_or(true);
+            // S3-04 precedence (D-08): per-trigger override beats DAG-level
+            // default; absence of both falls back to Airflow's `aws_default`
+            // by omitting the kwarg entirely.
+            let conn = s3.aws_conn_id.as_deref().or(default_aws_conn_id);
+
+            // bucket_key = exact `key` if set, else `prefix`. The typed model
+            // does not enforce exactly-one-of (S3Trigger has both fields as
+            // Option<String>); a future plan can add that in validate_dag_full
+            // alongside the other knob rules. Here we trust the parser and
+            // pick `key` first when both are present (consistent with
+            // documented precedence).
+            let bucket_key_value = s3
+                .key
+                .as_deref()
+                .or(s3.prefix.as_deref())
+                .unwrap_or("");
+
+            // Build the sensor task lines. Indented 4 spaces (inside the
+            // `with DAG(...) as dag:` block).
+            let mut sensor = String::new();
+            sensor.push_str("    _yard_wait_s3 = S3KeySensor(\n");
+            sensor.push_str("        task_id=\"_yard_wait_s3\",\n");
+            sensor.push_str(&format!(
+                "        bucket_name={},\n",
+                python_string_literal(&s3.bucket)
+            ));
+            sensor.push_str(&format!(
+                "        bucket_key={},\n",
+                python_string_literal(bucket_key_value)
+            ));
+            sensor.push_str(&format!("        poke_interval={poke},\n"));
+            sensor.push_str(&format!("        timeout={timeout},\n"));
+            sensor.push_str(&format!(
+                "        deferrable={},\n",
+                if deferrable { "True" } else { "False" }
+            ));
+            if let Some(c) = conn {
+                sensor.push_str(&format!(
+                    "        aws_conn_id={},\n",
+                    python_string_literal(c)
+                ));
+            }
+            sensor.push_str("    )");
+
+            // One edge per root in input order — generation.rs computes
+            // `roots` deterministically (DAG task list filter + cloned).
+            let deps: Vec<String> = roots
+                .iter()
+                .map(|r| format!("_yard_wait_s3 >> {}", python_var_name(r)))
+                .collect();
+
+            TriggerRender {
+                schedule_expr: "None".to_string(),
+                sensor_tasks: vec![sensor],
+                sensor_deps: deps,
+                extra_imports: vec![
+                    "from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor".to_string(),
+                ],
+                max_active_runs: None,
+            }
+        }
+        // SQS / API render branches land in plans 30-03 / 30-04. Until then,
+        // fall back to schedule=None placeholder so existing fixtures keep
+        // passing byte-identical. PRES-02 protects this contract.
+        SingleSource::Sqs(_) | SingleSource::Api(_) => TriggerRender {
             schedule_expr: "None".to_string(),
             sensor_tasks: Vec::new(),
             sensor_deps: Vec::new(),
@@ -184,11 +265,20 @@ fn render_composite(t: &Trigger) -> TriggerRender {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use yard_structs::{DatasetTrigger, ScheduleTrigger};
+    use yard_structs::{DatasetTrigger, S3Trigger, ScheduleTrigger};
 
     fn ds(uri: &str) -> SingleSource {
         SingleSource::Dataset(DatasetTrigger {
             uri: uri.to_string(),
+        })
+    }
+
+    /// Default-knob bare S3 trigger fixture for the render_trigger_s3_* tests.
+    fn s3(bucket: &str, prefix: Option<&str>) -> SingleSource {
+        SingleSource::S3(S3Trigger {
+            bucket: bucket.to_string(),
+            prefix: prefix.map(|s| s.to_string()),
+            ..Default::default()
         })
     }
 
@@ -299,5 +389,153 @@ mod tests {
         let out = render_trigger(Some(&t), None, None, &[]);
         assert_eq!(out.extra_imports.len(), 1);
         assert_eq!(out.extra_imports[0], "from airflow.datasets import Dataset");
+    }
+
+    // --- Phase 30 plan 30-02: S3 single-source render branch (S3-01..S3-04) ---
+
+    #[test]
+    fn render_trigger_s3_single_account_emits_deferrable_sensor() {
+        // S3-01: single-account default — knob defaults (poke_interval=60,
+        // timeout=86400, deferrable=True), no aws_conn_id (Airflow's
+        // aws_default applies by absence), one >> edge per root.
+        let t = Trigger::Single(s3("mybucket", Some("input/")));
+        let out = render_trigger(Some(&t), None, None, &["root_task".to_string()]);
+        assert_eq!(out.schedule_expr, "None");
+        assert_eq!(out.sensor_tasks.len(), 1);
+        let st = &out.sensor_tasks[0];
+        assert!(st.contains("_yard_wait_s3 = S3KeySensor("), "got: {st}");
+        assert!(st.contains("task_id=\"_yard_wait_s3\""), "got: {st}");
+        assert!(st.contains("bucket_name=\"mybucket\""), "got: {st}");
+        assert!(st.contains("bucket_key=\"input/\""), "got: {st}");
+        assert!(st.contains("poke_interval=60"), "got: {st}");
+        assert!(st.contains("timeout=86400"), "got: {st}");
+        assert!(st.contains("deferrable=True"), "got: {st}");
+        assert!(
+            !st.contains("aws_conn_id="),
+            "no override + no default = no conn line: {st}"
+        );
+        assert_eq!(
+            out.sensor_deps,
+            vec!["_yard_wait_s3 >> t_root_task".to_string()]
+        );
+        assert_eq!(
+            out.extra_imports,
+            vec![
+                "from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor".to_string()
+            ]
+        );
+        assert_eq!(out.max_active_runs, None);
+    }
+
+    #[test]
+    fn render_trigger_s3_with_exact_key_uses_bucket_key() {
+        // bucket_key takes the exact `key` path when set (vs. prefix glob).
+        let t = Trigger::Single(SingleSource::S3(S3Trigger {
+            bucket: "b".into(),
+            key: Some("path/to/file.csv".into()),
+            prefix: None,
+            ..Default::default()
+        }));
+        let out = render_trigger(Some(&t), None, None, &["r".to_string()]);
+        let st = &out.sensor_tasks[0];
+        assert!(st.contains("bucket_key=\"path/to/file.csv\""), "got: {st}");
+    }
+
+    #[test]
+    fn render_trigger_s3_user_override_knobs_propagate() {
+        // S3-02: user values override the render defaults verbatim.
+        let t = Trigger::Single(SingleSource::S3(S3Trigger {
+            bucket: "b".into(),
+            prefix: Some("p/".into()),
+            poke_interval: Some(120),
+            timeout: Some(3600),
+            ..Default::default()
+        }));
+        let out = render_trigger(Some(&t), None, None, &["r".to_string()]);
+        let st = &out.sensor_tasks[0];
+        assert!(st.contains("poke_interval=120"), "got: {st}");
+        assert!(st.contains("timeout=3600"), "got: {st}");
+    }
+
+    #[test]
+    fn render_trigger_s3_deferrable_false_renders_legacy_form() {
+        // S3-03: legacy escape hatch for old apache-airflow-providers-amazon.
+        // Python's `False` (capital F).
+        let t = Trigger::Single(SingleSource::S3(S3Trigger {
+            bucket: "b".into(),
+            prefix: Some("p/".into()),
+            deferrable: Some(false),
+            ..Default::default()
+        }));
+        let out = render_trigger(Some(&t), None, None, &["r".to_string()]);
+        let st = &out.sensor_tasks[0];
+        assert!(st.contains("deferrable=False"), "got: {st}");
+        assert!(!st.contains("deferrable=True"), "got: {st}");
+    }
+
+    #[test]
+    fn render_trigger_s3_aws_conn_id_user_override_wins() {
+        // S3-04 / D-08: per-trigger aws_conn_id beats DAG-level default.
+        let t = Trigger::Single(SingleSource::S3(S3Trigger {
+            bucket: "b".into(),
+            prefix: Some("p/".into()),
+            aws_conn_id: Some("custom_conn".into()),
+            ..Default::default()
+        }));
+        let out = render_trigger(
+            Some(&t),
+            None,
+            Some("dag_default_conn"),
+            &["r".to_string()],
+        );
+        let st = &out.sensor_tasks[0];
+        assert!(st.contains("aws_conn_id=\"custom_conn\""), "got: {st}");
+        assert!(!st.contains("dag_default_conn"), "got: {st}");
+    }
+
+    #[test]
+    fn render_trigger_s3_aws_conn_id_dag_default_used_when_no_override() {
+        // S3-04: absence of per-trigger override falls through to DAG-level
+        // derive_aws_conn_id value.
+        let t = Trigger::Single(s3("b", Some("p/")));
+        let out = render_trigger(
+            Some(&t),
+            None,
+            Some("dag_default_conn"),
+            &["r".to_string()],
+        );
+        let st = &out.sensor_tasks[0];
+        assert!(st.contains("aws_conn_id=\"dag_default_conn\""), "got: {st}");
+    }
+
+    #[test]
+    fn render_trigger_s3_no_aws_conn_id_when_both_none() {
+        // S3-04: neither override nor DAG default = omit kwarg entirely.
+        // Airflow's `aws_default` applies by absence.
+        let t = Trigger::Single(s3("b", Some("p/")));
+        let out = render_trigger(Some(&t), None, None, &["r".to_string()]);
+        let st = &out.sensor_tasks[0];
+        assert!(!st.contains("aws_conn_id="), "got: {st}");
+    }
+
+    #[test]
+    fn render_trigger_s3_multiple_roots_emit_multiple_dep_edges() {
+        // S3-01: one >> edge per root, in input order. generation.rs computes
+        // roots from the DAG task list deterministically; we mirror that
+        // order here without re-sorting.
+        let t = Trigger::Single(s3("b", Some("p/")));
+        let out = render_trigger(
+            Some(&t),
+            None,
+            None,
+            &["a".to_string(), "b".to_string()],
+        );
+        assert_eq!(
+            out.sensor_deps,
+            vec![
+                "_yard_wait_s3 >> t_a".to_string(),
+                "_yard_wait_s3 >> t_b".to_string(),
+            ]
+        );
     }
 }
