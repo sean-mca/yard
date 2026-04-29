@@ -1585,6 +1585,235 @@ mod tests {
         );
     }
 
+    // ---- Phase 30 plan 30-04: API trigger end-to-end ----
+
+    #[test]
+    fn dag_trigger_api_emits_schedule_none_with_header_docstring() {
+        // API-01..API-03 end-to-end: trigger: { api: { description } }
+        // emits schedule=None plus a header docstring with curl/CLI snippets,
+        // $AIRFLOW_URL placeholder, and the description verbatim. CONC-01:
+        // any trigger DAG renders max_active_runs=1 by default.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  api:\n    description: Manual replay\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("worker".into(), bash_job("echo work", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("schedule=None"),
+            "API trigger renders schedule=None: {script}"
+        );
+        assert!(
+            script.contains("# Manual replay"),
+            "description must appear in header: {script}"
+        );
+        assert!(
+            script.contains("$AIRFLOW_URL"),
+            "header must use $AIRFLOW_URL placeholder: {script}"
+        );
+        assert!(
+            script.contains("curl -X POST"),
+            "header must include curl snippet: {script}"
+        );
+        assert!(
+            script.contains("airflow dags trigger"),
+            "header must include CLI snippet: {script}"
+        );
+        assert!(
+            script.contains("max_active_runs=1"),
+            "CONC-01 default for trigger DAG: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_trigger_heterogeneous_all_emits_join_operator() {
+        // DS-04 + D-09 end-to-end: trigger: { all: [s3, sqs] } emits both
+        // sensors, _yard_join EmptyOperator with trigger_rule="all_success",
+        // sensor->join->root edges, EmptyOperator import, and CONC-01
+        // max_active_runs=1.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  all:\n    - s3:\n        bucket: mybucket\n        prefix: input/\n    - sqs:\n        queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/myqueue\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("worker".into(), bash_job("echo work", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("_yard_wait_s3 = S3KeySensor("),
+            "S3 sensor task: {script}"
+        );
+        assert!(
+            script.contains("_yard_wait_sqs = SqsSensor("),
+            "SQS sensor task: {script}"
+        );
+        assert!(
+            script.contains("_yard_join = EmptyOperator("),
+            "_yard_join task: {script}"
+        );
+        assert!(
+            script.contains("task_id=\"_yard_join\""),
+            "_yard_join task_id literal: {script}"
+        );
+        assert!(
+            script.contains("trigger_rule=\"all_success\""),
+            "_yard_join trigger_rule: {script}"
+        );
+        assert!(
+            script.contains("_yard_wait_s3 >> _yard_join"),
+            "S3 -> _yard_join edge: {script}"
+        );
+        assert!(
+            script.contains("_yard_wait_sqs >> _yard_join"),
+            "SQS -> _yard_join edge: {script}"
+        );
+        assert!(
+            script.contains("_yard_join >> t_worker"),
+            "_yard_join -> root edge: {script}"
+        );
+        assert!(
+            script.contains("from airflow.operators.empty import EmptyOperator"),
+            "EmptyOperator import: {script}"
+        );
+        assert!(
+            script.contains("max_active_runs=1"),
+            "CONC-01 default: {script}"
+        );
+        assert!(
+            script.contains("schedule=None"),
+            "no Datasets => schedule=None: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_trigger_max_active_runs_user_override_wins() {
+        // CONC-01 user-override-wins end-to-end: airflow.max_active_runs: 4 set
+        // alongside trigger: { s3: ... }. User value 4 wins over CONC-01
+        // auto-default of 1.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "max_active_runs: 4\ntrigger:\n  s3:\n    bucket: mybucket\n    prefix: input/\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("worker".into(), bash_job("echo work", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("max_active_runs=4"),
+            "user override (4) must beat CONC-01 auto-default (1): {script}"
+        );
+        assert!(
+            !script.contains("max_active_runs=1"),
+            "CONC-01 auto-default must not also leak when user overrides: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_schedule_only_with_explicit_max_active_runs_renders_user_value() {
+        // PRES-02 + CONC-01 user-override: schedule-only DAG with explicit
+        // airflow.max_active_runs: 8 — render the user value. Without the
+        // explicit field, schedule-only DAGs render no max_active_runs= line
+        // at all (locked by `dag_schedule_only_omits_max_active_runs_pres_02_invariant`
+        // from plan 30-01).
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "schedule: \"@daily\"\nmax_active_runs: 8\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("worker".into(), bash_job("echo work", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("max_active_runs=8"),
+            "explicit user value renders: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_trigger_api_with_payload_schema_documents_fields() {
+        // API-02 doc-only end-to-end: payload_schema fields appear in the
+        // header docstring. No runtime enforcement — just docs for the user
+        // assembling the curl/CLI invocation.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  api:\n    payload_schema:\n      customer_id: string\n      event_id: string\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("worker".into(), bash_job("echo work", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("customer_id"),
+            "payload_schema field customer_id must appear in header: {script}"
+        );
+        assert!(
+            script.contains("event_id"),
+            "payload_schema field event_id must appear in header: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
     #[test]
     fn trigger_overrides_inherited_schedule() {
         let tmp = setup_project_tree();

@@ -42,6 +42,10 @@ pub(super) struct TriggerRender {
     /// override. None when no trigger or schedule-only. Plan 30-04 wires the
     /// auto-default; plan 30-01 stakes the field shape only.
     pub max_active_runs: Option<u32>,
+    /// API-01: optional `# ...` comment block emitted near the top of the
+    /// rendered DAG file, documenting how to invoke the DAG via Airflow's
+    /// REST API or CLI. Empty string when the trigger is not API-driven.
+    pub header_docstring: String,
 }
 
 /// Render a resolved trigger into Python sensor tasks, schedule expression,
@@ -78,26 +82,36 @@ pub(super) fn render_trigger(
     };
 
     // Branch 1: bare-single (or collapsed single-element composite).
-    if let Some(single) = normalized {
-        return render_single(single, default_aws_conn_id, roots);
-    }
+    let mut result = if let Some(single) = normalized {
+        render_single(single, default_aws_conn_id, roots)
+    } else if let Some(t) = trigger {
+        // Branch 2: composite (>= 2 elements).
+        render_composite(t, default_aws_conn_id, roots)
+    } else {
+        // Branch 3: no trigger — render top-level schedule literal or None.
+        TriggerRender {
+            schedule_expr: match schedule {
+                Some(s) => python_string_literal(s),
+                None => "None".to_string(),
+            },
+            sensor_tasks: Vec::new(),
+            sensor_deps: Vec::new(),
+            extra_imports: Vec::new(),
+            max_active_runs: None,
+            header_docstring: String::new(),
+        }
+    };
 
-    // Branch 2: composite (>= 2 elements).
-    if let Some(t) = trigger {
-        return render_composite(t);
+    // CONC-01: any DAG with a `trigger:` block defaults to max_active_runs=1
+    // when neither a per-arm value nor a user override has set it. Schedule-only
+    // DAGs (`trigger.is_none()`) preserve Airflow's implicit default of 16 — no
+    // `max_active_runs=` line emitted (PRES-02 byte-identical guarantee).
+    // User overrides via `AirflowSection.max_active_runs` always win — applied
+    // later in generation.rs by overlaying onto `result.max_active_runs`.
+    if trigger.is_some() && result.max_active_runs.is_none() {
+        result.max_active_runs = Some(1);
     }
-
-    // Branch 3: no trigger — render top-level schedule literal or None.
-    TriggerRender {
-        schedule_expr: match schedule {
-            Some(s) => python_string_literal(s),
-            None => "None".to_string(),
-        },
-        sensor_tasks: Vec::new(),
-        sensor_deps: Vec::new(),
-        extra_imports: Vec::new(),
-        max_active_runs: None,
-    }
+    result
 }
 
 /// Bare-single render branch.
@@ -128,6 +142,7 @@ fn render_single(
             sensor_deps: Vec::new(),
             extra_imports: Vec::new(),
             max_active_runs: None,
+            header_docstring: String::new(),
         },
         SingleSource::Dataset(d) => TriggerRender {
             schedule_expr: format!("[Dataset({})]", python_string_literal(&d.uri)),
@@ -135,6 +150,7 @@ fn render_single(
             sensor_deps: Vec::new(),
             extra_imports: vec!["from airflow.datasets import Dataset".to_string()],
             max_active_runs: None,
+            header_docstring: String::new(),
         },
         SingleSource::S3(s3) => {
             // Knob defaults (S3-02): poke_interval=60, timeout=86400.
@@ -203,6 +219,7 @@ fn render_single(
                     "from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor".to_string(),
                 ],
                 max_active_runs: None,
+                header_docstring: String::new(),
             }
         }
         SingleSource::Sqs(sqs) => {
@@ -263,24 +280,82 @@ fn render_single(
                     "from airflow.providers.amazon.aws.sensors.sqs import SqsSensor".to_string(),
                 ],
                 max_active_runs: None,
+                header_docstring: String::new(),
             }
         }
-        // API render branch lands in plan 30-04. Until then, fall back to
-        // schedule=None placeholder so existing fixtures keep passing
-        // byte-identical. PRES-02 protects this contract.
-        SingleSource::Api(_) => TriggerRender {
-            schedule_expr: "None".to_string(),
-            sensor_tasks: Vec::new(),
-            sensor_deps: Vec::new(),
-            extra_imports: Vec::new(),
-            max_active_runs: None,
-        },
+        SingleSource::Api(api) => {
+            // API-01..API-03 (plan 30-04). API triggers have no Airflow sensor
+            // — they fire on manual REST/CLI invocation. The render contribution
+            // is a header docstring documenting curl/CLI snippets with placeholder
+            // env vars (no hardcoded URLs — CLAUDE.md "Never hardcode personal
+            // info" precedent applies to AIRFLOW URLs too) and an auth-management
+            // callout (yard does NOT manage Airflow REST auth). payload_schema
+            // is doc-only in v1.6 — Airflow's typed Params landed in 3.x.
+            let mut header = String::new();
+            header.push_str("# Trigger: API (manual / external invocation)\n");
+            if let Some(desc) = &api.description {
+                header.push_str(&format!("# {desc}\n"));
+            }
+            header.push_str("#\n");
+            header.push_str("# This DAG is triggered manually via Airflow's REST API or CLI.\n");
+            header.push_str("# yard does NOT manage Airflow REST auth — configure JWT, Basic,\n");
+            header.push_str("# or IAM SigV4 credentials in your Airflow deployment.\n");
+            header.push_str("#\n");
+            header.push_str("# Invoke via REST:\n");
+            header.push_str("#   curl -X POST \"$AIRFLOW_URL/api/v1/dags/<dag_id>/dagRuns\" \\\n");
+            header.push_str("#        -u \"$AIRFLOW_USER:$AIRFLOW_PASS\" \\\n");
+            header.push_str("#        -H \"Content-Type: application/json\" \\\n");
+            header.push_str("#        -d '{\"conf\": {\"key\": \"value\"}}'\n");
+            header.push_str("#\n");
+            header.push_str("# Invoke via CLI:\n");
+            header.push_str(
+                "#   airflow dags trigger <dag_id> --conf '{\"key\": \"value\"}'\n",
+            );
+            if let Some(schema) = &api.payload_schema {
+                header.push_str("#\n");
+                header.push_str(
+                    "# Expected payload fields (doc-only — no runtime enforcement in v1.6):\n",
+                );
+                // BTreeMap iteration is sorted by key already, locking deterministic
+                // header ordering across runs.
+                for (field, ty) in schema {
+                    header.push_str(&format!("#   {field}: {ty}\n"));
+                }
+            }
+            TriggerRender {
+                schedule_expr: "None".to_string(),
+                sensor_tasks: Vec::new(),
+                sensor_deps: Vec::new(),
+                extra_imports: Vec::new(),
+                // CONC-01 auto-default applied centrally in render_trigger.
+                max_active_runs: None,
+                header_docstring: header,
+            }
+        }
     }
 }
 
-/// Composite render branch — Datasets-only homogeneous all/any (DS-02, DS-03).
-/// Heterogeneous all + max_active_runs default land in plan 30-04.
-fn render_composite(t: &Trigger) -> TriggerRender {
+/// Composite render branch.
+///
+/// - DS-02 / DS-03: homogeneous Datasets all/any (alpha-sorted `&` / `|` chain
+///   at `schedule=` level).
+/// - DS-04: heterogeneous-all — non-Dataset items render as sensor tasks under
+///   `_yard_join` `EmptyOperator(trigger_rule="all_success")`.
+/// - D-11: mixed Dataset + non-Dataset all — Datasets at `schedule=` level
+///   AND non-Datasets as sensor tasks; `_yard_join` only when there are
+///   2+ sensor tasks (D-10).
+/// - D-07: sensor render order alphabetical by source kind (api < dataset <
+///   s3 < sqs). API has no sensor task — its `header_docstring` flows through
+///   the `combined_header` aggregator.
+///
+/// Phase 29 TRIG-06 already rejects heterogeneous-`any:` at validation, so
+/// the only composite shape that reaches the heterogeneous branch here is
+/// `Trigger::All(_)` with at least one non-Dataset item.
+fn render_composite(
+    t: &Trigger,
+    default_aws_conn_id: Option<&str>,
+    roots: &[String],
+) -> TriggerRender {
     let (items, separator) = match t {
         Trigger::All(v) => (v, " & "),
         Trigger::Any(v) => (v, " | "),
@@ -309,21 +384,130 @@ fn render_composite(t: &Trigger) -> TriggerRender {
             sensor_deps: Vec::new(),
             extra_imports: vec!["from airflow.datasets import Dataset".to_string()],
             max_active_runs: None,
+            header_docstring: String::new(),
         };
     }
 
-    // Heterogeneous-all (DS-04) + non-Dataset composites land in plans
-    // 30-02 / 30-03 / 30-04. For now (plan 30-01), these return a
-    // placeholder that won't be exercised by 30-01 fixtures; Phase 29's
-    // TRIG-06 already rejects heterogeneous-`any:`, so the only composite
-    // shape that reaches this fall-through is heterogeneous-`all:` which
-    // 30-04 will own.
+    // DS-04 + D-11: heterogeneous-all (Phase 29 TRIG-06 rejects heterogeneous-any
+    // at validation, so the only composite shape reaching here is Trigger::All
+    // with at least one non-Dataset item).
+    debug_assert!(
+        matches!(t, Trigger::All(_)),
+        "heterogeneous Trigger::Any is rejected by Phase 29 validation; render_composite \
+         should only see Trigger::All for heterogeneous mixes"
+    );
+
+    // Split Datasets (-> schedule level) from non-Datasets (-> sensor tasks).
+    let mut dataset_uris: Vec<&str> = Vec::new();
+    let mut non_datasets: Vec<&SingleSource> = Vec::new();
+    for s in items {
+        match s {
+            SingleSource::Dataset(d) => dataset_uris.push(d.uri.as_str()),
+            _ => non_datasets.push(s),
+        }
+    }
+    dataset_uris.sort();
+
+    // schedule= level: alpha-sorted `&` chain when Datasets present, else None.
+    let schedule_expr = if dataset_uris.is_empty() {
+        "None".to_string()
+    } else if dataset_uris.len() == 1 {
+        format!("[Dataset({})]", python_string_literal(dataset_uris[0]))
+    } else {
+        let chain = dataset_uris
+            .iter()
+            .map(|u| format!("Dataset({})", python_string_literal(u)))
+            .collect::<Vec<_>>()
+            .join(" & ");
+        format!("({chain})")
+    };
+
+    // D-07: sensor render order alphabetical by source kind.
+    let mut non_dataset_sorted: Vec<&SingleSource> = non_datasets.clone();
+    non_dataset_sorted.sort_by_key(|s| s.source_kind());
+
+    // Recurse into render_single for each non-Dataset source. Pass empty roots
+    // so the per-source arms don't emit edges to user roots — we'll emit
+    // sensor->_yard_join + _yard_join->root edges explicitly below (or
+    // sensor->root if there's only one sensor).
+    let empty_roots: &[String] = &[];
+    let mut all_sensor_tasks: Vec<String> = Vec::new();
+    let mut combined_imports: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    if !dataset_uris.is_empty() {
+        combined_imports.insert("from airflow.datasets import Dataset".to_string());
+    }
+    let mut combined_header = String::new();
+    for s in &non_dataset_sorted {
+        let r = render_single(s, default_aws_conn_id, empty_roots);
+        all_sensor_tasks.extend(r.sensor_tasks);
+        combined_imports.extend(r.extra_imports);
+        // API contributes header docstring; collect verbatim.
+        if !r.header_docstring.is_empty() {
+            combined_header.push_str(&r.header_docstring);
+        }
+    }
+
+    // D-10: only emit _yard_join when there are 2+ sensor tasks.
+    let mut sensor_deps: Vec<String> = Vec::new();
+    if all_sensor_tasks.len() >= 2 {
+        // Append _yard_join AFTER all sensors. 4-space indent for the
+        // assignment + closing paren (inside the `with DAG:` block); 8-space
+        // indent for the kwargs to match the S3 / SQS sensor formatting.
+        let mut join_task = String::new();
+        join_task.push_str("    _yard_join = EmptyOperator(\n");
+        join_task.push_str("        task_id=\"_yard_join\",\n");
+        join_task.push_str("        trigger_rule=\"all_success\",\n");
+        join_task.push_str("    )");
+        all_sensor_tasks.push(join_task);
+        combined_imports.insert("from airflow.operators.empty import EmptyOperator".to_string());
+
+        // Sensor -> _yard_join edges (alpha-sorted by emission order).
+        for s in &non_dataset_sorted {
+            let sensor_id = match s {
+                SingleSource::S3(_) => Some("_yard_wait_s3"),
+                SingleSource::Sqs(_) => Some("_yard_wait_sqs"),
+                // API contributes no sensor task; skip for edge emission.
+                SingleSource::Api(_) => None,
+                // Dataset / Schedule cannot appear in non_datasets — Dataset
+                // was filtered out into dataset_uris above; Schedule is
+                // rejected at validation in heterogeneous composites.
+                SingleSource::Dataset(_) | SingleSource::Schedule(_) => None,
+            };
+            if let Some(id) = sensor_id {
+                sensor_deps.push(format!("{id} >> _yard_join"));
+            }
+        }
+        // _yard_join -> root edges, in user-declared root order.
+        for r in roots {
+            sensor_deps.push(format!("_yard_join >> {}", python_var_name(r)));
+        }
+    } else if all_sensor_tasks.len() == 1 {
+        // D-10: single-sensor mixed Dataset+sensor — connect the lone sensor
+        // directly to roots, no _yard_join. Find which sensor it is.
+        let sensor_id = non_dataset_sorted
+            .iter()
+            .find_map(|s| match s {
+                SingleSource::S3(_) => Some("_yard_wait_s3"),
+                SingleSource::Sqs(_) => Some("_yard_wait_sqs"),
+                _ => None,
+            })
+            .unwrap_or("_yard_wait_unknown");
+        for r in roots {
+            sensor_deps.push(format!("{sensor_id} >> {}", python_var_name(r)));
+        }
+    }
+    // If all_sensor_tasks.is_empty() (e.g. all-Datasets+API): no sensor_deps;
+    // Datasets fire at schedule level, API has no sensor.
+
     TriggerRender {
-        schedule_expr: "None".to_string(),
-        sensor_tasks: Vec::new(),
-        sensor_deps: Vec::new(),
-        extra_imports: Vec::new(),
+        schedule_expr,
+        sensor_tasks: all_sensor_tasks,
+        sensor_deps,
+        extra_imports: combined_imports.into_iter().collect(),
+        // CONC-01 auto-default applied centrally in render_trigger.
         max_active_runs: None,
+        header_docstring: combined_header,
     }
 }
 
@@ -331,7 +515,8 @@ fn render_composite(t: &Trigger) -> TriggerRender {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use yard_structs::{DatasetTrigger, S3Trigger, ScheduleTrigger, SqsTrigger};
+    use std::collections::BTreeMap;
+    use yard_structs::{ApiTrigger, DatasetTrigger, S3Trigger, ScheduleTrigger, SqsTrigger};
 
     fn ds(uri: &str) -> SingleSource {
         SingleSource::Dataset(DatasetTrigger {
@@ -357,6 +542,16 @@ mod tests {
             wait_time_seconds: None,
             max_messages: None,
             delete_message_on_reception: None,
+        })
+    }
+
+    /// Bare API trigger fixture for the render_trigger_api_* tests.
+    /// ApiTrigger derives Default, so callers can override only the fields
+    /// they care about.
+    fn api(description: Option<&str>) -> SingleSource {
+        SingleSource::Api(ApiTrigger {
+            description: description.map(|s| s.to_string()),
+            payload_schema: None,
         })
     }
 
@@ -452,13 +647,14 @@ mod tests {
     }
 
     #[test]
-    fn render_trigger_max_active_runs_field_is_none_for_datasets_only_in_this_plan() {
-        // Plan 30-01 stakes the field shape but does not yet wire CONC-01
-        // auto-default-to-Some(1). That lands in plan 30-04. Lock the
-        // current behavior so plan 30-04 can flip it intentionally.
+    fn render_trigger_max_active_runs_field_is_some_one_for_dataset_trigger() {
+        // CONC-01 (plan 30-04 flipped this): any DAG with a `trigger:` block
+        // defaults to max_active_runs=Some(1). Plan 30-01 staked the field
+        // shape with None; plan 30-04 wires the auto-default centrally in
+        // render_trigger. Schedule-only DAGs still preserve None (PRES-02).
         let t = Trigger::Single(ds("s3://x"));
         let out = render_trigger(Some(&t), None, None, &[]);
-        assert_eq!(out.max_active_runs, None);
+        assert_eq!(out.max_active_runs, Some(1));
     }
 
     #[test]
@@ -502,7 +698,8 @@ mod tests {
                 "from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor".to_string()
             ]
         );
-        assert_eq!(out.max_active_runs, None);
+        // CONC-01 (plan 30-04): any trigger DAG defaults to max_active_runs=1.
+        assert_eq!(out.max_active_runs, Some(1));
     }
 
     #[test]
@@ -656,7 +853,8 @@ mod tests {
             out.extra_imports,
             vec!["from airflow.providers.amazon.aws.sensors.sqs import SqsSensor".to_string()]
         );
-        assert_eq!(out.max_active_runs, None);
+        // CONC-01 (plan 30-04): any trigger DAG defaults to max_active_runs=1.
+        assert_eq!(out.max_active_runs, Some(1));
     }
 
     #[test]
@@ -718,5 +916,367 @@ mod tests {
                 "_yard_wait_sqs >> t_b".to_string(),
             ]
         );
+    }
+
+    // --- Phase 30 plan 30-04: API single-source render branch (API-01..API-03) ---
+
+    #[test]
+    fn render_trigger_api_default_emits_schedule_none_and_header() {
+        // API-01: bare API trigger emits schedule=None, no sensor task, but a
+        // header docstring with curl/CLI snippets and placeholders. CONC-01:
+        // any trigger DAG defaults to max_active_runs=Some(1).
+        let t = Trigger::Single(api(None));
+        let out = render_trigger(Some(&t), None, None, &[]);
+        assert_eq!(out.schedule_expr, "None");
+        assert!(out.sensor_tasks.is_empty(), "API has no sensor task");
+        assert!(out.sensor_deps.is_empty(), "API has no sensor deps");
+        assert!(out.extra_imports.is_empty(), "API needs no provider imports");
+        assert_eq!(
+            out.max_active_runs,
+            Some(1),
+            "CONC-01 default fires for any trigger DAG: {out:?}"
+        );
+        let h = &out.header_docstring;
+        assert!(h.contains("$AIRFLOW_URL"), "header missing $AIRFLOW_URL: {h}");
+        assert!(h.contains("$AIRFLOW_USER"), "header missing $AIRFLOW_USER: {h}");
+        assert!(h.contains("$AIRFLOW_PASS"), "header missing $AIRFLOW_PASS: {h}");
+        assert!(h.contains("curl -X POST"), "header missing curl snippet: {h}");
+        assert!(
+            h.contains("airflow dags trigger"),
+            "header missing CLI snippet: {h}"
+        );
+    }
+
+    #[test]
+    fn render_trigger_api_with_description_includes_in_header() {
+        // API-02 doc-only: description threads into the header verbatim.
+        let t = Trigger::Single(api(Some("Replay failed S3 ingests")));
+        let out = render_trigger(Some(&t), None, None, &[]);
+        assert!(
+            out.header_docstring.contains("Replay failed S3 ingests"),
+            "header missing description: {}",
+            out.header_docstring
+        );
+    }
+
+    #[test]
+    fn render_trigger_api_with_payload_schema_documents_fields() {
+        // API-02 doc-only: payload_schema fields render into the header
+        // (sorted alphabetically — BTreeMap iteration is sorted).
+        let mut schema = BTreeMap::new();
+        schema.insert("customer_id".to_string(), "string".to_string());
+        schema.insert("event_id".to_string(), "string".to_string());
+        let t = Trigger::Single(SingleSource::Api(ApiTrigger {
+            description: None,
+            payload_schema: Some(schema),
+        }));
+        let out = render_trigger(Some(&t), None, None, &[]);
+        let h = &out.header_docstring;
+        assert!(h.contains("customer_id"), "header missing customer_id: {h}");
+        assert!(h.contains("event_id"), "header missing event_id: {h}");
+        // BTreeMap is sorted: customer_id appears BEFORE event_id.
+        let i_customer = h.find("customer_id").expect("customer_id present");
+        let i_event = h.find("event_id").expect("event_id present");
+        assert!(
+            i_customer < i_event,
+            "BTreeMap iteration must render alphabetically: customer_id before event_id: {h}"
+        );
+    }
+
+    #[test]
+    fn render_trigger_api_header_uses_placeholders_not_hardcoded_urls() {
+        // API-01: never hardcode URLs. Use $AIRFLOW_URL placeholder.
+        let t = Trigger::Single(api(None));
+        let out = render_trigger(Some(&t), None, None, &[]);
+        let h = &out.header_docstring;
+        assert!(
+            !h.contains("https://airflow.example.com"),
+            "header must not hardcode airflow.example.com: {h}"
+        );
+        assert!(
+            !h.contains("localhost:8080"),
+            "header must not hardcode localhost:8080: {h}"
+        );
+        assert!(h.contains("$AIRFLOW_URL"), "header must use $AIRFLOW_URL: {h}");
+    }
+
+    #[test]
+    fn render_trigger_api_header_includes_no_auth_management_callout() {
+        // API-03: yard does NOT manage Airflow REST auth. Header must say so.
+        let t = Trigger::Single(api(None));
+        let out = render_trigger(Some(&t), None, None, &[]);
+        let h = &out.header_docstring;
+        let mentions_no_auth = h.contains("does NOT manage")
+            || h.contains("does not manage")
+            || h.contains("wire JWT")
+            || h.contains("JWT")
+            || h.contains("Basic")
+            || h.contains("IAM SigV4");
+        assert!(
+            mentions_no_auth,
+            "header must call out that yard does not manage Airflow REST auth: {h}"
+        );
+    }
+
+    // --- Phase 30 plan 30-04 Task 2: heterogeneous-all (DS-04 + D-11 + D-10) ---
+
+    /// Default-knob bare S3 trigger fixture for the heterogeneous-all tests.
+    fn s3_basic(bucket: &str, prefix: &str) -> SingleSource {
+        SingleSource::S3(S3Trigger {
+            bucket: bucket.to_string(),
+            prefix: Some(prefix.to_string()),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn render_trigger_heterogeneous_all_s3_sqs_emits_join() {
+        // DS-04: heterogeneous Trigger::All(S3, SQS) emits both sensors plus
+        // _yard_join EmptyOperator with trigger_rule="all_success", and
+        // sensor->join->root edges. CONC-01: max_active_runs=Some(1).
+        let t = Trigger::All(vec![s3_basic("b", "p/"), sqs("q")]);
+        let out = render_trigger(
+            Some(&t),
+            None,
+            None,
+            &["root_a".to_string(), "root_b".to_string()],
+        );
+        assert_eq!(out.schedule_expr, "None");
+        // 2 sensors + _yard_join task = 3 entries.
+        assert_eq!(out.sensor_tasks.len(), 3, "tasks: {:?}", out.sensor_tasks);
+        // D-07: alpha-sort by source kind. "s3" < "sqs", _yard_join LAST.
+        assert!(
+            out.sensor_tasks[0].contains("_yard_wait_s3 = S3KeySensor("),
+            "first sensor must be S3: {}",
+            out.sensor_tasks[0]
+        );
+        assert!(
+            out.sensor_tasks[1].contains("_yard_wait_sqs = SqsSensor("),
+            "second sensor must be SQS: {}",
+            out.sensor_tasks[1]
+        );
+        assert!(
+            out.sensor_tasks[2].contains("_yard_join = EmptyOperator("),
+            "_yard_join task must be last: {}",
+            out.sensor_tasks[2]
+        );
+        assert!(
+            out.sensor_tasks[2].contains("task_id=\"_yard_join\""),
+            "_yard_join task_id literal: {}",
+            out.sensor_tasks[2]
+        );
+        assert!(
+            out.sensor_tasks[2].contains("trigger_rule=\"all_success\""),
+            "_yard_join trigger_rule: {}",
+            out.sensor_tasks[2]
+        );
+        // Edges: sensor->join (alpha), then join->root.
+        assert_eq!(
+            out.sensor_deps,
+            vec![
+                "_yard_wait_s3 >> _yard_join".to_string(),
+                "_yard_wait_sqs >> _yard_join".to_string(),
+                "_yard_join >> t_root_a".to_string(),
+                "_yard_join >> t_root_b".to_string(),
+            ]
+        );
+        // Imports: S3KeySensor + SqsSensor + EmptyOperator. Vec is sorted by
+        // BTreeSet inside render_composite for determinism.
+        assert!(
+            out.extra_imports.iter().any(|i| i
+                .contains("from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor")),
+            "S3KeySensor import: {:?}",
+            out.extra_imports
+        );
+        assert!(
+            out.extra_imports
+                .iter()
+                .any(|i| i.contains("from airflow.providers.amazon.aws.sensors.sqs import SqsSensor")),
+            "SqsSensor import: {:?}",
+            out.extra_imports
+        );
+        assert!(
+            out.extra_imports
+                .iter()
+                .any(|i| i.contains("from airflow.operators.empty import EmptyOperator")),
+            "EmptyOperator import: {:?}",
+            out.extra_imports
+        );
+        assert_eq!(out.max_active_runs, Some(1), "CONC-01 default");
+    }
+
+    #[test]
+    fn render_trigger_heterogeneous_all_dataset_plus_s3_splits_correctly() {
+        // D-11: Trigger::All([Dataset, S3]) — Dataset goes to schedule= level,
+        // S3 becomes a sensor. With only ONE sensor, no _yard_join (D-10).
+        let t = Trigger::All(vec![ds("ds_uri"), s3_basic("b", "p/")]);
+        let out = render_trigger(Some(&t), None, None, &["root".to_string()]);
+        assert_eq!(out.schedule_expr, "[Dataset(\"ds_uri\")]");
+        // 1 sensor (S3 only — Dataset is NOT a sensor in this split).
+        assert_eq!(out.sensor_tasks.len(), 1, "tasks: {:?}", out.sensor_tasks);
+        assert!(
+            out.sensor_tasks[0].contains("_yard_wait_s3 = S3KeySensor("),
+            "S3 sensor only: {}",
+            out.sensor_tasks[0]
+        );
+        // No Dataset sensor edge — Dataset fires at schedule level.
+        assert_eq!(
+            out.sensor_deps,
+            vec!["_yard_wait_s3 >> t_root".to_string()]
+        );
+        // Imports include both Dataset (schedule level) and S3KeySensor.
+        assert!(
+            out.extra_imports
+                .iter()
+                .any(|i| i.contains("from airflow.datasets import Dataset")),
+            "Dataset import: {:?}",
+            out.extra_imports
+        );
+        assert!(
+            out.extra_imports.iter().any(|i| i
+                .contains("from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor")),
+            "S3KeySensor import: {:?}",
+            out.extra_imports
+        );
+        // No EmptyOperator import — only one sensor, no join needed.
+        assert!(
+            !out.extra_imports
+                .iter()
+                .any(|i| i.contains("EmptyOperator")),
+            "single-sensor mixed Dataset+sensor must NOT pull EmptyOperator: {:?}",
+            out.extra_imports
+        );
+    }
+
+    #[test]
+    fn render_trigger_heterogeneous_all_dataset_plus_two_sensors_emits_join() {
+        // D-11 + DS-04: Dataset at schedule level, S3 + SQS sensors under
+        // _yard_join (multiple sensors require the join).
+        let t = Trigger::All(vec![
+            ds("ds_uri"),
+            s3_basic("b", "p/"),
+            sqs("q"),
+        ]);
+        let out = render_trigger(Some(&t), None, None, &["root".to_string()]);
+        assert_eq!(out.schedule_expr, "[Dataset(\"ds_uri\")]");
+        assert_eq!(out.sensor_tasks.len(), 3, "tasks: {:?}", out.sensor_tasks);
+        assert!(
+            out.sensor_tasks[2].contains("_yard_join = EmptyOperator("),
+            "_yard_join must appear: {}",
+            out.sensor_tasks[2]
+        );
+        assert_eq!(
+            out.sensor_deps,
+            vec![
+                "_yard_wait_s3 >> _yard_join".to_string(),
+                "_yard_wait_sqs >> _yard_join".to_string(),
+                "_yard_join >> t_root".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_trigger_heterogeneous_all_three_sensors_alpha_sorted() {
+        // D-07: source-kind alphabetical (api < s3 < sqs). API has no sensor
+        // task (it contributes header docstring only) — sensor_tasks must
+        // contain only S3 + SQS + _yard_join.
+        let t = Trigger::All(vec![sqs("q"), s3_basic("b", "p/"), api(None)]);
+        let out = render_trigger(Some(&t), None, None, &["root".to_string()]);
+        assert_eq!(
+            out.sensor_tasks.len(),
+            3,
+            "API contributes no sensor task — should be S3 + SQS + _yard_join: {:?}",
+            out.sensor_tasks
+        );
+        assert!(
+            out.sensor_tasks[0].contains("_yard_wait_s3"),
+            "alpha-sorted: S3 first: {}",
+            out.sensor_tasks[0]
+        );
+        assert!(
+            out.sensor_tasks[1].contains("_yard_wait_sqs"),
+            "alpha-sorted: SQS second: {}",
+            out.sensor_tasks[1]
+        );
+        assert!(
+            out.sensor_tasks[2].contains("_yard_join"),
+            "_yard_join last: {}",
+            out.sensor_tasks[2]
+        );
+        // API still contributes header docstring.
+        assert!(
+            !out.header_docstring.is_empty(),
+            "API arm contributes header docstring even in heterogeneous-all"
+        );
+    }
+
+    #[test]
+    fn render_trigger_single_sensor_does_not_emit_join() {
+        // D-10: bare-single S3 trigger (or Trigger::All([S3]) collapsed) must
+        // NOT emit _yard_join. Already covered by 30-02 fixtures, re-asserted
+        // here to lock the contract.
+        let t = Trigger::Single(s3_basic("b", "p/"));
+        let out = render_trigger(Some(&t), None, None, &["root".to_string()]);
+        assert_eq!(out.sensor_tasks.len(), 1, "single sensor only");
+        assert!(
+            !out.sensor_tasks[0].contains("_yard_join"),
+            "single-sensor must NOT emit _yard_join: {}",
+            out.sensor_tasks[0]
+        );
+        assert!(
+            !out.extra_imports
+                .iter()
+                .any(|i| i.contains("EmptyOperator")),
+            "single-sensor must NOT import EmptyOperator: {:?}",
+            out.extra_imports
+        );
+    }
+
+    #[test]
+    fn render_trigger_homogeneous_all_datasets_does_not_emit_join() {
+        // D-10: homogeneous all-Datasets is pure schedule-level (no sensors).
+        // Re-assert no _yard_join leaks in.
+        let t = Trigger::All(vec![ds("a"), ds("b")]);
+        let out = render_trigger(Some(&t), None, None, &["root".to_string()]);
+        assert!(out.sensor_tasks.is_empty(), "no sensor tasks for Datasets");
+        assert!(
+            !out.extra_imports
+                .iter()
+                .any(|i| i.contains("EmptyOperator")),
+            "homogeneous Datasets must NOT pull EmptyOperator: {:?}",
+            out.extra_imports
+        );
+    }
+
+    #[test]
+    fn render_trigger_max_active_runs_auto_default_for_all_trigger_kinds() {
+        // CONC-01: every kind of trigger flips max_active_runs to Some(1).
+        let cases: Vec<Trigger> = vec![
+            Trigger::Single(s3_basic("b", "p/")),
+            Trigger::Single(sqs("q")),
+            Trigger::Single(api(None)),
+            Trigger::Single(ds("a")),
+            Trigger::All(vec![ds("a"), ds("b")]),
+            Trigger::Any(vec![ds("a"), ds("b")]),
+            Trigger::All(vec![s3_basic("b", "p/"), sqs("q")]),
+        ];
+        for t in &cases {
+            let out = render_trigger(Some(t), None, None, &["r".to_string()]);
+            assert_eq!(
+                out.max_active_runs,
+                Some(1),
+                "CONC-01 must default to Some(1) for every trigger kind: {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_trigger_max_active_runs_none_for_no_trigger() {
+        // PRES-02: schedule-only DAGs (trigger.is_none()) preserve Airflow's
+        // implicit default of 16 — no max_active_runs= line emitted.
+        let out = render_trigger(None, Some("@daily"), None, &[]);
+        assert_eq!(out.max_active_runs, None, "schedule-only must not auto-default");
+        let out2 = render_trigger(None, None, None, &[]);
+        assert_eq!(out2.max_active_runs, None);
     }
 }

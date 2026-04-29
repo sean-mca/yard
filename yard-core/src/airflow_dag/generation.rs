@@ -126,11 +126,15 @@ pub fn generate_dag(
 
     // D-15 / D-16: max_active_runs_block is empty for schedule-only DAGs
     // (PRES-02 byte-identical guarantee — no new kwarg leaks into existing
-    // fixtures), and `    max_active_runs={N},\n` when set. Plan 30-04 wires
-    // CONC-01 auto-default-to-Some(1) for any trigger DAG; plan 30-01 only
-    // stakes the field shape so the template insertion point + Tera context
-    // key exist for subsequent plans.
-    let max_active_runs_block = match trender.max_active_runs {
+    // fixtures), and `    max_active_runs={N},\n` when set.
+    //
+    // CONC-01 + user-override-wins (plan 30-04): `AirflowSection.max_active_runs`
+    // (user spec) always wins over `trender.max_active_runs` (CONC-01 auto-default
+    // of 1 for any trigger DAG). When BOTH are None — schedule-only DAGs without
+    // an explicit value — emit no kwarg line at all so Airflow's implicit
+    // default of 16 applies by absence.
+    let effective_max_active = dag.config.max_active_runs.or(trender.max_active_runs);
+    let max_active_runs_block = match effective_max_active {
         Some(n) => format!("    max_active_runs={n},\n"),
         None => String::new(),
     };
@@ -205,6 +209,10 @@ pub fn generate_dag(
     ctx.insert("tasks_block", &tasks_block);
     ctx.insert("deps_block", &deps_block);
     ctx.insert("required_connections_block", &required_connections_block);
+    // API-01 (plan 30-04): API trigger contributes a header docstring with
+    // curl/CLI snippets. Empty string for non-API triggers — concatenates
+    // cleanly with required_connections_block (also empty-or-newline-terminated).
+    ctx.insert("trigger_header_block", &trender.header_docstring);
 
     tera.render("airflow_dag", &ctx)
         .context("Failed to render Airflow DAG template")
