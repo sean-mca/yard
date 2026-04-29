@@ -110,6 +110,12 @@ pub(super) fn render_trigger(
 /// defaults (poke_interval=60, timeout=86400, deferrable=True), the
 /// per-trigger > DAG-level > None aws_conn_id precedence (S3-04, D-08),
 /// and the legacy `deferrable=False` escape hatch (S3-03).
+///
+/// SQS (plan 30-03) — emits `_yard_wait_sqs = SqsSensor(...)` with knob
+/// defaults (wait_time_seconds=20 long-poll, max_messages=5,
+/// delete_message_on_reception=True, deferrable=True). SqsTrigger has no
+/// per-trigger aws_conn_id field (Phase 28 omission); plumbing flows from
+/// `default_aws_conn_id` directly with the same omit-when-None contract.
 fn render_single(
     s: &SingleSource,
     default_aws_conn_id: Option<&str>,
@@ -199,10 +205,70 @@ fn render_single(
                 max_active_runs: None,
             }
         }
-        // SQS / API render branches land in plans 30-03 / 30-04. Until then,
-        // fall back to schedule=None placeholder so existing fixtures keep
-        // passing byte-identical. PRES-02 protects this contract.
-        SingleSource::Sqs(_) | SingleSource::Api(_) => TriggerRender {
+        SingleSource::Sqs(sqs) => {
+            // Knob defaults (SQS-02): wait_time_seconds=20 (long-poll, saves
+            // SQS API costs vs. the SDK's 0-second default), max_messages=5,
+            // delete_message_on_reception=True. deferrable=True is locked
+            // unconditionally — Phase 28 didn't add a `deferrable` field to
+            // SqsTrigger, and the locked CONTEXT decision is to render as
+            // deferrable always. A future SqsTrigger.deferrable field would be
+            // a non-breaking addition that mirrors the S3 escape hatch.
+            let wait = sqs.wait_time_seconds.unwrap_or(20);
+            let max_msgs = sqs.max_messages.unwrap_or(5);
+            let del_on_recv = sqs.delete_message_on_reception.unwrap_or(true);
+
+            // SqsTrigger has NO per-trigger aws_conn_id field (Phase 28
+            // omitted it). Use DAG-level default directly. None means
+            // Airflow's `aws_default` applies by absence — same PRES-02
+            // pattern as the S3 arm when both override and default are unset.
+            let conn = default_aws_conn_id;
+
+            // Build the sensor task lines. 4-space indent = inside the
+            // `with DAG(...) as dag:` block. Kwarg order matches the S3 arm
+            // for diff-churn minimization: task_id, queue, knobs, conn.
+            let mut sensor = String::new();
+            sensor.push_str("    _yard_wait_sqs = SqsSensor(\n");
+            sensor.push_str("        task_id=\"_yard_wait_sqs\",\n");
+            sensor.push_str(&format!(
+                "        sqs_queue={},\n",
+                python_string_literal(&sqs.queue_url)
+            ));
+            sensor.push_str(&format!("        wait_time_seconds={wait},\n"));
+            sensor.push_str(&format!("        max_messages={max_msgs},\n"));
+            sensor.push_str(&format!(
+                "        delete_message_on_reception={},\n",
+                if del_on_recv { "True" } else { "False" }
+            ));
+            sensor.push_str("        deferrable=True,\n");
+            if let Some(c) = conn {
+                sensor.push_str(&format!(
+                    "        aws_conn_id={},\n",
+                    python_string_literal(c)
+                ));
+            }
+            sensor.push_str("    )");
+
+            // One edge per root in input order — generation.rs computes
+            // `roots` deterministically (DAG task list filter + cloned).
+            let deps: Vec<String> = roots
+                .iter()
+                .map(|r| format!("_yard_wait_sqs >> {}", python_var_name(r)))
+                .collect();
+
+            TriggerRender {
+                schedule_expr: "None".to_string(),
+                sensor_tasks: vec![sensor],
+                sensor_deps: deps,
+                extra_imports: vec![
+                    "from airflow.providers.amazon.aws.sensors.sqs import SqsSensor".to_string(),
+                ],
+                max_active_runs: None,
+            }
+        }
+        // API render branch lands in plan 30-04. Until then, fall back to
+        // schedule=None placeholder so existing fixtures keep passing
+        // byte-identical. PRES-02 protects this contract.
+        SingleSource::Api(_) => TriggerRender {
             schedule_expr: "None".to_string(),
             sensor_tasks: Vec::new(),
             sensor_deps: Vec::new(),
