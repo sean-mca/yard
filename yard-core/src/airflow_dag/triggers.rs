@@ -902,4 +902,266 @@ mod tests {
             "header must call out that yard does not manage Airflow REST auth: {h}"
         );
     }
+
+    // --- Phase 30 plan 30-04 Task 2: heterogeneous-all (DS-04 + D-11 + D-10) ---
+
+    /// Default-knob bare S3 trigger fixture for the heterogeneous-all tests.
+    fn s3_basic(bucket: &str, prefix: &str) -> SingleSource {
+        SingleSource::S3(S3Trigger {
+            bucket: bucket.to_string(),
+            prefix: Some(prefix.to_string()),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn render_trigger_heterogeneous_all_s3_sqs_emits_join() {
+        // DS-04: heterogeneous Trigger::All(S3, SQS) emits both sensors plus
+        // _yard_join EmptyOperator with trigger_rule="all_success", and
+        // sensor->join->root edges. CONC-01: max_active_runs=Some(1).
+        let t = Trigger::All(vec![s3_basic("b", "p/"), sqs("q")]);
+        let out = render_trigger(
+            Some(&t),
+            None,
+            None,
+            &["root_a".to_string(), "root_b".to_string()],
+        );
+        assert_eq!(out.schedule_expr, "None");
+        // 2 sensors + _yard_join task = 3 entries.
+        assert_eq!(out.sensor_tasks.len(), 3, "tasks: {:?}", out.sensor_tasks);
+        // D-07: alpha-sort by source kind. "s3" < "sqs", _yard_join LAST.
+        assert!(
+            out.sensor_tasks[0].contains("_yard_wait_s3 = S3KeySensor("),
+            "first sensor must be S3: {}",
+            out.sensor_tasks[0]
+        );
+        assert!(
+            out.sensor_tasks[1].contains("_yard_wait_sqs = SqsSensor("),
+            "second sensor must be SQS: {}",
+            out.sensor_tasks[1]
+        );
+        assert!(
+            out.sensor_tasks[2].contains("_yard_join = EmptyOperator("),
+            "_yard_join task must be last: {}",
+            out.sensor_tasks[2]
+        );
+        assert!(
+            out.sensor_tasks[2].contains("task_id=\"_yard_join\""),
+            "_yard_join task_id literal: {}",
+            out.sensor_tasks[2]
+        );
+        assert!(
+            out.sensor_tasks[2].contains("trigger_rule=\"all_success\""),
+            "_yard_join trigger_rule: {}",
+            out.sensor_tasks[2]
+        );
+        // Edges: sensor->join (alpha), then join->root.
+        assert_eq!(
+            out.sensor_deps,
+            vec![
+                "_yard_wait_s3 >> _yard_join".to_string(),
+                "_yard_wait_sqs >> _yard_join".to_string(),
+                "_yard_join >> t_root_a".to_string(),
+                "_yard_join >> t_root_b".to_string(),
+            ]
+        );
+        // Imports: S3KeySensor + SqsSensor + EmptyOperator. Vec is sorted by
+        // BTreeSet inside render_composite for determinism.
+        assert!(
+            out.extra_imports.iter().any(|i| i
+                .contains("from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor")),
+            "S3KeySensor import: {:?}",
+            out.extra_imports
+        );
+        assert!(
+            out.extra_imports
+                .iter()
+                .any(|i| i.contains("from airflow.providers.amazon.aws.sensors.sqs import SqsSensor")),
+            "SqsSensor import: {:?}",
+            out.extra_imports
+        );
+        assert!(
+            out.extra_imports
+                .iter()
+                .any(|i| i.contains("from airflow.operators.empty import EmptyOperator")),
+            "EmptyOperator import: {:?}",
+            out.extra_imports
+        );
+        assert_eq!(out.max_active_runs, Some(1), "CONC-01 default");
+    }
+
+    #[test]
+    fn render_trigger_heterogeneous_all_dataset_plus_s3_splits_correctly() {
+        // D-11: Trigger::All([Dataset, S3]) — Dataset goes to schedule= level,
+        // S3 becomes a sensor. With only ONE sensor, no _yard_join (D-10).
+        let t = Trigger::All(vec![ds("ds_uri"), s3_basic("b", "p/")]);
+        let out = render_trigger(Some(&t), None, None, &["root".to_string()]);
+        assert_eq!(out.schedule_expr, "[Dataset(\"ds_uri\")]");
+        // 1 sensor (S3 only — Dataset is NOT a sensor in this split).
+        assert_eq!(out.sensor_tasks.len(), 1, "tasks: {:?}", out.sensor_tasks);
+        assert!(
+            out.sensor_tasks[0].contains("_yard_wait_s3 = S3KeySensor("),
+            "S3 sensor only: {}",
+            out.sensor_tasks[0]
+        );
+        // No Dataset sensor edge — Dataset fires at schedule level.
+        assert_eq!(
+            out.sensor_deps,
+            vec!["_yard_wait_s3 >> t_root".to_string()]
+        );
+        // Imports include both Dataset (schedule level) and S3KeySensor.
+        assert!(
+            out.extra_imports
+                .iter()
+                .any(|i| i.contains("from airflow.datasets import Dataset")),
+            "Dataset import: {:?}",
+            out.extra_imports
+        );
+        assert!(
+            out.extra_imports.iter().any(|i| i
+                .contains("from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor")),
+            "S3KeySensor import: {:?}",
+            out.extra_imports
+        );
+        // No EmptyOperator import — only one sensor, no join needed.
+        assert!(
+            !out.extra_imports
+                .iter()
+                .any(|i| i.contains("EmptyOperator")),
+            "single-sensor mixed Dataset+sensor must NOT pull EmptyOperator: {:?}",
+            out.extra_imports
+        );
+    }
+
+    #[test]
+    fn render_trigger_heterogeneous_all_dataset_plus_two_sensors_emits_join() {
+        // D-11 + DS-04: Dataset at schedule level, S3 + SQS sensors under
+        // _yard_join (multiple sensors require the join).
+        let t = Trigger::All(vec![
+            ds("ds_uri"),
+            s3_basic("b", "p/"),
+            sqs("q"),
+        ]);
+        let out = render_trigger(Some(&t), None, None, &["root".to_string()]);
+        assert_eq!(out.schedule_expr, "[Dataset(\"ds_uri\")]");
+        assert_eq!(out.sensor_tasks.len(), 3, "tasks: {:?}", out.sensor_tasks);
+        assert!(
+            out.sensor_tasks[2].contains("_yard_join = EmptyOperator("),
+            "_yard_join must appear: {}",
+            out.sensor_tasks[2]
+        );
+        assert_eq!(
+            out.sensor_deps,
+            vec![
+                "_yard_wait_s3 >> _yard_join".to_string(),
+                "_yard_wait_sqs >> _yard_join".to_string(),
+                "_yard_join >> t_root".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_trigger_heterogeneous_all_three_sensors_alpha_sorted() {
+        // D-07: source-kind alphabetical (api < s3 < sqs). API has no sensor
+        // task (it contributes header docstring only) — sensor_tasks must
+        // contain only S3 + SQS + _yard_join.
+        let t = Trigger::All(vec![sqs("q"), s3_basic("b", "p/"), api(None)]);
+        let out = render_trigger(Some(&t), None, None, &["root".to_string()]);
+        assert_eq!(
+            out.sensor_tasks.len(),
+            3,
+            "API contributes no sensor task — should be S3 + SQS + _yard_join: {:?}",
+            out.sensor_tasks
+        );
+        assert!(
+            out.sensor_tasks[0].contains("_yard_wait_s3"),
+            "alpha-sorted: S3 first: {}",
+            out.sensor_tasks[0]
+        );
+        assert!(
+            out.sensor_tasks[1].contains("_yard_wait_sqs"),
+            "alpha-sorted: SQS second: {}",
+            out.sensor_tasks[1]
+        );
+        assert!(
+            out.sensor_tasks[2].contains("_yard_join"),
+            "_yard_join last: {}",
+            out.sensor_tasks[2]
+        );
+        // API still contributes header docstring.
+        assert!(
+            !out.header_docstring.is_empty(),
+            "API arm contributes header docstring even in heterogeneous-all"
+        );
+    }
+
+    #[test]
+    fn render_trigger_single_sensor_does_not_emit_join() {
+        // D-10: bare-single S3 trigger (or Trigger::All([S3]) collapsed) must
+        // NOT emit _yard_join. Already covered by 30-02 fixtures, re-asserted
+        // here to lock the contract.
+        let t = Trigger::Single(s3_basic("b", "p/"));
+        let out = render_trigger(Some(&t), None, None, &["root".to_string()]);
+        assert_eq!(out.sensor_tasks.len(), 1, "single sensor only");
+        assert!(
+            !out.sensor_tasks[0].contains("_yard_join"),
+            "single-sensor must NOT emit _yard_join: {}",
+            out.sensor_tasks[0]
+        );
+        assert!(
+            !out.extra_imports
+                .iter()
+                .any(|i| i.contains("EmptyOperator")),
+            "single-sensor must NOT import EmptyOperator: {:?}",
+            out.extra_imports
+        );
+    }
+
+    #[test]
+    fn render_trigger_homogeneous_all_datasets_does_not_emit_join() {
+        // D-10: homogeneous all-Datasets is pure schedule-level (no sensors).
+        // Re-assert no _yard_join leaks in.
+        let t = Trigger::All(vec![ds("a"), ds("b")]);
+        let out = render_trigger(Some(&t), None, None, &["root".to_string()]);
+        assert!(out.sensor_tasks.is_empty(), "no sensor tasks for Datasets");
+        assert!(
+            !out.extra_imports
+                .iter()
+                .any(|i| i.contains("EmptyOperator")),
+            "homogeneous Datasets must NOT pull EmptyOperator: {:?}",
+            out.extra_imports
+        );
+    }
+
+    #[test]
+    fn render_trigger_max_active_runs_auto_default_for_all_trigger_kinds() {
+        // CONC-01: every kind of trigger flips max_active_runs to Some(1).
+        let cases: Vec<Trigger> = vec![
+            Trigger::Single(s3_basic("b", "p/")),
+            Trigger::Single(sqs("q")),
+            Trigger::Single(api(None)),
+            Trigger::Single(ds("a")),
+            Trigger::All(vec![ds("a"), ds("b")]),
+            Trigger::Any(vec![ds("a"), ds("b")]),
+            Trigger::All(vec![s3_basic("b", "p/"), sqs("q")]),
+        ];
+        for t in &cases {
+            let out = render_trigger(Some(t), None, None, &["r".to_string()]);
+            assert_eq!(
+                out.max_active_runs,
+                Some(1),
+                "CONC-01 must default to Some(1) for every trigger kind: {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_trigger_max_active_runs_none_for_no_trigger() {
+        // PRES-02: schedule-only DAGs (trigger.is_none()) preserve Airflow's
+        // implicit default of 16 — no max_active_runs= line emitted.
+        let out = render_trigger(None, Some("@daily"), None, &[]);
+        assert_eq!(out.max_active_runs, None, "schedule-only must not auto-default");
+        let out2 = render_trigger(None, None, None, &[]);
+        assert_eq!(out2.max_active_runs, None);
+    }
 }
