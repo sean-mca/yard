@@ -1294,6 +1294,148 @@ mod tests {
         );
     }
 
+    // --- Phase 30 plan 30-02: end-to-end S3 sensor render fixtures (S3-01..S3-04) ---
+
+    #[test]
+    fn dag_trigger_s3_emits_deferrable_sensor() {
+        // S3-01 end-to-end: trigger: { s3: { bucket, prefix } } with one
+        // bash task. Verify deterministic task_id, knob defaults, and the
+        // _yard_wait_s3 >> t_<root> edge wire through generation.rs +
+        // template render. Generated Python must parse cleanly.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  s3:\n    bucket: mybucket\n    prefix: \"input/\"\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("ingest".into(), bash_job("echo ingest", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor"),
+            "expected S3KeySensor import line: {script}"
+        );
+        assert!(
+            script.contains("_yard_wait_s3 = S3KeySensor("),
+            "expected _yard_wait_s3 task assignment: {script}"
+        );
+        assert!(
+            script.contains("task_id=\"_yard_wait_s3\""),
+            "expected deterministic task_id: {script}"
+        );
+        assert!(
+            script.contains("bucket_name=\"mybucket\""),
+            "expected bucket_name kwarg: {script}"
+        );
+        assert!(
+            script.contains("bucket_key=\"input/\""),
+            "expected bucket_key from prefix: {script}"
+        );
+        assert!(script.contains("poke_interval=60"), "default knob: {script}");
+        assert!(script.contains("timeout=86400"), "default knob: {script}");
+        assert!(
+            script.contains("deferrable=True"),
+            "S3-03 default: {script}"
+        );
+        assert!(
+            script.contains("_yard_wait_s3 >> t_ingest"),
+            "expected sensor edge to root task: {script}"
+        );
+        assert!(
+            script.contains("schedule=None"),
+            "S3 sensor-driven DAG must render schedule=None: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_trigger_s3_with_user_knob_overrides_renders_overrides() {
+        // S3-02 + S3-03 end-to-end: poke_interval, timeout, deferrable=false
+        // overrides propagate through to the rendered Python verbatim.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  s3:\n    bucket: b\n    prefix: \"p/\"\n    poke_interval: 120\n    timeout: 3600\n    deferrable: false\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("ingest".into(), bash_job("echo ingest", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("poke_interval=120"),
+            "user override propagates: {script}"
+        );
+        assert!(
+            script.contains("timeout=3600"),
+            "user override propagates: {script}"
+        );
+        assert!(
+            script.contains("deferrable=False"),
+            "S3-03 legacy escape hatch: {script}"
+        );
+        assert!(
+            !script.contains("deferrable=True"),
+            "must not also emit deferrable=True: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_trigger_s3_inherits_aws_conn_id_from_assume_role() {
+        // S3-04 end-to-end: when manifest.aws.assume_role is set, the S3
+        // sensor task inherits the derived aws_conn_id via the same
+        // derive_aws_conn_id plumbing that powers Glue tasks. No per-trigger
+        // override means the DAG-level default wins.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  s3:\n    bucket: b\n    prefix: \"p/\"\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest.aws = Some(AwsCredentialConfig {
+            assume_role: Some("arn:aws:iam::123456789012:role/MyRole".to_string()),
+            ..Default::default()
+        });
+        manifest
+            .jobs
+            .insert("ingest".into(), bash_job("echo ingest", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("aws_conn_id=\"yard_123456789012_MyRole\""),
+            "S3 sensor must inherit DAG-level aws_conn_id from assume_role: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
+    }
+
     #[test]
     fn trigger_overrides_inherited_schedule() {
         let tmp = setup_project_tree();
