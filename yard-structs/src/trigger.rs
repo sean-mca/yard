@@ -307,6 +307,22 @@ impl Trigger {
     }
 }
 
+impl SingleSource {
+    /// Wire-form key for this source variant — must agree exactly with
+    /// the Serialize impl keys at lines 177-183 above. Used by
+    /// `validate_dag_full` (TRIG-06) to render the `{kinds}` list of
+    /// non-Dataset sources in heterogeneous-`any:` errors.
+    pub fn source_kind(&self) -> &'static str {
+        match self {
+            SingleSource::Schedule(_) => "schedule",
+            SingleSource::S3(_) => "s3",
+            SingleSource::Dataset(_) => "dataset",
+            SingleSource::Sqs(_) => "sqs",
+            SingleSource::Api(_) => "api",
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -576,5 +592,44 @@ mod tests {
             }),
         ]);
         assert_eq!(t.dataset_uris(), vec!["s3://a"]);
+    }
+
+    // --- SingleSource::source_kind (Phase 29 wire-key helper, D-19) ---
+
+    #[test]
+    fn single_source_kind_returns_wire_keys() {
+        assert_eq!(
+            SingleSource::Schedule(ScheduleTrigger {
+                value: "@daily".into(),
+            })
+            .source_kind(),
+            "schedule"
+        );
+        assert_eq!(
+            SingleSource::S3(S3Trigger {
+                bucket: "b".into(),
+                ..Default::default()
+            })
+            .source_kind(),
+            "s3"
+        );
+        assert_eq!(
+            SingleSource::Dataset(DatasetTrigger { uri: "x".into() }).source_kind(),
+            "dataset"
+        );
+        assert_eq!(
+            SingleSource::Sqs(SqsTrigger {
+                queue_url: "q".into(),
+                wait_time_seconds: None,
+                max_messages: None,
+                delete_message_on_reception: None,
+            })
+            .source_kind(),
+            "sqs"
+        );
+        assert_eq!(
+            SingleSource::Api(ApiTrigger::default()).source_kind(),
+            "api"
+        );
     }
 }
