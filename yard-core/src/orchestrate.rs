@@ -184,6 +184,25 @@ pub async fn apply(
         return Err(anyhow!("{msg}"));
     }
 
+    // Validate trigger config across all DAGs (TRIG-04..TRIG-07).
+    // Errors accumulate per DAG and roll up into a single anyhow::Error before any codegen.
+    let mut all_dag_errors: Vec<(String, Vec<yard_structs::ValidationError>)> = Vec::new();
+    for dag in &pre_dags {
+        let errors = validation::validate_dag_full(dag);
+        if !errors.is_empty() {
+            all_dag_errors.push((dag.name.clone(), errors));
+        }
+    }
+    if !all_dag_errors.is_empty() {
+        let mut msg = String::from("Validation failed:\n");
+        for (name, errors) in &all_dag_errors {
+            for e in errors {
+                msg.push_str(&format!("  [{}] {}: {}\n", name, e.field, e.message));
+            }
+        }
+        return Err(anyhow!("{msg}"));
+    }
+
     // Target validation: shared helper, identical contract for apply + plan (D-02).
     validate_target(manifest, &pre_dags, target.as_deref())?;
 
@@ -436,6 +455,25 @@ pub async fn plan(
         let mut msg = String::from("Validation failed:\n");
         for (name, err) in &orphans {
             msg.push_str(&format!("  [{name}] {err}\n"));
+        }
+        return Err(anyhow!("{msg}"));
+    }
+
+    // Validate trigger config across all DAGs (TRIG-04..TRIG-07).
+    // Errors accumulate per DAG and roll up into a single anyhow::Error before any codegen.
+    let mut all_dag_errors: Vec<(String, Vec<yard_structs::ValidationError>)> = Vec::new();
+    for dag in &pre_dags {
+        let errors = validation::validate_dag_full(dag);
+        if !errors.is_empty() {
+            all_dag_errors.push((dag.name.clone(), errors));
+        }
+    }
+    if !all_dag_errors.is_empty() {
+        let mut msg = String::from("Validation failed:\n");
+        for (name, errors) in &all_dag_errors {
+            for e in errors {
+                msg.push_str(&format!("  [{}] {}: {}\n", name, e.field, e.message));
+            }
         }
         return Err(anyhow!("{msg}"));
     }
@@ -1030,4 +1068,97 @@ mod tests {
     // which is structurally upstream of `apply` and cannot be exercised by
     // constructing a JobDefinition directly. The behavior is covered by
     // `yard-structs::config::tests::job_type_deserialize_unknown_rejects`.
+
+    // --- validate_dag_full integration tests (Phase 29 — TRIG-07 wiring) ---
+
+    /// Build a minimal on-disk yard project with one DAG dir holding a single
+    /// bash task. `dag_yaml_body` becomes the contents of `<root>/<dag_name>/dag.yaml`.
+    /// Returns (root_dir, manifest). Caller is responsible for cleanup via
+    /// `std::fs::remove_dir_all(&root_dir)`.
+    ///
+    /// The on-disk layout matches the airflow_dag-module test fixtures
+    /// (`yard.yaml` + `account.yaml` + `region.yaml` ancestry needed by
+    /// `resolve::load_context`). Bash task is chosen so `validate_job_full`
+    /// passes cleanly — the trigger gate fires AFTER job validation.
+    fn build_dag_project_fixture(
+        slug: &str,
+        dag_name: &str,
+        dag_yaml_body: &str,
+    ) -> (std::path::PathBuf, ProjectManifest) {
+        let root = std::env::temp_dir().join(format!(
+            "yard_validate_dag_full_{}_{}",
+            std::process::id(),
+            slug
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("yard.yaml"), "project: test\n").unwrap();
+        std::fs::write(root.join("account.yaml"), "account:\n  id: \"123\"\n").unwrap();
+        std::fs::write(root.join("region.yaml"), "region:\n  id: us-east-1\n").unwrap();
+
+        let dag_dir = root.join(dag_name);
+        std::fs::create_dir_all(&dag_dir).unwrap();
+        std::fs::write(dag_dir.join("dag.yaml"), dag_yaml_body).unwrap();
+
+        let bash = JobDefinition {
+            job_type: JobType::Bash,
+            config: json!({"type": "bash", "command": "echo hi"}),
+            dir: dag_dir.clone(),
+            ..Default::default()
+        };
+
+        let manifest = ProjectManifest {
+            project: "test".to_string(),
+            state: StateBackend::Local {
+                path: root.join(".yard/state"),
+            },
+            providers: HashMap::new(),
+            jobs: HashMap::from([("runit".to_string(), bash)]),
+            aws: None,
+        };
+
+        (root, manifest)
+    }
+
+    #[tokio::test]
+    async fn plan_rejects_dag_with_schedule_and_trigger() {
+        // dag.yaml carries BOTH top-level `schedule:` AND a `trigger:` block.
+        // The cascade resolver lifts both into the resolved AirflowSection
+        // (parsing.rs:279-297 preserves them independently), so TRIG-04 fires.
+        let (root, manifest) = build_dag_project_fixture(
+            "plan_sched_and_trig",
+            "pipeline",
+            "schedule: \"@daily\"\ntrigger:\n  dataset:\n    uri: \"s3://bucket/key\"\n",
+        );
+
+        let result = plan(&manifest, &empty_state(), &root, None).await;
+        let _ = std::fs::remove_dir_all(&root);
+
+        let err = result.expect_err("plan must reject dag with schedule + trigger").to_string();
+        assert!(err.contains("Validation failed:"), "got: {err}");
+        // The DAG name is project-prefixed + sanitized: `test_pipeline`.
+        assert!(err.contains("[test_pipeline]"), "got: {err}");
+        assert!(err.contains("airflow.trigger:"), "got: {err}");
+        assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn apply_rejects_dag_with_empty_any() {
+        // dag.yaml has `trigger: { any: [] }` — TRIG-05b fires.
+        // Apply runs with `dry_run: true` so no AWS provider invocation.
+        let (root, manifest) = build_dag_project_fixture(
+            "apply_empty_any",
+            "pipeline",
+            "trigger:\n  any: []\n",
+        );
+
+        let result = apply(&manifest, &empty_state(), &root, true, None).await;
+        let _ = std::fs::remove_dir_all(&root);
+
+        let err = result.expect_err("apply must reject dag with empty any:").to_string();
+        assert!(err.contains("Validation failed:"), "got: {err}");
+        assert!(err.contains("[test_pipeline]"), "got: {err}");
+        assert!(err.contains("airflow.trigger.any:"), "got: {err}");
+        assert!(err.contains("empty 'any: []' composite"), "got: {err}");
+    }
 }
