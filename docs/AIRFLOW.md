@@ -110,7 +110,7 @@ Every layer that can contribute Airflow config uses the same
 override earlier layers via `merge_airflow_sections`
 (`yard-core/src/parsing.rs`), which means any `Some` field in the overlay
 replaces the base; unset (`None`) overlay fields leave the base unchanged.
-Arrays follow the same rule — a non-empty `triggered_by` replaces the
+Arrays follow the same rule — a non-empty `publishes` replaces the
 inherited one wholesale.
 
 The chain applied to each DAG (in `airflow_dag/collection.rs::resolve_dag_airflow_config`):
@@ -145,7 +145,7 @@ no `airflow:` wrapper key inside it. Its body IS the airflow section.
 ### Single DAG-level override rule
 
 A task's `airflow:` block is primarily for per-task metadata (`depends_on`,
-`produces`). It can also carry DAG-level field overrides (`schedule`,
+`publishes`). It can also carry DAG-level field overrides (`schedule`,
 `retries`, `owner`, `dags_bucket`, `dags_prefix`) via the flattened
 `AirflowSection` fields — but **at most one task per DAG may declare any of
 those DAG-level fields**. Declaring DAG-level overrides on two tasks in the
@@ -169,12 +169,14 @@ shape.
 
 | Field | Type | Where it can appear | Emitted as | Notes |
 |-------|------|---------------------|-----------|-------|
-| `schedule` | string | any layer | `schedule="<cron>"` on `DAG(...)` | Standard Airflow cron or preset (`@daily`, `@hourly`). Mutually exclusive with `triggered_by` — if both are set, `triggered_by` wins and `schedule` is ignored. |
+| `schedule` | string | any layer | `schedule="<cron>"` on `DAG(...)` | Standard Airflow cron or preset (`@daily`, `@hourly`). Mutually exclusive with `trigger:` block — declaring both is rejected at validation. |
 | `owner` | string | any layer | `default_args["owner"]` | Free-form string. |
 | `retries` | int | any layer | `default_args["retries"]` | Passed through as an integer. |
 | `dags_bucket` | string | any layer | — (deployment) | S3 bucket the generated `.py` is uploaded to during `yard apply`. Typically the MWAA DAGs bucket. |
 | `dags_prefix` | string | any layer | — (deployment) | S3 key prefix under `dags_bucket`. Defaults to `dags/` when unset. |
-| `triggered_by` | array of strings | any layer | `schedule=[Dataset("uri"), ...]` | Dataset URIs that trigger the DAG. See [Airflow Datasets](#airflow-datasets). |
+| `trigger` | object (typed) | DAG layer | per-source schedule (Dataset list, sensor task chain, or `schedule=None` for API) | Optional event-driven trigger block. See [Airflow Datasets](#airflow-datasets) and [docs/CONFIGURATION.md](CONFIGURATION.md#dagyaml-trigger-block). |
+| `publishes` | array of strings | any layer | `_yard_publish` synthetic terminal task with `outlets=[Dataset("uri"), ...]` | DAG-level Dataset URIs published when every user task succeeds. Per-task `outlets=` is configured via per-job `airflow.publishes`. |
+| `max_active_runs` | int (>=1) | DAG layer | `max_active_runs=N` on `DAG(...)` | Optional concurrency limit. Defaults to `1` for event-driven DAGs (CONC-01); Airflow's default of 16 for schedule-only DAGs. |
 | `aws` | object | any layer | — (deployment) | Optional credential override for DAG upload/destroy. When set, this `aws:` block OVERRIDES the root+account.yaml cascade. Same shape as root `aws:` (`assume_role`, `session_name`, `external_id`). See [DAG bucket credentials](#dag-bucket-credentials). |
 
 Unknown keys in an `airflow:` body are ignored — forward compatibility.
@@ -190,8 +192,8 @@ flattened into it as `overrides`.
 | Field | Type | Emitted as | Notes |
 |-------|------|-----------|-------|
 | `depends_on` | array of strings | `t_up >> t_down` edges at module level | See [`depends_on` semantics](#depends_on-semantics). |
-| `produces` | array of strings | `outlets=[Dataset("uri"), ...]` on the operator | Dataset URIs this task produces. Completion of the task marks every listed Dataset. |
-| `schedule`, `owner`, `retries`, `dags_bucket`, `dags_prefix`, `triggered_by` | (inherited from `AirflowSection`) | DAG-level | See [Single DAG-level override rule](#single-dag-level-override-rule). |
+| `publishes` | array of strings | `outlets=[Dataset("uri"), ...]` on the operator | Dataset URIs this task publishes. Completion of the task marks every listed Dataset. |
+| `schedule`, `owner`, `retries`, `dags_bucket`, `dags_prefix`, `trigger`, `publishes`, `max_active_runs` | (inherited from `AirflowSection`) | DAG-level | See [Single DAG-level override rule](#single-dag-level-override-rule). |
 
 Example task YAML:
 
@@ -201,8 +203,8 @@ role: arn:aws:iam::123456789012:role/GlueJob
 airflow:
   depends_on:
     - orders
-  produces:
-    - s3://warehouse/sales/shipments
+  publishes:
+    - s3://example-bucket/sales/shipments
   # DAG-level fields are allowed but only on one task per DAG
   # schedule: "@hourly"
 ```
@@ -233,7 +235,7 @@ Per-operator field mapping:
 t_<task_id> = BashOperator(
     task_id="<task_id>",
     bash_command="<from config.command>",
-    outlets=[Dataset(...), ...],   # only if produces is non-empty
+    outlets=[Dataset(...), ...],   # only if publishes is non-empty
 )
 ```
 
@@ -247,7 +249,7 @@ t_<task_id> = GlueJobOperator(
     task_id="<task_id>",
     job_name="<task_id>",
     aws_conn_id="<derived>",       # see Cross-account connections
-    outlets=[Dataset(...), ...],   # only if produces is non-empty
+    outlets=[Dataset(...), ...],   # only if publishes is non-empty
 )
 ```
 
@@ -377,49 +379,71 @@ yard supports [Airflow
 Datasets](https://airflow.apache.org/docs/apache-airflow/stable/authoring-and-scheduling/datasets.html)
 on both sides of a dependency:
 
-### Producing datasets (`produces` on a task)
+### Producing datasets (`publishes` on a task)
 
 ```yaml
 # shipments.yaml
 type: glue
 role: arn:aws:iam::111111111111:role/GlueJob
 airflow:
-  produces:
-    - s3://warehouse/sales/shipments
+  publishes:
+    - s3://example-bucket/sales/shipments
 ```
 
-Emits `outlets=[Dataset("s3://warehouse/sales/shipments")]` on the
+Emits `outlets=[Dataset("s3://example-bucket/sales/shipments")]` on the
 operator. Multiple URIs are allowed and produce a list of `Dataset(...)`
 entries in declaration order.
 
-### Consuming datasets (`triggered_by` on a DAG)
+DAG-level `publishes:` (declared at the top of `dag.yaml`) instead emits a
+synthetic terminal `_yard_publish = EmptyOperator(...)` task with the
+`Dataset(...)` outlets, wired downstream of every leaf user task. See
+[docs/CONFIGURATION.md](CONFIGURATION.md#dagyaml-publishes) for the
+`publishes:` reference.
+
+### Consuming datasets (`trigger.dataset:` on a DAG)
 
 ```yaml
 # dag.yaml
-triggered_by:
-  - s3://warehouse/sales/orders
-  - s3://warehouse/sales/shipments
+trigger:
+  all:
+    - dataset: { uri: s3://example-bucket/sales/orders }
+    - dataset: { uri: s3://example-bucket/sales/shipments }
 ```
 
-Emits:
+Emits (homogeneous-Datasets composite under `all:` uses Airflow 2.9 native
+`&` operator):
 
 ```python
 from airflow.datasets import Dataset
 ...
-schedule=[Dataset("s3://warehouse/sales/orders"), Dataset("s3://warehouse/sales/shipments")]
+schedule=(Dataset("s3://example-bucket/sales/orders") & Dataset("s3://example-bucket/sales/shipments"))
 ```
+
+A single-source variant (`trigger: { dataset: { uri: ... } }`) emits
+`schedule=[Dataset(uri)]`. See [docs/CONFIGURATION.md](CONFIGURATION.md#dagyaml-trigger-block)
+for the full `trigger:` block reference.
 
 ### Precedence
 
-`triggered_by` takes precedence over any inherited `schedule`:
-
-- If `triggered_by` is non-empty, `schedule=` becomes the Dataset list and
-  any inherited cron schedule is dropped silently.
-- If `triggered_by` is empty, `schedule=` becomes the inherited cron string
-  (or `None` if no schedule is set anywhere in the chain).
+The typed `trigger:` block is mutually exclusive with `schedule:`. Declaring
+both at any layer is rejected at validation. See the
+[decision matrix](CONFIGURATION.md#dagyaml-decision-matrix--schedule-vs-trigger)
+in CONFIGURATION.md for the four-cell truth table.
 
 The `from airflow.datasets import Dataset` import is emitted only when the
 DAG uses datasets on either side.
+
+### Backfill semantics per trigger source
+
+| Source | Backfill works? | Notes |
+|--------|-----------------|-------|
+| `schedule:` cron | Yes | Standard `airflow dags backfill <dag_id>` replays missed cron runs. |
+| `trigger.dataset:` | NO | Datasets have no `logical_date` — historical re-runs do NOT replay missed Dataset events. Use API-trigger replay (below) to backfill against synthetic `dag_run.conf` payloads. |
+| `trigger.s3:` | Broken | The deferrable `S3KeySensor` re-pokes against current S3 state — the original landed object is not replayable from event history. If the object still exists at backfill time, the sensor fires; otherwise it times out. |
+| `trigger.sqs:` | Broken AND DESTRUCTIVE | `SqsSensor` drains the real queue. Backfilling against a live queue consumes pending messages. Do not run. |
+| `trigger.api:` | Yes | Pass `--conf` payload via Airflow CLI/REST: `airflow dags trigger <dag_id> --conf '{"s3_key": "...", "sqs_body": "..."}'`. This is the recommended escape hatch for Dataset / S3 / SQS replays. |
+
+**Recommended replay pattern**: declare a sibling `trigger: { api: { ... } }` DAG that takes the same `op_kwargs` shape and re-runs the user task. yard's `op_kwargs` threading (Phase 31) already wires the canonical fields (`s3_key`, `s3_bucket`, `sqs_body`, etc.) regardless of trigger source — the same task code accepts both event-driven payloads and synthetic API payloads.
 
 ---
 
@@ -704,8 +728,8 @@ schedule: "@hourly"
 type: glue
 role: arn:aws:iam::111111111111:role/GlueJob
 airflow:
-  produces:
-    - s3://warehouse/sales/orders
+  publishes:
+    - s3://example-bucket/sales/orders
 # transforms/sources elided — see CONFIGURATION.md
 ```
 
@@ -751,7 +775,7 @@ with DAG(
         task_id="orders",
         job_name="orders",
         aws_conn_id="aws_default",
-        outlets=[Dataset("s3://warehouse/sales/orders")],
+        outlets=[Dataset("s3://example-bucket/sales/orders")],
     )
     t_notify = BashOperator(
         task_id="notify",
@@ -809,6 +833,23 @@ re-parsed before upload.
 
 ---
 
+## Airflow version matrix
+
+yard's emitted DAGs target Airflow 2.9+ (the first version with native `&` / `|` Dataset operators and stable deferrable sensors).
+
+| Track | Airflow | apache-airflow-providers-amazon | aiobotocore |
+|-------|---------|----------------------------------|-------------|
+| Modern | >= 2.11 | >= 9.x | >= 2.5.x |
+| Conservative | >= 2.9 | 8.13.x — 8.x | >= 2.1.1 |
+
+The `apache-airflow-providers-amazon` floor matters for the deferrable sensor implementations. The conservative track pins `apache-airflow-providers-amazon` at the 8.13.x line (last 8.x with stable Triggerer-side `S3KeySensor`); the modern track tracks 9.x for current `SqsSensor` payload-shape parity.
+
+**Triggerer process required.** Deferrable sensors (`S3KeySensor(deferrable=True)`, `SqsSensor(deferrable=True)`) only fire when the Triggerer is running. MWAA enables this by default; self-hosted deployments may need to start it explicitly (`airflow triggerer`).
+
+Every emitted event-driven DAG carries this version contract as a comment header, alongside per-source backfill caveats. Schedule-only DAGs render WITHOUT this banner — they have no version-floor requirement beyond Airflow 2.0.
+
+---
+
 ## Limitations and planned work
 
 Derived from code comments and the supported-types list in
@@ -817,8 +858,11 @@ Derived from code comments and the supported-types list in
 - **Supported job types:** only `bash` and `glue`. EMR (and any future
   provider that is not `bash`-like) errors out at codegen time. EMR Airflow
   support is not implemented.
-- **Cross-DAG dependencies:** unsupported — use Datasets (`produces` +
-  `triggered_by`) for cross-DAG chaining.
+- **Cross-DAG dependencies:** unsupported — use Datasets (`publishes:` +
+  `trigger.dataset:`) for cross-DAG chaining. v1.6 emits a non-fatal
+  `WARN: dag '<dag_id>': trigger.dataset "<uri>" has no publisher in this
+  project (broken link, non-fatal)` when a `trigger.dataset:` URI has no
+  matching `publishes:` entry anywhere in the project.
 - **Hardcoded DAG settings:** `start_date=datetime(2024, 1, 1)` and
   `catchup=False` are fixed in the template.
 - **Dependency wiring shape:** one `t_up >> t_down` edge per line, no
