@@ -743,6 +743,7 @@ fn merge_state_aws_with_env(
         // `region` lives on `StateBackend::S3.region`, not on the aws
         // sub-block here — keep it None at this layer.
         region: None,
+        aws_conn_id: None,
     };
     let merged = AwsCredentialConfig::merge(&yaml, &env_overlay);
 

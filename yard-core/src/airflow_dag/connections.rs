@@ -8,11 +8,19 @@ use super::RequiredConnection;
 use super::ResolvedDag;
 use super::DEFAULT_AWS_CONN_ID;
 
-/// Derive the Airflow connection id a task should use. Returns
-/// `DEFAULT_AWS_CONN_ID` when the task's assume-role matches the project root
-/// (same-account case, no per-task override needed) or when no assume-role is
-/// set. Otherwise returns a deterministic id derived from the role ARN.
+/// Derive the Airflow connection id a task should use.
+///
+/// Precedence (highest first):
+///   1. Cascaded `_aws.aws_conn_id` — explicit override from any layer of the
+///      yard.yaml → account → region → job.yaml chain (deep-merged into the
+///      `_aws` blob by `cascade_provider_defaults`).
+///   2. `derive_aws_conn_id(task_role)` — when the task's assume_role
+///      differs from the project root (cross-account).
+///   3. `DEFAULT_AWS_CONN_ID` (`aws_default`) — same-account or no assume_role.
 pub(super) fn resolve_task_aws_conn_id(job: &JobDefinition, manifest: &ProjectManifest) -> Result<String> {
+    if let Some(explicit) = job_aws_conn_id(job) {
+        return Ok(explicit.to_string());
+    }
     let task_role = job_assume_role(job);
     let root_role = manifest
         .aws
@@ -23,6 +31,14 @@ pub(super) fn resolve_task_aws_conn_id(job: &JobDefinition, manifest: &ProjectMa
         (Some(task), _) => derive_aws_conn_id(task),
         (None, _) => Ok(DEFAULT_AWS_CONN_ID.to_string()),
     }
+}
+
+fn job_aws_conn_id(job: &JobDefinition) -> Option<&str> {
+    job.config
+        .get("_aws")
+        .and_then(|a| a.get("aws_conn_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
 }
 
 fn job_assume_role(job: &JobDefinition) -> Option<&str> {

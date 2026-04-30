@@ -72,18 +72,38 @@ pub fn generate_dag(
     // default_args dict. Only include fields we actually have.
     let default_args = render_default_args(&dag.config);
 
-    // D-08 (Phase 30 plan 30-01): compute the DAG-level default aws_conn_id
-    // once via the existing `derive_aws_conn_id` helper, then pass to
-    // `render_trigger` as a primitive `&str`. Keeps triggers.rs free of
-    // yard-config types. The S3/SQS sensor branches in plans 30-02/03 will
-    // honor: per-trigger override > DAG-level default > None.
-    let default_aws_conn_id: Option<String> = manifest
+    // DAG-level default aws_conn_id passed into `render_trigger` as a
+    // primitive `&str`. Precedence (highest first):
+    //   1. Cascaded `airflow.aws.aws_conn_id` on this DAG (yard.yaml →
+    //      account → region → dag.yaml chain via `merge_airflow_sections`).
+    //   2. Project-root `aws.aws_conn_id` (yard.yaml top-level `aws:` block).
+    //   3. `derive_aws_conn_id(project-root assume_role)` — pre-cascade
+    //      behavior; same-account/no-role still yields `None` here and
+    //      sensors fall through to `aws_default` at runtime.
+    let default_aws_conn_id: Option<String> = if let Some(explicit) = dag
+        .config
         .aws
         .as_ref()
-        .and_then(|a| a.assume_role.as_deref())
+        .and_then(|a| a.aws_conn_id.as_deref())
         .filter(|s| !s.is_empty())
-        .map(derive_aws_conn_id)
-        .transpose()?;
+    {
+        Some(explicit.to_string())
+    } else if let Some(explicit) = manifest
+        .aws
+        .as_ref()
+        .and_then(|a| a.aws_conn_id.as_deref())
+        .filter(|s| !s.is_empty())
+    {
+        Some(explicit.to_string())
+    } else {
+        manifest
+            .aws
+            .as_ref()
+            .and_then(|a| a.assume_role.as_deref())
+            .filter(|s| !s.is_empty())
+            .map(derive_aws_conn_id)
+            .transpose()?
+    };
 
     // D-05 (Phase 30 plan 30-01): roots = user task IDs with no upstream
     // edges. Sensor branches (plans 30-02/03/04) connect

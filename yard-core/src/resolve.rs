@@ -683,6 +683,43 @@ mod tests {
         assert_eq!(aws_field(&out["j"], "from_job"), Some("job"));
     }
 
+    #[test]
+    fn aws_conn_id_cascades_per_field_with_assume_role() {
+        // Mixed-layer override: assume_role at root, aws_conn_id at account.yaml.
+        // Both must survive into _aws — cascade is per-field on the aws block.
+        let tmp = TempDir::new();
+        fs::write(
+            tmp.0.join("account.yaml"),
+            "aws:\n  aws_conn_id: my_acct_conn\n",
+        )
+        .unwrap();
+        let job = glue_job(&tmp.0, None);
+        let out = run_cascade(
+            vec![("j".into(), job)],
+            json!({"assume_role": "arn:aws:iam::111111111111:role/Root"}),
+        );
+        assert_eq!(aws_field(&out["j"], "aws_conn_id"), Some("my_acct_conn"));
+        assert_eq!(
+            aws_field(&out["j"], "assume_role"),
+            Some("arn:aws:iam::111111111111:role/Root"),
+            "assume_role from root must survive when account.yaml only sets aws_conn_id"
+        );
+    }
+
+    #[test]
+    fn aws_conn_id_inline_job_overrides_lower_layers() {
+        // job-inline aws_conn_id beats account.yaml's value.
+        let tmp = TempDir::new();
+        fs::write(
+            tmp.0.join("account.yaml"),
+            "aws:\n  aws_conn_id: from_account\n",
+        )
+        .unwrap();
+        let job = glue_job(&tmp.0, Some(json!({"aws_conn_id": "from_inline"})));
+        let out = run_cascade(vec![("j".into(), job)], Value::Null);
+        assert_eq!(aws_field(&out["j"], "aws_conn_id"), Some("from_inline"));
+    }
+
     // --- provider cascade: root → account → region → job ---
 
     #[test]

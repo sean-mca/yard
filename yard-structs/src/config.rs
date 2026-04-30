@@ -57,8 +57,10 @@ impl std::str::FromStr for JobType {
 ///
 /// Provider-specific extension fields (per-provider AWS knobs) keep their
 /// `serde_json::Value` envelope inside `JobDefinition.config: Value` per
-/// D-14 — this struct covers ONLY the common four fields used at the
-/// manifest level.
+/// D-14 — this struct covers ONLY the common fields used at the manifest
+/// level. `aws_conn_id` is an explicit override for the Airflow connection
+/// id rendered into Glue tasks; when omitted, yard derives it from
+/// `assume_role` or falls back to `aws_default`.
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
 pub struct AwsCredentialConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -69,6 +71,8 @@ pub struct AwsCredentialConfig {
     pub session_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_conn_id: Option<String>,
 }
 
 impl AwsCredentialConfig {
@@ -92,6 +96,10 @@ impl AwsCredentialConfig {
                 .clone()
                 .or_else(|| base.session_name.clone()),
             region: overlay.region.clone().or_else(|| base.region.clone()),
+            aws_conn_id: overlay
+                .aws_conn_id
+                .clone()
+                .or_else(|| base.aws_conn_id.clone()),
         }
     }
 }
@@ -603,6 +611,7 @@ mod tests {
             external_id: Some("xid-1".to_string()),
             session_name: Some("yard-test".to_string()),
             region: Some("us-east-1".to_string()),
+            aws_conn_id: None,
         };
         let serialized = serde_json::to_value(&creds).unwrap();
         assert_eq!(
@@ -625,6 +634,7 @@ mod tests {
             external_id: None,
             session_name: None,
             region: None,
+            aws_conn_id: None,
         };
         let serialized = serde_json::to_value(&creds).unwrap();
         assert_eq!(
@@ -640,12 +650,14 @@ mod tests {
             external_id: Some("base-eid".to_string()),
             session_name: None,
             region: Some("us-east-1".to_string()),
+            aws_conn_id: None,
         };
         let overlay = AwsCredentialConfig {
             assume_role: Some("overlay-role".to_string()),
             external_id: None,
             session_name: Some("overlay-name".to_string()),
             region: None,
+            aws_conn_id: None,
         };
         let merged = AwsCredentialConfig::merge(&base, &overlay);
         // overlay Some wins over base Some

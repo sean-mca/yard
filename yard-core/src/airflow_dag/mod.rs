@@ -101,7 +101,7 @@ pub(crate) fn script_locations_from_state(
 mod tests {
     use super::*;
     use crate::validation::validate_python_syntax;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -808,6 +808,139 @@ mod tests {
         assert!(script.contains(
             "yard_222222222222_GlueInvoker  ->  arn:aws:iam::222222222222:role/GlueInvoker"
         ));
+    }
+
+    fn glue_job_with_aws_overrides(dir: &Path, overrides: Value) -> JobDefinition {
+        JobDefinition {
+            job_type: JobType::Glue,
+            config: json!({
+                "type": "glue",
+                "role": "arn:aws:iam::123456789:role/TestGlueRole",
+                "_aws": overrides,
+            }),
+            dir: dir.to_path_buf(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn render_task_glue_explicit_aws_conn_id_short_circuits_derive() {
+        // Cascaded `_aws.aws_conn_id` is the highest-precedence override on the
+        // Glue task path: even when assume_role would otherwise produce a
+        // derived connection id, the explicit value wins verbatim.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        manifest.aws = Some(AwsCredentialConfig {
+            assume_role: Some("arn:aws:iam::111111111111:role/OperatorA".to_string()),
+            ..Default::default()
+        });
+        manifest.jobs.insert(
+            "orders".into(),
+            glue_job_with_aws_overrides(
+                &dag_dir,
+                json!({
+                    "assume_role": "arn:aws:iam::222222222222:role/GlueInvoker",
+                    "aws_conn_id": "my_explicit_conn",
+                }),
+            ),
+        );
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script_locations: HashMap<String, String> = [(
+            "orders".to_string(),
+            "s3://bucket/scripts/orders.py".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
+
+        assert!(
+            script.contains("aws_conn_id=\"my_explicit_conn\""),
+            "explicit cascaded aws_conn_id must win over derived value: {script}"
+        );
+        assert!(
+            !script.contains("aws_conn_id=\"yard_222222222222_GlueInvoker\""),
+            "derived value must not appear when explicit override is set: {script}"
+        );
+    }
+
+    #[test]
+    fn render_task_glue_explicit_aws_conn_id_without_assume_role() {
+        // Same-account case + explicit aws_conn_id: explicit wins over the
+        // aws_default fallback that resolve_task_aws_conn_id would otherwise
+        // emit for a job with no assume_role.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        manifest.jobs.insert(
+            "orders".into(),
+            glue_job_with_aws_overrides(&dag_dir, json!({"aws_conn_id": "team_glue_conn"})),
+        );
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script_locations: HashMap<String, String> = [(
+            "orders".to_string(),
+            "s3://bucket/scripts/orders.py".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let script = generate_dag(&manifest, &dags[0], &script_locations).unwrap();
+
+        assert!(
+            script.contains("aws_conn_id=\"team_glue_conn\""),
+            "explicit aws_conn_id must win over aws_default: {script}"
+        );
+        assert!(
+            !script.contains("aws_conn_id=\"aws_default\""),
+            "aws_default must not appear when explicit override is set: {script}"
+        );
+    }
+
+    #[test]
+    fn render_dag_trigger_default_aws_conn_id_from_root_aws_field() {
+        // DAG-trigger path: explicit manifest.aws.aws_conn_id wins over the
+        // assume_role-derived default at generation.rs's default_aws_conn_id
+        // resolver. Verifies precedence step 2 of the new ladder.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  s3:\n    bucket: b\n    prefix: \"p/\"\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest.aws = Some(AwsCredentialConfig {
+            assume_role: Some("arn:aws:iam::123456789012:role/MyRole".to_string()),
+            aws_conn_id: Some("dag_root_explicit_conn".to_string()),
+            ..Default::default()
+        });
+        manifest
+            .jobs
+            .insert("ingest".into(), bash_job("echo ingest", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("aws_conn_id=\"dag_root_explicit_conn\""),
+            "S3 sensor must use explicit manifest.aws.aws_conn_id: {script}"
+        );
+        assert!(
+            !script.contains("aws_conn_id=\"yard_123456789012_MyRole\""),
+            "derived value must not appear when explicit override is set: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "generated DAG has syntax error:\n{script}"
+        );
     }
 
     // ---- Phase 15 DAG-03 regression: both new kwargs render correctly ----

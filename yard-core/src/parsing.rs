@@ -312,8 +312,17 @@ pub fn merge_airflow_sections(base: &AirflowSection, overlay: &AirflowSection) -
         } else {
             overlay.publishes.clone()
         },
-        // Overlay wins when Some; None means "not set" so fall back to base.
-        aws: overlay.aws.clone().or_else(|| base.aws.clone()),
+        // Per-field merge (overlay-wins-on-Some) so each AwsCredentialConfig
+        // field cascades independently through yard.yaml → account → region →
+        // dag.yaml. Pre-v1.4 behavior was overlay-block-wins-as-atomic, which
+        // silently dropped sibling fields (e.g. setting external_id at the dag
+        // level erased an inherited assume_role).
+        aws: match (base.aws.as_ref(), overlay.aws.as_ref()) {
+            (None, None) => None,
+            (Some(b), None) => Some(b.clone()),
+            (None, Some(o)) => Some(o.clone()),
+            (Some(b), Some(o)) => Some(AwsCredentialConfig::merge(b, o)),
+        },
         // Same overlay-wins-when-Some semantics as `aws` and `trigger` —
         // most-specific layer's explicit setting takes precedence; None
         // falls through to base.
@@ -710,6 +719,37 @@ mod tests {
         assert_eq!(final_cfg.owner.as_deref(), Some("data"));
         assert_eq!(final_cfg.retries, Some(3));
         assert_eq!(final_cfg.dags_bucket.as_deref(), Some("proj-bucket"));
+    }
+
+    #[test]
+    fn merge_airflow_sections_aws_field_per_field_merge() {
+        // Per-field cascade for the aws block: dag.yaml overlay sets only
+        // aws_conn_id; assume_role from yard.yaml must survive the merge.
+        // (Pre-fix behavior was atomic-block-swap, which dropped assume_role.)
+        let project = AirflowSection {
+            aws: Some(AwsCredentialConfig {
+                assume_role: Some("arn:aws:iam::111111111111:role/Root".to_string()),
+                region: Some("us-east-1".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dag = AirflowSection {
+            aws: Some(AwsCredentialConfig {
+                aws_conn_id: Some("dag_explicit_conn".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let merged = merge_airflow_sections(&project, &dag);
+        let aws = merged.aws.expect("aws should be Some after merge");
+        assert_eq!(aws.aws_conn_id.as_deref(), Some("dag_explicit_conn"));
+        assert_eq!(
+            aws.assume_role.as_deref(),
+            Some("arn:aws:iam::111111111111:role/Root"),
+            "assume_role from project must survive when dag overlay sets only aws_conn_id"
+        );
+        assert_eq!(aws.region.as_deref(), Some("us-east-1"));
     }
 
     // --- validate_unknown_keys (TYPE-03) ---
