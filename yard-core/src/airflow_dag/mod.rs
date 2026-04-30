@@ -2327,4 +2327,88 @@ mod tests {
         );
         assert!(validate_python_syntax(&script).is_none(), "{script}");
     }
+
+    // --- Phase 32 plan 32-03: VERSION_BANNER + per-source backfill caveats (DOC-05) ---
+
+    #[test]
+    fn version_banner_renders_on_event_driven_dag_render() {
+        // DOC-05 / D-11 / D-14b: an event-driven DAG (any trigger:* set) must
+        // render the fixed Airflow-version-contract banner inside the
+        // header docstring block. Banner flows through the existing
+        // {{ trigger_header_block }} insertion in airflow_dag.py.tera —
+        // NO template change.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  dataset:\n    uri: s3://x\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("agg".into(), bash_job("echo agg", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        // All four banner content lines must be present verbatim.
+        assert!(
+            script.contains("# Airflow version contract:"),
+            "banner header line missing: {script}"
+        );
+        assert!(
+            script.contains("#   - apache-airflow >= 2.9"),
+            "banner apache-airflow line missing: {script}"
+        );
+        assert!(
+            script.contains("#   - apache-airflow-providers-amazon >= 8.13.0"),
+            "banner providers-amazon line missing: {script}"
+        );
+        assert!(
+            script.contains("#   - aiobotocore >= 2.1.1"),
+            "banner aiobotocore line missing: {script}"
+        );
+        assert!(
+            script.contains("#   - Triggerer process required"),
+            "banner Triggerer line missing: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "rendered DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn version_banner_absent_on_schedule_only_dag_render() {
+        // PRES-02 / D-12 byte-id guard: a schedule-only DAG must render WITHOUT
+        // the banner (and without any per-source block). This is the regression
+        // gate for the 20+ pre-Phase-32 schedule-only fixtures.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("runit".into(), bash_job("echo hi", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            !script.contains("# Airflow version contract:"),
+            "schedule-only DAG must NOT render banner header (PRES-02): {script}"
+        );
+        assert!(
+            !script.contains("apache-airflow >= 2.9"),
+            "schedule-only DAG must NOT render any banner content (PRES-02): {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "rendered schedule-only DAG has syntax error:\n{script}"
+        );
+    }
 }
