@@ -1,0 +1,153 @@
+<!-- generated-by: gsd-doc-writer -->
+# Migrating to v1.6
+
+v1.6 introduces event-driven DAG triggers and renames two `dag.yaml` fields without back-compat aliases. This guide walks through the upgrade.
+
+## What changed
+
+Two field names were renamed in `dag.yaml`. Both parser-level rejections fire at `yard plan` / `yard apply` parse time with a verbatim error message pointing at this guide.
+
+| v1.5 field | v1.6 field | Location | Verbatim parse error |
+|------------|-----------|----------|----------------------|
+| `triggered_by:` (DAG-level) | `trigger.dataset:` (single) or `trigger.all: [{ dataset: ... }, ...]` (multiple) | `dag.yaml` `airflow:` block | `unknown field 'triggered_by' — use 'trigger:' block (see migration guide)` |
+| `produces:` (per-task) | `publishes:` | `<job>.yaml` `airflow:` block | `unknown field 'produces' — use 'publishes: [...]' instead. See migration guide.` |
+
+No `#[serde(alias)]` back-compat — existing `dag.yaml` files using these field names fail at parse until migrated.
+
+## Grep-replace recipe
+
+Run from your yard project root. The recipes below are conservative — they assume `produces:` and `triggered_by:` only appear inside `airflow:` blocks (the typical case). If your project uses these names elsewhere, audit the matches first.
+
+### Step 1: rename per-task `produces:` → `publishes:`
+
+Find every per-task usage:
+
+```bash
+grep -rn 'produces:' --include='*.yaml' --include='*.yml' .
+```
+
+For each match, rename `produces:` to `publishes:` in place. Example before / after:
+
+```yaml
+# Before
+airflow:
+  depends_on: [extract]
+  produces:
+    - s3://example-bucket/processed/orders/
+
+# After
+airflow:
+  depends_on: [extract]
+  publishes:
+    - s3://example-bucket/processed/orders/
+```
+
+A `sed` one-liner works on most projects:
+
+```bash
+grep -rl 'produces:' --include='*.yaml' --include='*.yml' . | xargs sed -i.bak 's/^\(\s*\)produces:/\1publishes:/'
+# Audit the .bak files; remove when satisfied.
+```
+
+### Step 2: rename DAG-level `triggered_by:` → `trigger.dataset:` (single) or `trigger.all:` (multiple)
+
+Find every DAG-level usage:
+
+```bash
+grep -rn 'triggered_by:' --include='*.yaml' --include='*.yml' .
+```
+
+For each match, decide single-vs-composite based on the URI count:
+
+**Single dataset:**
+
+```yaml
+# Before
+airflow:
+  triggered_by:
+    - s3://example-bucket/raw/orders/
+
+# After
+airflow:
+  trigger:
+    dataset:
+      uri: s3://example-bucket/raw/orders/
+```
+
+**Multiple datasets (formerly OR-style — v1.5 `triggered_by:` was implicitly `any`-style; v1.6 explicit choice):**
+
+```yaml
+# Before
+airflow:
+  triggered_by:
+    - s3://example-bucket/raw/orders/
+    - s3://example-bucket/raw/customers/
+
+# After (chose `all:` — DAG fires when BOTH datasets update)
+airflow:
+  trigger:
+    all:
+      - dataset: { uri: s3://example-bucket/raw/orders/ }
+      - dataset: { uri: s3://example-bucket/raw/customers/ }
+
+# OR (chose `any:` — DAG fires when EITHER dataset updates)
+airflow:
+  trigger:
+    any:
+      - dataset: { uri: s3://example-bucket/raw/orders/ }
+      - dataset: { uri: s3://example-bucket/raw/customers/ }
+```
+
+Pick `any:` for v1.5-equivalent behavior (Airflow's pre-2.9 multi-Dataset schedule was OR-by-default).
+
+### Step 3: validate the migration
+
+Run `yard plan` and confirm zero parse errors. The four reserved trigger task IDs (`_yard_wait_s3`, `_yard_wait_sqs`, `_yard_wait_dataset`, `_yard_wait_api`, `_yard_join`, and the new `_yard_publish` synthetic task) cannot collide with your declared task names — `validate_dag_full` rejects collisions with the verbatim error `task_id '<id>' is reserved for trigger codegen — rename your task`. Rename if hit.
+
+See [docs/CONFIGURATION.md](CONFIGURATION.md#dagyaml-trigger-block) for the full `trigger:` block reference, and [docs/AIRFLOW.md](AIRFLOW.md#backfill-semantics-per-trigger-source) for backfill caveats per source.
+
+## One-time post-upgrade drift (HASH-03)
+
+The first `yard apply` after upgrading from v1.5 to v1.6 will report drift on every previously-deployed DAG. **This is expected and harmless.** v1.6 changed the canonical state-hash form (renamed fields enter the blake3 input), so the stored hash from v1.5 no longer matches the v1.6 hash even though the rendered DAG semantics are identical.
+
+Behavior:
+
+- First `yard apply` after upgrade: every DAG re-converges once. Airflow sees a re-uploaded DAG file with the same operator graph; the run history is preserved (Airflow keys on `dag_id`, not file content).
+- Subsequent `yard apply` runs: no-op as usual. State hashes settle on the v1.6 canonical form.
+
+No code change in v1.6 mitigates this — state-migration tooling (`yard migrate-state v1.5 → v1.6`) is deferred to a future milestone. The grep-replace recipe in this guide is the v1.6 answer for the source-side migration; the one-shot drift on the deploy side is unavoidable.
+
+## Cross-DAG broken-link warnings
+
+v1.6 also introduces a soft cross-DAG warning at `yard plan` / `yard apply` time. If a DAG declares `trigger: { dataset: URI }` but no DAG in your project declares `publishes: [URI]`, you'll see:
+
+```
+WARN: dag '<dag_id>': trigger.dataset "<uri>" has no publisher in this project (broken link, non-fatal)
+```
+
+These are non-fatal — yard continues to plan/apply normally. The warning surfaces typos and missing publishers before you push to Airflow. If you intentionally trigger on Datasets produced outside this yard project, ignore the warning.
+
+## Behavioral change: `airflow.aws:` per-field merge
+
+v1.6 also changes how the `airflow.aws:` block cascades from project root → account → region → DAG. Previously each more-specific layer **atomically replaced** the entire `aws:` block — silently dropping any sibling fields the more-specific layer didn't restate. v1.6 merges per-field, so each field cascades independently.
+
+**Practical effect:** if you set `airflow.aws.external_id` at the DAG level, the inherited `assume_role`, `region`, and friends now stay populated instead of being cleared. In v1.5 you had to restate every field on every overlay or accept the silent clear.
+
+**What you might need to change:** intentional-strip use cases (rare). If you relied on the atomic-swap to clear an inherited field by setting only the new ones, set the field to an explicit empty string at the more-specific layer instead — the typed parser filters empty strings out, matching the v1.5 cleared behavior.
+
+### New cascading field: `aws_conn_id`
+
+`aws_conn_id` is now a first-class field on the `aws:` block at every layer of the cascade chain. yard derives the per-DAG `default_aws_conn_id` (used by emitted sensors when no per-trigger override is set) via this precedence ladder (highest first):
+
+1. **DAG-level cascaded `airflow.aws.aws_conn_id`** — set on `dag.yaml` `airflow.aws:` (or inherited via `yard.yaml → account → region → dag`).
+2. **Project-root `aws.aws_conn_id`** — set on the top-level `aws:` block in `yard.yaml`.
+3. **`derive_aws_conn_id(assume_role)`** — synthesized from `aws.assume_role` ARN. Pre-v1.6 behavior, unchanged.
+4. **Airflow's `aws_default`** — runtime fallback when none of the above resolve.
+
+No source-side change is required for users who never set `aws_conn_id` explicitly — the third tier (`derive_aws_conn_id(assume_role)`) is unchanged from v1.5, and emitted DAGs without an explicit cascade entry render byte-identically.
+
+See [docs/CONFIGURATION.md](CONFIGURATION.md#dagyaml-aws_conn_id-resolution) for the full resolution ladder reference.
+
+## Questions
+
+See [docs/CONFIGURATION.md](CONFIGURATION.md) for the full v1.6 `dag.yaml` reference, [docs/AIRFLOW.md](AIRFLOW.md) for runtime semantics, and the [v1.6 ROADMAP entry](../.planning/ROADMAP.md) for the milestone scope.
