@@ -205,6 +205,12 @@ fn check_s3_poke_interval(trigger: Option<&Trigger>) -> Vec<ValidationError> {
     out
 }
 
+/// Cross-DAG broken-link soft warning. See D-06/D-08.
+/// (Task 1 stub — Task 2 replaces this with the real implementation.)
+pub fn validate_project(_dags: &[ResolvedDag]) -> Vec<String> {
+    Vec::new()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1685,6 +1691,243 @@ mod tests {
         assert_eq!(
             s3_errs[0].message,
             "must be >= 10 (lower values trigger the Airflow triggerer hot-loop)"
+        );
+    }
+
+    // --- Phase 32 plan 32-02: PUB-03 cross-DAG broken-link warnings + extended TRIG-08 ---
+
+    /// Build a minimal ResolvedDag with a custom name + AirflowSection. The
+    /// existing `dag_with` helper uses a fixed `"test_dag"` name, but PUB-03
+    /// tests need multiple DAGs with distinct names, so this variant exposes
+    /// the name parameter.
+    fn dag_named(name: &str, section: AirflowSection) -> ResolvedDag {
+        ResolvedDag {
+            name: name.to_string(),
+            dir: PathBuf::new(),
+            config: section,
+            tasks: Vec::new(),
+            depends_on: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn validate_project_warns_on_broken_dataset_link() {
+        // DAG-A consumes a Dataset URI no DAG in the project publishes.
+        let dag_a = dag_named(
+            "dag-a",
+            AirflowSection {
+                trigger: Some(Trigger::Single(SingleSource::Dataset(DatasetTrigger {
+                    uri: "s3://orders/raw".into(),
+                }))),
+                ..Default::default()
+            },
+        );
+        let dag_b = dag_named(
+            "dag-b",
+            AirflowSection {
+                publishes: vec!["s3://orders/processed".into()],
+                ..Default::default()
+            },
+        );
+        let warnings = validate_project(&[dag_a, dag_b]);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings[0],
+            "WARN: dag 'dag-a': trigger.dataset \"s3://orders/raw\" has no publisher in this project (broken link, non-fatal)"
+        );
+    }
+
+    #[test]
+    fn validate_project_passes_when_publisher_present() {
+        // DAG-A consumes s3://orders/raw, DAG-B publishes s3://orders/raw.
+        let dag_a = dag_named(
+            "dag-a",
+            AirflowSection {
+                trigger: Some(Trigger::Single(SingleSource::Dataset(DatasetTrigger {
+                    uri: "s3://orders/raw".into(),
+                }))),
+                ..Default::default()
+            },
+        );
+        let dag_b = dag_named(
+            "dag-b",
+            AirflowSection {
+                publishes: vec!["s3://orders/raw".into()],
+                ..Default::default()
+            },
+        );
+        let warnings = validate_project(&[dag_a, dag_b]);
+        assert!(warnings.is_empty(), "expected no warnings, got: {warnings:?}");
+    }
+
+    #[test]
+    fn validate_project_walks_all_composite_datasets() {
+        // DAG-A consumes two Dataset URIs via `all:`; nothing publishes either.
+        let dag_a = dag_named(
+            "dag-a",
+            AirflowSection {
+                trigger: Some(Trigger::All(vec![
+                    SingleSource::Dataset(DatasetTrigger { uri: "s3://a".into() }),
+                    SingleSource::Dataset(DatasetTrigger { uri: "s3://b".into() }),
+                ])),
+                ..Default::default()
+            },
+        );
+        let warnings = validate_project(&[dag_a]);
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(
+            warnings[0],
+            "WARN: dag 'dag-a': trigger.dataset \"s3://a\" has no publisher in this project (broken link, non-fatal)"
+        );
+        assert_eq!(
+            warnings[1],
+            "WARN: dag 'dag-a': trigger.dataset \"s3://b\" has no publisher in this project (broken link, non-fatal)"
+        );
+    }
+
+    #[test]
+    fn validate_project_walks_heterogeneous_all_datasets() {
+        // Heterogeneous `all:` mixes Dataset, S3, and Sqs sources. Only the
+        // Dataset URI flows through dataset_uris() — S3/SQS elements MUST NOT
+        // produce broken-link warnings (D-09 scope: Dataset URIs only).
+        let dag_a = dag_named(
+            "dag-a",
+            AirflowSection {
+                trigger: Some(Trigger::All(vec![
+                    SingleSource::Dataset(DatasetTrigger {
+                        uri: "s3://only-dataset".into(),
+                    }),
+                    SingleSource::S3(S3Trigger {
+                        bucket: "b".into(),
+                        ..Default::default()
+                    }),
+                    SingleSource::Sqs(SqsTrigger {
+                        queue_url: "q".into(),
+                        wait_time_seconds: None,
+                        max_messages: None,
+                        delete_message_on_reception: None,
+                    }),
+                ])),
+                ..Default::default()
+            },
+        );
+        let warnings = validate_project(&[dag_a]);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings[0],
+            "WARN: dag 'dag-a': trigger.dataset \"s3://only-dataset\" has no publisher in this project (broken link, non-fatal)"
+        );
+    }
+
+    #[test]
+    fn validate_project_warnings_sorted_by_dag_then_uri() {
+        // Two DAGs ("dag-zebra", "dag-alpha"), each consuming two missing URIs
+        // ("s3://z", "s3://a"). Output must be sorted by (dag_id, uri) lex.
+        let dag_zebra = dag_named(
+            "dag-zebra",
+            AirflowSection {
+                trigger: Some(Trigger::All(vec![
+                    SingleSource::Dataset(DatasetTrigger { uri: "s3://z".into() }),
+                    SingleSource::Dataset(DatasetTrigger { uri: "s3://a".into() }),
+                ])),
+                ..Default::default()
+            },
+        );
+        let dag_alpha = dag_named(
+            "dag-alpha",
+            AirflowSection {
+                trigger: Some(Trigger::All(vec![
+                    SingleSource::Dataset(DatasetTrigger { uri: "s3://z".into() }),
+                    SingleSource::Dataset(DatasetTrigger { uri: "s3://a".into() }),
+                ])),
+                ..Default::default()
+            },
+        );
+        // Pass in deliberately reversed order to confirm sort is on the output, not the input.
+        let warnings = validate_project(&[dag_zebra, dag_alpha]);
+        assert_eq!(warnings.len(), 4);
+        assert_eq!(
+            warnings[0],
+            "WARN: dag 'dag-alpha': trigger.dataset \"s3://a\" has no publisher in this project (broken link, non-fatal)"
+        );
+        assert_eq!(
+            warnings[1],
+            "WARN: dag 'dag-alpha': trigger.dataset \"s3://z\" has no publisher in this project (broken link, non-fatal)"
+        );
+        assert_eq!(
+            warnings[2],
+            "WARN: dag 'dag-zebra': trigger.dataset \"s3://a\" has no publisher in this project (broken link, non-fatal)"
+        );
+        assert_eq!(
+            warnings[3],
+            "WARN: dag 'dag-zebra': trigger.dataset \"s3://z\" has no publisher in this project (broken link, non-fatal)"
+        );
+    }
+
+    #[test]
+    fn check_reserved_task_ids_rejects_yard_publish_when_publishes_non_empty_no_trigger() {
+        // Schedule-only DAG (`trigger: None`) with `publishes:` non-empty must
+        // still reserve `_yard_publish` — codegen synthesizes the publish task
+        // whenever publishes is non-empty regardless of trigger presence.
+        // This is the gating bug Phase 32 fixes (RESEARCH Code Example 2).
+        let mut dag = dag_with(AirflowSection {
+            schedule: Some("@daily".into()),
+            trigger: None,
+            publishes: vec!["s3://x".into()],
+            ..Default::default()
+        });
+        dag.tasks = vec!["_yard_publish".to_string()];
+        let errs = validate_dag_full(&dag);
+        let publish_errs: Vec<_> = errs
+            .iter()
+            .filter(|e| e.field == "airflow.tasks")
+            .collect();
+        assert_eq!(publish_errs.len(), 1, "expected one TRIG-08 error: {errs:?}");
+        assert_eq!(
+            publish_errs[0].message,
+            "task_id '_yard_publish' is reserved for trigger codegen — rename your task"
+        );
+    }
+
+    #[test]
+    fn check_reserved_task_ids_returns_empty_for_schedule_only_no_publishes() {
+        // Schedule-only DAG, NO publishes, with a `_yard_wait_s3` task name.
+        // The original early-return must still apply: no codegen reserves IDs
+        // for schedule-only-no-publishes DAGs, so naming a task `_yard_wait_s3`
+        // is allowed (no regression on the existing TRIG-08 contract).
+        let mut dag = dag_with(AirflowSection {
+            schedule: Some("@daily".into()),
+            trigger: None,
+            publishes: vec![],
+            ..Default::default()
+        });
+        dag.tasks = vec!["_yard_wait_s3".to_string()];
+        let errs = check_reserved_task_ids(&dag);
+        assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
+    }
+
+    #[test]
+    fn check_reserved_task_ids_still_rejects_yard_wait_when_trigger_present() {
+        // DAG with a `trigger:` block (no publishes) and a user task named
+        // `_yard_wait_s3` — existing TRIG-08 path unchanged. This guards
+        // against accidentally narrowing the existing reservation set.
+        let mut dag = dag_with(AirflowSection {
+            trigger: Some(Trigger::Single(SingleSource::S3(S3Trigger {
+                bucket: "b".into(),
+                ..Default::default()
+            }))),
+            ..Default::default()
+        });
+        dag.tasks = vec!["_yard_wait_s3".to_string()];
+        let errs = validate_dag_full(&dag);
+        let task_errs: Vec<_> = errs
+            .iter()
+            .filter(|e| e.field == "airflow.tasks")
+            .collect();
+        assert_eq!(task_errs.len(), 1, "expected one TRIG-08 error: {errs:?}");
+        assert_eq!(
+            task_errs[0].message,
+            "task_id '_yard_wait_s3' is reserved for trigger codegen — rename your task"
         );
     }
 }
