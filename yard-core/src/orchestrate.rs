@@ -203,6 +203,12 @@ pub async fn apply(
         return Err(anyhow!("{msg}"));
     }
 
+    // PUB-03: cross-DAG broken-link soft warning (D-07/D-08).
+    // Never returns Err — emits one stderr line per (DAG, missing-URI) pair.
+    for w in validation::validate_project(&pre_dags) {
+        eprintln!("{w}");
+    }
+
     // Target validation: shared helper, identical contract for apply + plan (D-02).
     validate_target(manifest, &pre_dags, target.as_deref())?;
 
@@ -476,6 +482,12 @@ pub async fn plan(
             }
         }
         return Err(anyhow!("{msg}"));
+    }
+
+    // PUB-03: cross-DAG broken-link soft warning (D-07/D-08).
+    // Never returns Err — emits one stderr line per (DAG, missing-URI) pair.
+    for w in validation::validate_project(&pre_dags) {
+        eprintln!("{w}");
     }
 
     // Target validation: shared helper, identical contract with apply (D-01 / D-04).
@@ -1160,5 +1172,48 @@ mod tests {
         assert!(err.contains("[test_pipeline]"), "got: {err}");
         assert!(err.contains("airflow.trigger.any:"), "got: {err}");
         assert!(err.contains("empty 'any: []' composite"), "got: {err}");
+    }
+
+    // --- Phase 32 plan 32-02: validate_project soft-warning rollup wiring ---
+
+    #[tokio::test]
+    async fn validate_project_runs_in_plan_path_and_does_not_fail() {
+        // DAG triggers on a Dataset URI no DAG in the project publishes —
+        // PUB-03 emits a warning to stderr, but plan must still return Ok.
+        // (Stderr capture not asserted; the contract under test is "no Err".)
+        let (root, manifest) = build_dag_project_fixture(
+            "plan_broken_link",
+            "pipeline",
+            "trigger:\n  dataset:\n    uri: \"s3://nobody/publishes/this\"\n",
+        );
+
+        let result = plan(&manifest, &empty_state(), &root, None).await;
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            result.is_ok(),
+            "plan must NOT fail on cross-DAG broken Dataset link: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_project_runs_in_apply_path_and_does_not_fail() {
+        // Symmetric to the plan-path test: apply with dry_run=true MUST also
+        // return Ok in the presence of a broken cross-DAG Dataset link.
+        let (root, manifest) = build_dag_project_fixture(
+            "apply_broken_link",
+            "pipeline",
+            "trigger:\n  dataset:\n    uri: \"s3://nobody/publishes/this\"\n",
+        );
+
+        let result = apply(&manifest, &empty_state(), &root, true, None).await;
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            result.is_ok(),
+            "apply must NOT fail on cross-DAG broken Dataset link: {:?}",
+            result.err()
+        );
     }
 }
