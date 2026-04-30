@@ -2149,4 +2149,266 @@ mod tests {
         let out = script_locations_from_state(&states);
         assert!(out.is_empty());
     }
+
+    // ---- Phase 32 (PUB-01): DAG-level `publishes:` synthesizes _yard_publish ----
+
+    #[test]
+    fn dag_with_publishes_emits_yard_publish_task() {
+        // PUB-01: AirflowSection.publishes (DAG-level) renders a synthetic
+        // _yard_publish EmptyOperator with alpha-sorted Dataset outlets, wired
+        // downstream of every leaf task via `[leaf_a, leaf_b] >> _yard_publish`.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "schedule: \"@daily\"\npublishes:\n  - s3://warehouse/sales/orders\n  - s3://warehouse/sales/processed\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("orders".into(), bash_job("echo orders", &dag_dir));
+        manifest
+            .jobs
+            .insert("shipments".into(), bash_job("echo shipments", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("_yard_publish = EmptyOperator("),
+            "expected synthetic _yard_publish task body: {script}"
+        );
+        assert!(
+            script.contains("        task_id=\"_yard_publish\","),
+            "expected verbatim task_id line: {script}"
+        );
+        assert!(
+            script.contains(
+                "outlets=[Dataset(\"s3://warehouse/sales/orders\"), Dataset(\"s3://warehouse/sales/processed\")]"
+            ),
+            "expected alpha-sorted outlets list: {script}"
+        );
+        // Leaf order is task-iteration order — accept either ordering of t_orders/t_shipments.
+        let order_a = script.contains("[t_orders, t_shipments] >> _yard_publish");
+        let order_b = script.contains("[t_shipments, t_orders] >> _yard_publish");
+        assert!(
+            order_a || order_b,
+            "expected fan-in deps line covering both leaves: {script}"
+        );
+        assert!(
+            script.contains("from airflow.operators.empty import EmptyOperator"),
+            "expected EmptyOperator import: {script}"
+        );
+        assert!(
+            script.contains("from airflow.datasets import Dataset"),
+            "expected Dataset import: {script}"
+        );
+        assert!(validate_python_syntax(&script).is_none(), "{script}");
+    }
+
+    #[test]
+    fn yard_publish_outlets_alpha_sorted() {
+        // D-04: outlets URIs are alpha-sorted independent of declaration order.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "schedule: \"@daily\"\npublishes:\n  - s3://b\n  - s3://a\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("only".into(), bash_job("echo only", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("outlets=[Dataset(\"s3://a\"), Dataset(\"s3://b\")]"),
+            "expected alpha-sorted outlets regardless of declaration order: {script}"
+        );
+        assert!(validate_python_syntax(&script).is_none(), "{script}");
+    }
+
+    #[test]
+    fn yard_publish_skipped_when_publishes_empty() {
+        // D-05 / PRES-02: schedule-only DAG with no publishes renders byte-identical
+        // — no _yard_publish, no EmptyOperator import.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("runit".into(), bash_job("echo hi", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            !script.contains("_yard_publish"),
+            "schedule-only DAG must NOT contain _yard_publish: {script}"
+        );
+        assert!(
+            !script.contains("from airflow.operators.empty import EmptyOperator"),
+            "schedule-only DAG must NOT import EmptyOperator: {script}"
+        );
+        assert!(validate_python_syntax(&script).is_none(), "{script}");
+    }
+
+    #[test]
+    fn yard_publish_single_leaf_emits_list_form() {
+        // RESEARCH Pattern 1: single-leaf form is uniform list form
+        // `[t_only] >> _yard_publish` (locked for grep-uniformity).
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "schedule: \"@daily\"\npublishes:\n  - s3://a\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("only".into(), bash_job("echo only", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("[t_only] >> _yard_publish"),
+            "expected single-leaf list form `[t_only] >> _yard_publish`: {script}"
+        );
+        assert!(validate_python_syntax(&script).is_none(), "{script}");
+    }
+
+    #[test]
+    fn yard_publish_with_chain_picks_terminal_leaf() {
+        // Leaf detection: in a chain `t_a -> t_b`, only `t_b` is a leaf
+        // (`t_a` appears in t_b's depends_on).
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "schedule: \"@daily\"\npublishes:\n  - s3://x\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest.jobs.insert("a".into(), bash_job("echo a", &dag_dir));
+        let mut b = bash_job("echo b", &dag_dir);
+        b.airflow = Some(AirflowJobBlock {
+            depends_on: vec!["a".to_string()],
+            ..Default::default()
+        });
+        manifest.jobs.insert("b".into(), b);
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("[t_b] >> _yard_publish"),
+            "expected only terminal leaf (`t_b`) wired to _yard_publish: {script}"
+        );
+        assert!(
+            !script.contains("[t_a, t_b]") && !script.contains("[t_b, t_a]"),
+            "non-leaf `t_a` must NOT appear in fan-in: {script}"
+        );
+        assert!(
+            !script.contains("[t_a] >> _yard_publish"),
+            "non-leaf `t_a` must NOT be the leaf: {script}"
+        );
+        assert!(validate_python_syntax(&script).is_none(), "{script}");
+    }
+
+    // --- Phase 32 plan 32-03: VERSION_BANNER + per-source backfill caveats (DOC-05) ---
+
+    #[test]
+    fn version_banner_renders_on_event_driven_dag_render() {
+        // DOC-05 / D-11 / D-14b: an event-driven DAG (any trigger:* set) must
+        // render the fixed Airflow-version-contract banner inside the
+        // header docstring block. Banner flows through the existing
+        // {{ trigger_header_block }} insertion in airflow_dag.py.tera —
+        // NO template change.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "trigger:\n  dataset:\n    uri: s3://x\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("agg".into(), bash_job("echo agg", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        // All four banner content lines must be present verbatim.
+        assert!(
+            script.contains("# Airflow version contract:"),
+            "banner header line missing: {script}"
+        );
+        assert!(
+            script.contains("#   - apache-airflow >= 2.9"),
+            "banner apache-airflow line missing: {script}"
+        );
+        assert!(
+            script.contains("#   - apache-airflow-providers-amazon >= 8.13.0"),
+            "banner providers-amazon line missing: {script}"
+        );
+        assert!(
+            script.contains("#   - aiobotocore >= 2.1.1"),
+            "banner aiobotocore line missing: {script}"
+        );
+        assert!(
+            script.contains("#   - Triggerer process required"),
+            "banner Triggerer line missing: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "rendered DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn version_banner_absent_on_schedule_only_dag_render() {
+        // PRES-02 / D-12 byte-id guard: a schedule-only DAG must render WITHOUT
+        // the banner (and without any per-source block). This is the regression
+        // gate for the 20+ pre-Phase-32 schedule-only fixtures.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(&dag_dir.join("dag.yaml"), "schedule: \"@daily\"\n");
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("runit".into(), bash_job("echo hi", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            !script.contains("# Airflow version contract:"),
+            "schedule-only DAG must NOT render banner header (PRES-02): {script}"
+        );
+        assert!(
+            !script.contains("apache-airflow >= 2.9"),
+            "schedule-only DAG must NOT render any banner content (PRES-02): {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "rendered schedule-only DAG has syntax error:\n{script}"
+        );
+    }
 }

@@ -18,6 +18,62 @@ use yard_structs::{SingleSource, Trigger};
 
 use super::helpers::{python_string_literal, python_var_name};
 
+/// Phase 32 D-11: fixed Airflow-version contract banner. Renders on every
+/// event-driven DAG (D-12 — `trigger.is_some()` gate). Schedule-only DAGs
+/// render WITHOUT this banner (PRES-02 byte-id guarantee for the 20+
+/// pre-Phase-32 schedule-only fixtures). D-14b: inline-prepend at the
+/// `render_trigger` boundary; the Tera template is unchanged — banner
+/// flows through the existing `{{ trigger_header_block }}` insertion.
+pub(super) const VERSION_BANNER: &str = "# Airflow version contract:
+#   - apache-airflow >= 2.9
+#   - apache-airflow-providers-amazon >= 8.13.0
+#   - aiobotocore >= 2.1.1
+#   - Triggerer process required
+";
+
+/// D-13 per-source backfill caveat — Dataset arm. Single source of truth for
+/// the Dataset header_docstring text; both single-source (`Trigger::Single`)
+/// and composite-homogeneous (`Trigger::All` / `Trigger::Any` of Datasets) paths
+/// call through here. Datasets have no `logical_date`, so historical re-runs do
+/// NOT replay missed events — backfill must go through API-trigger replay.
+fn dataset_header(uri: &str) -> String {
+    format!(
+        "# Trigger: Dataset ({uri})\n\
+         #\n\
+         # Backfill caveat: Datasets have no logical_date — historical re-runs do NOT\n\
+         # replay missed Dataset events. Use API-trigger replay (see DOC-04) to backfill\n\
+         # this DAG against synthetic dag_run.conf payloads.\n",
+    )
+}
+
+/// D-13 per-source backfill caveat — S3 arm. The deferrable `S3KeySensor`
+/// re-pokes against current S3 state, so the original landed object is not
+/// replayable from event history.
+fn s3_header(bucket: &str, key: Option<&str>, prefix: Option<&str>) -> String {
+    let target = match (key, prefix) {
+        (Some(k), _) => format!("key={k}"),
+        (None, Some(p)) => format!("prefix={p}"),
+        _ => String::new(),
+    };
+    format!(
+        "# Trigger: S3 (bucket={bucket}, {target})\n\
+         #\n\
+         # Backfill caveat: deferrable sensor re-pokes against current S3 state —\n\
+         # original landed object is not replayable from event history.\n",
+    )
+}
+
+/// D-13 per-source backfill caveat — SQS arm. `SqsSensor` drains the real
+/// queue, so backfill is destructive and unsafe to run against a live queue.
+fn sqs_header(queue_url: &str) -> String {
+    format!(
+        "# Trigger: SQS (queue_url={queue_url})\n\
+         #\n\
+         # Backfill caveat: SqsSensor drains the real queue — backfill is destructive\n\
+         # and is not safe to run against a live queue.\n",
+    )
+}
+
 /// Result of rendering a [`Trigger`] to Python codegen fragments.
 ///
 /// Empty fields = "no contribution" (e.g., schedule-only DAGs return
@@ -111,6 +167,27 @@ pub(super) fn render_trigger(
     if trigger.is_some() && result.max_active_runs.is_none() {
         result.max_active_runs = Some(1);
     }
+
+    // D-11/D-12 (DOC-05): prepend VERSION_BANNER to header_docstring on
+    // event-driven DAGs only. Schedule-only DAGs (`trigger.is_none()`) skip
+    // the prefix entirely so the 20+ pre-Phase-32 schedule-only fixtures stay
+    // byte-identical (PRES-02 guarantee). D-14b: inline-prepend at this
+    // boundary; the Tera template is unchanged — banner flows through the
+    // existing `{{ trigger_header_block }}` insertion in airflow_dag.py.tera.
+    if trigger.is_some() {
+        let mut banner_plus_header =
+            String::with_capacity(VERSION_BANNER.len() + result.header_docstring.len() + 1);
+        banner_plus_header.push_str(VERSION_BANNER);
+        if !result.header_docstring.is_empty() {
+            // Blank separator line between the banner block and the
+            // per-source caveat block (purely aesthetic — both are Python
+            // comment text inside the rendered DAG header).
+            banner_plus_header.push('\n');
+        }
+        banner_plus_header.push_str(&result.header_docstring);
+        result.header_docstring = banner_plus_header;
+    }
+
     result
 }
 
@@ -150,7 +227,7 @@ fn render_single(
             sensor_deps: Vec::new(),
             extra_imports: vec!["from airflow.datasets import Dataset".to_string()],
             max_active_runs: None,
-            header_docstring: String::new(),
+            header_docstring: dataset_header(&d.uri),
         },
         SingleSource::S3(s3) => {
             // Knob defaults (S3-02): poke_interval=60, timeout=86400.
@@ -219,7 +296,7 @@ fn render_single(
                     "from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor".to_string(),
                 ],
                 max_active_runs: None,
-                header_docstring: String::new(),
+                header_docstring: s3_header(&s3.bucket, s3.key.as_deref(), s3.prefix.as_deref()),
             }
         }
         SingleSource::Sqs(sqs) => {
@@ -280,7 +357,7 @@ fn render_single(
                     "from airflow.providers.amazon.aws.sensors.sqs import SqsSensor".to_string(),
                 ],
                 max_active_runs: None,
-                header_docstring: String::new(),
+                header_docstring: sqs_header(&sqs.queue_url),
             }
         }
         SingleSource::Api(api) => {
@@ -378,13 +455,19 @@ fn render_composite(
             .map(|u| format!("Dataset({})", python_string_literal(u)))
             .collect::<Vec<_>>()
             .join(separator);
+        // D-13: one per-source caveat block per URI; banner is prepended later
+        // in render_trigger via the inline-prepend gate (D-14b).
+        let mut header = String::new();
+        for u in &uris {
+            header.push_str(&dataset_header(u));
+        }
         return TriggerRender {
             schedule_expr: format!("({chain})"),
             sensor_tasks: Vec::new(),
             sensor_deps: Vec::new(),
             extra_imports: vec!["from airflow.datasets import Dataset".to_string()],
             max_active_runs: None,
-            header_docstring: String::new(),
+            header_docstring: header,
         };
     }
 
@@ -1278,5 +1361,132 @@ mod tests {
         assert_eq!(out.max_active_runs, None, "schedule-only must not auto-default");
         let out2 = render_trigger(None, None, None, &[]);
         assert_eq!(out2.max_active_runs, None);
+    }
+
+    // --- Phase 32 plan 32-03: VERSION_BANNER + per-source backfill caveats (DOC-05) ---
+    //
+    // Six checks across five tests + two integration fixtures (in mod.rs):
+    // - Dataset / S3 / SQS arms now populate header_docstring with a per-source
+    //   backfill caveat block (D-13).
+    // - render_trigger prepends a fixed Airflow-version-contract banner whenever
+    //   trigger.is_some() (D-11 / D-14b — inline-prepend, no template change).
+    // - Schedule-only path (trigger.is_none()) keeps header_docstring empty so
+    //   the 20+ pre-Phase-32 schedule-only fixtures stay byte-identical (PRES-02
+    //   / D-12).
+    // - API arm regression: Phase 30's "# Trigger: API" header still rendered,
+    //   PLUS the new banner is prepended.
+
+    #[test]
+    fn render_trigger_dataset_emits_per_source_backfill_header() {
+        // D-13: Dataset arm now fills header_docstring with the
+        // "Datasets have no logical_date" backfill caveat. D-11/D-14b: the
+        // VERSION_BANNER is prepended above it because trigger.is_some().
+        let t = Trigger::Single(SingleSource::Dataset(DatasetTrigger {
+            uri: "s3://x/y".into(),
+        }));
+        let out = render_trigger(Some(&t), None, None, &[]);
+        let h = &out.header_docstring;
+        // Per-source backfill caveat block (Dataset).
+        assert!(
+            h.contains("# Trigger: Dataset (s3://x/y)"),
+            "Dataset header missing per-source line: {h}"
+        );
+        assert!(
+            h.contains("Backfill caveat: Datasets have no logical_date"),
+            "Dataset header missing backfill caveat: {h}"
+        );
+        // Version banner — prepended on every event-driven trigger.
+        assert!(
+            h.contains("# Airflow version contract:"),
+            "Dataset header missing VERSION_BANNER: {h}"
+        );
+        assert!(
+            h.contains("#   - apache-airflow-providers-amazon >= 8.13.0"),
+            "Dataset header missing providers-amazon banner line: {h}"
+        );
+    }
+
+    #[test]
+    fn render_trigger_s3_emits_per_source_backfill_header() {
+        // D-13: S3 arm now fills header_docstring with the deferrable-sensor
+        // re-poke backfill caveat. Banner prepended (D-11).
+        let t = Trigger::Single(SingleSource::S3(S3Trigger {
+            bucket: "b".into(),
+            key: None,
+            prefix: Some("p".into()),
+            ..Default::default()
+        }));
+        let out = render_trigger(Some(&t), None, None, &[]);
+        let h = &out.header_docstring;
+        assert!(
+            h.contains("# Airflow version contract:"),
+            "S3 header missing VERSION_BANNER: {h}"
+        );
+        assert!(
+            h.contains("deferrable sensor re-pokes"),
+            "S3 header missing backfill caveat: {h}"
+        );
+    }
+
+    #[test]
+    fn render_trigger_sqs_emits_per_source_backfill_header() {
+        // D-13: SQS arm now fills header_docstring with the destructive-drain
+        // backfill caveat. Banner prepended (D-11).
+        let t = Trigger::Single(sqs("https://sqs/q"));
+        let out = render_trigger(Some(&t), None, None, &[]);
+        let h = &out.header_docstring;
+        assert!(
+            h.contains("# Airflow version contract:"),
+            "SQS header missing VERSION_BANNER: {h}"
+        );
+        assert!(
+            h.contains("drains the real queue"),
+            "SQS header missing backfill caveat: {h}"
+        );
+    }
+
+    #[test]
+    fn render_trigger_schedule_emits_no_banner() {
+        // D-12 / PRES-02: schedule-only DAGs (trigger.is_none()) MUST render
+        // an EMPTY header_docstring — banner absent, no per-source block.
+        // This guarantees the 20+ existing schedule-only fixtures stay
+        // byte-identical to pre-Phase-32 output.
+        let out = render_trigger(None, Some("@daily"), None, &[]);
+        assert!(
+            out.header_docstring.is_empty(),
+            "schedule-only must not emit any header (PRES-02): {:?}",
+            out.header_docstring
+        );
+        let out2 = render_trigger(None, None, None, &[]);
+        assert!(
+            out2.header_docstring.is_empty(),
+            "schedule-only (no schedule literal) must not emit any header: {:?}",
+            out2.header_docstring
+        );
+    }
+
+    #[test]
+    fn render_trigger_api_arm_still_passes_phase_30_regression() {
+        // The Phase 30 API header content stays — just gets the banner
+        // prepended. Asserts both: the existing "# Trigger: API" marker AND
+        // the new VERSION_BANNER prefix.
+        let t = Trigger::Single(SingleSource::Api(ApiTrigger::default()));
+        let out = render_trigger(Some(&t), None, None, &[]);
+        let h = &out.header_docstring;
+        assert!(
+            h.contains("# Trigger: API"),
+            "Phase 30 API header marker must still appear: {h}"
+        );
+        assert!(
+            h.contains("# Airflow version contract:"),
+            "Phase 32 banner must be prepended on API arm too: {h}"
+        );
+        // Banner must precede the per-source block.
+        let i_banner = h.find("# Airflow version contract:").expect("banner present");
+        let i_api = h.find("# Trigger: API").expect("api marker present");
+        assert!(
+            i_banner < i_api,
+            "VERSION_BANNER must be prepended ABOVE the API per-source header: {h}"
+        );
     }
 }

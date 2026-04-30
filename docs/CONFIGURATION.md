@@ -196,7 +196,7 @@ Defined by `JobDefinition` in `yard-structs/src/config.rs`.
 | `imports` | array | No | Extra Python imports injected into the generated script. |
 | `body` | string | No | Inline Python body appended to the generated script. |
 | `job_file` | string | No | Path to an external Python file that replaces codegen entirely. |
-| `airflow` | object | No | Per-job Airflow metadata (`depends_on`, `produces`, plus overrides for `schedule`/`owner`/`retries`/etc.). |
+| `airflow` | object | No | Per-job Airflow metadata (`depends_on`, `publishes`, plus overrides for `schedule`/`owner`/`retries`/etc.). |
 | `partition_by` | array | No | Iceberg partition columns. Only `year`, `month`, `day` are supported. |
 | `partition_timestamp_column` | string | No | Existing timestamp column to derive year/month/day from. Mutually exclusive with `create_timestamp`. |
 | `create_timestamp` | bool | No | If true, adds `ingestion_timestamp = current_timestamp()` and derives partitions. Mutually exclusive with `partition_timestamp_column`. |
@@ -397,12 +397,14 @@ The file contents are parsed as an `AirflowSection`:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `schedule` | string | Cron string. Mutually exclusive with `triggered_by`. |
+| `schedule` | string | Cron string. Mutually exclusive with `trigger:` block. |
 | `owner` | string | DAG `owner` default arg. |
 | `retries` | int | DAG `retries` default arg. |
 | `dags_bucket` | string | S3 bucket where the generated DAG `.py` is uploaded (typically the MWAA DAGs bucket). |
 | `dags_prefix` | string | Key prefix under `dags_bucket`. |
-| `triggered_by` | array | Dataset URIs that trigger this DAG. When set, `schedule` becomes `[Dataset("uri"), ...]`. |
+| `trigger` | object (typed) | Optional event-driven trigger block. See [trigger:](#dagyaml-trigger-block). Mutually exclusive with `schedule`. |
+| `publishes` | array of strings | Dataset URIs published when the DAG completes. See [publishes:](#dagyaml-publishes). |
+| `max_active_runs` | int (>=1) | Optional concurrency limit. Default `1` for event-driven DAGs (CONC-01); Airflow default (16) for schedule-only DAGs. |
 
 The same `AirflowSection` shape may also appear under an `airflow:` block
 in `yard.yaml`, `account.yaml`, `region.yaml`, and per-job files. Later
@@ -411,6 +413,120 @@ layers shallow-override earlier layers.
 For the full Airflow reference — how DAGs are discovered and generated,
 the operator mapping, dataset-based triggering, and per-job Airflow
 metadata — see [docs/AIRFLOW.md](./AIRFLOW.md).
+
+### dag.yaml: `trigger:` block
+
+Single-source map. Exactly one of these five keys at the top level of `trigger:`:
+
+- `schedule:` — cron string or preset (`"@daily"`, `"@hourly"`, etc.). Equivalent to top-level `schedule:`; the typed form is `trigger: { schedule: "@daily" }`.
+- `dataset:` — Airflow Dataset URI consumer. Renders as `schedule=[Dataset(uri)]`.
+  ```yaml
+  trigger:
+    dataset:
+      uri: s3://example-bucket/raw/orders/
+  ```
+- `s3:` — S3 file-drop trigger via `S3KeySensor(deferrable=True)`. Required: `bucket` plus one of `key` (exact) or `prefix` (glob).
+  ```yaml
+  trigger:
+    s3:
+      bucket: example-landing-bucket
+      prefix: incoming/orders/
+      poke_interval: 60         # seconds, default 60, must be >= 10
+      timeout: 86400            # seconds, default 86400
+      deferrable: true          # default true; false emits legacy non-deferrable form
+      aws_conn_id: yard_222222222222_GlueInvoker  # see "aws_conn_id resolution" below
+  ```
+- `sqs:` — SQS queue trigger via `SqsSensor(deferrable=True)`. Required: `queue_url`.
+  ```yaml
+  trigger:
+    sqs:
+      queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/orders-events
+      wait_time_seconds: 20     # default 20 (long polling)
+      max_messages: 5           # default 5
+      delete_message_on_reception: true  # default true
+  ```
+- `api:` — manual / external trigger. Renders `schedule=None`. Optional `description` and `payload_schema`.
+  ```yaml
+  trigger:
+    api:
+      description: "Triggered by upstream replay job"
+      payload_schema:
+        customer_id: string
+        replay_window_start: string
+  ```
+
+### dag.yaml: `trigger.any:` / `trigger.all:` composites
+
+Flat one-level lists of single-source variants:
+
+```yaml
+trigger:
+  all:
+    - dataset: { uri: s3://example-bucket/raw/orders/ }
+    - dataset: { uri: s3://example-bucket/raw/customers/ }
+```
+
+- **Homogeneous Datasets (`any:` or `all:`)** — render via Airflow 2.9 native operators: `schedule=(Dataset(a) & Dataset(b))` for `all:`, `schedule=(Dataset(a) | Dataset(b))` for `any:`.
+- **Heterogeneous `all:`** (mixing `dataset:` with `s3:` / `sqs:` / `api:`) — renders as a sensor chain plus `_yard_join` `EmptyOperator(trigger_rule="all_success")` synthesis. Sensor task IDs are deterministic: `_yard_wait_s3`, `_yard_wait_sqs`, `_yard_wait_dataset`, `_yard_wait_api`, `_yard_join`.
+- **Heterogeneous `any:`** is REJECTED at validation — no clean Airflow primitive in v1.6. Split into multiple DAGs.
+- Empty composites (`any: []`, `all: []`) and nested composites (`any: [{ all: [...] }]`) are REJECTED at validation.
+
+### dag.yaml: `publishes:`
+
+Top-level DAG-level Dataset producers. Each URI emits `Dataset(uri)` in a synthetic terminal task `_yard_publish` wired downstream of every leaf user task.
+
+```yaml
+publishes:
+  - s3://example-bucket/processed/orders/
+  - s3://example-bucket/processed/shipments/
+```
+
+Runtime semantics: the synthetic `_yard_publish = EmptyOperator(task_id="_yard_publish", outlets=[Dataset(...), ...])` runs after every user task succeeds (default `trigger_rule="all_success"`). Outlets fire on success. Per-task `outlets=` is still available via `airflow.publishes` on each `<job>.yaml` (renamed from `produces:`).
+
+See [docs/AIRFLOW.md](AIRFLOW.md#airflow-datasets) for runtime semantics and backfill caveats.
+
+### dag.yaml: `max_active_runs:`
+
+Optional concurrency limit. Must be `>= 1`.
+
+- **Event-driven DAGs** (any DAG with a `trigger:` block) default to `max_active_runs=1`. Override by setting `max_active_runs: <N>` explicitly.
+- **Schedule-only DAGs** preserve Airflow's default of `16` unless overridden.
+
+### dag.yaml: per-source knobs
+
+| Source | Knob | Default | Notes |
+|--------|------|---------|-------|
+| `s3` | `poke_interval` | 60 (seconds) | Must be `>= 10` (rejected at parse otherwise) |
+| `s3` | `timeout` | 86400 (seconds) | |
+| `s3` | `deferrable` | `true` | Set `false` for `apache-airflow-providers-amazon < 8.0.0` deployments |
+| `s3` | `aws_conn_id` | resolved per cascade ladder below | Per-trigger override beats cascade. See "aws_conn_id resolution" below. |
+| `sqs` | `wait_time_seconds` | 20 | Long polling — saves SQS API costs |
+| `sqs` | `max_messages` | 5 | |
+| `sqs` | `delete_message_on_reception` | `true` | |
+| `api` | `description` | (none) | Free-form prose injected into DAG header |
+| `api` | `payload_schema` | (none) | `field: type` map; doc-only — no runtime enforcement in Airflow 2.9 |
+| `dataset` | `uri` | (required) | |
+
+### dag.yaml: `aws_conn_id` resolution
+
+yard derives the AWS connection ID for emitted sensors and the per-DAG `default_aws_conn_id` via this precedence ladder (highest first):
+
+1. **Per-trigger explicit override** — e.g. `trigger.s3.aws_conn_id` set on a single trigger source. Wins for that one sensor.
+2. **DAG-level cascaded `airflow.aws.aws_conn_id`** — set on `dag.yaml` `airflow.aws:` (or inherited via the cascade chain `yard.yaml → account → region → dag`). Becomes the DAG's `default_aws_conn_id`.
+3. **Project-root `aws.aws_conn_id`** — set on the top-level `aws:` block in `yard.yaml`. Inherited via `cascade_provider_defaults` for jobs that don't override.
+4. **`derive_aws_conn_id(assume_role)`** — synthesized from `aws.assume_role` ARN when set (e.g. `assume_role: arn:aws:iam::222222222222:role/GlueInvoker` yields `yard_222222222222_GlueInvoker`).
+5. **Airflow's `aws_default`** — runtime fallback when none of the above resolve. yard emits no `aws_conn_id` kwarg in this case; the sensor uses the Airflow worker's default chain.
+
+Empty strings are treated as unset at every layer (the typed-config helper filters them out), so setting `aws_conn_id: ""` at a more-specific layer falls through to the next tier — useful for intentional-strip overlays.
+
+### dag.yaml: decision matrix — `schedule:` vs `trigger:`
+
+| | `trigger:` declared | `trigger:` absent |
+|---|---|---|
+| **`schedule:` declared** | REJECTED at validation. Pick one — use `trigger: { schedule: "<cron>" }` if you need both forms in one DAG. | Schedule-only DAG. Renders `schedule="<cron>"`. PRES-02 byte-identical to pre-v1.6. |
+| **`schedule:` absent** | Event-driven DAG. Renders per-source schedule (Dataset list, sensor task, or `schedule=None` for API). `max_active_runs=1` default applies. | DAG with no scheduling — Airflow defaults to manual trigger. Same as pre-v1.6 behavior. |
+
+Migration from `triggered_by:` and `produces:` is documented in [docs/MIGRATION-v1.6.md](MIGRATION-v1.6.md).
 
 ---
 

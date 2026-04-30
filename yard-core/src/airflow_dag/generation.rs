@@ -138,11 +138,16 @@ pub fn generate_dag(
     // above. BTreeSet de-dups (so a DAG that BOTH trigger-on-Dataset AND
     // per-task-publishes-Dataset emits the import line once) and gives
     // deterministic ordering across runs.
-    let combined_imports: BTreeSet<String> = import_lines
+    //
+    // Phase 32 (PUB-01): the PUB-01 branch below mutates this set to add the
+    // EmptyOperator import only when `dag.config.publishes` is non-empty —
+    // free de-dup against any heterogeneous-all `_yard_join` import that may
+    // already be present from `trender.extra_imports`. The `imports_block`
+    // flush is deferred to after that branch.
+    let mut combined_imports: BTreeSet<String> = import_lines
         .into_iter()
         .chain(trender.extra_imports.iter().cloned())
         .collect();
-    let imports_block = combined_imports.into_iter().collect::<Vec<_>>().join("\n");
 
     // D-15 / D-16: max_active_runs_block is empty for schedule-only DAGs
     // (PRES-02 byte-identical guarantee — no new kwarg leaks into existing
@@ -175,9 +180,12 @@ pub fn generate_dag(
     // 30-01 (Datasets branch emits no sensors); plans 30-02/03/04 fill these.
     // PRES-02 byte-identical for schedule-only DAGs: trender.sensor_tasks is
     // an empty Vec, so the join below is a no-op vs. pre-Phase-30 behavior.
+    //
+    // Phase 32 (PUB-01): the publish branch below appends `_yard_publish` to
+    // this Vec when `dag.config.publishes` is non-empty, so `tasks_block` is
+    // computed AFTER the branch.
     let mut all_task_lines: Vec<String> = trender.sensor_tasks.clone();
     all_task_lines.extend(task_lines);
-    let tasks_block = all_task_lines.join("\n");
 
     // Cross-account connection docstring. Empty for single-account DAGs so we
     // don't clutter the header.
@@ -212,13 +220,76 @@ pub fn generate_dag(
     // to `_yard_join` / `_yard_join >> root`) precede user-task edges so the
     // rendered deps section reads top-down. Empty for plan 30-01 (Datasets
     // branch emits no sensor edges); plans 30-02/03/04 populate these.
+    //
+    // Phase 32 (PUB-01): the publish branch below appends a fan-in deps line
+    // (`[leaf_a, leaf_b] >> _yard_publish`) when `dag.config.publishes` is
+    // non-empty, so `deps_block` is computed AFTER the branch.
     let mut all_dep_lines: Vec<String> = trender.sensor_deps.clone();
     all_dep_lines.extend(dep_lines);
+
+    // PUB-01: synthesize `_yard_publish` EmptyOperator + leaf fan-in when
+    // `AirflowSection.publishes` is non-empty. Schedule-only AND trigger-only
+    // DAGs without publishes skip this entire branch (D-05, PRES-02 byte-id
+    // guard). URIs alpha-sorted in outlets per D-04. Symmetric to the root
+    // detection at lines 113-123, but a leaf is a task that does NOT appear
+    // in any OTHER task's `depends_on` Vec.
+    if !dag.config.publishes.is_empty() {
+        // D-04: alpha-sort URIs, independent of declaration order.
+        let mut sorted_uris: Vec<&str> =
+            dag.config.publishes.iter().map(String::as_str).collect();
+        sorted_uris.sort();
+        let outlets = sorted_uris
+            .iter()
+            .map(|u| format!("Dataset({})", python_string_literal(u)))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // Synthetic task body — mirrors Phase 30 `_yard_join` shape
+        // (triggers.rs:454-461). `trigger_rule` defaults to `all_success`,
+        // so we omit the kwarg — Dataset producer fires only after every
+        // upstream user task succeeds.
+        let yard_publish_task = format!(
+            "    _yard_publish = EmptyOperator(\n        task_id=\"_yard_publish\",\n        outlets=[{outlets}],\n    )"
+        );
+        all_task_lines.push(yard_publish_task);
+
+        // Leaf detection (Pitfall 1: lives ONLY inside this branch — never
+        // computed for DAGs without publishes). Symmetric to root detection.
+        let leaves: Vec<String> = dag
+            .tasks
+            .iter()
+            .filter(|t| {
+                !dag.depends_on
+                    .iter()
+                    .any(|(other, ups)| other.as_str() != t.as_str() && ups.contains(t))
+            })
+            .cloned()
+            .collect();
+        let leaf_list = leaves
+            .iter()
+            .map(|l| python_var_name(l))
+            .collect::<Vec<_>>()
+            .join(", ");
+        all_dep_lines.push(format!("[{leaf_list}] >> _yard_publish"));
+
+        // Pitfall 2: BTreeSet de-dups against any heterogeneous-all
+        // `_yard_join` import already present in `combined_imports`. Also
+        // ensure `Dataset` is imported — it may be absent if no per-task
+        // `airflow.publishes` (PUB-02) is set anywhere AND no Dataset trigger
+        // is configured. Idempotent re-insert is safe.
+        combined_imports.insert("from airflow.operators.empty import EmptyOperator".to_string());
+        combined_imports.insert("from airflow.datasets import Dataset".to_string());
+    }
+
+    // Final flush — `tasks_block`, `deps_block`, and `imports_block` are all
+    // computed AFTER the PUB-01 branch so its mutations are observed.
+    let tasks_block = all_task_lines.join("\n");
     let deps_block = if all_dep_lines.is_empty() {
         "# No task dependencies".to_string()
     } else {
         all_dep_lines.join("\n")
     };
+    let imports_block = combined_imports.into_iter().collect::<Vec<_>>().join("\n");
 
     let mut ctx = Context::new();
     ctx.insert("dag_name", &dag.name);
