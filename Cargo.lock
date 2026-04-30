@@ -6000,7 +6000,7 @@ dependencies = [
 
 [[package]]
 name = "yard"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6016,7 +6016,7 @@ dependencies = [
 
 [[package]]
 name = "yard-core"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -6076,7 +6076,7 @@ dependencies = [
 
 [[package]]
 name = "yard-structs"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "serde",
