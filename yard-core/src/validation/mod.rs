@@ -129,28 +129,35 @@ fn check_heterogeneous_any(trigger: Option<&Trigger>) -> Option<ValidationError>
     ))
 }
 
-/// TRIG-08 (Phase 30, plan 30-01): reserved trigger task IDs cannot collide
-/// with user-declared task IDs. Reserved IDs emitted by
-/// `triggers.rs::render_trigger` are `_yard_wait_s3`, `_yard_wait_sqs`,
-/// `_yard_wait_dataset`, `_yard_wait_api`, and `_yard_join`. Caught at
-/// `validate_dag_full` pre-codegen so users get a clear actionable error
+/// TRIG-08 (Phase 30, plan 30-01; extended Phase 32 plan 32-02): reserved
+/// trigger codegen task IDs cannot collide with user-declared task IDs. Caught
+/// at `validate_dag_full` pre-codegen so users get a clear actionable error
 /// before codegen produces an invalid DAG with two same-id tasks.
 ///
-/// Only fires when a `trigger:` block is present — schedule-only DAGs do
-/// not emit any reserved IDs and may freely name a task `_yard_wait_s3`.
+/// Reserved IDs split by codegen surface (D-03):
+/// - `_yard_wait_s3`, `_yard_wait_sqs`, `_yard_wait_dataset`, `_yard_wait_api`,
+///   `_yard_join` are reserved when `trigger.is_some()` (Phase 30 contract —
+///   schedule-only DAGs may freely name a task `_yard_wait_s3`).
+/// - `_yard_publish` is reserved when `!publishes.is_empty()` regardless of
+///   `trigger.is_some()` (Phase 32 — codegen synthesizes the publish task
+///   whenever publishes is non-empty, including schedule-only DAGs with
+///   `publishes:`).
 fn check_reserved_task_ids(dag: &ResolvedDag) -> Vec<ValidationError> {
-    if dag.config.trigger.is_none() {
+    // Early-return only when neither codegen surface produces reserved IDs.
+    if dag.config.trigger.is_none() && dag.config.publishes.is_empty() {
         return Vec::new();
     }
-    let reserved: BTreeSet<&'static str> = [
-        "_yard_wait_s3",
-        "_yard_wait_sqs",
-        "_yard_wait_dataset",
-        "_yard_wait_api",
-        "_yard_join",
-    ]
-    .into_iter()
-    .collect();
+    let mut reserved: BTreeSet<&'static str> = BTreeSet::new();
+    if dag.config.trigger.is_some() {
+        reserved.insert("_yard_wait_s3");
+        reserved.insert("_yard_wait_sqs");
+        reserved.insert("_yard_wait_dataset");
+        reserved.insert("_yard_wait_api");
+        reserved.insert("_yard_join");
+    }
+    if !dag.config.publishes.is_empty() {
+        reserved.insert("_yard_publish");
+    }
     let mut out = Vec::new();
     for task_id in &dag.tasks {
         if reserved.contains(task_id.as_str()) {
@@ -205,10 +212,44 @@ fn check_s3_poke_interval(trigger: Option<&Trigger>) -> Vec<ValidationError> {
     out
 }
 
-/// Cross-DAG broken-link soft warning. See D-06/D-08.
-/// (Task 1 stub — Task 2 replaces this with the real implementation.)
-pub fn validate_project(_dags: &[ResolvedDag]) -> Vec<String> {
-    Vec::new()
+/// Cross-DAG broken-link soft warning. Walks every DAG's `AirflowSection.publishes`
+/// to build the publish-set, then yields a soft warning per `(DAG, missing-URI)`
+/// for every Dataset trigger consumer with no in-project publisher. Sorted by
+/// `(dag_id, uri)` per D-08. Never returns Err — soft warnings only.
+///
+/// Wired symmetrically into `orchestrate::plan` and `orchestrate::apply` after
+/// the `validate_dag_full` rollup. Detection scope is Dataset URIs only (D-09);
+/// S3 / SQS / API consumers do not flow through this check.
+pub fn validate_project(dags: &[ResolvedDag]) -> Vec<String> {
+    let mut published: BTreeSet<&str> = BTreeSet::new();
+    for dag in dags {
+        for uri in &dag.config.publishes {
+            published.insert(uri.as_str());
+        }
+    }
+    let mut warnings: Vec<(String, String)> = Vec::new();
+    for dag in dags {
+        let consumed = dag
+            .config
+            .trigger
+            .as_ref()
+            .map(|t| t.dataset_uris())
+            .unwrap_or_default();
+        for uri in consumed {
+            if !published.contains(uri) {
+                warnings.push((dag.name.clone(), uri.to_string()));
+            }
+        }
+    }
+    warnings.sort();
+    warnings
+        .into_iter()
+        .map(|(dag_id, uri)| {
+            format!(
+                "WARN: dag '{dag_id}': trigger.dataset \"{uri}\" has no publisher in this project (broken link, non-fatal)"
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
