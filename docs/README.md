@@ -2,7 +2,7 @@
 
 ← [Back to repo README](../README.md)
 
-11 docs across 7 categories. This index links to every page in `docs/`.
+15 docs across 7 categories. This index links to every page in `docs/`.
 
 > Diátaxis-lite layout: tutorials (one quickstart) / how-to (task recipes) / reference (schema + API) / explanation (architecture + rationale) / examples (copy-paste projects) / server (yard-server) / contributing (developer setup).
 
@@ -18,13 +18,15 @@
 
 ## Reference
 
+- [reference/cli.md](reference/cli.md) — Every `yard` subcommand (`init`, `plan`, `apply`, `show`, `validate`, `destroy`, `force-unlock`, `list targets`) and every flag, with synopsis + flag table + 1-2 examples per command. CI-guarded by `.github/workflows/verify-cli-docs.yml` against drift.
 - [reference/configuration.md](reference/configuration.md) — Full configuration surface: `yard.yaml` / `<account>.yaml` / `<region>.yaml` / `<job>.yaml` / `dag.yaml` field reference, CLI environment variables, yard-server env vars, and the runtime Settings page.
-- [reference/codegen.md](reference/codegen.md) — Authoritative reference for the `<job>.yaml` → PySpark codegen pipeline: Tera templates, source/transform/sink renderers, escape hatches, Glue vs EMR differences, and a "how to add a new provider/source/transform/sink" guide. *(Phase 34 splits the rationale half into `explanation/why-codegen.md`.)*
-- [reference/airflow-dag.md](reference/airflow-dag.md) — `dag.yaml` schema, AirflowSection / AirflowJobBlock field reference, operator mapping, cross-account connections, Airflow Datasets, version matrix, and per-source backfill semantics. *(Phase 34 splits per-trigger recipes out into how-to pages.)*
+- [reference/codegen.md](reference/codegen.md) — Authoritative reference for the `<job>.yaml` → PySpark codegen pipeline: Tera templates, source/transform/sink renderers, escape hatches, Glue vs EMR differences, and a "how to add a new provider/source/transform/sink" guide.
+- [reference/airflow-dag.md](reference/airflow-dag.md) — `dag.yaml` schema, AirflowSection / AirflowJobBlock field reference, operator mapping, cross-account connections, Airflow Datasets, version matrix, and per-source backfill semantics. *(Phase 35 will lift the worked-example trailer into how-to recipes.)*
 
 ### Providers
 
-*Coming in Phase 34: `reference/providers/glue.md` (Glue provider config) + `reference/providers/emr.md` (EMR Serverless provider config).*
+- [reference/providers/glue.md](reference/providers/glue.md) — AWS Glue provider config: every knob in `GlueRawConfig`, AWS resources created/updated, IAM action requirements, and limitations.
+- [reference/providers/emr.md](reference/providers/emr.md) — AWS EMR (classic, NOT Serverless) provider config: every knob in `EmrRawConfig`, step-submission model, and the existing-cluster requirement.
 
 ### Migrations
 
@@ -33,6 +35,7 @@
 ## Explanation
 
 - [explanation/architecture.md](explanation/architecture.md) — System overview, four-crate workspace layout (yard-cli / yard-core / yard-structs / yard-server), crate dependency graph, trait-based provider model, and the layering rules each crate enforces.
+- [explanation/why-codegen.md](explanation/why-codegen.md) — Rationale for yard's codegen design: why Tera scaffolds, why dataframe bodies are baked in Rust at apply-time, and why the split. Pairs with [reference/codegen.md](reference/codegen.md) for the rules.
 
 ## Examples
 
@@ -50,4 +53,4 @@
 
 ---
 
-*Doc count rises to 17+ after Phase 35 fills `examples/` and adds the additional how-to recipes. Phase 36 closes the milestone with the root-`README.md` refresh and a final stale-content sweep.*
+*Doc count rises further after Phase 35 fills `examples/` and adds the additional how-to recipes. Phase 36 closes the milestone with the root-`README.md` refresh and a final stale-content sweep.*
