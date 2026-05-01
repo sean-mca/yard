@@ -7,7 +7,7 @@ scopes, per-crate test layout, the in-memory test harness used by
 `yard-server`, the integration-test setup against the `ministack` docker
 container, and how CI invokes the suite.
 
-For general developer setup, see [DEVELOPMENT.md](DEVELOPMENT.md).
+For general developer setup, see [development](development.md).
 
 ---
 
