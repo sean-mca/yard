@@ -9,10 +9,10 @@ users sidestep codegen entirely, and how Glue vs. EMR differ in the
 generated output.
 
 For the `transforms[]`, `sources[]`, and `sink:` field reference, see
-[CONFIGURATION.md](./CONFIGURATION.md). For Airflow DAG generation (a
+[configuration](configuration.md). For Airflow DAG generation (a
 separate codegen path sharing nothing with this one besides the Tera
-engine), see [AIRFLOW.md](./AIRFLOW.md). This doc is the deep dive that
-[ARCHITECTURE.md](./ARCHITECTURE.md) links to when it mentions codegen at
+engine), see [airflow DAG reference](airflow-dag.md). This doc is the deep dive that
+[architecture](../explanation/architecture.md) links to when it mentions codegen at
 a high level.
 
 - [Overview](#overview)
@@ -69,7 +69,7 @@ Defined in `yard-core/src/codegen/mod.rs` and re-exported via
 |---|---|---|
 | `codegen::generate_python_script(job_name, job_def) -> Result<String>` | Providers, `show::show` | The only codegen entry point. Returns the full script text. |
 | `show::show(manifest, job_name) -> Result<String>` | `yard show <job>` CLI | Thin wrapper that looks up the job and calls `generate_python_script`. |
-| `show::show_dag(manifest, dags, dag_name)` | `yard show <dag>` CLI | Parallel DAG-codegen entry; see [AIRFLOW.md](./AIRFLOW.md). |
+| `show::show_dag(manifest, dags, dag_name)` | `yard show <dag>` CLI | Parallel DAG-codegen entry; see [airflow DAG reference](airflow-dag.md). |
 
 Task-only job types (currently just `bash` — see
 `config_merge::is_task_only`) return an empty string from
@@ -95,7 +95,7 @@ All live under `yard-core/src/templates/`:
 |---|---|---|
 | `glue.py.tera` | `job_type: glue` | AWS Glue scaffold: `getResolvedOptions`, `SparkSession`, `GlueContext`, `Job.init` / `job.commit`. |
 | `emr.py.tera` | `job_type: emr` | EMR classic scaffold: `SparkSession.builder.appName(...)` + `spark.stop()` in `finally`. No Glue imports. |
-| `airflow_dag.py.tera` | DAG codegen | Airflow DAG scaffold. Rendered by a separate pipeline — see [AIRFLOW.md](./AIRFLOW.md). |
+| `airflow_dag.py.tera` | DAG codegen | Airflow DAG scaffold. Rendered by a separate pipeline — see [airflow DAG reference](airflow-dag.md). |
 
 ### Render context
 
@@ -231,7 +231,7 @@ Switch to `engine: glue` and the same block becomes:
 
 `yard-core/src/codegen/transform.rs` handles the `transforms:` list. The
 full per-`transform_type` field reference lives in
-[CONFIGURATION.md](./CONFIGURATION.md); this section documents only how
+[configuration](configuration.md); this section documents only how
 those fields translate into PySpark calls.
 
 ### Execution model
@@ -262,7 +262,7 @@ listed in `Transform::transform_type` (see `yard-structs/src/config.rs`):
 `filter`, `sql`, `join`, `drop_columns`, `select`, `rename`, `add_column`,
 `aggregate`, `window`. Unknown values emit a `# Unsupported transform
 type: ...` comment. Full field → PySpark mappings are in
-[CONFIGURATION.md](./CONFIGURATION.md#transforms-fields-transform-struct).
+[configuration](configuration.md#transforms-fields-transform-struct).
 
 ### Temp view registration for `sql`
 
@@ -473,7 +473,7 @@ Things to note:
 - `JOB_NAME` is the only arg yard's generated scaffold reads via
   `getResolvedOptions`. Additional args are wired in via
   `providers.glue.default_arguments` (see
-  [CONFIGURATION.md](./CONFIGURATION.md)), which the Glue provider
+  [configuration](configuration.md)), which the Glue provider
   applies to `CreateJob` / `UpdateJob` — those become available inside
   the script via `getResolvedOptions(sys.argv, ['JOB_NAME', 'MY_ARG'])`
   that **you** add to an `imports:` or `body:` block.
@@ -714,7 +714,7 @@ implicit imports to add (see the `if needs_*` checks in
 ## Adding a new provider, source, transform, or sink
 
 Broader contributor setup (lint, format, test, branch) is covered in
-[DEVELOPMENT.md](./DEVELOPMENT.md). This section is codegen-specific.
+[development](../contributing/development.md). This section is codegen-specific.
 
 ### New source type
 
@@ -753,14 +753,14 @@ Broader contributor setup (lint, format, test, branch) is covered in
    mandatory fields.
 3. If the new sink needs boto3 or other runtime libs, extend the
    predicates in `helpers.rs`.
-4. Document fields in [CONFIGURATION.md](./CONFIGURATION.md) under the
+4. Document fields in [configuration](configuration.md) under the
    sink reference.
 5. Add unit tests.
 
 ### New provider
 
 Full steps are in
-[DEVELOPMENT.md → Adding a new provider](./DEVELOPMENT.md#adding-a-new-provider).
+[development → adding a new provider](../contributing/development.md#adding-a-new-provider).
 The codegen-specific piece is:
 
 1. Add a new Tera template under `yard-core/src/templates/` (e.g.
@@ -790,7 +790,7 @@ in the project manifest. If it matches a job, it calls
 `yard_core::show(manifest, job_name)` (which wraps
 `generate_python_script`) and prints the result to stdout. If it matches
 a DAG instead, it calls `yard_core::show_dag` — see
-[AIRFLOW.md](./AIRFLOW.md).
+[airflow DAG reference](airflow-dag.md).
 
 ```bash
 # From a project directory (or any descendant of it):
