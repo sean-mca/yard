@@ -122,22 +122,7 @@ Implementation: `yard-core/src/storage.rs::get_storage` and
 
 #### `providers.glue` — AWS Glue provider defaults
 
-Consumed by `GlueProvider::new` in `yard-core/src/providers/glue.rs`.
-
-| Field | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `script_bucket` | Yes | — | S3 bucket where generated PySpark scripts are uploaded. |
-| `script_prefix` | No | `yard-scripts/` | Key prefix under `script_bucket`. |
-| `region` | No | `us-east-1` | AWS region for the Glue client. |
-| `glue_version` | No | `4.0` | Glue runtime version. |
-| `worker_type` | No | `G.1X` | Glue worker instance type. |
-| `number_of_workers` | No | `2` | Number of Glue workers. |
-| `timeout` | No | (unset) | Job timeout in minutes. |
-| `max_retries` | No | (unset) | Maximum automatic retries. |
-| `max_concurrent_runs` | No | (unset) | Max concurrent executions. |
-| `bookmark` | No | (unset) | `enabled`/`true` sets `--job-bookmark-enable`; anything else sets `--job-bookmark-disable`. |
-| `connections` | No | `[]` | Array of Glue connection names to attach. |
-| `default_arguments` | No | `{}` | Extra `--key: value` arguments. `--datalake-formats: iceberg` is injected automatically unless overridden. |
+See [providers/glue.md](providers/glue.md) for the full Glue provider reference (knobs, AWS resources, IAM actions, limitations).
 
 #### `providers.emr` — AWS EMR (classic) provider defaults
 
