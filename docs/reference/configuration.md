@@ -126,16 +126,7 @@ See [providers/glue.md](providers/glue.md) for the full Glue provider reference 
 
 #### `providers.emr` — AWS EMR (classic) provider defaults
 
-Consumed by `EmrProvider::new` in `yard-core/src/providers/emr.rs`.
-
-| Field | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `script_bucket` | Yes | — | S3 bucket for uploaded scripts. |
-| `cluster_id` | Yes | — | ID of an existing EMR cluster (`j-XXXXXXXX`). |
-| `script_prefix` | No | `yard-scripts/` | Key prefix under `script_bucket`. |
-| `region` | No | `us-east-1` | AWS region. |
-| `deploy_mode` | No | `cluster` | Passed to `spark-submit --deploy-mode`. |
-| `action_on_failure` | No | `CONTINUE` | EMR step failure action (`CONTINUE`, `CANCEL_AND_WAIT`, `TERMINATE_CLUSTER`). |
+See [providers/emr.md](providers/emr.md) for the full EMR (classic, NOT EMR Serverless) provider reference (knobs, AWS resources, IAM actions, limitations).
 
 #### `aws` (root-level)
 
