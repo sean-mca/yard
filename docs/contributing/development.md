@@ -4,7 +4,7 @@
 This document is for contributors working on yard itself (adding providers,
 fixing bugs in `yard-core`, extending the Dioxus UI, etc.). If you are
 trying to *use* yard to deploy data jobs, start with
-[GETTING-STARTED.md](GETTING-STARTED.md) instead.
+[quickstart](../quickstart.md) instead.
 
 - [Repo layout](#repo-layout)
 - [Local dev setup](#local-dev-setup)
@@ -43,7 +43,7 @@ depends on nothing inside the workspace. `yard-core` never depends on
 
 For the full breakdown — component diagrams, data flow through a
 `yard apply`, and per-directory descriptions — see
-[ARCHITECTURE.md](ARCHITECTURE.md).
+[architecture](../explanation/architecture.md).
 
 ---
 
@@ -102,7 +102,7 @@ All build commands target the entire workspace by default.
 | `cargo build -p yard` | Build only the CLI (package name is `yard`, not `yard-cli`). |
 | `cargo build -p yard-core` | Build only the core library. |
 | `cargo build -p yard-server` | Build only the server crate (native target). |
-| `cargo test` | Run the full test suite. See [TESTING.md](TESTING.md) for details. |
+| `cargo test` | Run the full test suite. See [testing](testing.md) for details. |
 | `cargo clippy --all-targets -- -D warnings` | Lint. Must be clean before any PR. |
 | `cargo fmt --all` | Format. Must be clean before any PR. |
 | `cargo fmt --all -- --check` | CI formatting gate (doesn't modify files). |
@@ -160,7 +160,7 @@ export AWS_ENDPOINT_URL=http://localhost:4566
 cargo run -p yard -- plan
 ```
 
-See [CONFIGURATION.md](CONFIGURATION.md) for every env var yard respects.
+See [configuration reference](../reference/configuration.md) for every env var yard respects.
 
 ---
 
@@ -208,7 +208,7 @@ the API is mounted under `/api` on the same port.
 
 Real-time dashboard updates use a WebSocket at `/api/ws/events`; the
 Dioxus UI connects to it automatically when the page loads. See
-[docs/API.md](API.md) for the full endpoint list.
+[server API reference](../server/api.md) for the full endpoint list.
 
 To stop the server, Ctrl+C in the `dx serve` terminal. To reset
 ministack state:
@@ -364,7 +364,7 @@ If the provider doesn't need codegen (task-only types like Airflow's
 for the new type — the provider's `deploy` method won't receive an
 artifact to upload.
 
-See [docs/CODEGEN.md](./CODEGEN.md) for the full codegen reference —
+See [codegen reference](../reference/codegen.md) for the full codegen reference —
 template context variables, how source/transform/sink dispatch works,
 and where to wire a new source/sink/transform type.
 
@@ -471,4 +471,4 @@ cargo test
 
 If the real logic lives in `yard-core`, add tests there. The command
 file itself is too thin to warrant its own tests. See
-[TESTING.md](TESTING.md) for test conventions.
+[testing](testing.md) for test conventions.
