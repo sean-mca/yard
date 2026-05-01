@@ -195,6 +195,23 @@ Defined by `JobDefinition` in `yard-structs/src/config.rs`.
 | `url` / `headers` | api | HTTP GET URL and headers. |
 | `options` | No | Opaque passthrough to `.option()` (spark) or `connection_options` (glue). |
 
+**`secret_id` JSON schema:**
+
+When `source_type: jdbc`, the referenced AWS Secrets Manager secret's `SecretString` MUST be a JSON object with this shape:
+
+```json
+{
+  "username": "<jdbc-user>",
+  "password": "<jdbc-password>"
+}
+```
+
+These keys are read literally by the emitted PySpark (`_secret["username"]` / `_secret["password"]`); other key names will cause the script to error at job execution time.
+
+Consumed by `render_secret_fetch` in `yard-core/src/codegen/helpers.rs` (line 101); the jdbc consumer is at `yard-core/src/codegen/source.rs` (line 80).
+
+**Gotcha (`secret_id` on non-jdbc):** If `secret_id` is set on a non-jdbc source (`s3`, `catalog`, `kafka`, `api`), `render_secret_fetch` still emits the boto3 SecretsManager fetch lines, but no codegen arm reads `_secret`. The fetch is silently unused — jobs run but waste a SecretsManager call. AWS Secrets Manager setup (creating the secret, granting `secretsmanager:GetSecretValue` to the job role) is out of scope for this page; see AWS docs.
+
 #### `sink` fields (`Sink` struct)
 
 | Field | Required | Description |
@@ -202,10 +219,19 @@ Defined by `JobDefinition` in `yard-structs/src/config.rs`.
 | `source` | No | Which DataFrame to write (defaults to first/only source). |
 | `sink_type` (often `type:`) | Yes | `s3`, `jdbc`, or `catalog`. |
 | `format` | Context-dependent | `parquet`, `csv`, `json`, `orc`. |
-| `path` / `connection_url` / `table` / `database` / `secret_id` | Varies | Location + credentials. |
+| `path` | s3 | S3 URI for the output. |
+| `connection_url` | jdbc | JDBC URL. |
+| `table` / `database` | jdbc / catalog / iceberg | Table and database names. |
+| `secret_id` | No | AWS Secrets Manager secret for credentials. |
 | `mode` | No | `overwrite`, `append`, or `error`. |
 | `partition_by` | No | Partition columns. |
 | `fill_nulls` | No | Iceberg-only. Defaults to true; set `false` to opt out of null/void coercion. |
+
+**`secret_id` JSON schema:**
+
+Same `{"username": "...", "password": "..."}` shape as for sources. Consumed when `sink_type: jdbc` — see `yard-core/src/codegen/sink.rs` (line 48). The non-jdbc dead-code gotcha applies the same way: setting `secret_id` on `s3` / `catalog` / `iceberg` sinks emits an unused SecretsManager fetch.
+
+For the full schema and rationale, see the [Source `secret_id` schema](#sources-fields-source-struct) section above.
 
 #### `transforms[]` fields (`Transform` struct)
 
