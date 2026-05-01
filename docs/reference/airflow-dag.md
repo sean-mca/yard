@@ -10,7 +10,7 @@ to a Python file and (optionally) upload it to an MWAA-compatible S3 bucket.
 
 This document is the authoritative reference for that integration. For the
 top-level `airflow:` block field list that also appears in
-[CONFIGURATION.md](./CONFIGURATION.md), this doc gives the complete semantics,
+[configuration](configuration.md), this doc gives the complete semantics,
 operator mapping, and end-to-end examples.
 
 - [Discovery and grouping](#discovery-and-grouping)
@@ -174,7 +174,7 @@ shape.
 | `retries` | int | any layer | `default_args["retries"]` | Passed through as an integer. |
 | `dags_bucket` | string | any layer | — (deployment) | S3 bucket the generated `.py` is uploaded to during `yard apply`. Typically the MWAA DAGs bucket. |
 | `dags_prefix` | string | any layer | — (deployment) | S3 key prefix under `dags_bucket`. Defaults to `dags/` when unset. |
-| `trigger` | object (typed) | DAG layer | per-source schedule (Dataset list, sensor task chain, or `schedule=None` for API) | Optional event-driven trigger block. See [Airflow Datasets](#airflow-datasets) and [docs/CONFIGURATION.md](CONFIGURATION.md#dagyaml-trigger-block). |
+| `trigger` | object (typed) | DAG layer | per-source schedule (Dataset list, sensor task chain, or `schedule=None` for API) | Optional event-driven trigger block. See [Airflow Datasets](#airflow-datasets) and [configuration](configuration.md#dagyaml-trigger-block). |
 | `publishes` | array of strings | any layer | `_yard_publish` synthetic terminal task with `outlets=[Dataset("uri"), ...]` | DAG-level Dataset URIs published when every user task succeeds. Per-task `outlets=` is configured via per-job `airflow.publishes`. |
 | `max_active_runs` | int (>=1) | DAG layer | `max_active_runs=N` on `DAG(...)` | Optional concurrency limit. Defaults to `1` for event-driven DAGs (CONC-01); Airflow's default of 16 for schedule-only DAGs. |
 | `aws` | object | any layer | — (deployment) | Optional credential override for DAG upload/destroy. When set, this `aws:` block OVERRIDES the root+account.yaml cascade. Same shape as root `aws:` (`assume_role`, `session_name`, `external_id`). See [DAG bucket credentials](#dag-bucket-credentials). |
@@ -397,7 +397,7 @@ entries in declaration order.
 DAG-level `publishes:` (declared at the top of `dag.yaml`) instead emits a
 synthetic terminal `_yard_publish = EmptyOperator(...)` task with the
 `Dataset(...)` outlets, wired downstream of every leaf user task. See
-[docs/CONFIGURATION.md](CONFIGURATION.md#dagyaml-publishes) for the
+[configuration](configuration.md#dagyaml-publishes) for the
 `publishes:` reference.
 
 ### Consuming datasets (`trigger.dataset:` on a DAG)
@@ -420,15 +420,15 @@ schedule=(Dataset("s3://example-bucket/sales/orders") & Dataset("s3://example-bu
 ```
 
 A single-source variant (`trigger: { dataset: { uri: ... } }`) emits
-`schedule=[Dataset(uri)]`. See [docs/CONFIGURATION.md](CONFIGURATION.md#dagyaml-trigger-block)
+`schedule=[Dataset(uri)]`. See [configuration](configuration.md#dagyaml-trigger-block)
 for the full `trigger:` block reference.
 
 ### Precedence
 
 The typed `trigger:` block is mutually exclusive with `schedule:`. Declaring
 both at any layer is rejected at validation. See the
-[decision matrix](CONFIGURATION.md#dagyaml-decision-matrix--schedule-vs-trigger)
-in CONFIGURATION.md for the four-cell truth table.
+[decision matrix](configuration.md#dagyaml-decision-matrix--schedule-vs-trigger)
+in `configuration.md` for the four-cell truth table.
 
 The `from airflow.datasets import Dataset` import is emitted only when the
 DAG uses datasets on either side.
