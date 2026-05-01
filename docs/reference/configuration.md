@@ -412,7 +412,7 @@ layers shallow-override earlier layers.
 
 For the full Airflow reference — how DAGs are discovered and generated,
 the operator mapping, dataset-based triggering, and per-job Airflow
-metadata — see [docs/AIRFLOW.md](./AIRFLOW.md).
+metadata — see [airflow DAG reference](airflow-dag.md).
 
 ### dag.yaml: `trigger:` block
 
@@ -483,7 +483,7 @@ publishes:
 
 Runtime semantics: the synthetic `_yard_publish = EmptyOperator(task_id="_yard_publish", outlets=[Dataset(...), ...])` runs after every user task succeeds (default `trigger_rule="all_success"`). Outlets fire on success. Per-task `outlets=` is still available via `airflow.publishes` on each `<job>.yaml` (renamed from `produces:`).
 
-See [docs/AIRFLOW.md](AIRFLOW.md#airflow-datasets) for runtime semantics and backfill caveats.
+See [airflow DAG reference](airflow-dag.md#airflow-datasets) for runtime semantics and backfill caveats.
 
 ### dag.yaml: `max_active_runs:`
 
@@ -526,7 +526,7 @@ Empty strings are treated as unset at every layer (the typed-config helper filte
 | **`schedule:` declared** | REJECTED at validation. Pick one — use `trigger: { schedule: "<cron>" }` if you need both forms in one DAG. | Schedule-only DAG. Renders `schedule="<cron>"`. PRES-02 byte-identical to pre-v1.6. |
 | **`schedule:` absent** | Event-driven DAG. Renders per-source schedule (Dataset list, sensor task, or `schedule=None` for API). `max_active_runs=1` default applies. | DAG with no scheduling — Airflow defaults to manual trigger. Same as pre-v1.6 behavior. |
 
-Migration from `triggered_by:` and `produces:` is documented in [docs/MIGRATION-v1.6.md](MIGRATION-v1.6.md).
+Migration from `triggered_by:` and `produces:` is documented in [v1.6 migration](migrations/v1.6.md).
 
 ---
 
