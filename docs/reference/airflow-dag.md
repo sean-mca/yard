@@ -13,6 +13,8 @@ top-level `airflow:` block field list that also appears in
 [configuration](configuration.md), this doc gives the complete semantics,
 operator mapping, and end-to-end examples.
 
+For the rationale behind yard's codegen design (the Tera scaffolding + Rust body split that DAG codegen also uses), see [explanation/why-codegen.md](../explanation/why-codegen.md).
+
 - [Discovery and grouping](#discovery-and-grouping)
 - [Config inheritance](#config-inheritance)
 - [AirflowSection reference](#airflowsection-reference)
@@ -22,7 +24,7 @@ operator mapping, and end-to-end examples.
 - [Cross-account connections](#cross-account-connections)
 - [Airflow Datasets](#airflow-datasets)
 - [Generation, deployment, destroy](#generation-deployment-destroy)
-- [End-to-end example](#end-to-end-example)
+- [Examples (Phase 35 lift candidates)](#examples-phase-35-will-lift-these-to-how-toschedule-a-dagmd)
 - [Validation errors](#validation-errors)
 - [Limitations and planned work](#limitations-and-planned-work)
 
@@ -505,7 +507,93 @@ Implementation:
 
 ---
 
-## Worked example: three-account deployment
+## Generation, deployment, destroy
+
+### CLI commands
+
+See [cli.md](cli.md) for the flag reference. The behavior described below is DAG-specific.
+
+- `yard plan` — shows `+ Create DAG`, `~ Modify DAG`, `- Delete DAG` diffs alongside job diffs. No side effects.
+- `yard apply` — regenerates DAG Python, writes to `.yard/generated/dags/<dag>.py`, uploads to S3 if `dags_bucket` is set, persists DAG state. Prints required cross-account connections.
+- `yard show <dag_name>` — prints the generated DAG Python to stdout without writing or uploading. Falls back from job lookup.
+- `yard destroy <dag_name>` — deletes the DAG `.py` from S3 (if deployed), deletes DAG state, removes `.yard/generated/dags/<dag>.py`.
+- `yard destroy` (no target) — destroys every tracked DAG in addition to every tracked job.
+- `yard validate` — does **not** run DAG validation currently; only per-job schema + Python syntax. Orphan `airflow:` blocks are caught at `yard apply`, not `yard validate`.
+
+### Local output
+
+For every DAG in the diff, `apply_dags` (`yard-core/src/dag_lifecycle.rs`)
+writes the rendered Python to:
+
+```
+<project_root>/.yard/generated/dags/<dag_name>.py
+```
+
+The directory is created if missing. The file stays on disk even after a
+dry-run apply.
+
+### S3 upload (MWAA)
+
+When `dags_bucket` resolves to a non-empty string (from anywhere in the
+inheritance chain), `apply_dags` uploads the generated file to S3:
+
+```
+s3://<dags_bucket>/<dags_prefix><dag_name>.py
+```
+
+where `dags_prefix` defaults to `dags/` when unset. The resulting `s3_uri` is
+recorded in DAG state with `status: "deployed"`. When `dags_bucket` is unset,
+the file is only written locally and `status` becomes `"generated"`.
+
+Region for the S3 client is resolved in this order
+(`dag_lifecycle.rs::extract_airflow_region`):
+
+1. `providers.airflow.region` in `yard.yaml`.
+2. The state backend's region if `state.type: s3`.
+3. Error: `Cannot determine AWS region for DAG S3 upload. Set 'region' in
+   providers.airflow or use an S3 state backend.`
+
+For cross-account uploads, the `account.yaml` `aws:` block at the DAG's
+directory is shallow-merged with the root `aws:` block
+(`dag_lifecycle.rs::resolve_aws_for_dir`), so per-account AssumeRole overrides
+apply.
+
+Example project-level config:
+
+```yaml
+# yard.yaml
+providers:
+  airflow:
+    region: us-east-1
+    dags_bucket: your-mwaa-dags-bucket
+    dags_prefix: dags/
+```
+
+### State
+
+DAG deployment state is persisted via the same storage backend as jobs
+(`yard-core/src/storage.rs`). The per-DAG record (`DagState`) holds:
+
+- `content_hash` — blake3 hash of the rendered Python.
+- `config` — serialized `AirflowSection` at apply time.
+- `tasks` — ordered task list.
+- `status` — `"deployed"` or `"generated"`.
+- `applied_at` — RFC 3339 timestamp.
+- `s3_uri` — the upload URI, or `None` for local-only DAGs.
+
+Diffs (`calculate_dag_diffs` in `dag_lifecycle.rs`) compare the new
+`content_hash` against the stored one and surface field-level changes when
+they differ.
+
+---
+
+## Examples (Phase 35 will lift these to how-to/schedule-a-dag.md)
+
+These are full worked examples kept here transitionally; Phase 35 HOW-01 will lift them into `how-to/schedule-a-dag.md` and adjacent recipes. Each subsection's Phase-35 destination is annotated below.
+
+### Worked example: three-account deployment
+
+*Phase 35 destination: docs/how-to/cross-account-deploy.md (HOW-02).*
 
 A realistic configuration where state, deployment targets, and the
 DAG bucket each live in different AWS accounts:
@@ -583,103 +671,11 @@ resolves credentials exactly as before Phase 9 — the default chain
 for state, the existing root+account.yaml cascade for providers and
 DAG uploads.
 
----
+### End-to-end example
 
-## Generation, deployment, destroy
+*Phase 35 destination: docs/how-to/schedule-a-dag.md (HOW-01).*
 
-### CLI commands
-
-All Airflow codegen is triggered from the same CLI that handles jobs — there
-is no dedicated `yard airflow` subcommand. The wiring lives in
-`yard-cli/src/commands/`:
-
-| Command | Wiring | What it does for DAGs |
-|---------|--------|-----------------------|
-| `yard plan` | `plan.rs` → `airflow_dag::collect_dags` + `calculate_dag_diffs` | Shows `+ Create DAG`, `~ Modify DAG`, `- Delete DAG` diffs alongside job diffs. No side effects. |
-| `yard apply` | `apply.rs` → `yard_core::apply` → `dag_lifecycle::apply_dags` | Regenerates DAG Python, writes to `.yard/generated/dags/<dag>.py`, uploads to S3 if `dags_bucket` is set, persists DAG state. Prints required cross-account connections. |
-| `yard show <dag_name>` | `show.rs` → `show_dag` | Prints the generated DAG Python to stdout without writing or uploading. Falls back from job lookup. |
-| `yard destroy <dag_name>` | `destroy.rs` → `destroy_dag` | Deletes the DAG `.py` from S3 (if deployed), deletes DAG state, removes `.yard/generated/dags/<dag>.py`. |
-| `yard destroy` (no target) | `destroy.rs` → `destroy_all` | Destroys every tracked DAG in addition to every tracked job. |
-| `yard validate` | `validate.rs` | Does **not** run DAG validation currently — only per-job schema + Python syntax. Orphan `airflow:` blocks are caught at `yard apply`, not `yard validate`. |
-
-### Local output
-
-For every DAG in the diff, `apply_dags` (`yard-core/src/dag_lifecycle.rs`)
-writes the rendered Python to:
-
-```
-<project_root>/.yard/generated/dags/<dag_name>.py
-```
-
-The directory is created if missing. The file stays on disk even after a
-dry-run apply.
-
-### S3 upload (MWAA)
-
-When `dags_bucket` resolves to a non-empty string (from anywhere in the
-inheritance chain), `apply_dags` uploads the generated file to S3:
-
-```
-s3://<dags_bucket>/<dags_prefix><dag_name>.py
-```
-
-where `dags_prefix` defaults to `dags/` when unset. The resulting `s3_uri` is
-recorded in DAG state with `status: "deployed"`. When `dags_bucket` is unset,
-the file is only written locally and `status` becomes `"generated"`.
-
-Region for the S3 client is resolved in this order
-(`dag_lifecycle.rs::extract_airflow_region`):
-
-1. `providers.airflow.region` in `yard.yaml`.
-2. The state backend's region if `state.type: s3`.
-3. Error: `Cannot determine AWS region for DAG S3 upload. Set 'region' in
-   providers.airflow or use an S3 state backend.`
-
-For cross-account uploads, the `account.yaml` `aws:` block at the DAG's
-directory is shallow-merged with the root `aws:` block
-(`dag_lifecycle.rs::resolve_aws_for_dir`), so per-account AssumeRole overrides
-apply.
-
-Example project-level config:
-
-```yaml
-# yard.yaml
-providers:
-  airflow:
-    region: us-east-1
-    dags_bucket: your-mwaa-dags-bucket
-    dags_prefix: dags/
-```
-
-### Destroy
-
-`yard destroy <dag_name>` deletes the S3 object (if `s3_uri` was recorded),
-deletes the DAG state row, and removes the local `.py` file. Destroy uses
-`aws_config` from the root manifest (without the DAG directory's
-`account.yaml` overrides, since destroy runs purely off state and may not
-have filesystem context).
-
-### State
-
-DAG deployment state is persisted via the same storage backend as jobs
-(`yard-core/src/storage.rs`). The per-DAG record (`DagState`) holds:
-
-- `content_hash` — blake3 hash of the rendered Python.
-- `config` — serialized `AirflowSection` at apply time.
-- `tasks` — ordered task list.
-- `status` — `"deployed"` or `"generated"`.
-- `applied_at` — RFC 3339 timestamp.
-- `s3_uri` — the upload URI, or `None` for local-only DAGs.
-
-Diffs (`calculate_dag_diffs` in `dag_lifecycle.rs`) compare the new
-`content_hash` against the stored one and surface field-level changes when
-they differ.
-
----
-
-## End-to-end example
-
-### Directory layout
+#### Directory layout
 
 ```
 my-project/
@@ -695,7 +691,7 @@ my-project/
           notify.yaml           # task (depends on orders)
 ```
 
-### Files
+#### Files
 
 **`yard.yaml`**
 
@@ -743,7 +739,7 @@ airflow:
     - orders
 ```
 
-### Resulting DAG Python
+#### Resulting DAG Python
 
 Rendered by `generate_dag` for the resolved DAG (illustrative; actual
 whitespace follows the template in
@@ -785,7 +781,7 @@ with DAG(
 t_orders >> t_notify
 ```
 
-### What `yard apply` does
+#### What `yard apply` does
 
 1. Walks to find `orders-pipeline/dag.yaml`. DAG id = `my_proj_orders_pipeline`.
 2. Resolves schedule: project `airflow` has none; `dag.yaml` contributes
@@ -801,6 +797,16 @@ t_orders >> t_notify
 Because no task declares a cross-account `_aws.assume_role`, the
 `aws_conn_id` is `aws_default` and no `# Required Airflow connections` header
 is emitted.
+
+### Destroy walkthrough
+
+*Phase 35 destination: docs/how-to/cross-account-deploy.md or adjacent (HOW-02).*
+
+`yard destroy <dag_name>` deletes the S3 object (if `s3_uri` was recorded),
+deletes the DAG state row, and removes the local `.py` file. Destroy uses
+`aws_config` from the root manifest (without the DAG directory's
+`account.yaml` overrides, since destroy runs purely off state and may not
+have filesystem context).
 
 ---
 
