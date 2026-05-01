@@ -5,7 +5,7 @@ This document is for **operators deploying `yard-server`** — the web
 dashboard + GitHub webhook receiver defined in the `yard-server` crate. It
 does *not* cover the `yard` CLI, which runs locally on developer / CI
 machines and is not deployed as a service (see
-[GETTING-STARTED.md](GETTING-STARTED.md) for CLI setup).
+[quickstart](../quickstart.md) for CLI setup).
 
 ## Deployment topology
 
@@ -15,7 +15,7 @@ machines and is not deployed as a service (see
 - Receives GitHub webhooks at `POST /api/webhook/github`
   (`github/router.rs:30`).
 - Serves the Dioxus dashboard + API (dashboard, jobs, drift, settings,
-  WebSocket events — see [API.md](API.md) for the full route list).
+  WebSocket events — see [server API reference](../server/api.md) for the full route list).
 - Runs two background tasks inside the same process:
   - `drift_poll_loop` — clones the configured GitHub repo, runs
     `yard_core::calculate_diff` + `verify_deployed_resources`, writes
@@ -130,7 +130,7 @@ following works in production:
 |----------|---------|-------|
 | `YARD_API_BASE` | `http://127.0.0.1:3001` | Baked into the Dioxus wasm bundle via `option_env!`. Production builds typically set `YARD_API_BASE=""` so the UI derives the host from `window().location()`. Changing it requires a rebuild of `yard-server`. |
 
-See [CONFIGURATION.md](CONFIGURATION.md) for the full env var reference
+See [configuration reference](../reference/configuration.md) for the full env var reference
 (including the CLI-side vars the apply path also uses).
 
 A working local-dev template is in `env.local.example`:
@@ -239,7 +239,7 @@ role only DynamoDB + `sts:AssumeRole` into one or more *target* deploy
 roles (one per AWS account being deployed to), and let per-project
 `aws.assume_role` config in `yard.yaml` perform the actual cross-account
 privilege grant. This mirrors how the CLI's `YARD_AWS_ASSUME_ROLE` works
-(see [CONFIGURATION.md](CONFIGURATION.md#yard-cli-environment-variables)).
+(see [configuration reference](../reference/configuration.md#yard-cli-environment-variables)).
 
 <!-- VERIFY: cross-account AssumeRole setup. The repository supports STS AssumeRole via YAML or YARD_AWS_* env vars, but the trust-policy wiring is deployment-specific. -->
 
@@ -456,7 +456,7 @@ as a reminder that each requires deployment-specific configuration:
 
 ## Related docs
 
-- [CONFIGURATION.md](CONFIGURATION.md) — full env var + YAML reference.
-- [ARCHITECTURE.md](ARCHITECTURE.md) — yard-server component layout and
+- [configuration reference](../reference/configuration.md) — full env var + YAML reference.
+- [architecture](../explanation/architecture.md) — yard-server component layout and
   data flow.
-- [API.md](API.md) — every HTTP + WebSocket route the server exposes.
+- [server API reference](../server/api.md) — every HTTP + WebSocket route the server exposes.
