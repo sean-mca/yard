@@ -76,7 +76,7 @@ Your caller identity needs permission to:
 
 If you plan to use AssumeRole (for cross-account deploys), yard also reads
 `YARD_AWS_ASSUME_ROLE`, `YARD_AWS_SESSION_NAME`, and `YARD_AWS_EXTERNAL_ID`
-env vars — see [CONFIGURATION.md](CONFIGURATION.md#yard-cli-environment-variables).
+env vars — see [configuration](reference/configuration.md#yard-cli-environment-variables).
 
 ### S3 bucket(s)
 
@@ -188,7 +188,7 @@ providers:
 
 The full list of `providers.glue` fields (worker type, Glue version,
 bookmarks, connections, etc.) is documented in
-[CONFIGURATION.md](CONFIGURATION.md#providersglue--aws-glue-provider-defaults).
+[configuration](reference/configuration.md#providersglue--aws-glue-provider-defaults).
 The defaults (`script_prefix: yard-scripts/`, `glue_version: 4.0`,
 `worker_type: G.1X`, `number_of_workers: 2`) are fine for this tutorial.
 
@@ -237,7 +237,7 @@ job files by walking the directory tree from `yard.yaml` downward. For a
 hierarchical multi-account layout (e.g. `aws/dev/us-east-2/orders.yaml`), see
 the project structure section of the [README](../README.md#project-structure)
 and the context-inheritance rules in
-[CONFIGURATION.md](CONFIGURATION.md#accountyaml--regionyaml-hierarchical-context).
+[configuration](reference/configuration.md#accountyaml--regionyaml-hierarchical-context).
 
 ### 4. Validate the job
 
@@ -431,18 +431,18 @@ a yard project or you passed the wrong directory.
 
 You now have a working single-job yard project. From here:
 
-- **[ARCHITECTURE.md](ARCHITECTURE.md)** — how the yard-cli / yard-core /
+- **[architecture](explanation/architecture.md)** — how the yard-cli / yard-core /
   yard-structs / yard-server crates fit together, the provider trait, state
   storage, and the end-to-end data flow for `plan` / `apply`.
-- **[CONFIGURATION.md](CONFIGURATION.md)** — the full reference for
+- **[configuration](reference/configuration.md)** — the full reference for
   `yard.yaml`, `account.yaml`, `region.yaml`, `dag.yaml`, per-job fields
   (sources, sinks, transforms, partitioning, Airflow metadata), and every
   environment variable the CLI reads.
-- **[DEVELOPMENT.md](DEVELOPMENT.md)** — how to work on yard itself — build
+- **[development](contributing/development.md)** — how to work on yard itself — build
   commands, running tests, linting, and the workspace layout.
 - **README project structure** — the [hierarchical multi-account
   layout](../README.md#project-structure) for teams managing many accounts
   and regions.
-- **[DEPLOYMENT.md](DEPLOYMENT.md)** — deploying yard-server (the companion
+- **[deploy](how-to/deploy.md)** — deploying yard-server (the companion
   service for GitHub-webhook-driven PR workflows and drift detection). Not
   needed for the CLI-only workflow you just set up.
