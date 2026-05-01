@@ -16,7 +16,6 @@ engine), see [airflow DAG reference](airflow-dag.md). This doc is the deep dive 
 a high level.
 
 - [Overview](#overview)
-- [Template system](#template-system)
 - [Source generation](#source-generation)
 - [Transform generation](#transform-generation)
 - [Sink generation](#sink-generation)
@@ -31,34 +30,11 @@ a high level.
 
 ## Overview
 
-### What codegen does
-
-Codegen takes a parsed `JobDefinition` (from `yard-structs/src/config.rs`)
-plus provider context (merged from `providers.<type>:` in `yard.yaml` and
-the per-job `<job_type>:` block) and produces a single Python/PySpark
-script as a `String`. The string is then either:
-
-- written to stdout by `yard show <job>`; or
-- uploaded to S3 by the provider's `deploy` method (as `text/x-python`)
-  and pointed at by the Glue job definition or EMR step that yard
-  creates/updates.
-
-No code runs locally — yard only emits the script, uploads it, and wires
-up the cloud resource that will execute it.
-
-### Where it fits in plan/apply
-
-From `yard-core/src/providers/glue.rs` and `yard-core/src/providers/emr.rs`:
-
-1. `generate_python_script(job_name, job_def)` produces the script string.
-2. `S3ScriptOps::upload_script(job_name, artifact)` uploads it to
-   `s3://{script_bucket}/{script_prefix}{job_name}.py`.
-3. The Glue provider calls `update_job` (falling back to `create_job` if
-   the Glue job doesn't exist yet) with `script_location` set to that S3
-   URI. The EMR provider submits a `spark-submit` step whose last arg is
-   the S3 URI.
-4. `deploy` returns a `Vec<Resource>` (one `s3_object`, one `glue_job` or
-   `emr_step`) that `yard-core` records in state for drift detection.
+This page is the rules reference for how yard renders source / sink /
+transform code into a single PySpark script. For the *rationale* behind
+these design choices — why Tera, why bake at apply-time, why scaffolding
+lives in templates while the dataframe body is built in Rust — see
+[explanation/why-codegen.md](../explanation/why-codegen.md).
 
 ### Entry points
 
@@ -77,16 +53,6 @@ Task-only job types (currently just `bash` — see
 no PySpark artifact to generate or upload, and the apply path skips the
 deploy step for them.
 
----
-
-## Template system
-
-yard uses the [Tera](https://keats.github.io/tera/) template engine. The
-templates are compiled into the binary at build time with
-`include_str!("../templates/<name>")` (see the two `const` declarations at
-the top of `yard-core/src/codegen/mod.rs`), so there is nothing to deploy
-alongside the CLI.
-
 ### Template files
 
 All live under `yard-core/src/templates/`:
@@ -99,14 +65,8 @@ All live under `yard-core/src/templates/`:
 
 ### Render context
 
-Both the `glue.py.tera` and `emr.py.tera` templates receive a **flat**
-render context with pre-rendered string fragments rather than nested
-structures. The split — scaffolding in Tera, pipeline body generated in
-Rust — keeps the Tera templates short and predictable, and lets the Rust
-renderers emit arbitrary multiline strings without fighting Tera's
-whitespace rules.
-
-Keys inserted by `generate_python_script`:
+Keys inserted by `generate_python_script` into the flat Tera render
+context for `glue.py.tera` and `emr.py.tera`:
 
 | Key | Type | Used in template | Produced by |
 |---|---|---|---|
@@ -115,10 +75,6 @@ Keys inserted by `generate_python_script`:
 | `imports_block` | string | `{{ imports_block }}` inline at module scope (both) | `render_imports` + auto-injected imports; may have the Iceberg fill-nulls helpers appended |
 | `body` | string | `{{ body }}` inside `def run():` (both) | Rendered source/transform/sink pipeline, or indented user-supplied `body:`, or `"    pass"` |
 | `iceberg_warehouse` | string | `glue.py.tera` only — inside a `{%- if iceberg_warehouse %}` block that adds Iceberg Spark catalog configs | `job_def.config.glue.warehouse` (empty string if unset) |
-
-Nothing else is a template variable: there are no per-source, per-sink, or
-per-transform loops in the templates themselves. Everything under
-`def run():` is built in Rust and inlined as a single string.
 
 ---
 
