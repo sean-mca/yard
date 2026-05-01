@@ -8,7 +8,7 @@
 
 This document describes the HTTP and WebSocket API exposed by `yard-server`
 (the companion server binary in `yard-server/`). The CLI tool `yard` does not
-expose an API — see the root [README.md](../README.md) for CLI usage.
+expose an API — see the root [README.md](../../README.md) for CLI usage.
 
 ## Overview
 
