@@ -1,0 +1,32 @@
+name: Verify CLI docs
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docs/reference/cli.md'
+      - 'yard-cli/src/**'
+      - 'scripts/verify-cli-docs.sh'
+      - '.github/workflows/verify-cli-docs.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify cli.md flag coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Verify CLI flag coverage
+        run: bash scripts/verify-cli-docs.sh
