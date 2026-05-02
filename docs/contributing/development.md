@@ -4,7 +4,7 @@
 This document is for contributors working on yard itself (adding providers,
 fixing bugs in `yard-core`, extending the Dioxus UI, etc.). If you are
 trying to *use* yard to deploy data jobs, start with
-[GETTING-STARTED.md](GETTING-STARTED.md) instead.
+[quickstart](../quickstart.md) instead.
 
 - [Repo layout](#repo-layout)
 - [Local dev setup](#local-dev-setup)
@@ -31,10 +31,10 @@ members = ["yard-cli", "yard-core", "yard-structs", "yard-server"]
 
 | Crate | Role |
 |-------|------|
-| `yard-cli` (package name `yard`, produces the `yard` binary) | Thin CLI wrapper — parses `clap` args, delegates to `yard-core`, formats output. No business logic. |
-| `yard-core` | Library. All logic: codegen, providers, storage, validation, diff, DAG generation, orchestration. |
-| `yard-structs` | Shared `serde` types (`ProjectManifest`, `JobDefinition`, `JobState`, `JobDiff`, `StateBackend`, `Resource`, …). Minimal deps — `serde`, `anyhow`, `serde_json`. |
-| `yard-server` | Dioxus fullstack binary — GitHub webhooks, drift polling, Axum API, Dioxus/Tailwind dashboard, DynamoDB persistence. |
+| `yard-cli` (package name `yard`, produces the `yard` binary) | Thin CLI wrapper — parses `clap` args, delegates to `yard-core`, formats output. No business logic. The `list` subcommand (v1.3.4) follows this rule by calling `yard_core::list_targets::list_targets(&manifest, &root_dir)` and formatting the rows. |
+| `yard-core` | Library. All logic: codegen, providers, storage, validation, diff, DAG generation, orchestration. v1.5 added the `StorageBackend` trait (P23 EXT-01) at `yard-core/src/storage.rs` — backends now implement a single `Box<dyn StorageBackend>` interface (Local + S3 today; DynamoDB / GCS / etc. plug in by adding an impl). v1.5 also introduced typed-config helpers `GlueRawConfig` / `EmrRawConfig` (P24 EXT-02) — private `serde::Deserialize` structs in `yard-core/src/providers/{glue,emr}.rs` that own provider-knob extraction with field-level defaults. v1.6 added the `Trigger` enum (5 source variants — `schedule`, `s3`, `dataset`, `sqs`, `api`) at `yard-structs/src/trigger.rs` plus the `airflow_dag/{helpers,triggers}.rs` modules for event-driven DAG codegen. |
+| `yard-structs` | Shared `serde` types (`ProjectManifest`, `JobDefinition`, `JobState`, `JobDiff`, `StateBackend`, `Resource`, `Trigger`, …). Minimal deps — `serde`, `anyhow`, `serde_json`. |
+| `yard-server` | Dioxus fullstack binary — GitHub webhooks, drift polling, Axum API, Dioxus/Tailwind dashboard, DynamoDB persistence. v1.5 split the server into focused submodules: `auth/` (P25 SRV-01 — `require_bearer` middleware + hand-rolled constant-time `ct_eq` compare), `secrets/` (P25 SRV-02 — `SecretStore` trait with `AwsSecretStore` impl over `secretsmanager:GetSecretValue`), and `polling/` (P26 SRV-03 — `supervised_iteration` per-iteration timeouts + `compute_backoff_sleep` exponential backoff). The cookie-session login surface (`auth/session`, `auth/logout`) lives in `api/auth_session.rs`. |
 
 The dependency graph is strict: `yard-cli` and `yard-server` depend on
 `yard-core`; `yard-core` depends on `yard-structs`; `yard-structs`
@@ -43,7 +43,7 @@ depends on nothing inside the workspace. `yard-core` never depends on
 
 For the full breakdown — component diagrams, data flow through a
 `yard apply`, and per-directory descriptions — see
-[ARCHITECTURE.md](ARCHITECTURE.md).
+[architecture](../explanation/architecture.md).
 
 ---
 
@@ -56,7 +56,7 @@ For the full breakdown — component diagrams, data flow through a
 | Rust toolchain | `stable` | CI uses `dtolnay/rust-toolchain@stable` with `clippy` and `rustfmt` components. No `rust-toolchain.toml` is pinned in the repo. |
 | Cargo | Bundled with `rustup` | Workspace uses `resolver = "3"` (Edition 2024), which requires a recent enough toolchain. |
 | Docker + Docker Compose | Any recent version | Only needed if you plan to run `yard-server` locally against `ministack` (S3 + DynamoDB emulator). |
-| `dx` (Dioxus CLI) | Any version compatible with `dioxus = "0.7"` | Only needed for running the `yard-server` Dioxus UI. Install with `cargo install dioxus-cli`. <!-- VERIFY: exact dx version pinned for this Dioxus release --> |
+| `dx` (Dioxus CLI) | Any version compatible with `dioxus = "0.7"` | Only needed for running the `yard-server` Dioxus UI. The Dioxus runtime version is pinned to `dioxus = "0.7"` in `yard-server/Cargo.toml`; install a matching `dioxus-cli` with `cargo install dioxus-cli` (the latest 0.7.x is the supported pairing). |
 
 ### Clone and install dependencies
 
@@ -102,7 +102,7 @@ All build commands target the entire workspace by default.
 | `cargo build -p yard` | Build only the CLI (package name is `yard`, not `yard-cli`). |
 | `cargo build -p yard-core` | Build only the core library. |
 | `cargo build -p yard-server` | Build only the server crate (native target). |
-| `cargo test` | Run the full test suite. See [TESTING.md](TESTING.md) for details. |
+| `cargo test` | Run the full test suite. See [testing](testing.md) for details. |
 | `cargo clippy --all-targets -- -D warnings` | Lint. Must be clean before any PR. |
 | `cargo fmt --all` | Format. Must be clean before any PR. |
 | `cargo fmt --all -- --check` | CI formatting gate (doesn't modify files). |
@@ -160,7 +160,7 @@ export AWS_ENDPOINT_URL=http://localhost:4566
 cargo run -p yard -- plan
 ```
 
-See [CONFIGURATION.md](CONFIGURATION.md) for every env var yard respects.
+See [configuration reference](../reference/configuration.md) for every env var yard respects.
 
 ---
 
@@ -208,7 +208,7 @@ the API is mounted under `/api` on the same port.
 
 Real-time dashboard updates use a WebSocket at `/api/ws/events`; the
 Dioxus UI connects to it automatically when the page loads. See
-[docs/API.md](API.md) for the full endpoint list.
+[server API reference](../server/api.md) for the full endpoint list.
 
 To stop the server, Ctrl+C in the `dx serve` terminal. To reset
 ministack state:
@@ -321,9 +321,31 @@ is called by drift detection to confirm those resources still exist in
 the target service.
 
 Look at `yard-core/src/providers/glue.rs` for a reference implementation
-that covers all three methods, uses the shared `S3ScriptOps` helper for
-script uploads, and parses provider config via `serde_json::Value`
-lookups.
+that covers all three methods and uses the shared `S3ScriptOps` helper for
+script uploads.
+
+#### Typed-config helper pattern (v1.5 P24 EXT-02)
+
+New providers should define a private `XxxRawConfig` `serde::Deserialize`
+struct that owns the provider's knob extraction, mirroring the
+`GlueRawConfig` (`yard-core/src/providers/glue.rs::GlueRawConfig`) and
+`EmrRawConfig` (`yard-core/src/providers/emr.rs::EmrRawConfig`) examples.
+The pattern:
+
+- Private struct with `#[derive(Deserialize)]` and one field per
+  provider knob.
+- Per-field `#[serde(default = "...")]` for sensible defaults so
+  `serde_json::from_value` materialises a fully-typed config from a
+  partial `serde_json::Value`.
+- Provider `new()` extracts hard-required fields (e.g. `script_bucket`)
+  with the legacy error string preserved byte-for-byte before calling
+  `serde_json::from_value` for the typed knobs (so existing tests and
+  user-facing error messages don't drift).
+- The struct stays `pub(crate)` or private — it's an implementation
+  detail of the provider, not a public API.
+
+`GlueRawConfig` is the canonical example; copy its shape verbatim for
+new providers and replace the field set.
 
 ### 2. Register the file
 
@@ -364,14 +386,17 @@ If the provider doesn't need codegen (task-only types like Airflow's
 for the new type — the provider's `deploy` method won't receive an
 artifact to upload.
 
-See [docs/CODEGEN.md](./CODEGEN.md) for the full codegen reference —
+See [codegen reference](../reference/codegen.md) for the full codegen reference —
 template context variables, how source/transform/sink dispatch works,
 and where to wire a new source/sink/transform type.
 
 ### 5. Document and test
 
-- Add provider-defaults docs to `docs/CONFIGURATION.md` under the
-  `providers.<type>` section.
+- Add provider-defaults docs to `docs/reference/providers/<type>.md`
+  (mirror the existing `docs/reference/providers/glue.md` and
+  `docs/reference/providers/emr.md`), and add a one-line cross-link
+  from the relevant `providers.<type>` section in
+  `docs/reference/configuration.md`.
 - Add unit tests in the new `providers/<name>.rs` file (the existing
   providers use `#[cfg(test)]` modules with mocked `serde_json::Value`
   configs).
@@ -471,4 +496,4 @@ cargo test
 
 If the real logic lives in `yard-core`, add tests there. The command
 file itself is too thin to warrant its own tests. See
-[TESTING.md](TESTING.md) for test conventions.
+[testing](testing.md) for test conventions.

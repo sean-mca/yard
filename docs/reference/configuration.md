@@ -122,35 +122,11 @@ Implementation: `yard-core/src/storage.rs::get_storage` and
 
 #### `providers.glue` — AWS Glue provider defaults
 
-Consumed by `GlueProvider::new` in `yard-core/src/providers/glue.rs`.
-
-| Field | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `script_bucket` | Yes | — | S3 bucket where generated PySpark scripts are uploaded. |
-| `script_prefix` | No | `yard-scripts/` | Key prefix under `script_bucket`. |
-| `region` | No | `us-east-1` | AWS region for the Glue client. |
-| `glue_version` | No | `4.0` | Glue runtime version. |
-| `worker_type` | No | `G.1X` | Glue worker instance type. |
-| `number_of_workers` | No | `2` | Number of Glue workers. |
-| `timeout` | No | (unset) | Job timeout in minutes. |
-| `max_retries` | No | (unset) | Maximum automatic retries. |
-| `max_concurrent_runs` | No | (unset) | Max concurrent executions. |
-| `bookmark` | No | (unset) | `enabled`/`true` sets `--job-bookmark-enable`; anything else sets `--job-bookmark-disable`. |
-| `connections` | No | `[]` | Array of Glue connection names to attach. |
-| `default_arguments` | No | `{}` | Extra `--key: value` arguments. `--datalake-formats: iceberg` is injected automatically unless overridden. |
+See [providers/glue.md](providers/glue.md) for the full Glue provider reference (knobs, AWS resources, IAM actions, limitations). The on-disk schema is owned by the private `GlueRawConfig` `serde::Deserialize` struct in `yard-core/src/providers/glue.rs` (v1.5 P24 EXT-02 typed-config helper); per-field defaults and parse errors flow from there.
 
 #### `providers.emr` — AWS EMR (classic) provider defaults
 
-Consumed by `EmrProvider::new` in `yard-core/src/providers/emr.rs`.
-
-| Field | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `script_bucket` | Yes | — | S3 bucket for uploaded scripts. |
-| `cluster_id` | Yes | — | ID of an existing EMR cluster (`j-XXXXXXXX`). |
-| `script_prefix` | No | `yard-scripts/` | Key prefix under `script_bucket`. |
-| `region` | No | `us-east-1` | AWS region. |
-| `deploy_mode` | No | `cluster` | Passed to `spark-submit --deploy-mode`. |
-| `action_on_failure` | No | `CONTINUE` | EMR step failure action (`CONTINUE`, `CANCEL_AND_WAIT`, `TERMINATE_CLUSTER`). |
+See [providers/emr.md](providers/emr.md) for the full EMR (classic, NOT EMR Serverless) provider reference (knobs, AWS resources, IAM actions, limitations). The on-disk schema is owned by the private `EmrRawConfig` `serde::Deserialize` struct in `yard-core/src/providers/emr.rs` (v1.5 P24 EXT-02 typed-config helper).
 
 #### `aws` (root-level)
 
@@ -219,6 +195,23 @@ Defined by `JobDefinition` in `yard-structs/src/config.rs`.
 | `url` / `headers` | api | HTTP GET URL and headers. |
 | `options` | No | Opaque passthrough to `.option()` (spark) or `connection_options` (glue). |
 
+**`secret_id` JSON schema:**
+
+When `source_type: jdbc`, the referenced AWS Secrets Manager secret's `SecretString` MUST be a JSON object with this shape:
+
+```json
+{
+  "username": "<jdbc-user>",
+  "password": "<jdbc-password>"
+}
+```
+
+These keys are read literally by the emitted PySpark (`_secret["username"]` / `_secret["password"]`); other key names will cause the script to error at job execution time.
+
+Consumed by `render_secret_fetch` in `yard-core/src/codegen/helpers.rs` (line 101); the jdbc consumer is at `yard-core/src/codegen/source.rs` (line 80).
+
+**Gotcha (`secret_id` on non-jdbc):** If `secret_id` is set on a non-jdbc source (`s3`, `catalog`, `kafka`, `api`), `render_secret_fetch` still emits the boto3 SecretsManager fetch lines, but no codegen arm reads `_secret`. The fetch is silently unused — jobs run but waste a SecretsManager call. AWS Secrets Manager setup (creating the secret, granting `secretsmanager:GetSecretValue` to the job role) is out of scope for this page; see AWS docs.
+
 #### `sink` fields (`Sink` struct)
 
 | Field | Required | Description |
@@ -226,10 +219,19 @@ Defined by `JobDefinition` in `yard-structs/src/config.rs`.
 | `source` | No | Which DataFrame to write (defaults to first/only source). |
 | `sink_type` (often `type:`) | Yes | `s3`, `jdbc`, or `catalog`. |
 | `format` | Context-dependent | `parquet`, `csv`, `json`, `orc`. |
-| `path` / `connection_url` / `table` / `database` / `secret_id` | Varies | Location + credentials. |
+| `path` | s3 | S3 URI for the output. |
+| `connection_url` | jdbc | JDBC URL. |
+| `table` / `database` | jdbc / catalog / iceberg | Table and database names. |
+| `secret_id` | No | AWS Secrets Manager secret for credentials. |
 | `mode` | No | `overwrite`, `append`, or `error`. |
 | `partition_by` | No | Partition columns. |
 | `fill_nulls` | No | Iceberg-only. Defaults to true; set `false` to opt out of null/void coercion. |
+
+**`secret_id` JSON schema:**
+
+Same `{"username": "...", "password": "..."}` shape as for sources. Consumed when `sink_type: jdbc` — see `yard-core/src/codegen/sink.rs` (line 48). The non-jdbc dead-code gotcha applies the same way: setting `secret_id` on `s3` / `catalog` / `iceberg` sinks emits an unused SecretsManager fetch.
+
+For the full schema and rationale, see the [Source `secret_id` schema](#sources-fields-source-struct) section above.
 
 #### `transforms[]` fields (`Transform` struct)
 
@@ -412,7 +414,7 @@ layers shallow-override earlier layers.
 
 For the full Airflow reference — how DAGs are discovered and generated,
 the operator mapping, dataset-based triggering, and per-job Airflow
-metadata — see [docs/AIRFLOW.md](./AIRFLOW.md).
+metadata — see [airflow DAG reference](airflow-dag.md).
 
 ### dag.yaml: `trigger:` block
 
@@ -483,7 +485,7 @@ publishes:
 
 Runtime semantics: the synthetic `_yard_publish = EmptyOperator(task_id="_yard_publish", outlets=[Dataset(...), ...])` runs after every user task succeeds (default `trigger_rule="all_success"`). Outlets fire on success. Per-task `outlets=` is still available via `airflow.publishes` on each `<job>.yaml` (renamed from `produces:`).
 
-See [docs/AIRFLOW.md](AIRFLOW.md#airflow-datasets) for runtime semantics and backfill caveats.
+See [airflow DAG reference](airflow-dag.md#airflow-datasets) for runtime semantics and backfill caveats.
 
 ### dag.yaml: `max_active_runs:`
 
@@ -526,7 +528,7 @@ Empty strings are treated as unset at every layer (the typed-config helper filte
 | **`schedule:` declared** | REJECTED at validation. Pick one — use `trigger: { schedule: "<cron>" }` if you need both forms in one DAG. | Schedule-only DAG. Renders `schedule="<cron>"`. PRES-02 byte-identical to pre-v1.6. |
 | **`schedule:` absent** | Event-driven DAG. Renders per-source schedule (Dataset list, sensor task, or `schedule=None` for API). `max_active_runs=1` default applies. | DAG with no scheduling — Airflow defaults to manual trigger. Same as pre-v1.6 behavior. |
 
-Migration from `triggered_by:` and `produces:` is documented in [docs/MIGRATION-v1.6.md](MIGRATION-v1.6.md).
+Migration from `triggered_by:` and `produces:` is documented in [v1.6 migration](migrations/v1.6.md).
 
 ---
 
@@ -537,7 +539,7 @@ Discovered by greping `std::env::var` across `yard-cli/src/` and
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `AWS_ACCESS_KEY_ID` | Conditional | — | Used by the AWS SDK default credential chain. Required unless another mechanism (AssumeRole, IMDS, SSO, `~/.aws/credentials`) provides credentials. <!-- VERIFY: exact IAM permissions required for Glue + EMR + S3 operations --> |
+| `AWS_ACCESS_KEY_ID` | Conditional | — | Used by the AWS SDK default credential chain. Required unless another mechanism (AssumeRole, IMDS, SSO, `~/.aws/credentials`) provides credentials. The minimum IAM permissions for `yard apply` (Glue + EMR + S3 + STS + IAM:PassRole) are sketched at [deploy.md → AWS permissions for yard apply](../how-to/deploy.md#aws-permissions-for-yard-apply-webhook-triggered); cross-account guidance lives at [how-to/cross-account-deploy.md](../how-to/cross-account-deploy.md). |
 | `AWS_SECRET_ACCESS_KEY` | Conditional | — | Paired with `AWS_ACCESS_KEY_ID`. |
 | `AWS_SESSION_TOKEN` | Conditional | — | For temporary credentials. |
 | `AWS_REGION` | No | `us-east-1` (provider fallback) | Consumed by the AWS SDK. Provider `region` config overrides it. |
@@ -566,10 +568,11 @@ See `env.local.example` at the repo root for a working local-dev template.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `YARD_GITHUB_TOKEN` | Yes | GitHub personal access token or app token. The server exits with `"YARD_GITHUB_TOKEN must be set"` if missing or empty. <!-- VERIFY: exact GitHub token scopes required --> |
+| `YARD_GITHUB_TOKEN` | Yes | GitHub personal access token or app token. The server exits with `"YARD_GITHUB_TOKEN must be set"` if missing or empty. Minimum scopes: classic PAT with `repo` scope (or `public_repo` for public repos) is sufficient for clone + comment + read PR metadata; fine-grained PAT or GitHub App installation token needs **Pull requests: Read & Write** (PR comments), **Contents: Read** (clone), **Issues: Read & Write** (`issue_comment` events). See [deploy.md → Auth token scopes](../how-to/deploy.md#auth-token-scopes). |
 | `YARD_WEBHOOK_SECRET` | Yes | Shared secret used to validate `X-Hub-Signature-256` on incoming GitHub webhooks. |
 | `YARD_REPO_OWNER` | Yes | GitHub organization or user that owns the watched repo. |
 | `YARD_REPO_NAME` | Yes | Name of the watched repo (without owner prefix). |
+| `YARD_API_TOKEN` | Yes (always) | Bearer token required on every `Authorization: Bearer <token>` header for `/api/*` requests (v1.5 SRV-01). Required even when `YARD_API_AUTH_DISABLED` is set. The cookie-session path (`yard_session` cookie) carries the same token via `POST /api/auth/session`. **Charset constraint:** printable ASCII (`0x21..=0x7E`) excluding `;`, `,`, `"`, and `\` (RFC 6265 cookie-syntax). See [server/api.md → Authentication](../server/api.md#authentication) for the wire shape and [server/overview.md → Bearer-token auth](../server/overview.md#bearer-token-auth) for the canonical model. |
 
 ### Runtime (optional)
 
@@ -612,7 +615,7 @@ Allowed keys and their validation rules are defined in
 | `drift_interval` | string (minutes) | `1`, `3`, `5`, `10` | `3` | Interval between drift-check runs. Applied by the `drift_poll_loop` background task each iteration. |
 | `dashboard_interval` | string (minutes) | any positive integer | `5` | Interval between dashboard cache refreshes. |
 | `slack_enabled` | string bool | `true`, `false` | `false` (alerts disabled) | Master switch for drift-threshold Slack alerts. |
-| `slack_webhook_url` | string | any (lenient) | (empty) | Slack Incoming Webhook URL used for alerts. <!-- VERIFY: Slack workspace / webhook channel configuration is set up outside the repo --> |
+| `slack_webhook_secret_arn` | string (ARN) | any | (empty) | **NEW in v1.5 (SRV-02).** AWS Secrets Manager ARN whose secret value is the Slack incoming-webhook URL. Resolved on every drift-alert tick via `secretsmanager:GetSecretValue` (`yard-server/src/secrets/`). Slack workspace / channel / webhook URL provisioning is operator responsibility and lives outside the repo. The legacy `slack_webhook_url` key is **decommissioned** — POSTs containing it return `400 Bad Request`, and the server refuses to boot if a row with that key still exists in DynamoDB. See [server/overview.md → Slack webhook secret migration](../server/overview.md#slack-webhook-secret-migration) for the migration recipe. |
 | `alert_drift_threshold` | string (u32) | integer `>= 1` | (unset — alerts off) | Minimum number of drifted jobs that triggers a Slack alert. |
 | `alert_cooldown_minutes` | string (u64) | integer `>= 1` | `10` | Minimum minutes between consecutive alerts. |
 | `alert_last_sent_at` | string (RFC 3339) | any (server-written) | — | Timestamp of the last successful alert. Written by the alerting loop; not meant to be edited via the UI. |
@@ -666,7 +669,10 @@ following per-environment patterns are discoverable from the repo:
   `YARD_DB_ENDPOINT_URL=http://localhost:4566` and `AWS_ACCESS_KEY_ID=test`.
   In production, `YARD_DB_ENDPOINT_URL` is unset and real AWS credentials
   are supplied via the default credential chain. No `.env.production` or
-  `.env.staging` file exists in the repo. <!-- VERIFY: production deployment platform and how production env vars are injected (Docker, ECS task definition, Fargate, etc.) -->
+  `.env.staging` file exists in the repo — production deployment platform
+  and env-var injection mechanism (Docker run, ECS task definition,
+  Fargate, Kubernetes ConfigMap/Secret, systemd unit, etc.) is operator
+  choice, not encoded in the repo.
 - **CI / AssumeRole overrides.** The `YARD_AWS_ASSUME_ROLE`,
   `YARD_AWS_SESSION_NAME`, and `YARD_AWS_EXTERNAL_ID` env vars exist
   specifically so CI can override any YAML-declared `aws:` block without

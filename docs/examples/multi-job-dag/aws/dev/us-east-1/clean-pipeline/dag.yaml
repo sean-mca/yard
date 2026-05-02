@@ -1,0 +1,7 @@
+# Consumer DAG. Triggers automatically when the producer's
+# Dataset URI fires (see ../raw-pipeline/dag.yaml `publishes:`).
+# NOTE: `trigger:` is mutually exclusive with `schedule:` —
+# declaring both is REJECTED at validation.
+trigger:
+  dataset:
+    uri: s3://acme-analytics-prod-clean/orders/

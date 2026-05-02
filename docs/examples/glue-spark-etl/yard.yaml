@@ -1,0 +1,23 @@
+# acme-glue-etl example project — single Glue job demonstrating
+# the source -> transform -> sink pattern. See README.md for
+# what to change before applying to your own AWS account.
+project: acme-glue-etl
+
+state:
+  type: local
+  path: .yard/state
+
+providers:
+  glue:
+    script_bucket: acme-analytics-prod-glue-scripts
+    script_prefix: yard-scripts/
+    region: us-east-1
+    glue_version: "4.0"
+    worker_type: G.1X
+    number_of_workers: 2
+  airflow:
+    region: us-east-1
+    dags_bucket: acme-analytics-prod-mwaa-dags
+    dags_prefix: dags/
+    owner: data-team
+    retries: 1

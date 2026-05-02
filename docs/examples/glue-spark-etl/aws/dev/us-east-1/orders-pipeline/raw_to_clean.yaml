@@ -1,0 +1,30 @@
+type: glue
+role: arn:aws:iam::123456789012:role/acme-yard-glue-job
+
+sources:
+  - name: orders
+    type: s3
+    path: s3://acme-analytics-prod-raw/orders/
+    format: parquet
+
+transforms:
+  - type: sql
+    source: orders
+    output: orders_projected
+    query: "SELECT order_id, customer_id, order_total_cents, status, created_at FROM orders WHERE order_total_cents > 0"
+  - type: filter
+    source: orders_projected
+    output: paid_orders
+    condition: F.col("status") == "paid"
+  - type: drop_columns
+    source: paid_orders
+    output: paid_orders_clean
+    columns:
+      - status
+
+sink:
+  source: paid_orders_clean
+  type: s3
+  path: s3://acme-analytics-prod-clean/orders/
+  format: parquet
+  mode: overwrite

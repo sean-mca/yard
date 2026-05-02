@@ -8,7 +8,7 @@
 
 This document describes the HTTP and WebSocket API exposed by `yard-server`
 (the companion server binary in `yard-server/`). The CLI tool `yard` does not
-expose an API — see the root [README.md](../README.md) for CLI usage.
+expose an API — see the root [README.md](../../README.md) for CLI usage.
 
 ## Overview
 
@@ -30,24 +30,53 @@ that exposes:
   `issue_comment` events to drive `yard plan` and `yard apply` on PRs.
 
 The server binds to `0.0.0.0:${YARD_PORT}` (defaulting to `3001`), wraps the
-whole router in a CORS layer (`Any` origin/method/headers), a Tower Governor
-rate limiter (30 req/s with a burst of 60), and an HTTP tracing layer. Source:
+whole router in a narrowed CORS layer (single allowed origin via
+`YARD_CORS_ORIGIN`, methods restricted to `GET, POST`, headers restricted
+to `Content-Type, Authorization`; falls back to `AllowOrigin::any()` only
+when `YARD_CORS_ORIGIN` is unset for dev convenience —
+`yard-server/src/main.rs:292-300`), a Tower Governor rate limiter (30 req/s
+with a burst of 60), and an HTTP tracing layer. Source:
 `yard-server/src/main.rs::start_api_server`.
 
 ## Authentication
 
-### HTTP endpoints (`/api/dashboard*`, `/api/jobs*`, `/api/drift*`, `/api/settings`)
+See [server/overview.md](overview.md#bearer-token-auth) for the canonical
+auth model; this page documents the wire shapes.
 
-**There is no authentication on these endpoints.** They are not protected by
-bearer tokens, session cookies, OAuth, or any other client-side auth
-mechanism — the router applies only CORS and rate-limiting middleware. The
-server itself authenticates outbound to GitHub using a server-side Personal
-Access Token (`YARD_GITHUB_TOKEN`), but incoming HTTP requests are accepted
-from any origin.
+### HTTP endpoints (`/api/dashboard*`, `/api/jobs*`, `/api/drift*`, `/api/settings`, `/api/ws/events`)
 
-This is a development-grade posture. Do not expose `yard-server` directly to
-the public internet without fronting it with authentication at the reverse
-proxy / ingress layer. <!-- VERIFY: deployment auth posture for production environments -->
+Every `/api/*` route except the GitHub webhook and the
+`/api/auth/session` + `/api/auth/logout` endpoints sits behind the bearer
+auth middleware (`yard-server/src/auth/mod.rs::require_bearer`, wired at
+`yard-server/src/main.rs:314-323`). The middleware accepts EITHER of two
+credentials carrying the same `YARD_API_TOKEN`:
+
+- **`Authorization: Bearer <YARD_API_TOKEN>` header.** Used by CLI /
+  automation / `curl`. The middleware constant-time compares the presented
+  bytes against `YARD_API_TOKEN` (hand-rolled `ct_eq` in
+  `yard-server/src/auth/mod.rs`).
+- **`Cookie: yard_session=<YARD_API_TOKEN>` cookie.** Used by the bundled
+  Dioxus UI. Browsers do not let WASM set arbitrary `Authorization`
+  headers on cross-origin or WebSocket-upgrade requests, but they
+  automatically include same-origin cookies on every fetch and on the
+  WebSocket handshake. The cookie is set by `POST /api/auth/session`
+  (documented below) with `HttpOnly; SameSite=Strict; Path=/; Secure`.
+
+When both credentials are present on a single request, the header takes
+precedence over the cookie. Failure messages do not distinguish which
+credential was attempted (fail-undifferentiated). Missing or invalid
+credential returns `401 Unauthorized` with the standard
+`{error, status: 401}` body.
+
+**Loopback-only dev bypass.** Setting `YARD_API_AUTH_DISABLED=1` (or
+`true`/`yes`/`on`, case-insensitive) makes the middleware skip the bearer
+check **only for callers whose source SocketAddr is loopback**
+(`127.0.0.0/8` or `::1`). Non-loopback callers always go through the
+standard credential path. `YARD_API_TOKEN` is required at startup even
+when this is set. Do not enable in production. The middleware uses
+axum's `ConnectInfo<SocketAddr>` (the OS-reported peer address) — it
+does NOT consult `X-Forwarded-For` / `Forwarded` / any client-controlled
+header.
 
 ### GitHub webhook (`/api/webhook/github`)
 
@@ -63,31 +92,82 @@ Source: `yard-server/src/github/webhook.rs::parse_webhook`.
 
 ### WebSocket (`/api/ws/events`)
 
-The WebSocket upgrade handshake has no authentication. Any client that can
-reach the server can subscribe. The rate limiter applies only to the upgrade
-handshake; once upgraded, frames flow freely. Source:
-`yard-server/src/api/events.rs::events_router`.
+The WebSocket upgrade handshake sits behind the same bearer auth layer as
+every other `/api/*` route — the upgrade is rejected with `401` unless the
+request carries either an `Authorization: Bearer <YARD_API_TOKEN>` header
+OR a `yard_session=<YARD_API_TOKEN>` cookie. Browsers do not let WASM set
+arbitrary headers on the upgrade request, so the bundled Dioxus UI relies
+on the same-origin cookie path; CLI / automation callers use the bearer
+header. Source: `yard-server/src/api/events.rs::events_router`, gated by
+`yard-server/src/auth/mod.rs::require_bearer` per
+`yard-server/src/main.rs:319`.
+
+### Cookie-session endpoints (`/api/auth/session`, `/api/auth/logout`)
+
+These two endpoints sit OUTSIDE the bearer auth layer (mounted at the
+parent router level alongside the GitHub webhook router) — login can't
+require login. They are still rate-limited by the parent-router governor
+layer (30 req/s, burst 60). Source:
+`yard-server/src/api/auth_session.rs`.
+
+#### POST `/api/auth/session`
+
+Body:
+
+```json
+{ "token": "<YARD_API_TOKEN>" }
+```
+
+On match: `200 OK` + `Set-Cookie: yard_session=<YARD_API_TOKEN>; HttpOnly; SameSite=Strict; Path=/; Secure`.
+On mismatch or unconfigured token: `401 Unauthorized`, no `Set-Cookie`.
+
+Cookie attributes:
+
+- `HttpOnly` — JS cannot read via `document.cookie` (XSS payload cannot
+  exfiltrate the token).
+- `SameSite=Strict` — browser will not include the cookie on any
+  cross-site request (CSRF defence).
+- `Path=/` — scoped to the yard-server origin.
+- `Secure` — always set; the cookie is only ever sent over HTTPS. yard-server
+  does NOT detect HTTPS at the application layer (broken behind a TLS
+  terminator that talks plain HTTP to the app); failing closed is correct.
+  Practical consequence: on plain HTTP loopback dev, the cookie path does
+  not work — use the `Authorization: Bearer` header instead.
+
+No `Max-Age` / `Expires` — session cookie, cleared on browser close.
+
+#### POST `/api/auth/logout`
+
+No body. Always returns `204 No Content` + `Set-Cookie: yard_session=; HttpOnly; SameSite=Strict; Path=/; Secure; Max-Age=0`
+(clears the cookie unconditionally; no auth required).
+
+The clear mirrors the original cookie's `Secure` attribute — RFC 6265bis
+"Leave Secure Cookies Alone" forbids an insecure context from overwriting
+a Secure cookie, so `Secure` on the clear is mandatory for sign-out from
+HTTPS to work.
 
 ## Endpoints
 
 | Method | Path | Description | Auth |
 |---|---|---|---|
-| GET | `/api/dashboard` | Live-fetch PR list + job counts from GitHub. | None |
-| GET | `/api/dashboard/cached` | Paginated read from the DynamoDB dashboard cache. | None |
-| GET | `/api/jobs` | List job YAML files in the tracked repo's HEAD commit. | None |
-| GET | `/api/jobs/file?path=…` | Fetch the raw UTF-8 contents of a single file from the tracked repo. | None |
-| GET | `/api/drift` | Run a full drift check (clone + resolve + diff + AWS verify). Expensive. | None |
-| GET | `/api/drift/cached` | Return the most recent cached drift result. | None |
-| GET | `/api/drift/summary` | Lightweight `{drifted, in_sync}` counts derived from DynamoDB snapshots. | None |
-| GET | `/api/settings` | Return all key/value settings. | None |
-| POST | `/api/settings` | Validate and persist a batch of settings. | None |
-| GET | `/api/ws/events` | WebSocket upgrade for server-push refresh events. | None |
+| GET | `/api/dashboard` | Live-fetch PR list + job counts from GitHub. | Bearer or session |
+| GET | `/api/dashboard/cached` | Paginated read from the DynamoDB dashboard cache. | Bearer or session |
+| GET | `/api/jobs` | List job YAML files in the tracked repo's HEAD commit. | Bearer or session |
+| GET | `/api/jobs/file?path=…` | Fetch the raw UTF-8 contents of a single file from the tracked repo. | Bearer or session |
+| GET | `/api/drift` | Run a full drift check (clone + resolve + diff + AWS verify). Expensive. | Bearer or session |
+| GET | `/api/drift/cached` | Return the most recent cached drift result. | Bearer or session |
+| GET | `/api/drift/summary` | Lightweight `{drifted, in_sync}` counts derived from DynamoDB snapshots. | Bearer or session |
+| GET | `/api/settings` | Return all key/value settings. | Bearer or session |
+| POST | `/api/settings` | Validate and persist a batch of settings. | Bearer or session |
+| GET | `/api/ws/events` | WebSocket upgrade for server-push refresh events. | Bearer or session |
+| POST | `/api/auth/session` | Establish the `yard_session` cookie. | Token in body |
+| POST | `/api/auth/logout` | Clear the `yard_session` cookie. | None |
 | POST | `/api/webhook/github` | GitHub webhook receiver (plan on PR, apply via comment). | HMAC-SHA256 |
 
 All route registrations live in `yard-server/src/main.rs::start_api_server`,
 and each sub-router is defined in its corresponding module
 (`api/dashboard.rs`, `api/drift.rs`, `api/jobs.rs`, `api/settings.rs`,
-`api/events.rs`, `github/router.rs`).
+`api/events.rs`, `api/auth_session.rs`, `github/router.rs`).
 
 ## Request / Response Formats
 
@@ -280,10 +360,16 @@ no changes are persisted.
 | `drift_interval` | `"1"`, `"3"`, `"5"`, `"10"` (minutes) |
 | `dashboard_interval` | Any positive integer (minutes) |
 | `slack_enabled` | `"true"`, `"false"` |
-| `slack_webhook_url` | Any string (not validated as URL) |
+| `slack_webhook_secret_arn` | AWS Secrets Manager ARN (`arn:aws:secretsmanager:*`) — empty string allowed (clears) |
 | `alert_drift_threshold` | Any integer `>= 1` |
 | `alert_cooldown_minutes` | Any integer `>= 1` |
 | `alert_last_sent_at` | Any string (server-written; pass-through) |
+
+The legacy `slack_webhook_url` key is **rejected** with `400 Bad Request` —
+`yard-server/src/api/settings.rs::validate_setting` returns the message
+`"slack_webhook_url is read-only; configure slack_webhook_secret_arn (a Secrets Manager ARN) instead."`
+See [server/overview.md → Slack webhook secret migration](overview.md#slack-webhook-secret-migration)
+for the migration recipe.
 
 **Response:** `200 OK` with an empty body on success.
 

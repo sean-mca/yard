@@ -1,0 +1,23 @@
+# acme-multi-job example project — two DAGs wired by an Airflow
+# Dataset. Producer raw_to_clean publishes; consumer clean_to_aggregated
+# triggers on the published URI. See README.md for the full wiring shape.
+project: acme-multi-job
+
+state:
+  type: local
+  path: .yard/state
+
+providers:
+  glue:
+    script_bucket: acme-analytics-prod-glue-scripts
+    script_prefix: yard-scripts/
+    region: us-east-1
+    glue_version: "4.0"
+    worker_type: G.1X
+    number_of_workers: 2
+  airflow:
+    region: us-east-1
+    dags_bucket: acme-analytics-prod-mwaa-dags
+    dags_prefix: dags/
+    owner: data-team
+    retries: 1
