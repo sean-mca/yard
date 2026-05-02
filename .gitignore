@@ -1,7 +1,7 @@
 target/
 
 
-yard.yaml
+/yard.yaml
 .yard/
 
 
