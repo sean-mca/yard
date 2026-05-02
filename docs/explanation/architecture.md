@@ -173,7 +173,7 @@ For the full PySpark codegen reference — template system, per-source/transform
 
 - `main.rs` — one-liner that boots `tokio` and calls `yard::run()`.
 - `lib.rs` — `run()` parses args and dispatches to `commands::*`.
-- `parser.rs` — `clap` `Cli` / `Commands` enum for `init`, `plan`, `apply`, `show`, `validate`, `destroy`, `force-unlock`.
+- `parser.rs` — `clap` `Cli` / `Commands` enum for `init`, `plan`, `apply`, `show`, `validate`, `destroy`, `force-unlock`, `list`.
 - `commands/` — one file per subcommand; each is 20–80 lines of "call core, format output."
 - `context.rs`, `utils.rs` — terminal color handling (`--no-color`, `--colorblind`, `NO_COLOR` env var).
 
