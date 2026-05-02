@@ -122,11 +122,11 @@ Implementation: `yard-core/src/storage.rs::get_storage` and
 
 #### `providers.glue` — AWS Glue provider defaults
 
-See [providers/glue.md](providers/glue.md) for the full Glue provider reference (knobs, AWS resources, IAM actions, limitations).
+See [providers/glue.md](providers/glue.md) for the full Glue provider reference (knobs, AWS resources, IAM actions, limitations). The on-disk schema is owned by the private `GlueRawConfig` `serde::Deserialize` struct in `yard-core/src/providers/glue.rs` (v1.5 P24 EXT-02 typed-config helper); per-field defaults and parse errors flow from there.
 
 #### `providers.emr` — AWS EMR (classic) provider defaults
 
-See [providers/emr.md](providers/emr.md) for the full EMR (classic, NOT EMR Serverless) provider reference (knobs, AWS resources, IAM actions, limitations).
+See [providers/emr.md](providers/emr.md) for the full EMR (classic, NOT EMR Serverless) provider reference (knobs, AWS resources, IAM actions, limitations). The on-disk schema is owned by the private `EmrRawConfig` `serde::Deserialize` struct in `yard-core/src/providers/emr.rs` (v1.5 P24 EXT-02 typed-config helper).
 
 #### `aws` (root-level)
 
@@ -539,7 +539,7 @@ Discovered by greping `std::env::var` across `yard-cli/src/` and
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `AWS_ACCESS_KEY_ID` | Conditional | — | Used by the AWS SDK default credential chain. Required unless another mechanism (AssumeRole, IMDS, SSO, `~/.aws/credentials`) provides credentials. <!-- VERIFY: exact IAM permissions required for Glue + EMR + S3 operations --> |
+| `AWS_ACCESS_KEY_ID` | Conditional | — | Used by the AWS SDK default credential chain. Required unless another mechanism (AssumeRole, IMDS, SSO, `~/.aws/credentials`) provides credentials. The minimum IAM permissions for `yard apply` (Glue + EMR + S3 + STS + IAM:PassRole) are sketched at [deploy.md → AWS permissions for yard apply](../how-to/deploy.md#aws-permissions-for-yard-apply-webhook-triggered); cross-account guidance lives at [how-to/cross-account-deploy.md](../how-to/cross-account-deploy.md). |
 | `AWS_SECRET_ACCESS_KEY` | Conditional | — | Paired with `AWS_ACCESS_KEY_ID`. |
 | `AWS_SESSION_TOKEN` | Conditional | — | For temporary credentials. |
 | `AWS_REGION` | No | `us-east-1` (provider fallback) | Consumed by the AWS SDK. Provider `region` config overrides it. |
@@ -568,10 +568,11 @@ See `env.local.example` at the repo root for a working local-dev template.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `YARD_GITHUB_TOKEN` | Yes | GitHub personal access token or app token. The server exits with `"YARD_GITHUB_TOKEN must be set"` if missing or empty. <!-- VERIFY: exact GitHub token scopes required --> |
+| `YARD_GITHUB_TOKEN` | Yes | GitHub personal access token or app token. The server exits with `"YARD_GITHUB_TOKEN must be set"` if missing or empty. Minimum scopes: classic PAT with `repo` scope (or `public_repo` for public repos) is sufficient for clone + comment + read PR metadata; fine-grained PAT or GitHub App installation token needs **Pull requests: Read & Write** (PR comments), **Contents: Read** (clone), **Issues: Read & Write** (`issue_comment` events). See [deploy.md → Auth token scopes](../how-to/deploy.md#auth-token-scopes). |
 | `YARD_WEBHOOK_SECRET` | Yes | Shared secret used to validate `X-Hub-Signature-256` on incoming GitHub webhooks. |
 | `YARD_REPO_OWNER` | Yes | GitHub organization or user that owns the watched repo. |
 | `YARD_REPO_NAME` | Yes | Name of the watched repo (without owner prefix). |
+| `YARD_API_TOKEN` | Yes (always) | Bearer token required on every `Authorization: Bearer <token>` header for `/api/*` requests (v1.5 SRV-01). Required even when `YARD_API_AUTH_DISABLED` is set. The cookie-session path (`yard_session` cookie) carries the same token via `POST /api/auth/session`. **Charset constraint:** printable ASCII (`0x21..=0x7E`) excluding `;`, `,`, `"`, and `\` (RFC 6265 cookie-syntax). See [server/api.md → Authentication](../server/api.md#authentication) for the wire shape and [server/overview.md → Bearer-token auth](../server/overview.md#bearer-token-auth) for the canonical model. |
 
 ### Runtime (optional)
 
@@ -614,7 +615,7 @@ Allowed keys and their validation rules are defined in
 | `drift_interval` | string (minutes) | `1`, `3`, `5`, `10` | `3` | Interval between drift-check runs. Applied by the `drift_poll_loop` background task each iteration. |
 | `dashboard_interval` | string (minutes) | any positive integer | `5` | Interval between dashboard cache refreshes. |
 | `slack_enabled` | string bool | `true`, `false` | `false` (alerts disabled) | Master switch for drift-threshold Slack alerts. |
-| `slack_webhook_url` | string | any (lenient) | (empty) | Slack Incoming Webhook URL used for alerts. <!-- VERIFY: Slack workspace / webhook channel configuration is set up outside the repo --> |
+| `slack_webhook_secret_arn` | string (ARN) | any | (empty) | **NEW in v1.5 (SRV-02).** AWS Secrets Manager ARN whose secret value is the Slack incoming-webhook URL. Resolved on every drift-alert tick via `secretsmanager:GetSecretValue` (`yard-server/src/secrets/`). Slack workspace / channel / webhook URL provisioning is operator responsibility and lives outside the repo. The legacy `slack_webhook_url` key is **decommissioned** — POSTs containing it return `400 Bad Request`, and the server refuses to boot if a row with that key still exists in DynamoDB. See [server/overview.md → Slack webhook secret migration](../server/overview.md#slack-webhook-secret-migration) for the migration recipe. |
 | `alert_drift_threshold` | string (u32) | integer `>= 1` | (unset — alerts off) | Minimum number of drifted jobs that triggers a Slack alert. |
 | `alert_cooldown_minutes` | string (u64) | integer `>= 1` | `10` | Minimum minutes between consecutive alerts. |
 | `alert_last_sent_at` | string (RFC 3339) | any (server-written) | — | Timestamp of the last successful alert. Written by the alerting loop; not meant to be edited via the UI. |
@@ -668,7 +669,10 @@ following per-environment patterns are discoverable from the repo:
   `YARD_DB_ENDPOINT_URL=http://localhost:4566` and `AWS_ACCESS_KEY_ID=test`.
   In production, `YARD_DB_ENDPOINT_URL` is unset and real AWS credentials
   are supplied via the default credential chain. No `.env.production` or
-  `.env.staging` file exists in the repo. <!-- VERIFY: production deployment platform and how production env vars are injected (Docker, ECS task definition, Fargate, etc.) -->
+  `.env.staging` file exists in the repo — production deployment platform
+  and env-var injection mechanism (Docker run, ECS task definition,
+  Fargate, Kubernetes ConfigMap/Secret, systemd unit, etc.) is operator
+  choice, not encoded in the repo.
 - **CI / AssumeRole overrides.** The `YARD_AWS_ASSUME_ROLE`,
   `YARD_AWS_SESSION_NAME`, and `YARD_AWS_EXTERNAL_ID` env vars exist
   specifically so CI can override any YAML-declared `aws:` block without
