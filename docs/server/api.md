@@ -360,10 +360,16 @@ no changes are persisted.
 | `drift_interval` | `"1"`, `"3"`, `"5"`, `"10"` (minutes) |
 | `dashboard_interval` | Any positive integer (minutes) |
 | `slack_enabled` | `"true"`, `"false"` |
-| `slack_webhook_url` | Any string (not validated as URL) |
+| `slack_webhook_secret_arn` | AWS Secrets Manager ARN (`arn:aws:secretsmanager:*`) — empty string allowed (clears) |
 | `alert_drift_threshold` | Any integer `>= 1` |
 | `alert_cooldown_minutes` | Any integer `>= 1` |
 | `alert_last_sent_at` | Any string (server-written; pass-through) |
+
+The legacy `slack_webhook_url` key is **rejected** with `400 Bad Request` —
+`yard-server/src/api/settings.rs::validate_setting` returns the message
+`"slack_webhook_url is read-only; configure slack_webhook_secret_arn (a Secrets Manager ARN) instead."`
+See [server/overview.md → Slack webhook secret migration](overview.md#slack-webhook-secret-migration)
+for the migration recipe.
 
 **Response:** `200 OK` with an empty body on success.
 
