@@ -60,8 +60,15 @@ From the repository root, validate the example layout:
 cargo run -p yard -- validate docs/examples/multi-job-dag/
 ```
 
-Expected output: `[PASS] ...` lines per job and exit 0. This is what
-the `validate-examples` CI workflow runs on every PR.
+Expected output (alphabetically sorted by resolved job_name) and
+exit 0:
+
+```
+[PASS] clean-pipeline-clean_to_aggregated.yaml
+[PASS] raw-pipeline-raw_to_clean.yaml
+```
+
+This is what the `validate-examples` CI workflow runs on every PR.
 
 To preview an apply without touching AWS, copy the directory out and
 run `yard plan`:
