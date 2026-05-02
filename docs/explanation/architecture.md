@@ -19,10 +19,10 @@ members = ["yard-cli", "yard-core", "yard-structs", "yard-server"]
 
 | Crate | Binary/library | Purpose |
 |-------|----------------|---------|
-| `yard-cli` (package name `yard`) | `yard` binary | Parses `clap` args, delegates to `yard-core`, prints results. No business logic. |
-| `yard-core` | library | Codegen, providers, storage, validation, diff, DAG generation, orchestration. |
-| `yard-structs` | library | Shared `serde` types: `ProjectManifest`, `JobDefinition`, `JobState`, `JobDiff`, `StateBackend`, `LockInfo`, `Resource`. Minimal deps (`serde`, `anyhow`, `serde_json`). |
-| `yard-server` | Dioxus fullstack binary | GitHub webhooks, drift polling, Slack alerting, Axum API, Dioxus/Tailwind dashboard, DynamoDB persistence. |
+| `yard-cli` (package name `yard`) | `yard` binary | Parses `clap` args, delegates to `yard-core`, prints results. No business logic. v1.3.4 added the `list` subcommand (`yard list targets [--json]`) for CI matrix builders. |
+| `yard-core` | library | Codegen, providers, storage, validation, diff, DAG generation, orchestration. v1.5 added the `StorageBackend` trait, `GlueRawConfig` / `EmrRawConfig` typed-config helpers, and `list_targets.rs`. v1.6 added `airflow_dag/helpers.rs` and `airflow_dag/triggers.rs`. |
+| `yard-structs` | library | Shared `serde` types: `ProjectManifest`, `JobDefinition`, `JobState`, `JobDiff`, `StateBackend`, `LockInfo`, `Resource`. v1.6 added `trigger.rs` (the typed `Trigger` enum) and `error.rs`. Minimal deps (`serde`, `anyhow`, `serde_json`). |
+| `yard-server` | Dioxus fullstack binary | GitHub webhooks, drift polling, Slack alerting, Axum API, Dioxus/Tailwind dashboard, DynamoDB persistence. v1.5 split into focused submodules — `auth/` (bearer + cookie middleware), `secrets/` (`SecretStore` over Secrets Manager), `polling/` (per-iteration timeouts + exp backoff). |
 
 ## Crate dependency graph
 
@@ -47,29 +47,45 @@ Only `yard-cli` and `yard-server` are top-level consumers. `yard-core` never dep
 ```mermaid
 graph TD
     USER[User / CI]
-    CLI[yard-cli<br/>parser.rs, commands/*]
+    CLI[yard-cli<br/>parser.rs, commands/*<br/>incl. list]
     RESOLVE[yard-core::resolve<br/>resolve_project]
     CONFIG[yard-core::config_merge<br/>build_provider_config]
+    LIST[yard-core::list_targets<br/>list_targets]
+    VAL[yard-core::validation<br/>rules + syntax]
     CODEGEN[yard-core::codegen<br/>generate_python_script]
     DIFF[yard-core::diff<br/>calculate_diff]
-    DAG[yard-core::airflow_dag<br/>collect_dags + generate_dag]
+    TRIG[yard-structs::trigger<br/>Trigger enum<br/>5 source variants]
+    DAG[yard-core::airflow_dag<br/>collect_dags + generate_dag<br/>helpers.rs + triggers.rs]
     ORCH[yard-core::orchestrate<br/>apply / destroy / load_state]
-    STORAGE[yard-core::storage<br/>Local / S3]
+    STORAGE[yard-core::storage<br/>StorageBackend trait]
     PROV[yard-core::providers<br/>Provider trait]
     AWS[(AWS: Glue, EMR,<br/>S3, MWAA)]
 
     USER --> CLI
     CLI --> RESOLVE
+    CLI --> LIST
+    LIST --> RESOLVE
     RESOLVE --> CONFIG
+    CONFIG --> VAL
     CONFIG --> DIFF
     CONFIG --> CODEGEN
     CONFIG --> DAG
+    TRIG --> DAG
     DIFF --> ORCH
     ORCH --> STORAGE
     ORCH --> PROV
     PROV --> AWS
     STORAGE --> AWS
 ```
+
+The v1.6 `Trigger` enum (5 source variants — `schedule`, `s3`, `dataset`,
+`sqs`, `api` — plus composite `all`/`any` shapes) is consumed by the
+Airflow DAG codegen pipeline at `airflow_dag/triggers.rs`, which dispatches
+per-source rendering branches for sensors, Datasets, and schedule strings.
+Hand-rolled `Serialize` / `Deserialize` impls on `Trigger` and
+`SingleSource` (`yard-structs/src/trigger.rs:24-26`) emit canonical-JSON
+ordering for HASH-02 stability and produce actionable typo-correction
+errors for unknown source names.
 
 ## Data flow — `yard apply`
 
@@ -144,9 +160,11 @@ For the full PySpark codegen reference — template system, per-source/transform
 ### Airflow DAG codegen — `yard-core/src/airflow_dag/`
 
 - `collection.rs::collect_dags` groups jobs by their nearest `dag.yaml` marker file.
-- `resolve.rs` walks the Airflow config inheritance chain (`yard.yaml` → `account.yaml` → `region.yaml` → `dag.yaml` → per-job `airflow:` block; later layers shallow-override earlier ones).
+- `resolve.rs` walks the Airflow config inheritance chain (`yard.yaml` → `account.yaml` → `region.yaml` → `dag.yaml` → per-job `airflow:` block; later layers shallow-override earlier ones; per-field cascade for `airflow.aws:` since v1.6 commit `691a950`).
 - `generation.rs::generate_dag` renders `yard-core/src/templates/airflow_dag.py.tera`.
 - `connections.rs` emits the Airflow connections a DAG needs (AWS conn id per account).
+- `helpers.rs` (v1.6 P30) — shared template helpers (per-source schedule rendering, `_yard_publish` synthetic terminal task, dataset URI normalisation).
+- `triggers.rs` (v1.6 P32) — per-`Trigger`-variant codegen branches: schedule → `schedule="<cron>"`; dataset → native Airflow Dataset list; s3/sqs → sensor task chain plus `_yard_join` `EmptyOperator`; api → `schedule=None`. Composite `any:` / `all:` rendering (homogeneous Datasets via `&` / `|`, heterogeneous via sensor chain) lives here.
 - DAG state is stored separately (see `DagState` / `DagDeployment` in `yard-structs/src/state.rs`) and hashed by generated Python content.
 
 ## Directory structure rationale
@@ -171,31 +189,38 @@ For the full PySpark codegen reference — template system, per-source/transform
 - `orchestrate.rs` — top-level `apply` / `destroy_all` / `destroy_job` / `force_unlock` / `init_state_backend` / `load_state` / `verify_deployed_resources`.
 - `diff.rs` — hash-and-compare between `ProjectManifest` and `ProjectState`.
 - `validation/` — schema validation (`rules.rs`) + Python syntax check of the generated script (`syntax.rs`).
-- `airflow_dag/` — DAG discovery, config resolution, generation, connection derivation.
+- `airflow_dag/` — DAG discovery, config resolution, generation, connection derivation. v1.6 added `helpers.rs` (shared template helpers, synthetic terminal task) and `triggers.rs` (per-`Trigger`-variant codegen).
 - `dag_lifecycle.rs` — mirrors `orchestrate.rs` for DAG state (apply / destroy / diff).
+- `list_targets.rs` — v1.3.4 `yard list targets [--json]` implementation. Manifest-driven enumeration (jobs from `manifest.jobs`, DAGs from `airflow_dag::collect_dags`); state files are NOT consulted, so un-applied targets appear in the output. Used by CI/CD matrix builders to fan out `apply --target` with per-account OIDC roles.
 - `show.rs` — implements `yard show <job>` and `yard show <dag>`.
 - `utils.rs` — `calculate_hash` (BLAKE3) and misc helpers.
 
 ### `yard-structs/src/`
 
 - `config.rs` — `ProjectManifest`, `JobDefinition`, `Source`, `Sink`, `Transform`, `AirflowSection`, `YARDContext`.
-- `state.rs` — `StateBackend`, `JobState`, `DagState`, `Deployment`, `DagDeployment`, `Resource`, `ResourceStatus`, `LockInfo`.
+- `state.rs` — `StateBackend`, `JobState`, `DagState`, `Deployment`, `DagDeployment`, `Resource`, `ResourceStatus`, `LockInfo`, `AwsCredentialConfig` (per-field cascade for `airflow.aws:` since v1.6 `691a950`).
+- `trigger.rs` (v1.6) — typed `Trigger` enum (5 source variants — `schedule`, `s3`, `dataset`, `sqs`, `api` — plus composite `all`/`any`). Hand-rolled `Serialize` / `Deserialize` impls for actionable typo errors and HASH-02 canonical-JSON ordering of composite lists. `#[serde(deny_unknown_fields)]` on every leaf trigger struct (T-28-01-05 mitigation).
+- `error.rs` — workspace-shared error type referenced by orchestration and codegen surfaces.
 - `diff.rs` — `DiffType { Create, Modify { changes }, Delete }`, `JobDiff`, `DagDiff`.
 - `validation.rs` — `ValidationError { field, message }`.
 
 ### `yard-server/src/`
 
-- `main.rs` — Dioxus router + `start_api_server()` which spawns an Axum server on its own tokio runtime in a separate OS thread, plus background tasks `drift_poll_loop` and `dashboard_poll_loop`.
+- `main.rs` — Dioxus router + `start_api_server()` which spawns an Axum server on its own tokio runtime in a separate OS thread, plus background tasks `drift_poll_loop` and `dashboard_poll_loop`. Builds the parent router by merging the GitHub webhook router (HMAC-secured), the cookie-session router (`auth/session` + `auth/logout`, outside the bearer layer), and the bearer-protected `/api/*` sub-router.
 - `api/` — Axum sub-routers merged into the main router:
-  - `dashboard.rs` — `GET /api/dashboard`, `/api/dashboard/cached`. Holds the shared `ApiState` (GitHub token, repo owner/name, `Arc<dyn Database>`, broadcast `event_tx`).
+  - `dashboard.rs` — `GET /api/dashboard`, `/api/dashboard/cached`. Holds the shared `ApiState` (GitHub token, repo owner/name, `Arc<dyn Database>`, `Arc<dyn SecretStore>`, broadcast `event_tx`).
   - `jobs.rs` — `GET /api/jobs`, `/api/jobs/file`.
   - `drift.rs` — `GET /api/drift`, `/api/drift/cached`, `/api/drift/summary`; `run_drift_check` clones the repo at HEAD, runs core's `resolve_project` + `calculate_diff` + `verify_deployed_resources`, and stores results.
-  - `settings.rs` — `GET`/`POST /api/settings` with a validated allow-list of keys (`theme`, `drift_interval`, alert settings, …).
-  - `events.rs` — `GET /api/ws/events`. WebSocket upgrade handler fanning out a `tokio::sync::broadcast` stream of `Event { DriftRefreshed, DriftFailed, DashboardRefreshed, DashboardFailed, WebhookReceived, AlertSent }`.
+  - `settings.rs` — `GET`/`POST /api/settings` with a validated allow-list of keys (`theme`, `drift_interval`, `slack_webhook_secret_arn`, alert settings, …). Legacy `slack_webhook_url` rejected.
+  - `events.rs` — `GET /api/ws/events`. WebSocket upgrade handler (gated by the bearer layer) fanning out a `tokio::sync::broadcast` stream of `Event { DriftRefreshed, DriftFailed, DashboardRefreshed, DashboardFailed, WebhookReceived, AlertSent }`.
+  - `auth_session.rs` (v1.5 P25) — `POST /api/auth/session` + `POST /api/auth/logout`. Constant-time `ct_eq` compare against `YARD_API_TOKEN`; returns `Set-Cookie: yard_session=<token>; HttpOnly; SameSite=Strict; Path=/; Secure`. Sits OUTSIDE the bearer-auth layer (chicken-and-egg: login can't require login) but inside the rate-limit layer.
   - `error.rs` — `ApiError` → `IntoResponse` mapping.
+- `auth/` (v1.5 P25 SRV-01) — `mod.rs::require_bearer` middleware wires `Authorization: Bearer <YARD_API_TOKEN>` OR `Cookie: yard_session=<YARD_API_TOKEN>` against a hand-rolled constant-time `ct_eq`. Header beats cookie when both are present. Loopback-only dev bypass via `bypass_loopback` (set from `YARD_API_AUTH_DISABLED`); uses axum's `ConnectInfo<SocketAddr>` (kernel-level peer address; never trusts `X-Forwarded-For`).
+- `secrets/` (v1.5 P25 SRV-02) — `SecretStore` async trait + `AwsSecretStore` impl wrapping `aws_sdk_secretsmanager::Client::get_secret_value`. Used by the alerting loop to resolve the Slack webhook URL from a Secrets Manager ARN on every drift-alert tick. `test_support::InMemorySecretStore` (HashMap-backed) for unit tests.
+- `polling/` (v1.5 P26 SRV-03) — `supervised_iteration` wraps a `Future` in `tokio::time::timeout` and flattens to a `SupervisedResult { Ok | IterationFailed | IterationTimedOut }` enum. `compute_backoff_sleep` returns `min(interval, 30s * 2^min(consecutive_errors, 6))` for exponential backoff up to the configured tick interval. Iteration timeout overridable via `YARD_POLL_TIMEOUT_SECS` (range `1..=600`).
 - `github/` — `webhook.rs` parses and HMAC-verifies incoming payloads (`sha256=…`); `router.rs` mounts `POST /api/webhook/github` and drives the PR-comment plan workflow via `client.rs` (octocrab) and `git_ops.rs` (shallow clone at a SHA, guarded by `WorkdirGuard`).
 - `db/` — `Database` async trait (webhooks, plan results, drift snapshots, settings, cache) with a `DynamoDatabase` implementation (`db/dynamo.rs`) using a single-table design (`PK`, `SK`, `GSI1PK`, `GSI1SK`). `test_support::InMemoryDb` provides a mock for unit tests.
-- `alerting/` — `threshold.rs` is a pure `evaluate(drift, cfg, now) -> AlertDecision { BelowThreshold | Cooldown | Send }` (no I/O, testable); `slack.rs` does the webhook POST.
+- `alerting/` — `threshold.rs` is a pure `evaluate(drift, cfg, now) -> AlertDecision { BelowThreshold | Cooldown | Send }` (no I/O, testable); `slack.rs` does the webhook POST after resolving the URL via `SecretStore`.
 - `ui/` — Dioxus components: `dashboard.rs`, `jobs.rs`, `drift.rs`, `settings.rs`, `sheet.rs`, `sidebar.rs`, `metrics.rs`, `components.rs`. Real-time WebSocket plumbing in `connection.rs` (wasm32 only) + `connection_indicator.rs`.
 - `types.rs` — shared request/response DTOs between API handlers and the Dioxus UI.
 
