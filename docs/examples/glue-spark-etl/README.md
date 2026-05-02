@@ -9,8 +9,11 @@ Copy it, edit a few placeholders, run `yard apply`.
 
 - Project root manifest (`yard.yaml`) with `providers.glue` defaults and
   `providers.airflow` so the job can be wrapped in a DAG.
-- One Glue job (`raw_to_clean`) reading parquet from S3, applying three
-  transforms (`sql`, `filter`, `drop_columns`), and writing parquet back.
+- One Glue job, defined in `aws/dev/us-east-1/orders-pipeline/raw_to_clean.yaml`,
+  reading parquet from S3, applying three transforms (`sql`, `filter`,
+  `drop_columns`), and writing parquet back. yard's resolver synthesizes the
+  job name as `<env>-<folder>-<filename>` (here, `orders-pipeline-raw_to_clean`),
+  which is what `[PASS]` lines and `--target` flags reference.
 - One scheduled DAG (`@daily`) that wraps the job. Schedule-only — the
   [multi-job-dag](../multi-job-dag/) example covers `trigger:`.
 
@@ -66,6 +69,11 @@ yard schema you can keep as-is.
    `raw_to_clean.yaml` — replace with the IAM role Glue assumes when it
    runs the job. Required permissions are documented in
    [providers/glue.md](../../reference/providers/glue.md#aws-resources-and-iam).
+4. **Region `us-east-1`** appears in three places that must change
+   together: `providers.glue.region` and `providers.airflow.region` in
+   `yard.yaml`, plus the `aws/dev/us-east-1/` directory name (the
+   third path component is the region per yard's hierarchical context
+   convention).
 
 Optional knobs to tune in `yard.yaml` -> `providers.glue`:
 
