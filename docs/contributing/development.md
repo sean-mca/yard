@@ -392,8 +392,11 @@ and where to wire a new source/sink/transform type.
 
 ### 5. Document and test
 
-- Add provider-defaults docs to `docs/CONFIGURATION.md` under the
-  `providers.<type>` section.
+- Add provider-defaults docs to `docs/reference/providers/<type>.md`
+  (mirror the existing `docs/reference/providers/glue.md` and
+  `docs/reference/providers/emr.md`), and add a one-line cross-link
+  from the relevant `providers.<type>` section in
+  `docs/reference/configuration.md`.
 - Add unit tests in the new `providers/<name>.rs` file (the existing
   providers use `#[cfg(test)]` modules with mocked `serde_json::Value`
   configs).
