@@ -10,7 +10,7 @@ Declarative infrastructure for data pipelines. Define ETL jobs in YAML, and YARD
 
 ## Status
 
-Early and actively developed. The Glue & EMR providers work end-to-end (plan / apply / destroy / show / validate), local and S3 state backends both work, and the SQL and external-script escape hatches are functional. No releases yet, no stability guarantees, and the Databricks provider is planned but not started. Expect rough edges.
+Active development. Latest release: v1.3.4 (Linux-x86_64 binary). Current milestone (v1.7): docs restructure. Glue and EMR providers ship plan/apply/destroy/show/validate; event-driven Airflow DAGs via `trigger:` (v1.6); per-target deployment via `yard list targets` (v1.3.4). Databricks provider planned. No stability guarantees yet.
 
 ## Why YARD?
 
@@ -25,7 +25,19 @@ YARD replaces all of that with a single YAML-driven workflow:
 
 ## Installation
 
-No releases are published yet — build from source:
+Download the latest Linux-x86_64 binary:
+
+```bash
+curl -LO https://github.com/sean-mca/yard/releases/download/v1.3.4/yard-linux-x86_64
+curl -LO https://github.com/sean-mca/yard/releases/download/v1.3.4/yard-linux-x86_64.sha256
+sha256sum -c yard-linux-x86_64.sha256
+chmod +x yard-linux-x86_64
+sudo mv yard-linux-x86_64 /usr/local/bin/yard
+```
+
+Linux-x86_64 only — macOS and Windows users build from source.
+
+Or build from source:
 
 ```bash
 git clone https://github.com/sean-mca/yard.git
@@ -34,7 +46,7 @@ cargo build --release
 # Binary lives at target/release/yard
 ```
 
-See [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md) for prerequisites and first-run setup.
+See [docs/quickstart.md](docs/quickstart.md) for prerequisites and first-run setup.
 
 ## Demo
 
@@ -113,6 +125,7 @@ yard plan              Show what would change
 yard apply             Deploy changes (with confirmation)
 yard show <job>        Display the generated script
 yard validate          Check all job definitions
+yard list <kind>       List jobs/dags/targets in JSON or table format
 yard destroy [job]     Tear down deployed jobs
 yard force-unlock <job>  Remove a stale lock
 ```
@@ -129,7 +142,7 @@ Web dashboard with GitHub webhook integration and drift detection. PR-driven wor
 
 ![Drift Detection](docs/images/diff_with_content_sheet.png)
 
-See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for setup instructions.
+See [docs/how-to/deploy.md](docs/how-to/deploy.md) for setup instructions.
 
 ## Architecture
 
@@ -144,17 +157,14 @@ Rust workspace with four crates:
 
 Provider system is trait-based. Adding a new provider means implementing the `Provider` trait -- no changes to existing code.
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a deeper walk-through.
+See [docs/explanation/architecture.md](docs/explanation/architecture.md) for a deeper walk-through.
 
 ## Documentation
 
-- [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md) -- prerequisites, installation, first run
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) -- system overview, components, data flow
-- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) -- local setup, build commands, code style
-- [docs/TESTING.md](docs/TESTING.md) -- running tests, writing tests, coverage
-- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) -- yard.yaml, environment variables, state backends
-- [docs/API.md](docs/API.md) -- yard-server HTTP + WebSocket API
-- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) -- deploying yard-server, webhook setup, drift detection
+See [docs/](docs/README.md) for the full documentation tree.
+
+- [docs/quickstart.md](docs/quickstart.md) — install, prerequisites, first run
+- [docs/examples/](docs/examples/) — copy-paste-ready example projects
 
 ## Contributing
 
