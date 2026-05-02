@@ -1,0 +1,7 @@
+# Producer DAG. Runs hourly. When every user task succeeds,
+# the synthetic _yard_publish task fires the listed Dataset URI,
+# which causes the consumer DAG (clean-pipeline/) to trigger.
+schedule: "@hourly"
+
+publishes:
+  - s3://acme-analytics-prod-clean/orders/

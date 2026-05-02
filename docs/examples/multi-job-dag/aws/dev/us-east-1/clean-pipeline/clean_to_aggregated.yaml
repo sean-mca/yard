@@ -1,0 +1,21 @@
+type: glue
+role: arn:aws:iam::123456789012:role/acme-yard-glue-job
+
+sources:
+  - name: clean_orders
+    type: s3
+    path: s3://acme-analytics-prod-clean/orders/
+    format: parquet
+
+transforms:
+  - type: sql
+    source: clean_orders
+    output: orders_by_customer
+    query: "SELECT customer_id, COUNT(*) AS order_count, SUM(order_total_cents) AS lifetime_value_cents FROM clean_orders GROUP BY customer_id"
+
+sink:
+  source: orders_by_customer
+  type: s3
+  path: s3://acme-analytics-prod-aggregated/orders_by_customer/
+  format: parquet
+  mode: overwrite

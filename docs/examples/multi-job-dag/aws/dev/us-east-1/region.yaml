@@ -1,0 +1,5 @@
+# Region-level context. Required by yard's hierarchical resolver
+# (yard-core/src/resolve.rs::load_context). Content is opaque YAML —
+# yard reads it for ${region.*} variable interpolation, but does not
+# enforce a schema on it.
+name: us-east-1
