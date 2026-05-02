@@ -19,11 +19,14 @@ deploying anything:
 yard show <job_name>
 ```
 
-`<job_name>` is positional (the bare job name, no path). For example:
+`<job_name>` is positional (the resolver-synthesized
+`<env>-<folder>-<filename>` job name, NOT the bare yaml file
+basename). For example, the `glue-spark-etl` example resolves
+its single job to `orders-pipeline-raw_to_clean`:
 
 ```bash
-yard show raw_to_clean
-yard show raw_to_clean my-project/   # alternate project directory
+yard show orders-pipeline-raw_to_clean
+yard show orders-pipeline-raw_to_clean my-project/   # alternate project directory
 ```
 
 Pipe it through `less` for paging or `wc -l` to spot truncated
@@ -41,8 +44,8 @@ by reading `yard.yaml`. Pull the deployed copy with the AWS CLI to
 diff against `yard show`:
 
 ```bash
-aws s3 cp s3://acme-analytics-prod-glue-scripts/yard-scripts/raw_to_clean.py /tmp/deployed.py
-yard show raw_to_clean > /tmp/local.py
+aws s3 cp s3://acme-analytics-prod-glue-scripts/yard-scripts/orders-pipeline-raw_to_clean.py /tmp/deployed.py
+yard show orders-pipeline-raw_to_clean > /tmp/local.py
 diff /tmp/local.py /tmp/deployed.py
 ```
 
@@ -119,7 +122,7 @@ Glue job in the AWS console.
 To plan a single target only:
 
 ```bash
-yard plan --target raw_to_clean
+yard plan --target orders-pipeline-raw_to_clean
 ```
 
 See [docs/reference/cli.md "yard plan"](../reference/cli.md#yard-plan)
