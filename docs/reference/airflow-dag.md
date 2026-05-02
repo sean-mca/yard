@@ -287,7 +287,11 @@ with DAG(
 
 `start_date` is hardcoded to `datetime(2024, 1, 1)` and `catchup=False` is
 unconditional. There is currently no knob to change either.
-<!-- VERIFY: Airflow version compatibility — codegen emits `airflow.datasets.Dataset`, which is an Airflow 2.4+ feature, and the `schedule=` keyword is Airflow 2.4+ (older versions use `schedule_interval=`). MWAA must be on an Airflow 2.4+ environment image. -->
+
+**Airflow version compatibility:** codegen emits
+`airflow.datasets.Dataset`, which is an Airflow 2.4+ feature, and the
+`schedule=` keyword is Airflow 2.4+ (older versions use
+`schedule_interval=`). MWAA must be on an Airflow 2.4+ environment image.
 
 ---
 
@@ -371,7 +375,13 @@ Required Airflow connections (create in MWAA before the DAG runs):
 
 `required_connections_for_dag` deduplicates across tasks and returns them in
 deterministic (BTreeMap) order. Bash tasks are ignored by this path.
-<!-- VERIFY: exact MWAA connection-management procedure (UI, API, Secrets Manager backend) — yard does not interact with MWAA beyond uploading the DAG file to S3. -->
+
+**MWAA connection management is operator-side.** yard does not interact
+with MWAA beyond uploading the DAG file to S3 — the operator creates
+the listed connections in MWAA via the Airflow UI, the Airflow REST API,
+or the Secrets Manager backend (whichever the MWAA environment is
+configured to use). yard's responsibility ends at emitting the
+`Required Airflow connections` enumeration above.
 
 ---
 
