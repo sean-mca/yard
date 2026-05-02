@@ -52,12 +52,12 @@ binaries for today):
 
 ```bash
 # Replace <tag> with the desired release tag, e.g. v1.3.4
-curl -L -o yard \
+curl -L -o yard-linux-x86_64 \
   https://github.com/sean-mca/yard/releases/download/<tag>/yard-linux-x86_64
-curl -L -o yard.sha256 \
+curl -L -o yard-linux-x86_64.sha256 \
   https://github.com/sean-mca/yard/releases/download/<tag>/yard-linux-x86_64.sha256
-sha256sum -c yard.sha256
-chmod +x yard
+sha256sum -c yard-linux-x86_64.sha256
+install -m 0755 yard-linux-x86_64 yard
 ./yard --version
 ```
 
