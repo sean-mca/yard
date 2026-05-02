@@ -6,7 +6,8 @@ on:
     paths:
       - 'docs/examples/**'
       - 'yard-cli/**'
-      - 'yard-core/src/validation/**'
+      - 'yard-core/**'
+      - 'yard-structs/**'
       - 'docs/how-to/schedule-a-dag.md'
       - 'docs/how-to/cross-account-deploy.md'
       - 'docs/how-to/debug-codegen-output.md'
