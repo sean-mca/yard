@@ -125,7 +125,7 @@ yard plan              Show what would change
 yard apply             Deploy changes (with confirmation)
 yard show <job>        Display the generated script
 yard validate          Check all job definitions
-yard list <kind>       List jobs/dags/targets in JSON or table format
+yard list targets      List deployable targets (JSON output)
 yard destroy [job]     Tear down deployed jobs
 yard force-unlock <job>  Remove a stale lock
 ```
