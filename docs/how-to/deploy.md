@@ -508,10 +508,13 @@ next cycle (`main.rs:164, 313`).
   (`RUST_LOG`, default `info`). `TraceLayer` is attached to the Axum
   router (`main.rs:136`) so every HTTP request is logged.
 - **Slack alerts** — drift-threshold alerts are built in. When
-  `slack_enabled=true`, `slack_webhook_url` is set, and
+  `slack_enabled=true`, `slack_webhook_secret_arn` resolves to a
+  non-empty Slack Incoming Webhook URL via Secrets Manager, and
   `alert_drift_threshold` is ≥ drifted job count, the server POSTs a
-  Slack Blocks payload to the configured Incoming Webhook URL
-  (`main.rs:196-299`, `alerting/slack.rs`). There is one cooldown knob
+  Slack Blocks payload to that URL (`main.rs:196-299`,
+  `alerting/slack.rs`). The URL never lives in DynamoDB — see the
+  [Secrets Manager section](#secrets-manager-slack-webhook-secret-store)
+  above. There is one cooldown knob
   (`alert_cooldown_minutes`, default 10) and a single-attempt HTTP POST
   with a 10s timeout (`alerting/slack.rs:22, 36-44`) — no retry.
 - **Real-time events** — `GET /api/ws/events` broadcasts
