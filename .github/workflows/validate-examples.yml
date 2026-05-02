@@ -1,0 +1,42 @@
+name: Validate examples
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docs/examples/**'
+      - 'yard-cli/**'
+      - 'yard-core/src/validation/**'
+      - 'docs/how-to/schedule-a-dag.md'
+      - 'docs/how-to/cross-account-deploy.md'
+      - 'docs/how-to/debug-codegen-output.md'
+      - 'docs/how-to/upgrade-yard.md'
+      - '.github/workflows/validate-examples.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: yard validate docs/examples/*
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build yard CLI
+        run: cargo build --release -p yard
+      - name: Validate every docs/examples/<dir>
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          found=0
+          for dir in docs/examples/*/; do
+            found=1
+            echo "==> yard validate ${dir}"
+            ./target/release/yard validate "${dir}"
+          done
+          if [ "${found}" -eq 0 ]; then
+            echo "ERROR: no directories found under docs/examples/" >&2
+            exit 1
+          fi
