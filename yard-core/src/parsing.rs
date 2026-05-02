@@ -45,6 +45,10 @@ pub fn validate_unknown_keys(
 /// `providers.airflow` site, account.yaml/region.yaml/dag.yaml airflow
 /// blocks, and the recursive call from `parse_airflow_job_block` is
 /// avoided via the `parse_airflow_section_inner` split.
+///
+/// `region` is permitted but not stored on `AirflowSection` — it is read
+/// directly from the raw `manifest.providers["airflow"]["region"]` value
+/// by `dag_lifecycle::extract_airflow_region` (Phase 35 BLOCKER-01).
 const ALLOWED_AIRFLOW_SECTION: &[&str] = &[
     "schedule",
     "owner",
@@ -55,6 +59,7 @@ const ALLOWED_AIRFLOW_SECTION: &[&str] = &[
     "publishes",
     "aws",
     "max_active_runs",
+    "region",
 ];
 
 /// Allowed keys on a per-job `airflow:` block (`AirflowJobBlock` —
@@ -62,6 +67,14 @@ const ALLOWED_AIRFLOW_SECTION: &[&str] = &[
 /// `depends_on` and `publishes`). `AirflowJobBlock` is excluded from
 /// `deny_unknown_fields` because of `#[serde(flatten)]`; this validator
 /// covers its user-yaml typo path per D-CTX:177.
+///
+/// `region` mirrors `ALLOWED_AIRFLOW_SECTION` (Phase 35 BLOCKER-01).
+/// At the per-job scope it is currently inert — `extract_airflow_region`
+/// only reads `manifest.providers["airflow"]["region"]` — but accepting
+/// it here keeps the invariant that every section key is also valid on
+/// a per-job block (locked by the
+/// `allowed_airflow_job_block_extends_section_with_depends_on_and_publishes`
+/// test).
 const ALLOWED_AIRFLOW_JOB_BLOCK: &[&str] = &[
     "depends_on",
     "publishes",
@@ -73,6 +86,7 @@ const ALLOWED_AIRFLOW_JOB_BLOCK: &[&str] = &[
     "trigger",
     "aws",
     "max_active_runs",
+    "region",
 ];
 
 /// Allowed keys on a single source entry (or single-source `source:` block).
@@ -603,6 +617,25 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("unknown field 'future_field'"), "got: {msg}");
         assert!(msg.contains("at providers.airflow"), "got: {msg}");
+    }
+
+    /// Phase 35 BLOCKER-01: `region:` under `providers.airflow:` must be
+    /// accepted by the parser. The value is consumed downstream by
+    /// `dag_lifecycle::extract_airflow_region`, which reads it directly
+    /// from the raw `manifest.providers["airflow"]["region"]` JSON, so
+    /// the field is permitted in the allow-list even though
+    /// `AirflowSection` does not carry it as a typed field.
+    #[test]
+    fn parse_airflow_section_accepts_region() {
+        let v = json!({
+            "region": "us-east-1",
+            "dags_bucket": "my-dags",
+            "dags_prefix": "dags/",
+        });
+        let s = parse_airflow_section(&v, "providers.airflow")
+            .expect("region must be permitted under providers.airflow");
+        assert_eq!(s.dags_bucket.as_deref(), Some("my-dags"));
+        assert_eq!(s.dags_prefix.as_deref(), Some("dags/"));
     }
 
     // --- parse_airflow_job_block ---
