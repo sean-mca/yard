@@ -736,7 +736,7 @@ role: arn:aws:iam::111111111111:role/GlueJob
 airflow:
   publishes:
     - s3://example-bucket/sales/orders
-# transforms/sources elided — see CONFIGURATION.md
+# transforms/sources elided — see docs/reference/configuration.md
 ```
 
 **`aws/dev/us-east-2/orders-pipeline/notify.yaml`**
