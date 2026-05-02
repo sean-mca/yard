@@ -230,7 +230,7 @@ Synopsis:
 yard validate [OPTIONS] [DIRECTORY]
 ```
 
-Validate every job and DAG configuration in the project: schema-check the YAMLs, run cross-DAG link checks, and verify provider knob acceptance. Reads (does not write) state — requires AWS credentials.
+Validate every job in the project: schema-check the YAMLs and verify provider knob acceptance per `validate_job_full`. Iterates `manifest.jobs` only — does not run DAG validation, orphan checks, or cross-DAG link checks (see [airflow-dag.md](airflow-dag.md) for DAG-side validation scope). Reads (does not write) state — requires AWS credentials.
 
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
