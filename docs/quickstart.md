@@ -72,7 +72,10 @@ Your caller identity needs permission to:
 - **EMR** (only if using the EMR provider): `AddJobFlowSteps`,
   `DescribeStep`, `CancelSteps` on the target cluster.
 
-<!-- VERIFY: exact minimum IAM policy document for yard's Glue + EMR + S3 operations -->
+For the full IAM policy sketches (DynamoDB runtime for `yard-server`,
+Glue + EMR + S3 + STS for `yard apply` from PRs, Secrets Manager for
+the v1.5 Slack webhook abstraction), see
+[deploy.md → AWS resources needed](how-to/deploy.md#aws-resources-needed).
 
 If you plan to use AssumeRole (for cross-account deploys), yard also reads
 `YARD_AWS_ASSUME_ROLE`, `YARD_AWS_SESSION_NAME`, and `YARD_AWS_EXTERNAL_ID`
@@ -131,7 +134,10 @@ yard --help
 ```
 
 You should see the subcommands `init`, `plan`, `apply`, `show`, `validate`,
-`destroy`, `force-unlock`.
+`list`, `destroy`, `force-unlock`. The `list` subcommand (added in v1.3.4)
+emits `yard list targets [--json]` rows for CI matrix builders fanning out
+per-account deploys; see [reference/cli.md](reference/cli.md) for the full
+flag surface.
 
 ---
 
