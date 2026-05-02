@@ -753,7 +753,7 @@ a DAG instead, it calls `yard_core::show_dag` — see
 yard show orders
 
 # From outside the project:
-yard show orders --directory ./path/to/project
+yard show orders ./path/to/project
 ```
 
 `show` does **not** upload, deploy, or write state — it is the safest way
