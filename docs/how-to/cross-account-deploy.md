@@ -121,6 +121,11 @@ ladder (highest first):
    `aws.assume_role` ARN. For example
    `assume_role: arn:aws:iam::222222222222:role/GlueInvoker`
    yields conn id `yard_222222222222_GlueInvoker`.
+   Derivation returns `Result<String>` — malformed ARNs (non-IAM
+   resource, missing role-name, sanitization-illegal characters) error
+   at codegen time rather than silently falling through to tier 5.
+   See [airflow-dag.md "Conn id derivation"](../reference/airflow-dag.md#conn-id-derivation)
+   for the exact sanitization rules.
 5. **Airflow's `aws_default`** — runtime fallback when nothing
    above resolves. yard emits no `aws_conn_id` kwarg in this case.
 
@@ -139,4 +144,4 @@ the DAG runs. yard does NOT create the MWAA connections itself. See
 - [configuration.md "Cross-account state backend credentials"](../reference/configuration.md#cross-account-state-backend-credentials) — `state.aws:` resolution chain.
 - [configuration.md "yard CLI environment variables"](../reference/configuration.md#yard-cli-environment-variables) — full `YARD_*` env reference.
 - [airflow-dag.md "Cross-account connections"](../reference/airflow-dag.md#cross-account-connections) — emitted `# Required Airflow connections` header and operator-side MWAA setup.
-- [airflow-dag.md "aws_conn_id resolution"](../reference/airflow-dag.md#aws_conn_id-resolution) — full precedence ladder.
+- [configuration.md "dag.yaml: aws_conn_id resolution"](../reference/configuration.md#dagyaml-aws_conn_id-resolution) — full precedence ladder.
