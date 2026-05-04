@@ -165,6 +165,8 @@ def _yard_void_to_target(col, src_dt, tgt_dt):
             sub = col[f.name]
             if f.name in tgt_fields:
                 out.append(_yard_void_to_target(sub, f.dataType, tgt_fields[f.name]).alias(f.name))
+            elif _yard_has_void(f.dataType):
+                out.append(sub.cast(_yard_void_free_ddl(f.dataType)).alias(f.name))
             else:
                 out.append(sub.alias(f.name))
         return F.when(col.isNull(), F.lit(None).cast(tgt_dt)).otherwise(F.struct(*out))
@@ -200,6 +202,9 @@ def _yard_conform_to_target_schema(df, spark, tbl):
     for field in df.schema.fields:
         name, src_dt = field.name, field.dataType
         if name not in tgt_map:
+            if _yard_has_void(src_dt):
+                col = F.col(f"`{name}`")
+                df = df.withColumn(name, col.cast(_yard_void_free_ddl(src_dt)))
             continue
         if _yard_has_void(src_dt):
             col = F.col(f"`{name}`")
