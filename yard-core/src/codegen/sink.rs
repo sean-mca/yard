@@ -98,19 +98,26 @@ pub(super) fn render_sink(sink: &Sink, default_source: &str, fill_nulls: bool) -
                      _glue.create_database(DatabaseInput={{\"Name\": \"{db}\"}})"
             ));
             lines.push(format!("    _tbl = \"glue_catalog.{db}.{table}\""));
-            // Both branches call _yard_fill_nulls so void subtypes (array<void>,
-            // map<*,void>, struct<…,void>) get coerced to typed defaults before
-            // the parquet write. The earlier existing-table-only conform helper
-            // emitted F.lit(None).cast(target) which Spark does not reliably
-            // resolve for nested void subtypes, so writes to existing tables
-            // failed at parquet serialization time.
-            let coerce = if fill_nulls {
+            // New-table branch: dataframe-inferred fill (D-04). No live target
+            // schema to consult; _yard_fill_nulls coerces voids to source-side
+            // defaults so parquet accepts the schema at .create() time.
+            //
+            // Existing-table branch: schema-aware conform. _yard_conform_to_target_schema
+            // reads the live Iceberg schema and drives _yard_void_to_target
+            // element-wise for void/void-subtype source columns — uses the
+            // target column type rather than dataframe-inferred type, preserves
+            // non-void cells verbatim, and preserves nulls in nullable real-typed
+            // columns (no 0/False/"" fills against existing tables).
+            let new_table_coerce = if fill_nulls {
                 format!("{var} = _yard_fill_nulls({var})\n        ")
             } else {
                 String::new()
             };
-            let new_table_coerce = &coerce;
-            let existing_table_coerce = &coerce;
+            let existing_table_coerce = if fill_nulls {
+                format!("{var} = _yard_conform_to_target_schema({var}, spark, _tbl)\n        ")
+            } else {
+                String::new()
+            };
             lines.push(format!(
                 "    if not spark.catalog.tableExists(_tbl):\n        \
                      {new_table_coerce}({var}.writeTo(_tbl)\n            \

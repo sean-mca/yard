@@ -141,6 +141,70 @@ def _yard_fill_nulls(df):
         else:
             df = df.withColumn(name, F.coalesce(col.cast("string"), F.lit("")))
     return df
+
+
+def _yard_read_iceberg_schema(spark, tbl):
+    return spark.read.format("iceberg").load(tbl).schema
+
+
+def _yard_void_to_target(col, src_dt, tgt_dt):
+    if not _yard_has_void(src_dt):
+        return col
+    if isinstance(src_dt, NullType):
+        return F.lit(None).cast(tgt_dt)
+    if isinstance(src_dt, StructType) and isinstance(tgt_dt, StructType):
+        if len(src_dt.fields) == 0:
+            if len(tgt_dt.fields) == 0:
+                return F.when(col.isNull(), F.lit(None).cast(tgt_dt)) \
+                    .otherwise(F.struct(F.lit("").cast("string").alias("_yard_empty")))
+            return F.when(col.isNull(), F.lit(None).cast(tgt_dt)) \
+                .otherwise(F.struct(*[F.lit(None).cast(f.dataType).alias(f.name) for f in tgt_dt.fields]))
+        tgt_fields = {f.name: f.dataType for f in tgt_dt.fields}
+        out = []
+        for f in src_dt.fields:
+            sub = col[f.name]
+            if f.name in tgt_fields:
+                out.append(_yard_void_to_target(sub, f.dataType, tgt_fields[f.name]).alias(f.name))
+            else:
+                out.append(sub.alias(f.name))
+        return F.when(col.isNull(), F.lit(None).cast(tgt_dt)).otherwise(F.struct(*out))
+    if isinstance(src_dt, ArrayType) and isinstance(tgt_dt, ArrayType):
+        src_et, tgt_et = src_dt.elementType, tgt_dt.elementType
+        if isinstance(src_et, NullType):
+            return F.when(col.isNull(), F.lit(None).cast(tgt_dt)) \
+                .otherwise(F.transform(col, lambda x: F.lit(None).cast(tgt_et)))
+        if _yard_has_void(src_et):
+            return F.when(col.isNull(), F.lit(None).cast(tgt_dt)) \
+                .otherwise(F.transform(col, lambda x: _yard_void_to_target(x, src_et, tgt_et)))
+        return col
+    if isinstance(src_dt, MapType) and isinstance(tgt_dt, MapType):
+        src_kt, src_vt = src_dt.keyType, src_dt.valueType
+        tgt_vt = tgt_dt.valueType
+        if isinstance(src_kt, NullType):
+            return F.lit(None).cast(tgt_dt)
+        if isinstance(src_vt, NullType):
+            return F.when(col.isNull(), F.lit(None).cast(tgt_dt)) \
+                .otherwise(F.map_from_arrays(F.map_keys(col),
+                    F.transform(F.map_values(col), lambda v: F.lit(None).cast(tgt_vt))))
+        if _yard_has_void(src_vt):
+            return F.when(col.isNull(), F.lit(None).cast(tgt_dt)) \
+                .otherwise(F.map_from_arrays(F.map_keys(col),
+                    F.transform(F.map_values(col), lambda v: _yard_void_to_target(v, src_vt, tgt_vt))))
+        return col
+    return col
+
+
+def _yard_conform_to_target_schema(df, spark, tbl):
+    tgt = _yard_read_iceberg_schema(spark, tbl)
+    tgt_map = {f.name: f.dataType for f in tgt.fields}
+    for field in df.schema.fields:
+        name, src_dt = field.name, field.dataType
+        if name not in tgt_map:
+            continue
+        if _yard_has_void(src_dt):
+            col = F.col(f"`{name}`")
+            df = df.withColumn(name, _yard_void_to_target(col, src_dt, tgt_map[name]))
+    return df
 "#;
 
 pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result<String> {
@@ -779,29 +843,27 @@ mod tests {
         assert!(script.contains("\"`\" + f.name.replace(\"`\", \"``\") + \"`:\""));
     }
 
-    // --- iceberg fill_nulls on both branches ---
+    // --- iceberg per-branch coerce: fill_nulls (new-table) vs schema-aware conform (existing-table) ---
 
     #[test]
-    fn fill_nulls_emitted_on_existing_table_branch_append() {
+    fn existing_table_branch_uses_schema_aware_conform_append() {
         let mut job = base_job();
         job.sources = vec![s3_source("events", "s3://b/in")];
         job.sink = Some(iceberg_sink("analytics", "events", None));
         let script = generate_python_script("test_job", &job).unwrap();
-        // Both branches share one _yard_fill_nulls call-site so both new-table
-        // and existing-table writes get void subtype coercion.
+        // Existing-table branch reads the live target schema rather than
+        // re-running source-side fill_nulls — preserves nulls in nullable
+        // real-typed columns and routes void subtypes through target type.
         assert!(
-            script.contains("df_events = _yard_fill_nulls(df_events)"),
-            "existing-table branch must invoke _yard_fill_nulls so void subtypes are coerced before parquet serialization"
+            script.contains("df_events = _yard_conform_to_target_schema(df_events, spark, _tbl)"),
+            "existing-table branch must invoke _yard_conform_to_target_schema"
         );
-        // The old conform helpers are gone.
-        assert!(!script.contains("_yard_read_iceberg_schema"));
-        assert!(!script.contains("_yard_conform_voids_to_schema"));
         // Confirm we land in the append arm, not overwritePartitions.
         assert!(script.contains("df_events.writeTo(_tbl).option(\"mergeSchema\", \"true\").append()"));
     }
 
     #[test]
-    fn fill_nulls_emitted_on_existing_table_branch_overwrite() {
+    fn existing_table_branch_uses_schema_aware_conform_overwrite() {
         let mut job = base_job();
         job.sources = vec![s3_source("events", "s3://b/in")];
         job.sink = Some(iceberg_sink("analytics", "events", None));
@@ -809,7 +871,7 @@ mod tests {
             s.mode = Some("overwrite".to_string());
         }
         let script = generate_python_script("test_job", &job).unwrap();
-        assert!(script.contains("df_events = _yard_fill_nulls(df_events)"));
+        assert!(script.contains("df_events = _yard_conform_to_target_schema(df_events, spark, _tbl)"));
         // Overwrite mode maps to overwritePartitions, not append.
         assert!(script.contains("df_events.writeTo(_tbl).option(\"mergeSchema\", \"true\").overwritePartitions()"));
     }
@@ -827,6 +889,67 @@ mod tests {
         // Confirm the create-branch itself is still structurally present.
         assert!(script.contains("if not spark.catalog.tableExists(_tbl):"));
         assert!(script.contains(".create())"));
+    }
+
+    #[test]
+    fn schema_aware_conform_only_inside_else_branch() {
+        // Regression guard for Sean's gating concern: _yard_conform_to_target_schema
+        // reads the live Iceberg metadata, so it must NEVER fire on the new-table
+        // (.create()) branch — if it does, the read errors before the table exists.
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        let script = generate_python_script("test_job", &job).unwrap();
+
+        // Locate the if/else block. The conform call must sit AFTER the `else:`
+        // line and BEFORE the existing-table writeTo on that same arm. The
+        // new-table branch (between `if not ... tableExists(_tbl):` and `else:`)
+        // must contain _yard_fill_nulls but NOT _yard_conform_to_target_schema.
+        let if_idx = script
+            .find("if not spark.catalog.tableExists(_tbl):")
+            .expect("if/tableExists block must be present");
+        let else_idx = script[if_idx..]
+            .find("\n    else:\n")
+            .map(|o| if_idx + o)
+            .expect("else: branch must follow the tableExists check");
+        let new_table_block = &script[if_idx..else_idx];
+        let existing_table_block = &script[else_idx..];
+
+        assert!(
+            new_table_block.contains("_yard_fill_nulls(df_events)"),
+            "new-table branch must call _yard_fill_nulls"
+        );
+        assert!(
+            !new_table_block.contains("_yard_conform_to_target_schema"),
+            "_yard_conform_to_target_schema must NOT appear on the new-table branch — \
+             it reads live Iceberg metadata and would error before the table exists"
+        );
+        assert!(
+            existing_table_block.contains("_yard_conform_to_target_schema(df_events, spark, _tbl)"),
+            "existing-table branch must call _yard_conform_to_target_schema"
+        );
+        assert!(
+            !existing_table_block.contains("_yard_fill_nulls(df_events)"),
+            "existing-table branch must NOT call _yard_fill_nulls — that path drops \
+             schema awareness and overwrites real nulls with typed defaults (0/False/empty)"
+        );
+    }
+
+    #[test]
+    fn schema_aware_helpers_in_prelude() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        let script = generate_python_script("test_job", &job).unwrap();
+        // The three new helpers that drive the schema-aware existing-table path.
+        assert!(script.contains("def _yard_read_iceberg_schema(spark, tbl):"));
+        assert!(script.contains("def _yard_void_to_target(col, src_dt, tgt_dt):"));
+        assert!(script.contains("def _yard_conform_to_target_schema(df, spark, tbl):"));
+        // Schema-aware empty-struct expansion uses target field shape — when the
+        // target struct has real fields, no _yard_empty placeholder is emitted
+        // for the existing-table path. (The new-table path still synthesizes
+        // _yard_empty via _yard_default_struct because parquet rejects struct<>.)
+        assert!(script.contains("F.lit(None).cast(f.dataType).alias(f.name)"));
     }
 
     #[test]
@@ -873,10 +996,13 @@ mod tests {
         }
         let script = generate_python_script("test_job", &job).unwrap();
         // D-07: opt-out preserves verbatim mental model — no yard-side DF rewriting on either branch.
-        // Both branches share the same _yard_fill_nulls call-site, so suppressing it covers both.
         assert!(
             !script.contains("df_events = _yard_fill_nulls(df_events)"),
-            "fill_nulls: false must suppress the _yard_fill_nulls call-site on both branches"
+            "fill_nulls: false must suppress _yard_fill_nulls on the new-table branch"
+        );
+        assert!(
+            !script.contains("df_events = _yard_conform_to_target_schema(df_events, spark, _tbl)"),
+            "fill_nulls: false must suppress _yard_conform_to_target_schema on the existing-table branch"
         );
         // Structural shape of the sink block is otherwise intact.
         assert!(script.contains("if not spark.catalog.tableExists(_tbl):"));
