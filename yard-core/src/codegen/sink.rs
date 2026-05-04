@@ -94,23 +94,19 @@ pub(super) fn render_sink(sink: &Sink, default_source: &str, fill_nulls: bool) -
                      _glue.create_database(DatabaseInput={{\"Name\": \"{db}\"}})"
             ));
             lines.push(format!("    _tbl = \"glue_catalog.{db}.{table}\""));
-            // Per-branch coercion emission (Phase 18.1).
-            // New-table branch: preserve existing _yard_fill_nulls fallback (D-04).
-            // Existing-table branch: conform to live Iceberg schema, no _yard_empty synthesis (D-05).
-            let new_table_coerce = if fill_nulls {
+            // Both branches call _yard_fill_nulls so void subtypes (array<void>,
+            // map<*,void>, struct<…,void>) get coerced to typed defaults before
+            // the parquet write. The earlier existing-table-only conform helper
+            // emitted F.lit(None).cast(target) which Spark does not reliably
+            // resolve for nested void subtypes, so writes to existing tables
+            // failed at parquet serialization time.
+            let coerce = if fill_nulls {
                 format!("{var} = _yard_fill_nulls({var})\n        ")
             } else {
                 String::new()
             };
-            let existing_table_coerce = if fill_nulls {
-                format!(
-                    "# --- Conform to Iceberg table schema ---\n        \
-                     _tgt_schema = _yard_read_iceberg_schema(spark, _tbl)\n        \
-                     {var} = _yard_conform_voids_to_schema({var}, _tgt_schema)\n        "
-                )
-            } else {
-                String::new()
-            };
+            let new_table_coerce = &coerce;
+            let existing_table_coerce = &coerce;
             lines.push(format!(
                 "    if not spark.catalog.tableExists(_tbl):\n        \
                      {new_table_coerce}({var}.writeTo(_tbl)\n            \
