@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use yard_structs::{Import, JobDefinition, Source};
+use yard_structs::{Import, JdbcAuth, JobDefinition, RdsIamAuth, Source};
 
 // --- Import rendering ---
 
@@ -112,6 +112,67 @@ pub(super) fn needs_secrets_imports(job_def: &JobDefinition) -> bool {
     let source_has = job_def.sources.iter().any(|s| s.secret_id.is_some());
     let sink_has = job_def.sink.as_ref().is_some_and(|s| s.secret_id.is_some());
     source_has || sink_has
+}
+
+// --- JDBC auth (RDS IAM) ---
+
+pub(super) fn needs_jdbc_auth_imports(job_def: &JobDefinition) -> bool {
+    let source_has = job_def.sources.iter().any(|s| s.auth.is_some());
+    let sink_has = job_def.sink.as_ref().is_some_and(|s| s.auth.is_some());
+    source_has || sink_has
+}
+
+/// Resolve the JDBC user / password expressions for a jdbc source/sink, given
+/// its `secret_id` and `auth`. Returns `(user_expr, password_expr,
+/// pre_lines)` — `pre_lines` are Python statements emitted before the
+/// reader/writer call, `user_expr` and `password_expr` are inlined into
+/// `.option("user", …)` / `.option("password", …)`. Returns `None` if no
+/// auth options should be emitted (neither secret_id nor auth set).
+///
+/// Validation enforces that `auth.username` and `secret_id` cannot both be
+/// set, and that one of them must supply the username — so codegen here
+/// can assume well-formed input.
+pub(super) fn render_jdbc_auth(
+    prefix: &str,
+    secret_id: Option<&str>,
+    auth: Option<&JdbcAuth>,
+) -> Option<(String, String, Vec<String>)> {
+    let secret_var = format!("{prefix}_secret");
+    match (secret_id, auth) {
+        (None, None) => None,
+        (Some(_), None) => Some((
+            format!("{secret_var}[\"username\"]"),
+            format!("{secret_var}[\"password\"]"),
+            Vec::new(),
+        )),
+        (secret, Some(JdbcAuth::RdsIam(rds))) => {
+            let user_expr = if secret.is_some() {
+                format!("{secret_var}[\"username\"]")
+            } else {
+                // Validation guarantees username is Some when secret_id is None.
+                let u = rds.username.as_deref().unwrap_or("");
+                format!("\"{u}\"")
+            };
+            let token_var = format!("{prefix}_token");
+            let pre = render_rds_iam_token_fetch(prefix, rds, &user_expr);
+            Some((user_expr, token_var, pre))
+        }
+    }
+}
+
+fn render_rds_iam_token_fetch(prefix: &str, rds: &RdsIamAuth, user_expr: &str) -> Vec<String> {
+    let RdsIamAuth { host, port, region, .. } = rds;
+    let client_var = format!("_{prefix}_rds");
+    let token_var = format!("{prefix}_token");
+    vec![
+        format!("    {client_var} = boto3.client(\"rds\", region_name=\"{region}\")"),
+        format!("    {token_var} = {client_var}.generate_db_auth_token("),
+        format!("        DBHostname=\"{host}\","),
+        format!("        Port={port},"),
+        format!("        DBUsername={user_expr},"),
+        format!("        Region=\"{region}\","),
+        "    )".to_string(),
+    ]
 }
 
 pub(super) fn has_iceberg_sink(job_def: &JobDefinition) -> bool {

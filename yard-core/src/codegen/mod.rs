@@ -186,7 +186,7 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
     let mut extra_imports = Vec::new();
     let iceberg = has_iceberg_sink(job_def);
     let partitioning = !job_def.partition_by.is_empty();
-    if needs_secrets_imports(job_def) || iceberg {
+    if needs_secrets_imports(job_def) || needs_jdbc_auth_imports(job_def) || iceberg {
         extra_imports.push("import boto3".to_string());
         if needs_secrets_imports(job_def) {
             extra_imports.push("import json".to_string());
@@ -530,6 +530,7 @@ mod tests {
             mode: Some("overwrite".to_string()),
             partition_by: vec![],
             fill_nulls: None,
+            auth: None,
         });
         let script = generate_python_script("test_job", &job).unwrap();
         assert!(script.contains("df_events.write.format(\"parquet\")"));
@@ -573,6 +574,7 @@ mod tests {
             mode: Some("overwrite".to_string()),
             partition_by: vec![],
             fill_nulls: None,
+            auth: None,
         });
         let script = generate_python_script("test_job", &job).unwrap();
         assert!(script.contains("df_enriched.write.format(\"parquet\")"));
@@ -916,6 +918,104 @@ mod tests {
         assert!(script.contains("df_users = spark.read.format(\"jdbc\")"));
     }
 
+    // --- JDBC RDS IAM auth ---
+
+    fn rds_iam_auth(username: Option<&str>) -> yard_structs::JdbcAuth {
+        yard_structs::JdbcAuth::RdsIam(yard_structs::RdsIamAuth {
+            username: username.map(|u| u.to_string()),
+            host: "orders.cluster-abc.us-east-1.rds.amazonaws.com".to_string(),
+            port: 5432,
+            region: "us-east-1".to_string(),
+        })
+    }
+
+    #[test]
+    fn jdbc_source_rds_iam_auth_alone_uses_config_username() {
+        let mut job = base_job();
+        job.sources = vec![yard_structs::Source {
+            name: "orders".to_string(),
+            source_type: "jdbc".to_string(),
+            connection_url: Some("jdbc:postgresql://h:5432/db".to_string()),
+            table: Some("public.orders".to_string()),
+            auth: Some(rds_iam_auth(Some("yard_app"))),
+            ..Default::default()
+        }];
+        let script = generate_python_script("test_job", &job).unwrap();
+        // boto3 import gated on auth presence even without secret_id.
+        assert!(script.contains("import boto3"));
+        // Token fetch lines.
+        assert!(script.contains("_orders_source_rds = boto3.client(\"rds\", region_name=\"us-east-1\")"));
+        assert!(script.contains("orders_source_token = _orders_source_rds.generate_db_auth_token("));
+        assert!(script.contains("DBHostname=\"orders.cluster-abc.us-east-1.rds.amazonaws.com\","));
+        assert!(script.contains("Port=5432,"));
+        assert!(script.contains("DBUsername=\"yard_app\","));
+        assert!(script.contains("Region=\"us-east-1\","));
+        // user/password threaded into the spark reader.
+        assert!(script.contains(".option(\"user\", \"yard_app\").option(\"password\", orders_source_token)"));
+        // No secrets-manager flow when secret_id is absent.
+        assert!(!script.contains("get_secret_value"));
+    }
+
+    #[test]
+    fn jdbc_source_rds_iam_auth_with_secret_uses_secret_username() {
+        let mut job = base_job();
+        job.sources = vec![yard_structs::Source {
+            name: "orders".to_string(),
+            source_type: "jdbc".to_string(),
+            connection_url: Some("jdbc:postgresql://h:5432/db".to_string()),
+            table: Some("public.orders".to_string()),
+            secret_id: Some("rds-secret".to_string()),
+            auth: Some(rds_iam_auth(None)),
+            ..Default::default()
+        }];
+        let script = generate_python_script("test_job", &job).unwrap();
+        // Both flows emit: secret fetch AND rds token.
+        assert!(script.contains("get_secret_value(SecretId=\"rds-secret\")"));
+        assert!(script.contains("orders_source_token = _orders_source_rds.generate_db_auth_token("));
+        // Username is read from the secret in both the token call and the reader.
+        assert!(script.contains("DBUsername=orders_source_secret[\"username\"],"));
+        assert!(script.contains(".option(\"user\", orders_source_secret[\"username\"]).option(\"password\", orders_source_token)"));
+    }
+
+    #[test]
+    fn jdbc_source_rds_iam_auth_glue_engine() {
+        let mut job = base_job();
+        job.sources = vec![yard_structs::Source {
+            name: "orders".to_string(),
+            source_type: "jdbc".to_string(),
+            connection_url: Some("jdbc:postgresql://h:5432/db".to_string()),
+            table: Some("public.orders".to_string()),
+            engine: Some("glue".to_string()),
+            connection_type: Some("postgresql".to_string()),
+            auth: Some(rds_iam_auth(Some("yard_app"))),
+            ..Default::default()
+        }];
+        let script = generate_python_script("test_job", &job).unwrap();
+        // Glue engine threads user/password into the connection_options dict.
+        assert!(script.contains("orders_source_token = _orders_source_rds.generate_db_auth_token("));
+        assert!(script.contains("\"user\": \"yard_app\", \"password\": orders_source_token"));
+        assert!(script.contains("create_dynamic_frame.from_options"));
+    }
+
+    #[test]
+    fn jdbc_sink_rds_iam_auth_alone() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(yard_structs::Sink {
+            sink_type: "jdbc".to_string(),
+            connection_url: Some("jdbc:postgresql://h:5432/db".to_string()),
+            table: Some("public.events".to_string()),
+            mode: Some("append".to_string()),
+            auth: Some(rds_iam_auth(Some("yard_app"))),
+            ..Default::default()
+        });
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(script.contains("_sink_rds = boto3.client(\"rds\", region_name=\"us-east-1\")"));
+        assert!(script.contains("sink_token = _sink_rds.generate_db_auth_token("));
+        assert!(script.contains("DBUsername=\"yard_app\","));
+        assert!(script.contains(".option(\"user\", \"yard_app\").option(\"password\", sink_token)"));
+    }
+
     // --- Full pipeline with join ---
 
     #[test]
@@ -996,6 +1096,7 @@ mod tests {
             mode: Some("overwrite".to_string()),
             partition_by: vec![],
             fill_nulls: None,
+            auth: None,
         });
         let script = generate_python_script("test_job", &job).unwrap();
         assert!(script.contains("df_orders = spark.read"));
@@ -1247,6 +1348,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            auth: None,
         });
         let result = generate_python_script("test_job", &job);
         assert!(result.is_err());
@@ -1270,6 +1372,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            auth: None,
         });
         let result = generate_python_script("test_job", &job);
         assert!(result.is_err());
@@ -1293,6 +1396,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            auth: None,
         });
         let result = generate_python_script("test_job", &job);
         assert!(result.is_err());
@@ -1316,6 +1420,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            auth: None,
         });
         let result = generate_python_script("test_job", &job);
         assert!(result.is_err());
@@ -1339,6 +1444,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            auth: None,
         });
         let result = generate_python_script("test_job", &job);
         assert!(result.is_err());

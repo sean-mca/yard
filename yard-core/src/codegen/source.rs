@@ -3,7 +3,7 @@ use yard_structs::Source;
 
 use super::helpers::{
     append_spark_options, build_options_dict, effective_engine,
-    python_literal, render_secret_fetch, require_str,
+    python_literal, render_jdbc_auth, render_secret_fetch, require_str,
 };
 
 /// Render a `glueContext.create_dynamic_frame.from_options(...).toDF()` call.
@@ -31,11 +31,11 @@ pub(super) fn render_source(source: &Source, default_engine: &str) -> Result<Str
     let var = format!("df_{name}");
     let ctx = format!("{name}_ctx");
     let engine = effective_engine(source, default_engine);
-    let secret_var = format!("{name}_source_secret");
+    let auth_prefix = format!("{name}_source");
     let mut lines = Vec::new();
 
     if let Some(secret_id) = &source.secret_id {
-        lines.push(render_secret_fetch(secret_id, &format!("{name}_source")));
+        lines.push(render_secret_fetch(secret_id, &auth_prefix));
     }
 
     match source.source_type.as_str() {
@@ -61,6 +61,10 @@ pub(super) fn render_source(source: &Source, default_engine: &str) -> Result<Str
         "jdbc" => {
             let url = require_str(source.connection_url.as_deref(), name, "connection_url")?;
             let table = require_str(source.table.as_deref(), name, "table")?;
+            let auth = render_jdbc_auth(&auth_prefix, source.secret_id.as_deref(), source.auth.as_ref());
+            if let Some((_, _, ref pre)) = auth {
+                lines.extend(pre.iter().cloned());
+            }
             if engine == "glue" {
                 let connection_type = source.connection_type.as_deref().ok_or_else(|| {
                     anyhow::anyhow!(
@@ -74,10 +78,10 @@ pub(super) fn render_source(source: &Source, default_engine: &str) -> Result<Str
                     ],
                     &source.options,
                 );
-                let options_expr = if source.secret_id.is_some() {
+                let options_expr = if let Some((user_expr, password_expr, _)) = &auth {
                     let opts_var = format!("_opts_{name}");
                     lines.push(format!(
-                        "    {opts_var} = {{**{base_opts}, \"user\": {secret_var}[\"username\"], \"password\": {secret_var}[\"password\"]}}"
+                        "    {opts_var} = {{**{base_opts}, \"user\": {user_expr}, \"password\": {password_expr}}}"
                     ));
                     opts_var
                 } else {
@@ -91,9 +95,9 @@ pub(super) fn render_source(source: &Source, default_engine: &str) -> Result<Str
                     &[("url", url), ("dbtable", table)],
                     &source.options,
                 );
-                if source.secret_id.is_some() {
+                if let Some((user_expr, password_expr, _)) = &auth {
                     chain.push_str(&format!(
-                        ".option(\"user\", {secret_var}[\"username\"]).option(\"password\", {secret_var}[\"password\"])"
+                        ".option(\"user\", {user_expr}).option(\"password\", {password_expr})"
                     ));
                 }
                 chain.push_str(".load()");

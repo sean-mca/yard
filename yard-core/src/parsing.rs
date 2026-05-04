@@ -2,7 +2,8 @@ use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
 use yard_structs::{
-    AirflowJobBlock, AirflowSection, AwsCredentialConfig, Import, Sink, Source, Transform, Trigger,
+    AirflowJobBlock, AirflowSection, AwsCredentialConfig, Import, JdbcAuth, Sink, Source,
+    Transform, Trigger,
 };
 
 /// Validate that a JSON object has no keys outside `allowed`. Used by every
@@ -105,6 +106,7 @@ const ALLOWED_SOURCE: &[&str] = &[
     "url",
     "headers",
     "options",
+    "auth",
 ];
 
 /// Allowed keys on a `sink:` block.
@@ -120,6 +122,7 @@ const ALLOWED_SINK: &[&str] = &[
     "mode",
     "partition_by",
     "fill_nulls",
+    "auth",
 ];
 
 /// Allowed keys on a single transform entry inside the `transforms:` array.
@@ -474,6 +477,7 @@ fn parse_single_source(src: &Value, default_name: &str, path: &str) -> Result<Op
         url: str_field(src, "url"),
         headers,
         options,
+        auth: parse_jdbc_auth(src, path)?,
     }))
 }
 
@@ -528,7 +532,21 @@ pub fn parse_sink(config: &Value, path: &str) -> Result<Option<Sink>> {
         mode: str_field(snk, "mode"),
         partition_by: str_array_field(snk, "partition_by"),
         fill_nulls: snk.get("fill_nulls").and_then(|v| v.as_bool()),
+        auth: parse_jdbc_auth(snk, &sink_path)?,
     }))
+}
+
+/// Parse the optional `auth:` block on a jdbc source/sink. The block must be
+/// a JSON object whose `kind` discriminator matches a `JdbcAuth` variant.
+/// Returns `Ok(None)` if `auth` is absent. Errors are anchored at `path.auth`.
+fn parse_jdbc_auth(node: &Value, path: &str) -> Result<Option<JdbcAuth>> {
+    let Some(auth_v) = node.get("auth") else {
+        return Ok(None);
+    };
+    let parsed: JdbcAuth = serde_json::from_value(auth_v.clone()).map_err(|e| {
+        anyhow::anyhow!("invalid \"auth\" block at {path}.auth: {e}")
+    })?;
+    Ok(Some(parsed))
 }
 
 /// Extract transforms from a job config.
