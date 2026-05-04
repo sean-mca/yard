@@ -156,6 +156,29 @@ pub struct Import {
     pub from: Option<String>,
 }
 
+/// Auth strategy for jdbc source/sink. Wire format is a tagged union on `kind`:
+/// `kind: rds_iam` selects RDS IAM auth via `boto3 rds.generate_db_auth_token`.
+/// May coexist with `secret_id` — in that case the username comes from the
+/// secret and `RdsIamAuth.username` must be unset.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum JdbcAuth {
+    RdsIam(RdsIamAuth),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RdsIamAuth {
+    /// DB user. Optional only when `secret_id` is also set on the same
+    /// source/sink (in which case the username is read from the secret).
+    /// Required otherwise. Setting both is a validation error.
+    #[serde(default)]
+    pub username: Option<String>,
+    pub host: String,
+    pub port: u16,
+    pub region: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Source {
@@ -188,6 +211,10 @@ pub struct Source {
     /// (glue engine). Values are rendered as Python literals.
     #[serde(default)]
     pub options: HashMap<String, serde_json::Value>,
+    /// Auth strategy for `source_type: jdbc`. May coexist with `secret_id`
+    /// (username from secret, password from auth flow).
+    #[serde(default)]
+    pub auth: Option<JdbcAuth>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -208,6 +235,10 @@ pub struct Sink {
     /// Defaults to true on iceberg. Explicit `false` opts out.
     #[serde(default)]
     pub fill_nulls: Option<bool>,
+    /// Auth strategy for `sink_type: jdbc`. May coexist with `secret_id`
+    /// (username from secret, password from auth flow).
+    #[serde(default)]
+    pub auth: Option<JdbcAuth>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]

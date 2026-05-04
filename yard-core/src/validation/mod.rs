@@ -262,8 +262,8 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use yard_structs::{
-        AirflowSection, DatasetTrigger, JobType, S3Trigger, ScheduleTrigger, Sink, SingleSource,
-        Source, SqsTrigger, Transform, Trigger,
+        AirflowSection, DatasetTrigger, JdbcAuth, JobType, RdsIamAuth, S3Trigger, ScheduleTrigger,
+        Sink, SingleSource, Source, SqsTrigger, Transform, Trigger,
     };
 
     fn valid_glue_job() -> JobDefinition {
@@ -295,6 +295,7 @@ mod tests {
                 mode: Some("overwrite".to_string()),
                 partition_by: vec![],
             fill_nulls: None,
+            auth: None,
             }),
             transforms: vec![Transform {
                 transform_type: "filter".to_string(),
@@ -413,6 +414,104 @@ mod tests {
             errors
                 .iter()
                 .any(|e| e.message.contains("requires \"table\""))
+        );
+    }
+
+    fn rds_iam(username: Option<&str>) -> JdbcAuth {
+        JdbcAuth::RdsIam(RdsIamAuth {
+            username: username.map(|u| u.to_string()),
+            host: "h.example.com".to_string(),
+            port: 5432,
+            region: "us-east-1".to_string(),
+        })
+    }
+
+    fn jdbc_source(secret_id: Option<&str>, auth: Option<JdbcAuth>) -> Source {
+        Source {
+            name: "src".to_string(),
+            source_type: "jdbc".to_string(),
+            connection_url: Some("jdbc:postgresql://h:5432/db".to_string()),
+            table: Some("public.t".to_string()),
+            secret_id: secret_id.map(|s| s.to_string()),
+            auth,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn jdbc_auth_rds_iam_missing_username_without_secret_errors() {
+        let mut job = minimal_job();
+        job.sources = vec![jdbc_source(None, Some(rds_iam(None)))];
+        let errors = validate_job(&job);
+        assert!(
+            errors.iter().any(|e| e.message.contains("\"auth.username\" is required")),
+            "expected auth.username-required error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn jdbc_auth_rds_iam_username_and_secret_id_together_errors() {
+        let mut job = minimal_job();
+        job.sources = vec![jdbc_source(Some("rds-secret"), Some(rds_iam(Some("yard_app"))))];
+        let errors = validate_job(&job);
+        assert!(
+            errors.iter().any(|e| e.message.contains("\"auth.username\" must not be set")),
+            "expected auth.username-conflict error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn jdbc_auth_rds_iam_with_secret_id_and_no_username_ok() {
+        let mut job = minimal_job();
+        job.sources = vec![jdbc_source(Some("rds-secret"), Some(rds_iam(None)))];
+        let errors = validate_job(&job);
+        assert!(
+            !errors.iter().any(|e| e.field.starts_with("sources[0].auth")),
+            "auth-related errors should be empty, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn jdbc_auth_rds_iam_alone_with_username_ok() {
+        let mut job = minimal_job();
+        job.sources = vec![jdbc_source(None, Some(rds_iam(Some("yard_app"))))];
+        let errors = validate_job(&job);
+        assert!(
+            !errors.iter().any(|e| e.field.starts_with("sources[0].auth")),
+            "auth-related errors should be empty, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn auth_on_non_jdbc_source_errors() {
+        let mut job = minimal_job();
+        job.sources = vec![Source {
+            name: "events".to_string(),
+            source_type: "s3".to_string(),
+            path: Some("s3://b/in".to_string()),
+            auth: Some(rds_iam(Some("yard_app"))),
+            ..Default::default()
+        }];
+        let errors = validate_job(&job);
+        assert!(
+            errors.iter().any(|e| e.message.contains("\"auth\" is only supported on jdbc")),
+            "expected auth-on-non-jdbc error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn auth_on_non_jdbc_sink_errors() {
+        let mut job = minimal_job();
+        job.sink = Some(Sink {
+            sink_type: "s3".to_string(),
+            path: Some("s3://b/out".to_string()),
+            auth: Some(rds_iam(Some("yard_app"))),
+            ..Default::default()
+        });
+        let errors = validate_job(&job);
+        assert!(
+            errors.iter().any(|e| e.field == "sink.auth" && e.message.contains("only supported on jdbc")),
+            "expected sink-auth-on-non-jdbc error, got: {errors:?}"
         );
     }
 
@@ -681,6 +780,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            auth: None,
         });
         let errors = validate_job(&job);
         assert!(errors.iter().any(|e| e.field == "sink.type"));
@@ -701,6 +801,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            auth: None,
         });
         let errors = validate_job(&job);
         assert!(
@@ -768,6 +869,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            auth: None,
         });
         let errors = validate_job(&job);
         assert!(
@@ -897,6 +999,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            auth: None,
         });
         let errors = validate_job(&job);
         assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
@@ -955,6 +1058,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            auth: None,
         });
         let errors = validate_job(&job);
         // Down from `>= 3` after Phase 21 21-01 deleted the job-type
@@ -1251,6 +1355,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            auth: None,
         });
         let errors = validate_job(&job);
         assert!(errors.iter().any(|e| e.field == "sink"));

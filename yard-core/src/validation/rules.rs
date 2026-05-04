@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use yard_structs::{JobDefinition, JobType, ValidationError};
+use yard_structs::{JdbcAuth, JobDefinition, JobType, ValidationError};
 
 const SUPPORTED_SOURCE_TYPES: &[&str] = &["s3", "jdbc", "catalog", "kafka", "api"];
 const VALID_ENGINES: &[&str] = &["spark", "glue"];
@@ -65,6 +65,13 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
             ));
         }
 
+        if source.auth.is_some() && source.source_type != "jdbc" {
+            errors.push(err(
+                &format!("{prefix}.auth"),
+                "\"auth\" is only supported on jdbc sources",
+            ));
+        }
+
         match source.source_type.as_str() {
             "s3" => {
                 if source.path.is_none() {
@@ -89,6 +96,11 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
                         "type \"jdbc\" with engine \"glue\" requires \"connection_type\" (mysql, postgresql, sqlserver, oracle, redshift)",
                     ));
                 }
+                errors.extend(validate_jdbc_auth(
+                    &prefix.to_string(),
+                    source.secret_id.as_deref(),
+                    source.auth.as_ref(),
+                ));
             }
             "kafka" => {
                 if source.connection_url.is_none() {
@@ -304,6 +316,13 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
             ));
         }
 
+        if sink.auth.is_some() && sink.sink_type != "jdbc" {
+            errors.push(err(
+                "sink.auth",
+                "\"auth\" is only supported on jdbc sinks",
+            ));
+        }
+
         if let Some(ref src) = sink.source
             && !known_names.contains(src)
         {
@@ -329,6 +348,11 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
                 if sink.table.is_none() {
                     errors.push(err("sink", "type \"jdbc\" requires \"table\""));
                 }
+                errors.extend(validate_jdbc_auth(
+                    "sink",
+                    sink.secret_id.as_deref(),
+                    sink.auth.as_ref(),
+                ));
             }
             "catalog" => {
                 if sink.database.is_none() {
@@ -467,4 +491,28 @@ fn validate_task_only_job(job: &JobDefinition, errors: &mut Vec<ValidationError>
             ));
         }
     }
+}
+
+/// Validate the interplay between `secret_id` and `auth` on a jdbc source/sink.
+/// Caller has already confirmed source_type/sink_type is "jdbc".
+fn validate_jdbc_auth(
+    prefix: &str,
+    secret_id: Option<&str>,
+    auth: Option<&JdbcAuth>,
+) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    if let Some(JdbcAuth::RdsIam(rds)) = auth {
+        match (secret_id.is_some(), rds.username.is_some()) {
+            (true, true) => errors.push(err(
+                &format!("{prefix}.auth.username"),
+                "\"auth.username\" must not be set when \"secret_id\" is also set; the username is read from the secret",
+            )),
+            (false, false) => errors.push(err(
+                &format!("{prefix}.auth.username"),
+                "\"auth.username\" is required for kind \"rds_iam\" when no \"secret_id\" is set",
+            )),
+            _ => {}
+        }
+    }
+    errors
 }

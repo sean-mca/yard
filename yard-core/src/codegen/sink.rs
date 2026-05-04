@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use yard_structs::Sink;
 
-use super::helpers::{quoted_list, render_secret_fetch};
+use super::helpers::{quoted_list, render_jdbc_auth, render_secret_fetch};
 
 pub(super) fn require_sink_str<'a>(value: Option<&'a str>, sink_type: &str, field: &str) -> Result<&'a str> {
     value.ok_or_else(|| anyhow!("sink: '{field}' is required for {sink_type} sink"))
@@ -40,13 +40,17 @@ pub(super) fn render_sink(sink: &Sink, default_source: &str, fill_nulls: bool) -
         "jdbc" => {
             let url = require_sink_str(sink.connection_url.as_deref(), "jdbc", "connection_url")?;
             let table = require_sink_str(sink.table.as_deref(), "jdbc", "table")?;
+            let auth = render_jdbc_auth("sink", sink.secret_id.as_deref(), sink.auth.as_ref());
+            if let Some((_, _, ref pre)) = auth {
+                lines.extend(pre.iter().cloned());
+            }
             lines.push(format!(
                 "    {var}.write.format(\"jdbc\").option(\"url\", \"{url}\").option(\"dbtable\", \"{table}\")\\"
             ));
-            if sink.secret_id.is_some() {
-                lines.push(
-                    "        .option(\"user\", sink_secret[\"username\"]).option(\"password\", sink_secret[\"password\"])\\".to_string()
-                );
+            if let Some((user_expr, password_expr, _)) = &auth {
+                lines.push(format!(
+                    "        .option(\"user\", {user_expr}).option(\"password\", {password_expr})\\"
+                ));
             }
             lines.push(format!("        .mode(\"{mode}\").save()"));
         }
