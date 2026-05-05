@@ -2,7 +2,7 @@ use anyhow::Result;
 use yard_structs::Source;
 
 use super::helpers::{
-    append_spark_options, build_options_dict, effective_engine,
+    append_spark_options, build_options_dict, derive_jdbc_url, effective_engine,
     python_literal, render_jdbc_auth, render_secret_fetch, require_str,
 };
 
@@ -31,7 +31,7 @@ pub(super) fn render_source(source: &Source, default_engine: &str) -> Result<Str
     let var = format!("df_{name}");
     let ctx = format!("{name}_ctx");
     let engine = effective_engine(source, default_engine);
-    let auth_prefix = format!("{name}_source");
+    let auth_prefix = name.to_string();
     let mut lines = Vec::new();
 
     if let Some(secret_id) = &source.secret_id {
@@ -59,12 +59,30 @@ pub(super) fn render_source(source: &Source, default_engine: &str) -> Result<Str
             }
         }
         "jdbc" => {
-            let url = require_str(source.connection_url.as_deref(), name, "connection_url")?;
             let table = require_str(source.table.as_deref(), name, "table")?;
             let auth = render_jdbc_auth(&auth_prefix, source.secret_id.as_deref(), source.auth.as_ref());
             if let Some((_, _, ref pre)) = auth {
                 lines.extend(pre.iter().cloned());
             }
+            let derived_url;
+            let url = match source.connection_url.as_deref() {
+                Some(u) => u,
+                None => {
+                    let conn_type = source.connection_type.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "source '{name}': 'connection_type' is required when 'connection_url' is not set"
+                        )
+                    })?;
+                    let db = require_str(source.database.as_deref(), name, "database")?;
+                    let a = source.auth.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "source '{name}': 'connection_url' is required when 'auth' is not set"
+                        )
+                    })?;
+                    derived_url = derive_jdbc_url(a, conn_type, db);
+                    &derived_url
+                }
+            };
             if engine == "glue" {
                 let connection_type = source.connection_type.as_deref().ok_or_else(|| {
                     anyhow::anyhow!(

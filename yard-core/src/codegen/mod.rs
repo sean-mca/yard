@@ -599,6 +599,7 @@ mod tests {
             mode: Some("overwrite".to_string()),
             partition_by: vec![],
             fill_nulls: None,
+            connection_type: None,
             auth: None,
         });
         let script = generate_python_script("test_job", &job).unwrap();
@@ -643,6 +644,7 @@ mod tests {
             mode: Some("overwrite".to_string()),
             partition_by: vec![],
             fill_nulls: None,
+            connection_type: None,
             auth: None,
         });
         let script = generate_python_script("test_job", &job).unwrap();
@@ -1045,7 +1047,7 @@ mod tests {
         let script = generate_python_script("test_job", &job).unwrap();
         assert!(script.contains("import boto3"));
         assert!(script.contains("get_secret_value(SecretId=\"my-rds-secret\")"));
-        assert!(script.contains("users_source_secret[\"username\"]"));
+        assert!(script.contains("users_secret[\"username\"]"));
         assert!(script.contains("df_users = spark.read.format(\"jdbc\")"));
     }
 
@@ -1072,18 +1074,14 @@ mod tests {
             ..Default::default()
         }];
         let script = generate_python_script("test_job", &job).unwrap();
-        // boto3 import gated on auth presence even without secret_id.
         assert!(script.contains("import boto3"));
-        // Token fetch lines.
-        assert!(script.contains("_orders_source_rds = boto3.client(\"rds\", region_name=\"us-east-1\")"));
-        assert!(script.contains("orders_source_token = _orders_source_rds.generate_db_auth_token("));
+        assert!(script.contains("_orders_rds = boto3.client(\"rds\", region_name=\"us-east-1\")"));
+        assert!(script.contains("orders_token = _orders_rds.generate_db_auth_token("));
         assert!(script.contains("DBHostname=\"orders.cluster-abc.us-east-1.rds.amazonaws.com\","));
         assert!(script.contains("Port=5432,"));
         assert!(script.contains("DBUsername=\"yard_app\","));
         assert!(script.contains("Region=\"us-east-1\","));
-        // user/password threaded into the spark reader.
-        assert!(script.contains(".option(\"user\", \"yard_app\").option(\"password\", orders_source_token)"));
-        // No secrets-manager flow when secret_id is absent.
+        assert!(script.contains(".option(\"user\", \"yard_app\").option(\"password\", orders_token)"));
         assert!(!script.contains("get_secret_value"));
     }
 
@@ -1100,12 +1098,10 @@ mod tests {
             ..Default::default()
         }];
         let script = generate_python_script("test_job", &job).unwrap();
-        // Both flows emit: secret fetch AND rds token.
         assert!(script.contains("get_secret_value(SecretId=\"rds-secret\")"));
-        assert!(script.contains("orders_source_token = _orders_source_rds.generate_db_auth_token("));
-        // Username is read from the secret in both the token call and the reader.
-        assert!(script.contains("DBUsername=orders_source_secret[\"username\"],"));
-        assert!(script.contains(".option(\"user\", orders_source_secret[\"username\"]).option(\"password\", orders_source_token)"));
+        assert!(script.contains("orders_token = _orders_rds.generate_db_auth_token("));
+        assert!(script.contains("DBUsername=orders_secret[\"username\"],"));
+        assert!(script.contains(".option(\"user\", orders_secret[\"username\"]).option(\"password\", orders_token)"));
     }
 
     #[test]
@@ -1122,10 +1118,26 @@ mod tests {
             ..Default::default()
         }];
         let script = generate_python_script("test_job", &job).unwrap();
-        // Glue engine threads user/password into the connection_options dict.
-        assert!(script.contains("orders_source_token = _orders_source_rds.generate_db_auth_token("));
-        assert!(script.contains("\"user\": \"yard_app\", \"password\": orders_source_token"));
+        assert!(script.contains("orders_token = _orders_rds.generate_db_auth_token("));
+        assert!(script.contains("\"user\": \"yard_app\", \"password\": orders_token"));
         assert!(script.contains("create_dynamic_frame.from_options"));
+    }
+
+    #[test]
+    fn jdbc_source_rds_iam_derives_url_from_auth() {
+        let mut job = base_job();
+        job.sources = vec![yard_structs::Source {
+            name: "orders".to_string(),
+            source_type: "jdbc".to_string(),
+            database: Some("orders".to_string()),
+            table: Some("public.orders".to_string()),
+            connection_type: Some("postgresql".to_string()),
+            auth: Some(rds_iam_auth(Some("yard_app"))),
+            ..Default::default()
+        }];
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(script.contains("jdbc:postgresql://orders.cluster-abc.us-east-1.rds.amazonaws.com:5432/orders"));
+        assert!(script.contains("orders_token = _orders_rds.generate_db_auth_token("));
     }
 
     #[test]
@@ -1227,6 +1239,7 @@ mod tests {
             mode: Some("overwrite".to_string()),
             partition_by: vec![],
             fill_nulls: None,
+            connection_type: None,
             auth: None,
         });
         let script = generate_python_script("test_job", &job).unwrap();
@@ -1479,6 +1492,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            connection_type: None,
             auth: None,
         });
         let result = generate_python_script("test_job", &job);
@@ -1503,6 +1517,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            connection_type: None,
             auth: None,
         });
         let result = generate_python_script("test_job", &job);
@@ -1527,6 +1542,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            connection_type: None,
             auth: None,
         });
         let result = generate_python_script("test_job", &job);
@@ -1551,6 +1567,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            connection_type: None,
             auth: None,
         });
         let result = generate_python_script("test_job", &job);
@@ -1575,6 +1592,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            connection_type: None,
             auth: None,
         });
         let result = generate_python_script("test_job", &job);

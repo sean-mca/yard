@@ -122,6 +122,14 @@ pub(super) fn needs_jdbc_auth_imports(job_def: &JobDefinition) -> bool {
     source_has || sink_has
 }
 
+pub(super) fn derive_jdbc_url(auth: &JdbcAuth, connection_type: &str, database: &str) -> String {
+    match auth {
+        JdbcAuth::RdsIam(rds) => {
+            format!("jdbc:{connection_type}://{}:{}/{database}", rds.host, rds.port)
+        }
+    }
+}
+
 /// Resolve the JDBC user / password expressions for a jdbc source/sink, given
 /// its `secret_id` and `auth`. Returns `(user_expr, password_expr,
 /// pre_lines)` — `pre_lines` are Python statements emitted before the

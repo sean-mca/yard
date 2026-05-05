@@ -79,11 +79,25 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
                 }
             }
             "jdbc" => {
-                if source.connection_url.is_none() {
+                if source.connection_url.is_none() && source.auth.is_none() {
                     errors.push(err(
                         &prefix.to_string(),
-                        "type \"jdbc\" requires \"connection_url\"",
+                        "type \"jdbc\" requires \"connection_url\" or \"auth\" (to derive the URL)",
                     ));
+                }
+                if source.connection_url.is_none() && source.auth.is_some() {
+                    if source.connection_type.is_none() {
+                        errors.push(err(
+                            &prefix.to_string(),
+                            "type \"jdbc\" requires \"connection_type\" when \"connection_url\" is not set",
+                        ));
+                    }
+                    if source.database.is_none() {
+                        errors.push(err(
+                            &prefix.to_string(),
+                            "type \"jdbc\" requires \"database\" when \"connection_url\" is not set",
+                        ));
+                    }
                 }
                 if source.table.is_none() {
                     errors.push(err(&prefix.to_string(), "type \"jdbc\" requires \"table\""));
@@ -342,8 +356,16 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
                 }
             }
             "jdbc" => {
-                if sink.connection_url.is_none() {
-                    errors.push(err("sink", "type \"jdbc\" requires \"connection_url\""));
+                if sink.connection_url.is_none() && sink.auth.is_none() {
+                    errors.push(err("sink", "type \"jdbc\" requires \"connection_url\" or \"auth\" (to derive the URL)"));
+                }
+                if sink.connection_url.is_none() && sink.auth.is_some() {
+                    if sink.connection_type.is_none() {
+                        errors.push(err("sink", "type \"jdbc\" requires \"connection_type\" when \"connection_url\" is not set"));
+                    }
+                    if sink.database.is_none() {
+                        errors.push(err("sink", "type \"jdbc\" requires \"database\" when \"connection_url\" is not set"));
+                    }
                 }
                 if sink.table.is_none() {
                     errors.push(err("sink", "type \"jdbc\" requires \"table\""));

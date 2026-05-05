@@ -295,6 +295,7 @@ mod tests {
                 mode: Some("overwrite".to_string()),
                 partition_by: vec![],
             fill_nulls: None,
+            connection_type: None,
             auth: None,
             }),
             transforms: vec![Transform {
@@ -780,6 +781,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            connection_type: None,
             auth: None,
         });
         let errors = validate_job(&job);
@@ -801,6 +803,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            connection_type: None,
             auth: None,
         });
         let errors = validate_job(&job);
@@ -869,6 +872,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            connection_type: None,
             auth: None,
         });
         let errors = validate_job(&job);
@@ -999,6 +1003,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            connection_type: None,
             auth: None,
         });
         let errors = validate_job(&job);
@@ -1058,6 +1063,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            connection_type: None,
             auth: None,
         });
         let errors = validate_job(&job);
@@ -1355,6 +1361,7 @@ mod tests {
             mode: None,
             partition_by: vec![],
             fill_nulls: None,
+            connection_type: None,
             auth: None,
         });
         let errors = validate_job(&job);

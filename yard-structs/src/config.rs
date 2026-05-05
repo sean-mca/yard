@@ -230,6 +230,8 @@ pub struct Sink {
     pub secret_id: Option<String>, // Secrets Manager secret
     pub mode: Option<String>,   // overwrite, append, error
     pub partition_by: Vec<String>, // partition columns
+    #[serde(default)]
+    pub connection_type: Option<String>,
     /// For iceberg sinks only: coerce nulls/voids to type-appropriate defaults
     /// before writing (prevents `void`-typed columns from failing the write).
     /// Defaults to true on iceberg. Explicit `false` opts out.
