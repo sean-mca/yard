@@ -116,6 +116,7 @@ const ALLOWED_SINK: &[&str] = &[
     "format",
     "path",
     "connection_url",
+    "connection_type",
     "table",
     "database",
     "secret_id",
@@ -531,6 +532,7 @@ pub fn parse_sink(config: &Value, path: &str) -> Result<Option<Sink>> {
         secret_id: str_field(snk, "secret_id"),
         mode: str_field(snk, "mode"),
         partition_by: str_array_field(snk, "partition_by"),
+        connection_type: str_field(snk, "connection_type"),
         fill_nulls: snk.get("fill_nulls").and_then(|v| v.as_bool()),
         auth: parse_jdbc_auth(snk, &sink_path)?,
     }))

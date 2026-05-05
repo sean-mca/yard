@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use yard_structs::Sink;
 
-use super::helpers::{quoted_list, render_jdbc_auth, render_secret_fetch};
+use super::helpers::{derive_jdbc_url, quoted_list, render_jdbc_auth, render_secret_fetch};
 
 pub(super) fn require_sink_str<'a>(value: Option<&'a str>, sink_type: &str, field: &str) -> Result<&'a str> {
     value.ok_or_else(|| anyhow!("sink: '{field}' is required for {sink_type} sink"))
@@ -38,12 +38,26 @@ pub(super) fn render_sink(sink: &Sink, default_source: &str, fill_nulls: bool) -
             lines.push(write);
         }
         "jdbc" => {
-            let url = require_sink_str(sink.connection_url.as_deref(), "jdbc", "connection_url")?;
             let table = require_sink_str(sink.table.as_deref(), "jdbc", "table")?;
             let auth = render_jdbc_auth("sink", sink.secret_id.as_deref(), sink.auth.as_ref());
             if let Some((_, _, ref pre)) = auth {
                 lines.extend(pre.iter().cloned());
             }
+            let derived_url;
+            let url = match sink.connection_url.as_deref() {
+                Some(u) => u,
+                None => {
+                    let a = sink.auth.as_ref().ok_or_else(|| {
+                        anyhow!("sink: 'connection_url' is required when 'auth' is not set")
+                    })?;
+                    let conn_type = sink.connection_type.as_deref().ok_or_else(|| {
+                        anyhow!("sink: 'connection_type' is required when 'connection_url' is not set")
+                    })?;
+                    let db = require_sink_str(sink.database.as_deref(), "jdbc", "database")?;
+                    derived_url = derive_jdbc_url(a, conn_type, db);
+                    &derived_url
+                }
+            };
             lines.push(format!(
                 "    {var}.write.format(\"jdbc\").option(\"url\", \"{url}\").option(\"dbtable\", \"{table}\")\\"
             ));
