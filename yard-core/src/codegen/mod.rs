@@ -155,9 +155,9 @@ def _yard_void_to_target(col, src_dt, tgt_dt):
     if isinstance(src_dt, StructType) and isinstance(tgt_dt, StructType):
         if len(src_dt.fields) == 0:
             if len(tgt_dt.fields) == 0:
-                return F.when(col.isNull(), F.lit(None).cast(tgt_dt)) \
+                return F.when(col.isNull(), F.lit(None)) \
                     .otherwise(F.struct(F.lit("").cast("string").alias("_yard_empty")))
-            return F.when(col.isNull(), F.lit(None).cast(tgt_dt)) \
+            return F.when(col.isNull(), F.lit(None)) \
                 .otherwise(F.struct(*[F.lit(None).cast(f.dataType).alias(f.name) for f in tgt_dt.fields]))
         tgt_fields = {f.name: f.dataType for f in tgt_dt.fields}
         out = []
@@ -169,14 +169,14 @@ def _yard_void_to_target(col, src_dt, tgt_dt):
                 out.append(sub.cast(_yard_void_free_ddl(f.dataType)).alias(f.name))
             else:
                 out.append(sub.alias(f.name))
-        return F.when(col.isNull(), F.lit(None).cast(tgt_dt)).otherwise(F.struct(*out))
+        return F.when(col.isNull(), F.lit(None)).otherwise(F.struct(*out))
     if isinstance(src_dt, ArrayType) and isinstance(tgt_dt, ArrayType):
         src_et, tgt_et = src_dt.elementType, tgt_dt.elementType
         if isinstance(src_et, NullType):
-            return F.when(col.isNull(), F.lit(None).cast(tgt_dt)) \
+            return F.when(col.isNull(), F.lit(None)) \
                 .otherwise(F.transform(col, lambda x: F.lit(None).cast(tgt_et)))
         if _yard_has_void(src_et):
-            return F.when(col.isNull(), F.lit(None).cast(tgt_dt)) \
+            return F.when(col.isNull(), F.lit(None)) \
                 .otherwise(F.transform(col, lambda x: _yard_void_to_target(x, src_et, tgt_et)))
         return col
     if isinstance(src_dt, MapType) and isinstance(tgt_dt, MapType):
@@ -185,11 +185,11 @@ def _yard_void_to_target(col, src_dt, tgt_dt):
         if isinstance(src_kt, NullType):
             return F.lit(None).cast(tgt_dt)
         if isinstance(src_vt, NullType):
-            return F.when(col.isNull(), F.lit(None).cast(tgt_dt)) \
+            return F.when(col.isNull(), F.lit(None)) \
                 .otherwise(F.map_from_arrays(F.map_keys(col),
                     F.transform(F.map_values(col), lambda v: F.lit(None).cast(tgt_vt))))
         if _yard_has_void(src_vt):
-            return F.when(col.isNull(), F.lit(None).cast(tgt_dt)) \
+            return F.when(col.isNull(), F.lit(None)) \
                 .otherwise(F.map_from_arrays(F.map_keys(col),
                     F.transform(F.map_values(col), lambda v: _yard_void_to_target(v, src_vt, tgt_vt))))
         return col
