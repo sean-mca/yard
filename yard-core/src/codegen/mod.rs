@@ -193,6 +193,8 @@ def _yard_void_to_target(col, src_dt, tgt_dt):
                 .otherwise(F.map_from_arrays(F.map_keys(col),
                     F.transform(F.map_values(col), lambda v: _yard_void_to_target(v, src_vt, tgt_vt))))
         return col
+    if isinstance(src_dt, StructType) and len(src_dt.fields) == 0:
+        return F.lit(None).cast(tgt_dt)
     return col
 
 
