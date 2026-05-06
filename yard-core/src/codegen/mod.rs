@@ -160,16 +160,27 @@ def _yard_void_to_target(col, src_dt, tgt_dt):
             return F.when(col.isNull(), F.lit(None).cast(tgt_dt)) \
                 .otherwise(F.struct(*[F.lit(None).cast(f.dataType).alias(f.name) for f in tgt_dt.fields]))
         tgt_fields = {f.name: f.dataType for f in tgt_dt.fields}
+        src_names = set()
         out = []
+        null_out = []
         for f in src_dt.fields:
             sub = col[f.name]
+            src_names.add(f.name)
             if f.name in tgt_fields:
                 out.append(_yard_void_to_target(sub, f.dataType, tgt_fields[f.name]).alias(f.name))
+                null_out.append(F.lit(None).cast(tgt_fields[f.name]).alias(f.name))
             elif _yard_has_void(f.dataType):
-                out.append(sub.cast(_yard_void_free_ddl(f.dataType)).alias(f.name))
+                fallback = _yard_void_free_ddl(f.dataType)
+                out.append(sub.cast(fallback).alias(f.name))
+                null_out.append(F.lit(None).cast(fallback).alias(f.name))
             else:
                 out.append(sub.alias(f.name))
-        return F.when(col.isNull(), F.lit(None).cast(tgt_dt)).otherwise(F.struct(*out))
+                null_out.append(F.lit(None).cast(f.dataType).alias(f.name))
+        for f in tgt_dt.fields:
+            if f.name not in src_names:
+                out.append(F.lit(None).cast(f.dataType).alias(f.name))
+                null_out.append(F.lit(None).cast(f.dataType).alias(f.name))
+        return F.when(col.isNull(), F.struct(*null_out)).otherwise(F.struct(*out))
     if isinstance(src_dt, ArrayType) and isinstance(tgt_dt, ArrayType):
         src_et, tgt_et = src_dt.elementType, tgt_dt.elementType
         if isinstance(src_et, NullType):
