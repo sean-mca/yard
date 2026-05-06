@@ -24,7 +24,7 @@ const EMR_TEMPLATE: &str = include_str!("../templates/emr.py.tera");
 /// `fill_nulls: false` on the sink.
 const ICEBERG_FILL_NULLS_HELPERS: &str = r#"def _yard_default_struct(struct_type):
     if len(struct_type.fields) == 0:
-        return F.struct(F.lit("").cast("string").alias("_yard_empty"))
+        return F.lit(None).cast("string")
     out = []
     for f in struct_type.fields:
         dt = f.dataType
@@ -66,7 +66,7 @@ def _yard_void_free_ddl(dt):
         return "string"
     if isinstance(dt, StructType):
         if len(dt.fields) == 0:
-            return "struct<`_yard_empty`:string>"
+            return "string"
         parts = ["`" + f.name.replace("`", "``") + "`:" + _yard_void_free_ddl(f.dataType) for f in dt.fields]
         return "struct<" + ",".join(parts) + ">"
     if isinstance(dt, ArrayType):
@@ -83,7 +83,7 @@ def _yard_coerce_voids(col, dt):
         return F.coalesce(col.cast("string"), F.lit(""))
     if isinstance(dt, StructType):
         if len(dt.fields) == 0:
-            return F.struct(F.lit("").cast("string").alias("_yard_empty"))
+            return F.lit(None).cast("string")
         fields = [_yard_coerce_voids(col[f.name], f.dataType).alias(f.name) for f in dt.fields]
         return F.struct(*fields)
     if isinstance(dt, ArrayType):
@@ -155,8 +155,7 @@ def _yard_void_to_target(col, src_dt, tgt_dt):
     if isinstance(src_dt, StructType) and isinstance(tgt_dt, StructType):
         if len(src_dt.fields) == 0:
             if len(tgt_dt.fields) == 0:
-                return F.when(col.isNull(), F.lit(None)) \
-                    .otherwise(F.struct(F.lit("").cast("string").alias("_yard_empty")))
+                return F.lit(None).cast("string")
             return F.when(col.isNull(), F.lit(None)) \
                 .otherwise(F.struct(*[F.lit(None).cast(f.dataType).alias(f.name) for f in tgt_dt.fields]))
         tgt_fields = {f.name: f.dataType for f in tgt_dt.fields}
@@ -829,11 +828,11 @@ mod tests {
         job.sources = vec![s3_source("events", "s3://b/in")];
         job.sink = Some(iceberg_sink("analytics", "events", None));
         let script = generate_python_script("test_job", &job).unwrap();
-        // Empty structs (struct<>) get a synthetic _yard_empty: string field so Parquet doesn't reject them
+        // Empty structs (struct<>) collapse to null strings — no synthetic placeholder
         assert!(script.contains("if len(struct_type.fields) == 0:"));
         assert!(script.contains("if len(dt.fields) == 0:"));
-        assert!(script.contains("F.struct(F.lit(\"\").cast(\"string\").alias(\"_yard_empty\"))"));
-        assert!(script.contains("\"struct<`_yard_empty`:string>\""));
+        assert!(script.contains("F.lit(None).cast(\"string\")"));
+        assert!(!script.contains("_yard_empty"));
         // _yard_has_void flags empty structs so they get routed through coercion
         assert!(script.contains("if len(dt.fields) == 0:\n            return True"));
     }
@@ -955,9 +954,8 @@ mod tests {
         assert!(script.contains("def _yard_void_to_target(col, src_dt, tgt_dt):"));
         assert!(script.contains("def _yard_conform_to_target_schema(df, spark, tbl):"));
         // Schema-aware empty-struct expansion uses target field shape — when the
-        // target struct has real fields, no _yard_empty placeholder is emitted
-        // for the existing-table path. (The new-table path still synthesizes
-        // _yard_empty via _yard_default_struct because parquet rejects struct<>.)
+        // target struct has real fields, the existing-table path populates from
+        // target. Empty structs collapse to null strings on both paths.
         assert!(script.contains("F.lit(None).cast(f.dataType).alias(f.name)"));
     }
 
