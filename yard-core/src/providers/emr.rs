@@ -89,11 +89,21 @@ impl EmrProvider {
     ) -> Result<String> {
         let step = aws_sdk_emr::types::StepConfig::builder()
             .name(job_name)
-            .action_on_failure(
-                self.action_on_failure
+            .action_on_failure({
+                match self.action_on_failure
                     .parse::<aws_sdk_emr::types::ActionOnFailure>()
-                    .unwrap_or(aws_sdk_emr::types::ActionOnFailure::Continue),
-            )
+                {
+                    Ok(aof) => aof,
+                    Err(_) => {
+                        eprintln!(
+                            "Warning: invalid action_on_failure '{}' for job '{}', \
+                             using CONTINUE. Fix the emr config.",
+                            self.action_on_failure, job_name
+                        );
+                        aws_sdk_emr::types::ActionOnFailure::Continue
+                    }
+                }
+            })
             .hadoop_jar_step(
                 aws_sdk_emr::types::HadoopJarStepConfig::builder()
                     .jar("command-runner.jar")
