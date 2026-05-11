@@ -981,4 +981,37 @@ mod tests {
             "both None → None → caller passes None to aws_config → default chain (D-02)"
         );
     }
+
+    // --- Phase 38 Plan 01: F-CORE-001 / F-CORE-002 regression tests ---
+
+    #[test]
+    fn compare_dag_config_returns_result() {
+        let deployment = make_dag_deployment("somehash", vec!["task_a"]);
+        let dag = make_resolved_dag("test_dag", vec!["task_a"]);
+        let result = compare_dag_config(&deployment, &dag);
+        assert!(result.is_ok(), "compare_dag_config should return Ok for valid inputs");
+    }
+
+    #[test]
+    fn dag_diff_still_works_after_result_change() {
+        // Verifies calculate_dag_diffs propagates the Result from compare_dag_config
+        let dag = make_resolved_dag("test_dag", vec!["task_a"]);
+        let manifest = ProjectManifest {
+            project: "test".to_string(),
+            state: yard_structs::StateBackend::Local {
+                path: ".yard/state".into(),
+            },
+            providers: HashMap::new(),
+            jobs: HashMap::from([(
+                "task_a".to_string(),
+                make_job(JobType::Bash, json!({"type": "bash", "command": "echo hi"})),
+            )]),
+            aws: None,
+        };
+
+        let diffs =
+            calculate_dag_diffs(&manifest, &[dag], &HashMap::new(), &HashMap::new()).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert!(matches!(diffs[0].diff_type, DiffType::Create));
+    }
 }
