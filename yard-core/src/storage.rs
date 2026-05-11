@@ -8,6 +8,9 @@ use yard_structs::{AwsCredentialConfig, DagState, JobState, LockInfo, StateBacke
 /// Prefix for DAG state files to avoid colliding with job state files.
 pub const DAG_STATE_PREFIX: &str = "_dag_";
 
+/// Stale locks older than this are automatically reclaimed on next acquire (D-03).
+const LOCK_TTL_MINUTES: i64 = 30;
+
 // --- Storage backends ---
 
 pub struct LocalStorage {
@@ -253,12 +256,33 @@ impl StorageBackend for LocalStorage {
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     let existing = self.get_lock(&job_name).await?;
                     match existing {
-                        Some(held) => Err(anyhow!(
-                            "Job \"{job_name}\" is locked by {} (since {}). \
-                             Use `yard force-unlock` to override.",
-                            held.who,
-                            held.created_at
-                        )),
+                        Some(held) => {
+                            // D-02: Check if lock is stale (older than TTL)
+                            if let Ok(created) =
+                                chrono::DateTime::parse_from_rfc3339(&held.created_at)
+                            {
+                                let age = chrono::Utc::now().signed_duration_since(created);
+                                if age > chrono::TimeDelta::minutes(LOCK_TTL_MINUTES) {
+                                    eprintln!(
+                                        "Warning: reclaiming stale lock for \"{}\" \
+                                         (held by {} since {}, age {}m)",
+                                        job_name,
+                                        held.who,
+                                        held.created_at,
+                                        age.num_minutes()
+                                    );
+                                    self.force_unlock(&job_name).await?;
+                                    // Retry exactly once (Pitfall 3: no infinite loop)
+                                    return self.lock(&job_name).await;
+                                }
+                            }
+                            Err(anyhow!(
+                                "Job \"{job_name}\" is locked by {} (since {}). \
+                                 Use `yard force-unlock` to override.",
+                                held.who,
+                                held.created_at
+                            ))
+                        }
                         None => Err(anyhow!("Job \"{job_name}\" is locked (unknown holder)")),
                     }
                 }
@@ -493,12 +517,33 @@ impl StorageBackend for S3Storage {
                     // Object already exists — someone holds the lock
                     let existing = self.get_lock(&job_name).await.ok().flatten();
                     match existing {
-                        Some(held) => Err(anyhow!(
-                            "Job \"{job_name}\" is locked by {} (since {}). \
-                             Use `yard force-unlock` to override.",
-                            held.who,
-                            held.created_at
-                        )),
+                        Some(held) => {
+                            // D-02: Check if lock is stale (older than TTL)
+                            if let Ok(created) =
+                                chrono::DateTime::parse_from_rfc3339(&held.created_at)
+                            {
+                                let age = chrono::Utc::now().signed_duration_since(created);
+                                if age > chrono::TimeDelta::minutes(LOCK_TTL_MINUTES) {
+                                    eprintln!(
+                                        "Warning: reclaiming stale lock for \"{}\" \
+                                         (held by {} since {}, age {}m)",
+                                        job_name,
+                                        held.who,
+                                        held.created_at,
+                                        age.num_minutes()
+                                    );
+                                    self.force_unlock(&job_name).await?;
+                                    // Retry exactly once (Pitfall 3: no infinite loop)
+                                    return self.lock(&job_name).await;
+                                }
+                            }
+                            Err(anyhow!(
+                                "Job \"{job_name}\" is locked by {} (since {}). \
+                                 Use `yard force-unlock` to override.",
+                                held.who,
+                                held.created_at
+                            ))
+                        }
                         None => Err(e.into()),
                     }
                 }
@@ -711,6 +756,43 @@ impl Storage {
             if let Err(e) = self.unlock(name, info).await {
                 eprintln!("Warning: failed to unlock job \"{name}\": {e}");
             }
+        }
+    }
+}
+
+/// RAII guard that releases locks on drop.
+/// Call `release()` on the happy path to avoid the drop warning.
+/// If dropped without release (panic, early return), logs a warning;
+/// the TTL (D-02) covers cleanup on next acquire.
+pub struct LockGuard<'a> {
+    storage: &'a Storage,
+    locks: Vec<(String, LockInfo)>,
+    released: bool,
+}
+
+impl<'a> LockGuard<'a> {
+    pub fn new(storage: &'a Storage, locks: Vec<(String, LockInfo)>) -> Self {
+        Self {
+            storage,
+            locks,
+            released: false,
+        }
+    }
+
+    /// Explicit release on the normal-exit path.
+    pub async fn release(mut self) {
+        self.storage.unlock_jobs(&self.locks).await;
+        self.released = true;
+    }
+}
+
+impl<'a> Drop for LockGuard<'a> {
+    fn drop(&mut self) {
+        if !self.released {
+            for (name, _) in &self.locks {
+                eprintln!("Warning: lock guard dropped without explicit release for '{name}'");
+            }
+            // Best-effort: TTL covers any locks not cleaned up here.
         }
     }
 }
