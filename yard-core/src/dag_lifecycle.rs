@@ -104,7 +104,7 @@ pub fn calculate_dag_diffs(
 
         if let Some(existing) = dag_deployments.get(&dag.name) {
             if existing.content_hash != current_hash {
-                let changes = compare_dag_config(existing, dag);
+                let changes = compare_dag_config(existing, dag)?;
                 diffs.push(DagDiff {
                     name: dag.name.clone(),
                     diff_type: DiffType::Modify { changes },
@@ -147,9 +147,10 @@ pub fn calculate_dag_diffs(
 fn compare_dag_config(
     old: &DagDeployment,
     new: &airflow_dag::ResolvedDag,
-) -> BTreeMap<String, (String, String)> {
+) -> Result<BTreeMap<String, (String, String)>> {
     let mut changes = BTreeMap::new();
-    let new_config = serde_json::to_value(&new.config).unwrap_or_default();
+    let new_config = serde_json::to_value(&new.config)
+        .context("Failed to serialize DAG config for diff comparison")?;
     if let (Value::Object(old_obj), Value::Object(new_obj)) = (&old.config, &new_config) {
         for (k, v) in new_obj {
             let old_val = old_obj.get(k).unwrap_or(&Value::Null);
@@ -163,7 +164,7 @@ fn compare_dag_config(
     if old_tasks != new_tasks {
         changes.insert("tasks".to_string(), (old_tasks, new_tasks));
     }
-    changes
+    Ok(changes)
 }
 
 /// Apply DAG changes: generate Python files, upload to S3, persist state.
@@ -249,7 +250,8 @@ pub async fn apply_dags(
                     project: manifest.project.clone(),
                     deployment: DagDeployment {
                         content_hash,
-                        config: serde_json::to_value(&dag.config).unwrap_or_default(),
+                        config: serde_json::to_value(&dag.config)
+                            .context("Failed to serialize DAG config for state persistence")?,
                         tasks: dag.tasks.clone(),
                         status: status.to_string(),
                         applied_at: chrono::Utc::now().to_rfc3339(),
