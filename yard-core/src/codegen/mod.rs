@@ -37,9 +37,17 @@ const ICEBERG_FILL_NULLS_HELPERS: &str = r#"def _yard_default_struct(struct_type
         elif isinstance(dt, (IntegerType, LongType, ShortType, ByteType)):
             out.append(F.lit(0).cast(dt).alias(f.name))
         elif isinstance(dt, ArrayType):
-            out.append(F.array().cast(_yard_void_free_ddl(dt)).alias(f.name))
+            _ddl = _yard_void_free_ddl(dt)
+            if _ddl is None:
+                out.append(F.lit(None).alias(f.name))
+            else:
+                out.append(F.array().cast(_ddl).alias(f.name))
         elif isinstance(dt, MapType):
-            out.append(F.create_map().cast(_yard_void_free_ddl(dt)).alias(f.name))
+            _ddl = _yard_void_free_ddl(dt)
+            if _ddl is None:
+                out.append(F.lit(None).alias(f.name))
+            else:
+                out.append(F.create_map().cast(_ddl).alias(f.name))
         elif isinstance(dt, (TimestampType, DateType)):
             out.append(F.lit(None).cast(dt).alias(f.name))
         elif isinstance(dt, BooleanType):
@@ -156,7 +164,10 @@ def _yard_fill_nulls(df):
                     df = df.drop(name)
                 else:
                     target = _yard_void_free_ddl(dt)
-                    df = df.withColumn(name, F.when(col.isNull(), F.array().cast(target)).otherwise(coerced))
+                    if target is None:
+                        df = df.drop(name)
+                    else:
+                        df = df.withColumn(name, F.when(col.isNull(), F.array().cast(target)).otherwise(coerced))
             else:
                 df = df.withColumn(name, F.when(col.isNull(), F.array().cast(dt)).otherwise(col))
         elif isinstance(dt, MapType):
