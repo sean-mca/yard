@@ -104,7 +104,7 @@ pub fn calculate_dag_diffs(
 
         if let Some(existing) = dag_deployments.get(&dag.name) {
             if existing.content_hash != current_hash {
-                let changes = compare_dag_config(existing, dag);
+                let changes = compare_dag_config(existing, dag)?;
                 diffs.push(DagDiff {
                     name: dag.name.clone(),
                     diff_type: DiffType::Modify { changes },
@@ -147,9 +147,10 @@ pub fn calculate_dag_diffs(
 fn compare_dag_config(
     old: &DagDeployment,
     new: &airflow_dag::ResolvedDag,
-) -> BTreeMap<String, (String, String)> {
+) -> Result<BTreeMap<String, (String, String)>> {
     let mut changes = BTreeMap::new();
-    let new_config = serde_json::to_value(&new.config).unwrap_or_default();
+    let new_config = serde_json::to_value(&new.config)
+        .context("Failed to serialize DAG config for diff comparison")?;
     if let (Value::Object(old_obj), Value::Object(new_obj)) = (&old.config, &new_config) {
         for (k, v) in new_obj {
             let old_val = old_obj.get(k).unwrap_or(&Value::Null);
@@ -163,7 +164,7 @@ fn compare_dag_config(
     if old_tasks != new_tasks {
         changes.insert("tasks".to_string(), (old_tasks, new_tasks));
     }
-    changes
+    Ok(changes)
 }
 
 /// Apply DAG changes: generate Python files, upload to S3, persist state.
@@ -249,7 +250,8 @@ pub async fn apply_dags(
                     project: manifest.project.clone(),
                     deployment: DagDeployment {
                         content_hash,
-                        config: serde_json::to_value(&dag.config).unwrap_or_default(),
+                        config: serde_json::to_value(&dag.config)
+                            .context("Failed to serialize DAG config for state persistence")?,
                         tasks: dag.tasks.clone(),
                         status: status.to_string(),
                         applied_at: chrono::Utc::now().to_rfc3339(),
@@ -510,7 +512,11 @@ pub async fn destroy_dag(
                 let region = airflow_config
                     .get("region")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("us-east-1");
+                    .ok_or_else(|| anyhow!(
+                        "Cannot determine region for DAG '{}' destroy. \
+                         Set `region` in providers.airflow.",
+                        dag_name
+                    ))?;
                 let prefix = section.dags_prefix.as_deref().unwrap_or("dags/");
 
                 let destroy_aws = resolve_destroy_dag_aws(dag_state.aws.as_ref(), aws);
@@ -980,5 +986,99 @@ mod tests {
             picked.is_none(),
             "both None → None → caller passes None to aws_config → default chain (D-02)"
         );
+    }
+
+    // --- Phase 38 Plan 01: F-CORE-001 / F-CORE-002 regression tests ---
+
+    #[test]
+    fn compare_dag_config_returns_result() {
+        let deployment = make_dag_deployment("somehash", vec!["task_a"]);
+        let dag = make_resolved_dag("test_dag", vec!["task_a"]);
+        let result = compare_dag_config(&deployment, &dag);
+        assert!(result.is_ok(), "compare_dag_config should return Ok for valid inputs");
+    }
+
+    #[test]
+    fn dag_diff_still_works_after_result_change() {
+        // Verifies calculate_dag_diffs propagates the Result from compare_dag_config
+        let dag = make_resolved_dag("test_dag", vec!["task_a"]);
+        let manifest = ProjectManifest {
+            project: "test".to_string(),
+            state: yard_structs::StateBackend::Local {
+                path: ".yard/state".into(),
+            },
+            providers: HashMap::new(),
+            jobs: HashMap::from([(
+                "task_a".to_string(),
+                make_job(JobType::Bash, json!({"type": "bash", "command": "echo hi"})),
+            )]),
+            aws: None,
+        };
+
+        let diffs =
+            calculate_dag_diffs(&manifest, &[dag], &HashMap::new(), &HashMap::new()).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert!(matches!(diffs[0].diff_type, DiffType::Create));
+    }
+
+    // --- Phase 38 Plan 01: F-CORE-013 regression test ---
+
+    #[tokio::test]
+    async fn destroy_dag_bails_without_region() {
+        let tmp = std::env::temp_dir()
+            .join(format!("yard_destroy_no_region_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let state_dir = tmp.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let root_dir = tmp.join("root");
+        std::fs::create_dir_all(&root_dir).unwrap();
+
+        let backend = yard_structs::StateBackend::Local {
+            path: state_dir.clone(),
+        };
+
+        // Write a DagState with an s3_uri so destroy_dag enters the S3 branch
+        let storage = storage::get_storage(&backend).await.unwrap();
+        let dag_state = DagState {
+            dag_name: "test_dag".to_string(),
+            project: "test".to_string(),
+            deployment: DagDeployment {
+                content_hash: "abc123".to_string(),
+                config: json!({"schedule": "@daily"}),
+                tasks: vec!["task_a".to_string()],
+                status: "deployed".to_string(),
+                applied_at: "2025-01-01T00:00:00Z".to_string(),
+                s3_uri: Some("s3://bucket/dags/test_dag.py".to_string()),
+            },
+            aws: None,
+        };
+        storage.write_dag("test_dag", &dag_state).await.unwrap();
+
+        // Provider config with airflow but NO region key
+        let airflow_config = json!({
+            "dags_bucket": "test-bucket",
+            "dags_prefix": "dags/"
+        });
+        let mut provider_configs = HashMap::new();
+        provider_configs.insert("airflow".to_string(), airflow_config);
+
+        let result = destroy_dag(
+            &backend,
+            &provider_configs,
+            None,
+            "test_dag",
+            &root_dir,
+            false,
+        )
+        .await;
+
+        assert!(result.is_err(), "destroy_dag should bail when region is absent");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Cannot determine region"),
+            "Error should mention 'Cannot determine region', got: {err_msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
