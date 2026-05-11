@@ -438,8 +438,11 @@ pub async fn apply(
     }
     .await;
 
-    // Always release all locks, even on error
-    lock_guard.release().await;
+    // Always release all locks, even on error.
+    // Lock release is best-effort — TTL backstop (D-02) covers failures.
+    if let Err(e) = lock_guard.release().await {
+        eprintln!("Warning: lock release failed during apply: {e}");
+    }
 
     apply_result
 }
@@ -635,7 +638,10 @@ pub async fn destroy_job(
     }
     .await;
 
-    lock_guard.release().await;
+    // Lock release is best-effort — TTL backstop (D-02) covers failures.
+    if let Err(e) = lock_guard.release().await {
+        eprintln!("Warning: lock release failed during destroy_job: {e}");
+    }
     result?;
 
     Ok(true)

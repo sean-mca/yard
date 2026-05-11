@@ -795,9 +795,24 @@ impl<'a> LockGuard<'a> {
     }
 
     /// Explicit release on the normal-exit path.
-    pub async fn release(mut self) {
-        self.storage.unlock_jobs(&self.locks).await;
+    /// Returns the first unlock error (if any) after attempting all locks,
+    /// so callers can log or propagate.  The TTL backstop (D-02) covers
+    /// any locks that could not be released here.
+    pub async fn release(mut self) -> Result<()> {
+        let mut first_err: Option<anyhow::Error> = None;
+        for (name, info) in self.locks.iter().rev() {
+            if let Err(e) = self.storage.unlock(name, info).await {
+                eprintln!("Warning: failed to unlock '{name}': {e}");
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
         self.released = true;
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1684,7 +1699,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let lock = storage.lock("test_job").await.unwrap();
         let guard = LockGuard::new(&storage, vec![("test_job".to_string(), lock)]);
-        guard.release().await;
+        guard.release().await.expect("release should succeed in test");
         // Lock should be released — can acquire again
         let lock2 = storage.lock("test_job").await;
         assert!(lock2.is_ok(), "Should be able to lock after guard release");

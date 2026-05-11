@@ -553,7 +553,10 @@ pub async fn destroy_dag(
     }
     .await;
 
-    lock_guard.release().await;
+    // Lock release is best-effort — TTL backstop (D-02) covers failures.
+    if let Err(e) = lock_guard.release().await {
+        eprintln!("Warning: lock release failed during destroy_dag: {e}");
+    }
     result?;
 
     Ok(true)
