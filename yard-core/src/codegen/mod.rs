@@ -24,7 +24,7 @@ const EMR_TEMPLATE: &str = include_str!("../templates/emr.py.tera");
 /// `fill_nulls: false` on the sink.
 const ICEBERG_FILL_NULLS_HELPERS: &str = r#"def _yard_default_struct(struct_type):
     if len(struct_type.fields) == 0:
-        return F.lit(None).cast("string")
+        return F.lit(None).cast(struct_type)
     out = []
     for f in struct_type.fields:
         dt = f.dataType
@@ -42,6 +42,8 @@ const ICEBERG_FILL_NULLS_HELPERS: &str = r#"def _yard_default_struct(struct_type
             out.append(F.lit(None).cast(dt).alias(f.name))
         elif isinstance(dt, BooleanType):
             out.append(F.lit(False).alias(f.name))
+        elif isinstance(dt, NullType):
+            out.append(F.lit(None).cast("string").alias(f.name))
         else:
             out.append(F.lit("").cast("string").alias(f.name))
     return F.struct(*out)
@@ -66,7 +68,7 @@ def _yard_void_free_ddl(dt):
         return "string"
     if isinstance(dt, StructType):
         if len(dt.fields) == 0:
-            return "string"
+            return "struct<>"
         parts = ["`" + f.name.replace("`", "``") + "`:" + _yard_void_free_ddl(f.dataType) for f in dt.fields]
         return "struct<" + ",".join(parts) + ">"
     if isinstance(dt, ArrayType):
@@ -80,10 +82,10 @@ def _yard_void_free_ddl(dt):
 
 def _yard_coerce_voids(col, dt):
     if isinstance(dt, NullType):
-        return F.coalesce(col.cast("string"), F.lit(""))
+        return col.cast("string")
     if isinstance(dt, StructType):
         if len(dt.fields) == 0:
-            return F.lit(None).cast("string")
+            return F.lit(None).cast(dt)
         fields = [_yard_coerce_voids(col[f.name], f.dataType).alias(f.name) for f in dt.fields]
         return F.struct(*fields)
     if isinstance(dt, ArrayType):
@@ -91,7 +93,7 @@ def _yard_coerce_voids(col, dt):
         target = _yard_void_free_ddl(dt)
         if isinstance(et, NullType):
             return F.when(col.isNull(), F.lit(None).cast(target)) \
-                .otherwise(F.transform(col, lambda x: F.coalesce(x.cast("string"), F.lit(""))))
+                .otherwise(F.transform(col, lambda x: x.cast("string")))
         if _yard_has_void(et):
             return F.when(col.isNull(), F.lit(None).cast(target)) \
                 .otherwise(F.transform(col, lambda x: _yard_coerce_voids(x, et)))
@@ -103,7 +105,7 @@ def _yard_coerce_voids(col, dt):
         if isinstance(dt.valueType, NullType):
             return F.when(col.isNull(), F.lit(None).cast(target)) \
                 .otherwise(F.map_from_arrays(F.map_keys(col),
-                    F.transform(F.map_values(col), lambda _: F.lit(""))))
+                    F.transform(F.map_values(col), lambda v: v.cast("string"))))
         if _yard_has_void(dt.valueType):
             return F.when(col.isNull(), F.lit(None).cast(target)) \
                 .otherwise(F.map_from_arrays(F.map_keys(col),
@@ -117,7 +119,7 @@ def _yard_fill_nulls(df):
         dt, name = field.dataType, field.name
         col = F.col(f"`{name}`")
         if isinstance(dt, NullType):
-            df = df.withColumn(name, F.coalesce(col.cast("string"), F.lit("")))
+            df = df.withColumn(name, col.cast("string"))
         elif isinstance(dt, StructType):
             if _yard_has_void(dt):
                 df = df.withColumn(name, F.when(col.isNull(), _yard_default_struct(dt)).otherwise(_yard_coerce_voids(col, dt)))
@@ -155,7 +157,7 @@ def _yard_void_to_target(col, src_dt, tgt_dt):
     if isinstance(src_dt, StructType) and isinstance(tgt_dt, StructType):
         if len(src_dt.fields) == 0:
             if len(tgt_dt.fields) == 0:
-                return F.lit(None).cast("string")
+                return F.lit(None).cast(tgt_dt)
             return F.when(col.isNull(), F.lit(None)) \
                 .otherwise(F.struct(*[F.lit(None).cast(f.dataType).alias(f.name) for f in tgt_dt.fields]))
         tgt_fields = {f.name: f.dataType for f in tgt_dt.fields}
@@ -722,7 +724,7 @@ mod tests {
         job.sources = vec![s3_source("events", "s3://b/in")];
         job.sink = Some(iceberg_sink("analytics", "events", None));
         let script = generate_python_script("test_job", &job).unwrap();
-        assert!(script.contains("F.coalesce(col.cast(\"string\"), F.lit(\"\"))"));
+        assert!(script.contains("col.cast(\"string\")"));
     }
 
     #[test]
@@ -826,9 +828,9 @@ mod tests {
         assert!(script.contains("StructType, ArrayType, MapType,"));
         // MapType branch exists in _yard_fill_nulls
         assert!(script.contains("elif isinstance(dt, MapType):"));
-        // Void-value map path: preserve keys, rewrite values to empty strings via map_from_arrays
+        // Void-value map path: preserve keys, cast null values to string via map_from_arrays
         assert!(script.contains("F.map_from_arrays(F.map_keys(col)"));
-        assert!(script.contains("F.transform(F.map_values(col), lambda _: F.lit(\"\"))"));
+        assert!(script.contains("F.transform(F.map_values(col), lambda v: v.cast(\"string\"))"));
         // Void-key map path: drop to empty string-string map (keys carried no data)
         assert!(script.contains("F.create_map().cast(\"map<string,string>\")"));
     }
@@ -853,13 +855,16 @@ mod tests {
         job.sources = vec![s3_source("events", "s3://b/in")];
         job.sink = Some(iceberg_sink("analytics", "events", None));
         let script = generate_python_script("test_job", &job).unwrap();
-        // Empty structs (struct<>) collapse to null strings — no synthetic placeholder
+        // Empty structs preserve their struct type — cast to null of the original type
         assert!(script.contains("if len(struct_type.fields) == 0:"));
         assert!(script.contains("if len(dt.fields) == 0:"));
-        assert!(script.contains("F.lit(None).cast(\"string\")"));
+        assert!(script.contains("F.lit(None).cast(struct_type)"));
+        assert!(script.contains("F.lit(None).cast(dt)"));
         assert!(!script.contains("_yard_empty"));
         // _yard_has_void flags empty structs so they get routed through coercion
         assert!(script.contains("if len(dt.fields) == 0:\n            return True"));
+        // _yard_void_free_ddl preserves empty struct DDL
+        assert!(script.contains("return \"struct<>\""));
     }
 
     #[test]
@@ -980,7 +985,7 @@ mod tests {
         assert!(script.contains("def _yard_conform_to_target_schema(df, spark, tbl):"));
         // Schema-aware empty-struct expansion uses target field shape — when the
         // target struct has real fields, the existing-table path populates from
-        // target. Empty structs collapse to null strings on both paths.
+        // target. Empty structs cast to null of their original type.
         assert!(script.contains("F.lit(None).cast(f.dataType).alias(f.name)"));
     }
 
