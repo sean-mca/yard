@@ -178,6 +178,11 @@ pub(crate) mod test_support {
             output: &str,
             mode: CommentMode,
         ) -> Result<(), octocrab::Error> {
+            // NOTE: The mock stores raw output directly. The real
+            // GitHubClient::post_comment wraps output in a markdown template
+            // (header, details/summary, code fences, footer) and applies
+            // backtick sanitization. Tests asserting on `body` here see
+            // pre-template content, not what GitHub actually receives.
             self.posts.lock().await.push(PostedComment {
                 owner: owner.to_string(),
                 repo: repo.to_string(),
