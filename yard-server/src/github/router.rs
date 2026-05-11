@@ -10,7 +10,7 @@ use chrono::Utc;
 use std::sync::Arc;
 use tracing::{info, warn, error};
 
-use super::client::GitHubApi;
+use super::client::{CommentMode, GitHubApi};
 use super::git_ops::{clone_at_sha, WorkdirGuard};
 use super::webhook::{parse_webhook, WebhookAction};
 use crate::api::dashboard::ApiState;
@@ -36,6 +36,11 @@ pub fn github_router(state: Arc<AppState>) -> Router {
 const GITHUB_COMMENT_MAX_LEN: usize = 65_536;
 const TRUNCATION_NOTICE: &str =
     "\n\n---\n**Output truncated.** Full plan had more changes than can fit in a GitHub comment.\n";
+/// Byte overhead of the wrapping template (header + details + fences + footer)
+/// in `client.rs::post_comment`. Must be subtracted from the truncation budget
+/// so the final assembled comment fits within GITHUB_COMMENT_MAX_LEN.
+/// Actual template is ~140-160 bytes depending on mode; 200 is generous headroom.
+const COMMENT_TEMPLATE_OVERHEAD: usize = 200;
 
 fn format_plan_output(diffs: &[yard_structs::JobDiff], project_name: &str) -> String {
     let mut output = format!("### yard plan for {project_name}\n\n");
@@ -48,7 +53,7 @@ fn format_plan_output(diffs: &[yard_structs::JobDiff], project_name: &str) -> St
     let summary = format!("{} job(s) changed.\n\n", diffs.len());
     output.push_str(&summary);
 
-    let max_body = GITHUB_COMMENT_MAX_LEN - TRUNCATION_NOTICE.len();
+    let max_body = GITHUB_COMMENT_MAX_LEN - TRUNCATION_NOTICE.len() - COMMENT_TEMPLATE_OVERHEAD;
 
     for diff in diffs {
         let entry = match &diff.diff_type {
@@ -97,21 +102,6 @@ fn format_apply_output(result: &yard_core::ApplyResult) -> String {
     }
 
     output
-}
-
-async fn resolve_pr_head_sha(api_state: &ApiState, pr_number: u64) -> Result<String, String> {
-    let octo = octocrab::Octocrab::builder()
-        .personal_token(api_state.github_token.clone())
-        .build()
-        .map_err(|e| format!("Failed to build octocrab: {e}"))?;
-
-    let pr = octo
-        .pulls(&api_state.repo_owner, &api_state.repo_name)
-        .get(pr_number)
-        .await
-        .map_err(|e| format!("Failed to fetch PR #{pr_number}: {e}"))?;
-
-    Ok(pr.head.sha)
 }
 
 async fn handle_webhook(
@@ -219,7 +209,7 @@ async fn handle_webhook(
 
             let status = match state
                 .github_client
-                .post_plan_comment(&owner, &repo, pr_number, &plan_output)
+                .post_comment(&owner, &repo, pr_number, &plan_output, CommentMode::Plan)
                 .await
             {
                 Ok(_) => {
@@ -260,9 +250,13 @@ async fn handle_webhook(
             head_sha,
             clone_url,
         } => {
-            // Resolve head SHA if not provided (issue_comment events don't include it)
+            // Resolve head SHA if not provided (issue_comment events don't include it).
+            // WR-04: use GitHubApi trait method instead of free function so the
+            // Apply path goes through the same auth/mock surface as Plan.
             let head_sha = if head_sha.is_empty() {
-                match resolve_pr_head_sha(&state.api_state, pr_number).await {
+                match state.github_client.get_pr_head_sha(
+                    &owner, &repo, pr_number,
+                ).await {
                     Ok(sha) => sha,
                     Err(e) => {
                         error!(pr = pr_number, "Failed to resolve PR head SHA: {e}");
@@ -343,7 +337,7 @@ async fn handle_webhook(
             // Post apply result as PR comment
             let status = match state
                 .github_client
-                .post_plan_comment(&owner, &repo, pr_number, &apply_output)
+                .post_comment(&owner, &repo, pr_number, &apply_output, CommentMode::Apply)
                 .await
             {
                 Ok(_) => {
@@ -450,7 +444,7 @@ mod tests {
     use crate::api::dashboard::ApiState;
     use crate::db::Database;
     use crate::db::test_support::InMemoryDb;
-    use crate::github::client::GitHubApi;
+    use crate::github::client::{CommentMode, GitHubApi};
     use crate::github::client::test_support::InMemoryGitHubApi;
     use crate::secrets::SecretStore;
     use crate::secrets::test_support::InMemorySecretStore;
@@ -665,7 +659,7 @@ mod tests {
         let elapsed = start.elapsed();
 
         // ---- Assert handler returned 200 (D-25: status comes from
-        // post_plan_comment outcome, NOT from refresh_dashboard_cache —
+        // post_comment outcome, NOT from refresh_dashboard_cache —
         // D-24 allows the dashboard refresh to fail-and-warn).
         assert_eq!(
             response.status(),
@@ -685,7 +679,7 @@ mod tests {
         assert_eq!(
             posts.len(),
             1,
-            "expected exactly one post_plan_comment call; got {}",
+            "expected exactly one post_comment call; got {}",
             posts.len()
         );
         let body = &posts[0].body;
@@ -709,6 +703,12 @@ mod tests {
         assert!(
             body.contains("+ Create job [example-config]"),
             "missing Create-branch substring; body was:\n{body}"
+        );
+
+        // ---- Assert the comment was posted with Plan mode (WR-01 regression).
+        assert!(
+            matches!(posts[0].mode, CommentMode::Plan),
+            "expected CommentMode::Plan for Plan-path comment"
         );
     }
 }
