@@ -24,14 +24,17 @@ const EMR_TEMPLATE: &str = include_str!("../templates/emr.py.tera");
 /// `fill_nulls: false` on the sink.
 const ICEBERG_FILL_NULLS_HELPERS: &str = r#"def _yard_default_struct(struct_type):
     if len(struct_type.fields) == 0:
-        return F.lit(None).cast(struct_type)
+        return None
     out = []
     for f in struct_type.fields:
         dt = f.dataType
         if isinstance(dt, NullType):
             continue
         elif isinstance(dt, StructType):
-            out.append(_yard_default_struct(dt).alias(f.name))
+            sub = _yard_default_struct(dt)
+            if sub is None:
+                continue
+            out.append(sub.alias(f.name))
         elif isinstance(dt, (DoubleType, FloatType)):
             out.append(F.lit(0.0).cast(dt).alias(f.name))
         elif isinstance(dt, (IntegerType, LongType, ShortType, ByteType)):
@@ -39,15 +42,13 @@ const ICEBERG_FILL_NULLS_HELPERS: &str = r#"def _yard_default_struct(struct_type
         elif isinstance(dt, ArrayType):
             _ddl = _yard_void_free_ddl(dt)
             if _ddl is None:
-                out.append(F.lit(None).alias(f.name))
-            else:
-                out.append(F.array().cast(_ddl).alias(f.name))
+                continue
+            out.append(F.array().cast(_ddl).alias(f.name))
         elif isinstance(dt, MapType):
             _ddl = _yard_void_free_ddl(dt)
             if _ddl is None:
-                out.append(F.lit(None).alias(f.name))
-            else:
-                out.append(F.create_map().cast(_ddl).alias(f.name))
+                continue
+            out.append(F.create_map().cast(_ddl).alias(f.name))
         elif isinstance(dt, (TimestampType, DateType)):
             out.append(F.lit(None).cast(dt).alias(f.name))
         elif isinstance(dt, BooleanType):
@@ -55,7 +56,7 @@ const ICEBERG_FILL_NULLS_HELPERS: &str = r#"def _yard_default_struct(struct_type
         else:
             out.append(F.lit("").cast("string").alias(f.name))
     if not out:
-        return F.lit(None).cast(struct_type)
+        return None
     return F.struct(*out)
 
 
@@ -78,14 +79,14 @@ def _yard_void_free_ddl(dt):
         return None
     if isinstance(dt, StructType):
         if len(dt.fields) == 0:
-            return "struct<>"
+            return None
         parts = []
         for f in dt.fields:
             sub = _yard_void_free_ddl(f.dataType)
             if sub is not None:
                 parts.append("`" + f.name.replace("`", "``") + "`:" + sub)
         if not parts:
-            return "struct<>"
+            return None
         return "struct<" + ",".join(parts) + ">"
     if isinstance(dt, ArrayType):
         inner = _yard_void_free_ddl(dt.elementType)
@@ -106,14 +107,14 @@ def _yard_coerce_voids(col, dt):
         return None
     if isinstance(dt, StructType):
         if len(dt.fields) == 0:
-            return F.lit(None).cast(dt)
+            return None
         fields = []
         for f in dt.fields:
             coerced = _yard_coerce_voids(col[f.name], f.dataType)
             if coerced is not None:
                 fields.append(coerced.alias(f.name))
         if not fields:
-            return F.lit(None).cast(dt)
+            return None
         return F.struct(*fields)
     if isinstance(dt, ArrayType):
         et = dt.elementType
@@ -152,9 +153,17 @@ def _yard_fill_nulls(df):
                 if coerced is None:
                     df = df.drop(name)
                 else:
-                    df = df.withColumn(name, F.when(col.isNull(), _yard_default_struct(dt)).otherwise(coerced))
+                    default = _yard_default_struct(dt)
+                    if default is None:
+                        df = df.drop(name)
+                    else:
+                        df = df.withColumn(name, F.when(col.isNull(), default).otherwise(coerced))
             else:
-                df = df.withColumn(name, F.when(col.isNull(), _yard_default_struct(dt)).otherwise(col))
+                default = _yard_default_struct(dt)
+                if default is None:
+                    df = df.drop(name)
+                else:
+                    df = df.withColumn(name, F.when(col.isNull(), default).otherwise(col))
         elif isinstance(dt, ArrayType):
             if isinstance(dt.elementType, NullType):
                 df = df.drop(name)
@@ -778,7 +787,7 @@ mod tests {
         job.sink = Some(iceberg_sink("analytics", "events", None));
         let script = generate_python_script("test_job", &job).unwrap();
         assert!(script.contains("_yard_default_struct(dt)"));
-        assert!(script.contains("F.when(col.isNull(), _yard_default_struct(dt))"));
+        assert!(script.contains("F.when(col.isNull(), default).otherwise("));
     }
 
     #[test]
@@ -895,16 +904,13 @@ mod tests {
         job.sources = vec![s3_source("events", "s3://b/in")];
         job.sink = Some(iceberg_sink("analytics", "events", None));
         let script = generate_python_script("test_job", &job).unwrap();
-        // Empty structs preserve their struct type — cast to null of the original type
+        // Empty structs return None — signaling callers to drop the column
         assert!(script.contains("if len(struct_type.fields) == 0:"));
         assert!(script.contains("if len(dt.fields) == 0:"));
-        assert!(script.contains("F.lit(None).cast(struct_type)"));
-        assert!(script.contains("F.lit(None).cast(dt)"));
+        assert!(script.contains("return None"));
         assert!(!script.contains("_yard_empty"));
         // _yard_has_void flags empty structs so they get routed through coercion
         assert!(script.contains("if len(dt.fields) == 0:\n            return True"));
-        // _yard_void_free_ddl preserves empty struct DDL
-        assert!(script.contains("return \"struct<>\""));
     }
 
     #[test]
