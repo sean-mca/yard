@@ -1,17 +1,25 @@
 use async_trait::async_trait;
 use octocrab::Octocrab;
 
+/// Determines the header/footer text injected around plan/apply output.
+#[derive(Debug, Clone, Copy)]
+pub enum CommentMode {
+    Plan,
+    Apply,
+}
+
 /// Trait for GitHub API operations, enabling mock implementations in tests.
 #[allow(dead_code)]
 #[async_trait]
 pub trait GitHubApi: Send + Sync {
-    /// Post a plan comment on a pull request.
-    async fn post_plan_comment(
+    /// Post a plan or apply comment on a pull request.
+    async fn post_comment(
         &self,
         owner: &str,
         repo: &str,
         pr_number: u64,
-        plan_output: &str,
+        output: &str,
+        mode: CommentMode,
     ) -> Result<(), octocrab::Error>;
 
     /// List files changed in a pull request.
@@ -47,20 +55,36 @@ impl GitHubClient {
 
 #[async_trait]
 impl GitHubApi for GitHubClient {
-    async fn post_plan_comment(
+    async fn post_comment(
         &self,
         owner: &str,
         repo: &str,
         pr_number: u64,
-        plan_output: &str,
+        output: &str,
+        mode: CommentMode,
     ) -> Result<(), octocrab::Error> {
+        // Sanitize triple backticks to prevent markdown fence breakout in GitHub comments.
+        // Trades visual fidelity (``` → `` `) for injection safety.
+        let safe_output = output.replace("```", "`` `");
+
+        let (header, footer) = match mode {
+            CommentMode::Plan => (
+                "### yard plan",
+                "> To apply these changes, merge this PR.",
+            ),
+            CommentMode::Apply => (
+                "### yard apply",
+                "> Applied successfully.",
+            ),
+        };
+
         let body = format!(
-            "### yard plan\n\n\
+            "{header}\n\n\
              <details>\n\
-             <summary>Plan output</summary>\n\n\
-             ```\n{plan_output}\n```\n\n\
+             <summary>Output</summary>\n\n\
+             ```\n{safe_output}\n```\n\n\
              </details>\n\n\
-             > To apply these changes, merge this PR."
+             {footer}"
         );
 
         self.octo
@@ -109,12 +133,12 @@ impl GitHubApi for GitHubClient {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::GitHubApi;
+    use super::{CommentMode, GitHubApi};
     use async_trait::async_trait;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
-    /// Record of a single `post_plan_comment` invocation captured by
+    /// Record of a single `post_comment` invocation captured by
     /// `InMemoryGitHubApi`. Fields beyond `body` are kept for diagnostic
     /// value when an assertion fails — a regression that posts to the
     /// wrong owner/repo/pr is informative against the recorded record.
@@ -125,9 +149,10 @@ pub(crate) mod test_support {
         pub repo: String,
         pub pr_number: u64,
         pub body: String,
+        pub mode: CommentMode,
     }
 
-    /// In-memory `GitHubApi` impl: captures `post_plan_comment` calls into
+    /// In-memory `GitHubApi` impl: captures `post_comment` calls into
     /// `posts` (so the test can assert on them after the handler returns)
     /// and returns safe defaults from the two unused-by-Plan-path methods
     /// (D-15: full method record keeps the impl complete + future-proofs
@@ -146,18 +171,25 @@ pub(crate) mod test_support {
 
     #[async_trait]
     impl GitHubApi for InMemoryGitHubApi {
-        async fn post_plan_comment(
+        async fn post_comment(
             &self,
             owner: &str,
             repo: &str,
             pr_number: u64,
-            plan_output: &str,
+            output: &str,
+            mode: CommentMode,
         ) -> Result<(), octocrab::Error> {
+            // NOTE: The mock stores raw output directly. The real
+            // GitHubClient::post_comment wraps output in a markdown template
+            // (header, details/summary, code fences, footer) and applies
+            // backtick sanitization. Tests asserting on `body` here see
+            // pre-template content, not what GitHub actually receives.
             self.posts.lock().await.push(PostedComment {
                 owner: owner.to_string(),
                 repo: repo.to_string(),
                 pr_number,
-                body: plan_output.to_string(),
+                body: output.to_string(),
+                mode,
             });
             Ok(())
         }
@@ -178,11 +210,47 @@ pub(crate) mod test_support {
             _repo: &str,
             _pr_number: u64,
         ) -> Result<String, octocrab::Error> {
-            // Not exercised by the pull_request webhook path (head_sha is
-            // in the payload). Exercised only by the issue_comment "yard
-            // apply" path, out of scope for Phase 27. Returned safe
-            // default per D-15.
-            Ok(String::new())
+            // WR-05 fix: return a test SHA instead of empty string so
+            // Apply-path tests can exercise get_pr_head_sha without
+            // getting a misleading empty value.
+            Ok("test-sha-abc123".to_string())
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::test_support::InMemoryGitHubApi;
+    use super::CommentMode;
+    use super::GitHubApi;
+
+    #[tokio::test]
+    async fn post_comment_plan_mode_records_correctly() {
+        let api = InMemoryGitHubApi::new();
+        api.post_comment("owner", "repo", 1, "plan output", CommentMode::Plan)
+            .await
+            .unwrap();
+        let comments = api.posts.lock().await;
+        assert_eq!(comments.len(), 1);
+        assert!(matches!(comments[0].mode, CommentMode::Plan));
+    }
+
+    #[tokio::test]
+    async fn post_comment_apply_mode_records_correctly() {
+        let api = InMemoryGitHubApi::new();
+        api.post_comment("owner", "repo", 1, "apply output", CommentMode::Apply)
+            .await
+            .unwrap();
+        let comments = api.posts.lock().await;
+        assert!(matches!(comments[0].mode, CommentMode::Apply));
+    }
+
+    #[tokio::test]
+    async fn get_pr_head_sha_returns_test_sha() {
+        let api = InMemoryGitHubApi::new();
+        let sha = api.get_pr_head_sha("owner", "repo", 1).await.unwrap();
+        assert!(!sha.is_empty(), "Should return a non-empty test SHA");
+        assert_eq!(sha, "test-sha-abc123");
     }
 }

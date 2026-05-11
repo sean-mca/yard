@@ -8,6 +8,9 @@ use yard_structs::{AwsCredentialConfig, DagState, JobState, LockInfo, StateBacke
 /// Prefix for DAG state files to avoid colliding with job state files.
 pub const DAG_STATE_PREFIX: &str = "_dag_";
 
+/// Stale locks older than this are automatically reclaimed on next acquire (D-03).
+const LOCK_TTL_MINUTES: i64 = 30;
+
 // --- Storage backends ---
 
 pub struct LocalStorage {
@@ -253,12 +256,33 @@ impl StorageBackend for LocalStorage {
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     let existing = self.get_lock(&job_name).await?;
                     match existing {
-                        Some(held) => Err(anyhow!(
-                            "Job \"{job_name}\" is locked by {} (since {}). \
-                             Use `yard force-unlock` to override.",
-                            held.who,
-                            held.created_at
-                        )),
+                        Some(held) => {
+                            // D-02: Check if lock is stale (older than TTL)
+                            if let Ok(created) =
+                                chrono::DateTime::parse_from_rfc3339(&held.created_at)
+                            {
+                                let age = chrono::Utc::now().signed_duration_since(created);
+                                if age > chrono::TimeDelta::minutes(LOCK_TTL_MINUTES) {
+                                    eprintln!(
+                                        "Warning: reclaiming stale lock for \"{}\" \
+                                         (held by {} since {}, age {}m)",
+                                        job_name,
+                                        held.who,
+                                        held.created_at,
+                                        age.num_minutes()
+                                    );
+                                    self.force_unlock(&job_name).await?;
+                                    // Retry exactly once (Pitfall 3: no infinite loop)
+                                    return self.lock(&job_name).await;
+                                }
+                            }
+                            Err(anyhow!(
+                                "Job \"{job_name}\" is locked by {} (since {}). \
+                                 Use `yard force-unlock` to override.",
+                                held.who,
+                                held.created_at
+                            ))
+                        }
                         None => Err(anyhow!("Job \"{job_name}\" is locked (unknown holder)")),
                     }
                 }
@@ -490,15 +514,51 @@ impl StorageBackend for S3Storage {
             match result {
                 Ok(_) => Ok(info),
                 Err(e) => {
+                    // Only attempt TTL reclaim when S3 indicates the object
+                    // already exists (precondition failure from if_none_match).
+                    // Non-contention errors (network, throttle, auth, etc.)
+                    // must not enter the reclaim path — doing so could
+                    // incorrectly delete a legitimate lock holder's lock.
+                    let is_contention = e.as_service_error().is_some_and(|se| {
+                        matches!(
+                            se.meta().code(),
+                            Some("PreconditionFailed") | Some("ConditionalRequestConflict")
+                        )
+                    });
+                    if !is_contention {
+                        return Err(e.into());
+                    }
+
                     // Object already exists — someone holds the lock
                     let existing = self.get_lock(&job_name).await.ok().flatten();
                     match existing {
-                        Some(held) => Err(anyhow!(
-                            "Job \"{job_name}\" is locked by {} (since {}). \
-                             Use `yard force-unlock` to override.",
-                            held.who,
-                            held.created_at
-                        )),
+                        Some(held) => {
+                            // D-02: Check if lock is stale (older than TTL)
+                            if let Ok(created) =
+                                chrono::DateTime::parse_from_rfc3339(&held.created_at)
+                            {
+                                let age = chrono::Utc::now().signed_duration_since(created);
+                                if age > chrono::TimeDelta::minutes(LOCK_TTL_MINUTES) {
+                                    eprintln!(
+                                        "Warning: reclaiming stale lock for \"{}\" \
+                                         (held by {} since {}, age {}m)",
+                                        job_name,
+                                        held.who,
+                                        held.created_at,
+                                        age.num_minutes()
+                                    );
+                                    self.force_unlock(&job_name).await?;
+                                    // Retry exactly once (Pitfall 3: no infinite loop)
+                                    return self.lock(&job_name).await;
+                                }
+                            }
+                            Err(anyhow!(
+                                "Job \"{job_name}\" is locked by {} (since {}). \
+                                 Use `yard force-unlock` to override.",
+                                held.who,
+                                held.created_at
+                            ))
+                        }
                         None => Err(e.into()),
                     }
                 }
@@ -711,6 +771,58 @@ impl Storage {
             if let Err(e) = self.unlock(name, info).await {
                 eprintln!("Warning: failed to unlock job \"{name}\": {e}");
             }
+        }
+    }
+}
+
+/// RAII guard that releases locks on drop.
+/// Call `release()` on the happy path to avoid the drop warning.
+/// If dropped without release (panic, early return), logs a warning;
+/// the TTL (D-02) covers cleanup on next acquire.
+pub struct LockGuard<'a> {
+    storage: &'a Storage,
+    locks: Vec<(String, LockInfo)>,
+    released: bool,
+}
+
+impl<'a> LockGuard<'a> {
+    pub fn new(storage: &'a Storage, locks: Vec<(String, LockInfo)>) -> Self {
+        Self {
+            storage,
+            locks,
+            released: false,
+        }
+    }
+
+    /// Explicit release on the normal-exit path.
+    /// Returns the first unlock error (if any) after attempting all locks,
+    /// so callers can log or propagate.  The TTL backstop (D-02) covers
+    /// any locks that could not be released here.
+    pub async fn release(mut self) -> Result<()> {
+        let mut first_err: Option<anyhow::Error> = None;
+        for (name, info) in self.locks.iter().rev() {
+            if let Err(e) = self.storage.unlock(name, info).await {
+                eprintln!("Warning: failed to unlock '{name}': {e}");
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        self.released = true;
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<'a> Drop for LockGuard<'a> {
+    fn drop(&mut self) {
+        if !self.released {
+            for (name, _) in &self.locks {
+                eprintln!("Warning: lock guard dropped without explicit release for '{name}'");
+            }
+            // Best-effort: TTL covers any locks not cleaned up here.
         }
     }
 }
@@ -1577,6 +1689,57 @@ mod tests {
             let job_name = job_name.to_string();
             Box::pin(async move { Ok(self.locks.lock().await.get(&job_name).cloned()) })
         }
+    }
+
+    // --- Phase 38 Plan 02: LockGuard + TTL regression tests ---
+
+    #[tokio::test]
+    async fn lock_guard_release_unlocks() {
+        let (storage, dir) = temp_storage("guard_release");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = storage.lock("test_job").await.unwrap();
+        let guard = LockGuard::new(&storage, vec![("test_job".to_string(), lock)]);
+        guard.release().await.expect("release should succeed in test");
+        // Lock should be released — can acquire again
+        let lock2 = storage.lock("test_job").await;
+        assert!(lock2.is_ok(), "Should be able to lock after guard release");
+        storage.force_unlock("test_job").await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn stale_lock_reclaimed_by_ttl() {
+        let (storage, dir) = temp_storage("ttl_reclaim");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Acquire lock
+        let _lock = storage.lock("ttl_job").await.unwrap();
+        // Manually backdate the lock file to 31 minutes ago
+        let lock_path = dir.join("ttl_job.json.lock");
+        let old_time = (chrono::Utc::now() - chrono::TimeDelta::minutes(31)).to_rfc3339();
+        let backdated = LockInfo {
+            who: "old_user".to_string(),
+            created_at: old_time,
+        };
+        std::fs::write(&lock_path, serde_json::to_string(&backdated).unwrap()).unwrap();
+        // Second lock should reclaim the stale lock
+        let lock2 = storage.lock("ttl_job").await;
+        assert!(lock2.is_ok(), "Should reclaim stale lock older than TTL");
+        storage.force_unlock("ttl_job").await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fresh_lock_not_reclaimed() {
+        let (storage, dir) = temp_storage("ttl_fresh");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _lock = storage.lock("fresh_job").await.unwrap();
+        // Second lock should fail — lock is fresh
+        let lock2 = storage.lock("fresh_job").await;
+        assert!(lock2.is_err(), "Should NOT reclaim fresh lock");
+        let err_msg = lock2.unwrap_err().to_string();
+        assert!(err_msg.contains("is locked by"), "Error should mention who holds the lock");
+        storage.force_unlock("fresh_job").await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

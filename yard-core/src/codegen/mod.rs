@@ -32,7 +32,7 @@ const ICEBERG_FILL_NULLS_HELPERS: &str = r#"def _yard_default_struct(struct_type
             out.append(_yard_default_struct(dt).alias(f.name))
         elif isinstance(dt, (DoubleType, FloatType)):
             out.append(F.lit(0.0).cast(dt).alias(f.name))
-        elif isinstance(dt, (IntegerType, LongType)):
+        elif isinstance(dt, (IntegerType, LongType, ShortType, ByteType)):
             out.append(F.lit(0).cast(dt).alias(f.name))
         elif isinstance(dt, ArrayType):
             out.append(F.array().cast(_yard_void_free_ddl(dt)).alias(f.name))
@@ -733,6 +733,31 @@ mod tests {
         let script = generate_python_script("test_job", &job).unwrap();
         assert!(script.contains("_yard_default_struct(dt)"));
         assert!(script.contains("F.when(col.isNull(), _yard_default_struct(dt))"));
+    }
+
+    #[test]
+    fn yard_default_struct_handles_short_and_byte_types() {
+        // F-CROSS-002: _yard_default_struct must handle ShortType and ByteType
+        // in its integer branch, matching _yard_coerce_voids (which was already
+        // correct). Without this fix, ShortType/ByteType columns inside structs
+        // fall through to the string-cast else branch, producing wrong defaults.
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        let script = generate_python_script("test_job", &job).unwrap();
+
+        // Locate _yard_default_struct and verify its integer branch
+        let ds_start = script.find("def _yard_default_struct(struct_type):")
+            .expect("_yard_default_struct must be present");
+        let ds_end = script[ds_start..].find("\ndef _yard_has_void(")
+            .map(|o| ds_start + o)
+            .unwrap_or(script.len());
+        let ds_body = &script[ds_start..ds_end];
+
+        assert!(
+            ds_body.contains("isinstance(dt, (IntegerType, LongType, ShortType, ByteType))"),
+            "_yard_default_struct integer branch must include ShortType and ByteType, got:\n{ds_body}"
+        );
     }
 
     #[test]
