@@ -512,7 +512,11 @@ pub async fn destroy_dag(
                 let region = airflow_config
                     .get("region")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("us-east-1");
+                    .ok_or_else(|| anyhow!(
+                        "Cannot determine region for DAG '{}' destroy. \
+                         Set `region` in providers.airflow.",
+                        dag_name
+                    ))?;
                 let prefix = section.dags_prefix.as_deref().unwrap_or("dags/");
 
                 let destroy_aws = resolve_destroy_dag_aws(dag_state.aws.as_ref(), aws);
@@ -1015,5 +1019,66 @@ mod tests {
             calculate_dag_diffs(&manifest, &[dag], &HashMap::new(), &HashMap::new()).unwrap();
         assert_eq!(diffs.len(), 1);
         assert!(matches!(diffs[0].diff_type, DiffType::Create));
+    }
+
+    // --- Phase 38 Plan 01: F-CORE-013 regression test ---
+
+    #[tokio::test]
+    async fn destroy_dag_bails_without_region() {
+        let tmp = std::env::temp_dir()
+            .join(format!("yard_destroy_no_region_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let state_dir = tmp.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let root_dir = tmp.join("root");
+        std::fs::create_dir_all(&root_dir).unwrap();
+
+        let backend = yard_structs::StateBackend::Local {
+            path: state_dir.clone(),
+        };
+
+        // Write a DagState with an s3_uri so destroy_dag enters the S3 branch
+        let storage = storage::get_storage(&backend).await.unwrap();
+        let dag_state = DagState {
+            dag_name: "test_dag".to_string(),
+            project: "test".to_string(),
+            deployment: DagDeployment {
+                content_hash: "abc123".to_string(),
+                config: json!({"schedule": "@daily"}),
+                tasks: vec!["task_a".to_string()],
+                status: "deployed".to_string(),
+                applied_at: "2025-01-01T00:00:00Z".to_string(),
+                s3_uri: Some("s3://bucket/dags/test_dag.py".to_string()),
+            },
+            aws: None,
+        };
+        storage.write_dag("test_dag", &dag_state).await.unwrap();
+
+        // Provider config with airflow but NO region key
+        let airflow_config = json!({
+            "dags_bucket": "test-bucket",
+            "dags_prefix": "dags/"
+        });
+        let mut provider_configs = HashMap::new();
+        provider_configs.insert("airflow".to_string(), airflow_config);
+
+        let result = destroy_dag(
+            &backend,
+            &provider_configs,
+            None,
+            "test_dag",
+            &root_dir,
+            false,
+        )
+        .await;
+
+        assert!(result.is_err(), "destroy_dag should bail when region is absent");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Cannot determine region"),
+            "Error should mention 'Cannot determine region', got: {err_msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
