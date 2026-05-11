@@ -11,6 +11,7 @@ use crate::airflow_dag;
 use crate::codegen;
 use crate::providers;
 use crate::storage;
+use crate::storage::LockGuard;
 use crate::utils;
 use crate::validation;
 
@@ -228,6 +229,7 @@ pub async fn apply(
     } else {
         Vec::new()
     };
+    let lock_guard = LockGuard::new(&storage, locks);
 
     // All work happens inside this block so we always unlock on exit
     let apply_result = async {
@@ -436,8 +438,8 @@ pub async fn apply(
     }
     .await;
 
-    // Always unlock all jobs, even on error
-    storage.unlock_jobs(&locks).await;
+    // Always release all locks, even on error
+    lock_guard.release().await;
 
     apply_result
 }
@@ -590,6 +592,7 @@ pub async fn destroy_job(
     };
 
     let lock = storage.lock(job_name).await?;
+    let lock_guard = LockGuard::new(&storage, vec![(job_name.to_string(), lock)]);
 
     let result: Result<()> = async {
         // Destroy provider resources if they exist
@@ -632,7 +635,7 @@ pub async fn destroy_job(
     }
     .await;
 
-    storage.unlock(job_name, &lock).await?;
+    lock_guard.release().await;
     result?;
 
     Ok(true)

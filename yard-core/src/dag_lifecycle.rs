@@ -10,6 +10,7 @@ use crate::airflow_dag;
 use crate::providers;
 use crate::resolve;
 use crate::storage;
+use crate::storage::LockGuard;
 use crate::utils;
 
 use crate::parsing::parse_airflow_section;
@@ -498,6 +499,7 @@ pub async fn destroy_dag(
 
     let lock_key = format!("{}{dag_name}", storage::DAG_STATE_PREFIX);
     let lock = storage.lock(&lock_key).await?;
+    let lock_guard = LockGuard::new(&storage, vec![(lock_key, lock)]);
 
     let result: Result<()> = async {
         // Delete S3 file if deployed. Re-auth prefers the persisted
@@ -551,7 +553,7 @@ pub async fn destroy_dag(
     }
     .await;
 
-    storage.unlock(&lock_key, &lock).await?;
+    lock_guard.release().await;
     result?;
 
     Ok(true)
