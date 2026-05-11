@@ -63,7 +63,8 @@ impl GitHubApi for GitHubClient {
         output: &str,
         mode: CommentMode,
     ) -> Result<(), octocrab::Error> {
-        // WR-03: prevent triple-backtick fence breakout
+        // Sanitize triple backticks to prevent markdown fence breakout in GitHub comments.
+        // Trades visual fidelity (``` → `` `) for injection safety.
         let safe_output = output.replace("```", "`` `");
 
         let (header, footer) = match mode {

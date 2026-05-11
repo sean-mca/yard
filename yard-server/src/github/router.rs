@@ -53,7 +53,9 @@ fn format_plan_output(diffs: &[yard_structs::JobDiff], project_name: &str) -> St
     let summary = format!("{} job(s) changed.\n\n", diffs.len());
     output.push_str(&summary);
 
-    let max_body = GITHUB_COMMENT_MAX_LEN - TRUNCATION_NOTICE.len() - COMMENT_TEMPLATE_OVERHEAD;
+    let max_body = GITHUB_COMMENT_MAX_LEN
+        .saturating_sub(TRUNCATION_NOTICE.len())
+        .saturating_sub(COMMENT_TEMPLATE_OVERHEAD);
 
     for diff in diffs {
         let entry = match &diff.diff_type {
