@@ -197,8 +197,16 @@ pub async fn run_drift_check(state: &ApiState) -> Result<DriftData, String> {
         drifted,
     };
 
-    // Cache the full drift result so the UI can poll without triggering a full check
-    let cached = serde_json::to_string(&drift_data).unwrap_or_default();
+    // Cache the full drift result so the UI can poll without triggering a full check.
+    // F-SRV-001: On serialization failure, skip cache write entirely to avoid
+    // corrupting DynamoDB with an empty string that poisons subsequent reads.
+    let cached = match serde_json::to_string(&drift_data) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "Failed to serialize drift data -- skipping cache update");
+            return Ok(drift_data);
+        }
+    };
     if let Err(e) = state.db.set_cache("drift", &cached).await {
         warn!(error = %e, "Failed to cache drift data");
     }
@@ -437,6 +445,54 @@ mod tests {
     #[test]
     fn state_hash_in_sync_const_is_stable() {
         assert_eq!(STATE_HASH_IN_SYNC, "in_sync");
+    }
+
+    // F-SRV-001: Verify the cache serialization path no longer uses
+    // unwrap_or_default which would write an empty string to DynamoDB
+    // on serialization failure, corrupting subsequent cache reads.
+    #[test]
+    fn drift_cache_serialization_no_unwrap_or_default() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let target = format!("{manifest_dir}/src/api/drift.rs");
+        let contents = std::fs::read_to_string(&target)
+            .expect("failed to read api/drift.rs for serialization guard");
+
+        // Extract production code only (before #[cfg(test)])
+        let production_only: String = contents
+            .lines()
+            .take_while(|line| !line.trim_start().starts_with("#[cfg(test)]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The old pattern was: serde_json::to_string(&drift_data).unwrap_or_default()
+        // Verify it is gone from production code.
+        assert!(
+            !production_only.contains("to_string(&drift_data).unwrap_or_default()"),
+            "regression: unwrap_or_default on drift_data serialization reintroduced"
+        );
+
+        // Verify the replacement pattern exists: the match-based early return.
+        assert!(
+            production_only.contains("Failed to serialize drift data -- skipping cache update"),
+            "F-SRV-001 fix must include the skip-cache warning message"
+        );
+    }
+
+    #[test]
+    fn drift_cache_serialization_happy_path() {
+        // Verify that serde_json::to_string on a realistic DriftData produces
+        // a non-empty string (the happy path that the fix preserves).
+        let data = DriftData {
+            items: vec![],
+            in_sync: 5,
+            drifted: 0,
+        };
+        let serialized = serde_json::to_string(&data);
+        assert!(serialized.is_ok(), "serialization must succeed for valid data");
+        assert!(
+            !serialized.unwrap().is_empty(),
+            "serialized output must not be empty"
+        );
     }
 
     // SRV-05 / D-15: machine-enforced grep gate to prevent regression of
