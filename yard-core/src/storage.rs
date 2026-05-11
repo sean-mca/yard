@@ -514,6 +514,21 @@ impl StorageBackend for S3Storage {
             match result {
                 Ok(_) => Ok(info),
                 Err(e) => {
+                    // Only attempt TTL reclaim when S3 indicates the object
+                    // already exists (precondition failure from if_none_match).
+                    // Non-contention errors (network, throttle, auth, etc.)
+                    // must not enter the reclaim path — doing so could
+                    // incorrectly delete a legitimate lock holder's lock.
+                    let is_contention = e.as_service_error().is_some_and(|se| {
+                        matches!(
+                            se.meta().code(),
+                            Some("PreconditionFailed") | Some("ConditionalRequestConflict")
+                        )
+                    });
+                    if !is_contention {
+                        return Err(e.into());
+                    }
+
                     // Object already exists — someone holds the lock
                     let existing = self.get_lock(&job_name).await.ok().flatten();
                     match existing {
