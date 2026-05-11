@@ -1579,6 +1579,57 @@ mod tests {
         }
     }
 
+    // --- Phase 38 Plan 02: LockGuard + TTL regression tests ---
+
+    #[tokio::test]
+    async fn lock_guard_release_unlocks() {
+        let (storage, dir) = temp_storage("guard_release");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = storage.lock("test_job").await.unwrap();
+        let guard = LockGuard::new(&storage, vec![("test_job".to_string(), lock)]);
+        guard.release().await;
+        // Lock should be released — can acquire again
+        let lock2 = storage.lock("test_job").await;
+        assert!(lock2.is_ok(), "Should be able to lock after guard release");
+        storage.force_unlock("test_job").await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn stale_lock_reclaimed_by_ttl() {
+        let (storage, dir) = temp_storage("ttl_reclaim");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Acquire lock
+        let _lock = storage.lock("ttl_job").await.unwrap();
+        // Manually backdate the lock file to 31 minutes ago
+        let lock_path = dir.join("ttl_job.json.lock");
+        let old_time = (chrono::Utc::now() - chrono::TimeDelta::minutes(31)).to_rfc3339();
+        let backdated = LockInfo {
+            who: "old_user".to_string(),
+            created_at: old_time,
+        };
+        std::fs::write(&lock_path, serde_json::to_string(&backdated).unwrap()).unwrap();
+        // Second lock should reclaim the stale lock
+        let lock2 = storage.lock("ttl_job").await;
+        assert!(lock2.is_ok(), "Should reclaim stale lock older than TTL");
+        storage.force_unlock("ttl_job").await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fresh_lock_not_reclaimed() {
+        let (storage, dir) = temp_storage("ttl_fresh");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _lock = storage.lock("fresh_job").await.unwrap();
+        // Second lock should fail — lock is fresh
+        let lock2 = storage.lock("fresh_job").await;
+        assert!(lock2.is_err(), "Should NOT reclaim fresh lock");
+        let err_msg = lock2.unwrap_err().to_string();
+        assert!(err_msg.contains("is locked by"), "Error should mention who holds the lock");
+        storage.force_unlock("fresh_job").await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn in_memory_backend_full_cycle() {
         // SC #4 demonstration: construct Storage from a third backend (the
