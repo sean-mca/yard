@@ -479,6 +479,16 @@ pub fn yaml_to_json(yaml: &yaml_rust2::Yaml) -> Value {
     }
 }
 
+/// Reserved YAML filenames that are NOT counted as job files during
+/// environment discovery. Matches the exclusion list in `discover_jobs()`.
+const RESERVED_YAML_FILES: &[&str] = &[
+    "yard.yaml",
+    "account.yaml",
+    "region.yaml",
+    "transforms.yaml",
+    "dag.yaml",
+];
+
 /// Discover environments by walking the repo directory structure following the
 /// `root/{env}/{region}/**` convention (D-04, D-07). Resolves the yard.yaml
 /// config cascade per environment WITHOUT loading state. Each directory that
@@ -489,9 +499,157 @@ pub fn yaml_to_json(yaml: &yaml_rust2::Yaml) -> Value {
 /// not account ID per D-12), optional account_id/role_arn from account.yaml,
 /// and per-region job/DAG summaries.
 pub fn discover_environments(root_path: &Path) -> Result<Vec<DiscoveredEnvironment>> {
-    // Stub — will be implemented in the GREEN phase.
-    let _ = root_path;
-    Ok(Vec::new())
+    // 1. Locate yard.yaml to establish the project root (Pitfall 3).
+    let yard_yaml_path = find_in_parent_folders(root_path, "yard.yaml")
+        .ok_or_else(|| anyhow!("No yard.yaml found in {} or parent directories", root_path.display()))?;
+    let project_root = yard_yaml_path
+        .parent()
+        .ok_or_else(|| anyhow!("yard.yaml path has no parent directory"))?;
+
+    let mut environments = Vec::new();
+
+    // 2. Walk immediate children of the project root. Each child directory
+    //    that contains account.yaml is treated as an environment (Pitfall 5).
+    let entries = fs::read_dir(project_root)
+        .with_context(|| format!("Failed to read directory: {}", project_root.display()))?;
+
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!("Failed to read entry in {}", project_root.display())
+        })?;
+        let entry_path = entry.path();
+
+        // Skip non-directories
+        if !entry_path.is_dir() {
+            continue;
+        }
+
+        // Environment marker: must contain account.yaml (Pitfall 5, Pitfall 6).
+        // Directories without account.yaml are silently skipped.
+        if !entry_path.join("account.yaml").exists() {
+            continue;
+        }
+
+        let env_name = entry_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| anyhow!("Non-UTF8 directory name: {}", entry_path.display()))?
+            .to_string();
+
+        // 3. Parse account.yaml to extract account_id and role_arn.
+        let account_config = find_and_parse_context(&entry_path, "account.yaml", false)?;
+        let account_id = account_config
+            .get("account_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let role_arn = account_config
+            .pointer("/aws/assume_role")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        // 4. Walk immediate children of the env directory for region directories.
+        let mut regions = Vec::new();
+        let region_entries = fs::read_dir(&entry_path)
+            .with_context(|| format!("Failed to read env directory: {}", entry_path.display()))?;
+
+        for region_entry in region_entries {
+            let region_entry = region_entry.with_context(|| {
+                format!("Failed to read entry in {}", entry_path.display())
+            })?;
+            let region_path = region_entry.path();
+
+            // Skip non-directories
+            if !region_path.is_dir() {
+                continue;
+            }
+
+            // Region marker: must contain region.yaml
+            if !region_path.join("region.yaml").exists() {
+                continue;
+            }
+
+            let region_name = region_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| anyhow!("Non-UTF8 directory name: {}", region_path.display()))?
+                .to_string();
+
+            // 5. Count jobs and DAGs within the region directory.
+            let mut job_count: u64 = 0;
+            let mut dag_count: u64 = 0;
+            let mut jobs = Vec::new();
+
+            let region_files = fs::read_dir(&region_path)
+                .with_context(|| format!("Failed to read region directory: {}", region_path.display()))?;
+
+            for file_entry in region_files {
+                let file_entry = file_entry.with_context(|| {
+                    format!("Failed to read entry in {}", region_path.display())
+                })?;
+                let file_path = file_entry.path();
+
+                // Only process .yaml files
+                if file_path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                    continue;
+                }
+
+                let file_name = file_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| anyhow!("Non-UTF8 file name: {}", file_path.display()))?;
+
+                // Count dag.yaml marker files
+                if file_name == "dag.yaml" {
+                    dag_count += 1;
+                    continue;
+                }
+
+                // Skip other reserved files
+                if RESERVED_YAML_FILES.contains(&file_name) {
+                    continue;
+                }
+
+                // This is a job file — parse just the type field for JobSummary
+                let job_name = file_name.strip_suffix(".yaml")
+                    .ok_or_else(|| anyhow!("Expected .yaml extension: {}", file_path.display()))?
+                    .to_string();
+
+                let content = fs::read_to_string(&file_path)
+                    .with_context(|| format!("Failed to read {}", file_path.display()))?;
+                let docs = YamlLoader::load_from_str(&content)
+                    .map_err(|e| anyhow!("YAML error in {}: {}", file_path.display(), e))?;
+
+                if let Some(doc) = docs.first() {
+                    let job_value = yaml_to_json(doc);
+                    if let Some(type_str) = job_value.get("type").and_then(|v| v.as_str())
+                        && let Ok(job_type) = type_str.parse::<JobType>()
+                    {
+                        jobs.push(yard_structs::JobSummary {
+                            name: job_name,
+                            job_type,
+                        });
+                        job_count += 1;
+                    }
+                }
+            }
+
+            regions.push(RegionSummary {
+                name: region_name,
+                job_count,
+                dag_count,
+                jobs,
+            });
+        }
+
+        environments.push(DiscoveredEnvironment {
+            name: env_name,
+            account_id,
+            role_arn,
+            regions,
+        });
+    }
+
+    Ok(environments)
 }
 
 #[cfg(test)]
