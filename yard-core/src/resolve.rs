@@ -5,7 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use yaml_rust2::YamlLoader;
 use yard_structs::{
-    JobDefinition, JobType, ProjectManifest, ProjectState, StateBackend, YARDContext,
+    DiscoveredEnvironment, JobDefinition, JobType, ProjectManifest, ProjectState, RegionSummary,
+    StateBackend, YARDContext,
 };
 
 /// Allowed top-level keys on a yard.yaml manifest (TYPE-03 D-19). Any other
@@ -478,6 +479,21 @@ pub fn yaml_to_json(yaml: &yaml_rust2::Yaml) -> Value {
     }
 }
 
+/// Discover environments by walking the repo directory structure following the
+/// `root/{env}/{region}/**` convention (D-04, D-07). Resolves the yard.yaml
+/// config cascade per environment WITHOUT loading state. Each directory that
+/// contains `account.yaml` is treated as an environment directory; each
+/// subdirectory within it that contains `region.yaml` is treated as a region.
+///
+/// Returns `Vec<DiscoveredEnvironment>` with environment name (directory name,
+/// not account ID per D-12), optional account_id/role_arn from account.yaml,
+/// and per-region job/DAG summaries.
+pub fn discover_environments(root_path: &Path) -> Result<Vec<DiscoveredEnvironment>> {
+    // Stub — will be implemented in the GREEN phase.
+    let _ = root_path;
+    Ok(Vec::new())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -900,5 +916,147 @@ mod tests {
         let err = discover_jobs(&tmp.0).expect_err("typo must reject");
         let msg = format!("{err}");
         assert!(msg.contains("unknown field 'rolle'"), "got: {msg}");
+    }
+
+    // --- discover_environments (Phase 40) ---
+
+    /// Helper: create a minimal yard project fixture with env/region structure.
+    fn make_yard_project(root: &Path) {
+        fs::write(
+            root.join("yard.yaml"),
+            "project: test\nstate:\n  type: local\n  path: .yard/state\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn discover_environments_single_env_single_region() {
+        let tmp = TempDir::new();
+        make_yard_project(&tmp.0);
+
+        // Create production/us-east-1 with account.yaml, region.yaml, and 2 jobs
+        let env_dir = tmp.0.join("production");
+        let region_dir = env_dir.join("us-east-1");
+        fs::create_dir_all(&region_dir).unwrap();
+        fs::write(env_dir.join("account.yaml"), "{}").unwrap();
+        fs::write(region_dir.join("region.yaml"), "{}").unwrap();
+        fs::write(region_dir.join("orders.yaml"), "type: glue\n").unwrap();
+        fs::write(region_dir.join("users.yaml"), "type: emr\n").unwrap();
+
+        let envs = discover_environments(&tmp.0).unwrap();
+        assert_eq!(envs.len(), 1, "expected 1 env, got: {envs:?}");
+        assert_eq!(envs[0].name, "production");
+        assert_eq!(envs[0].regions.len(), 1);
+        assert_eq!(envs[0].regions[0].name, "us-east-1");
+        assert_eq!(envs[0].regions[0].job_count, 2);
+        assert_eq!(envs[0].regions[0].jobs.len(), 2);
+    }
+
+    #[test]
+    fn discover_environments_multi_env() {
+        let tmp = TempDir::new();
+        make_yard_project(&tmp.0);
+
+        // dev with one region
+        let dev_dir = tmp.0.join("dev");
+        let dev_region = dev_dir.join("us-east-1");
+        fs::create_dir_all(&dev_region).unwrap();
+        fs::write(dev_dir.join("account.yaml"), "{}").unwrap();
+        fs::write(dev_region.join("region.yaml"), "{}").unwrap();
+        fs::write(dev_region.join("job1.yaml"), "type: glue\n").unwrap();
+
+        // prod with one region
+        let prod_dir = tmp.0.join("prod");
+        let prod_region = prod_dir.join("eu-west-1");
+        fs::create_dir_all(&prod_region).unwrap();
+        fs::write(prod_dir.join("account.yaml"), "{}").unwrap();
+        fs::write(prod_region.join("region.yaml"), "{}").unwrap();
+        fs::write(prod_region.join("job2.yaml"), "type: bash\n").unwrap();
+
+        let envs = discover_environments(&tmp.0).unwrap();
+        assert_eq!(envs.len(), 2, "expected 2 envs, got: {envs:?}");
+        // Should be findable by name
+        let dev = envs.iter().find(|e| e.name == "dev").expect("dev missing");
+        let prod = envs.iter().find(|e| e.name == "prod").expect("prod missing");
+        assert_eq!(dev.regions[0].name, "us-east-1");
+        assert_eq!(prod.regions[0].name, "eu-west-1");
+    }
+
+    #[test]
+    fn discover_environments_missing_account_yaml_skipped() {
+        let tmp = TempDir::new();
+        make_yard_project(&tmp.0);
+
+        // good env has account.yaml
+        let good_dir = tmp.0.join("good");
+        let good_region = good_dir.join("us-east-1");
+        fs::create_dir_all(&good_region).unwrap();
+        fs::write(good_dir.join("account.yaml"), "{}").unwrap();
+        fs::write(good_region.join("region.yaml"), "{}").unwrap();
+
+        // bad env lacks account.yaml — should be skipped
+        let bad_dir = tmp.0.join("bad");
+        let bad_region = bad_dir.join("us-west-2");
+        fs::create_dir_all(&bad_region).unwrap();
+        // No account.yaml here
+        fs::write(bad_region.join("region.yaml"), "{}").unwrap();
+
+        let envs = discover_environments(&tmp.0).unwrap();
+        assert_eq!(envs.len(), 1, "expected only 1 env (bad skipped), got: {envs:?}");
+        assert_eq!(envs[0].name, "good");
+    }
+
+    #[test]
+    fn discover_environments_role_arn_from_account_yaml() {
+        let tmp = TempDir::new();
+        make_yard_project(&tmp.0);
+
+        let env_dir = tmp.0.join("staging");
+        let region_dir = env_dir.join("us-east-1");
+        fs::create_dir_all(&region_dir).unwrap();
+        fs::write(
+            env_dir.join("account.yaml"),
+            "aws:\n  assume_role: arn:aws:iam::987654321098:role/Deploy\n",
+        )
+        .unwrap();
+        fs::write(region_dir.join("region.yaml"), "{}").unwrap();
+
+        let envs = discover_environments(&tmp.0).unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(
+            envs[0].role_arn.as_deref(),
+            Some("arn:aws:iam::987654321098:role/Deploy")
+        );
+    }
+
+    #[test]
+    fn discover_environments_dag_count() {
+        let tmp = TempDir::new();
+        make_yard_project(&tmp.0);
+
+        let env_dir = tmp.0.join("production");
+        let region_dir = env_dir.join("us-east-1");
+        fs::create_dir_all(&region_dir).unwrap();
+        fs::write(env_dir.join("account.yaml"), "{}").unwrap();
+        fs::write(region_dir.join("region.yaml"), "{}").unwrap();
+        fs::write(region_dir.join("dag.yaml"), "schedule: '@daily'\n").unwrap();
+        fs::write(region_dir.join("orders.yaml"), "type: glue\n").unwrap();
+
+        let envs = discover_environments(&tmp.0).unwrap();
+        assert_eq!(envs[0].regions[0].dag_count, 1);
+        assert_eq!(envs[0].regions[0].job_count, 1); // dag.yaml not counted as job
+    }
+
+    #[test]
+    fn discover_environments_no_yard_yaml_errors() {
+        let tmp = TempDir::new();
+        // No yard.yaml at all
+        let result = discover_environments(&tmp.0);
+        assert!(result.is_err(), "expected error when no yard.yaml");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("yard.yaml"),
+            "error should mention yard.yaml, got: {msg}"
+        );
     }
 }
