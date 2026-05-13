@@ -3,6 +3,7 @@ use octocrab::Octocrab;
 
 /// Determines the header/footer text injected around plan/apply output.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub enum CommentMode {
     Plan,
     Apply,

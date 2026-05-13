@@ -12,6 +12,9 @@ use tracing::{info, warn, error};
 
 use super::client::{CommentMode, GitHubApi};
 use super::git_ops::{clone_at_sha, WorkdirGuard};
+use super::plan::{
+    filter_affected_environments, format_per_env_comment, run_per_env_plans, PLAN_COMMENT_MARKER,
+};
 use super::webhook::{parse_webhook, WebhookAction};
 use crate::api::dashboard::ApiState;
 use crate::db::{Database, PlanResultRow, PlanStatus, WebhookEvent};
@@ -22,6 +25,7 @@ pub struct AppState {
     pub webhook_secret: String,
     pub db: Arc<dyn Database>,
     pub api_state: Arc<ApiState>,
+    pub dashboard_url: Option<String>,
 }
 
 /// Build the axum router for GitHub webhook endpoints.
@@ -29,60 +33,6 @@ pub fn github_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/webhook/github", post(handle_webhook))
         .with_state(state)
-}
-
-/// Format diffs as text for a PR comment.
-/// GitHub comment body limit is 65,536 characters.
-const GITHUB_COMMENT_MAX_LEN: usize = 65_536;
-const TRUNCATION_NOTICE: &str =
-    "\n\n---\n**Output truncated.** Full plan had more changes than can fit in a GitHub comment.\n";
-/// Byte overhead of the wrapping template (header + details + fences + footer)
-/// in `client.rs::post_comment`. Must be subtracted from the truncation budget
-/// so the final assembled comment fits within GITHUB_COMMENT_MAX_LEN.
-/// Actual template is ~140-160 bytes depending on mode; 200 is generous headroom.
-const COMMENT_TEMPLATE_OVERHEAD: usize = 200;
-
-fn format_plan_output(diffs: &[yard_structs::JobDiff], project_name: &str) -> String {
-    let mut output = format!("### yard plan for {project_name}\n\n");
-
-    if diffs.is_empty() {
-        output.push_str("No changes. Infrastructure is up to date.\n");
-        return output;
-    }
-
-    let summary = format!("{} job(s) changed.\n\n", diffs.len());
-    output.push_str(&summary);
-
-    let max_body = GITHUB_COMMENT_MAX_LEN
-        .saturating_sub(TRUNCATION_NOTICE.len())
-        .saturating_sub(COMMENT_TEMPLATE_OVERHEAD);
-
-    for diff in diffs {
-        let entry = match &diff.diff_type {
-            yard_structs::DiffType::Create => {
-                format!("  + Create job [{}]\n", diff.name)
-            }
-            yard_structs::DiffType::Modify { changes } => {
-                let mut s = format!("  ~ Modify job [{}]\n", diff.name);
-                for (key, (old, new)) in changes {
-                    s.push_str(&format!("      {key} : {old} -> {new}\n"));
-                }
-                s
-            }
-            yard_structs::DiffType::Delete => {
-                format!("  - Delete job [{}]\n", diff.name)
-            }
-        };
-
-        if output.len() + entry.len() > max_body {
-            output.push_str(TRUNCATION_NOTICE);
-            return output;
-        }
-
-        output.push_str(&entry);
-    }
-
-    output
 }
 
 /// Format apply result as text for logging.
@@ -106,6 +56,166 @@ fn format_apply_output(result: &yard_core::ApplyResult) -> String {
     output
 }
 
+/// Search for an existing plan comment (by marker) and update it, or create a new one.
+async fn find_and_upsert_plan_comment(
+    github: &dyn GitHubApi,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    body: &str,
+) -> Result<(), String> {
+    let comments = github
+        .list_comments(owner, repo, pr_number)
+        .await
+        .map_err(|e| format!("list comments: {e}"))?;
+
+    if let Some(existing) = comments.iter().find(|c| c.body.starts_with(PLAN_COMMENT_MARKER)) {
+        github
+            .update_comment(owner, repo, existing.id, body)
+            .await
+            .map_err(|e| format!("update comment: {e}"))?;
+    } else {
+        github
+            .post_comment_raw(owner, repo, pr_number, body)
+            .await
+            .map_err(|e| format!("post comment: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Full plan pipeline: clone → discover → filter → plan → format → post → persist.
+/// Used by both the Plan branch and stale-plan auto-replan.
+async fn run_plan_pipeline(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    head_sha: &str,
+    clone_url: &str,
+    target_filter: Option<&str>,
+) -> StatusCode {
+    let workdir_path = match clone_at_sha(clone_url, head_sha, Some(&state.api_state.github_token))
+        .await
+    {
+        Ok(path) => path,
+        Err(e) => {
+            error!(pr = pr_number, "Clone failed: {e}");
+            let error_body = format!(
+                "{PLAN_COMMENT_MARKER}\n### yard plan\n\n:x: Clone failed: {e}"
+            );
+            let _ = find_and_upsert_plan_comment(
+                state.github_client.as_ref(),
+                owner,
+                repo,
+                pr_number,
+                &error_body,
+            )
+            .await;
+            return StatusCode::OK;
+        }
+    };
+    let workdir = WorkdirGuard::new(workdir_path);
+
+    let environments = match yard_core::resolve::discover_environments(workdir.path()) {
+        Ok(envs) => envs,
+        Err(e) => {
+            error!(pr = pr_number, "discover_environments failed: {e}");
+            let error_body = format!(
+                "{PLAN_COMMENT_MARKER}\n### yard plan\n\n:x: Discovery failed: {e}"
+            );
+            let _ = find_and_upsert_plan_comment(
+                state.github_client.as_ref(),
+                owner,
+                repo,
+                pr_number,
+                &error_body,
+            )
+            .await;
+            return StatusCode::OK;
+        }
+    };
+
+    let changed_files = match state
+        .github_client
+        .get_pr_changed_files(owner, repo, pr_number)
+        .await
+    {
+        Ok(files) => files,
+        Err(e) => {
+            error!(pr = pr_number, "get_pr_changed_files failed: {e}");
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    };
+
+    let affected_envs = filter_affected_environments(&environments, &changed_files);
+    let results = run_per_env_plans(affected_envs, workdir.path(), target_filter).await;
+
+    let plan_id = uuid::Uuid::new_v4().to_string();
+    let comment_body = format_per_env_comment(
+        &results,
+        head_sha,
+        state.dashboard_url.as_deref(),
+        Some(&plan_id),
+    );
+
+    let has_errors = results.iter().any(|r| r.diffs.is_err());
+    let plan_status = if has_errors {
+        PlanStatus::Failure
+    } else {
+        PlanStatus::Success
+    };
+
+    // Post or update the plan comment
+    if let Err(e) = find_and_upsert_plan_comment(
+        state.github_client.as_ref(),
+        owner,
+        repo,
+        pr_number,
+        &comment_body,
+    )
+    .await
+    {
+        warn!(pr = pr_number, error = %e, "Failed to post/update plan comment");
+    } else {
+        info!(pr = pr_number, "Posted plan comment");
+    }
+
+    // Persist plan result
+    let plan_result = PlanResultRow {
+        id: plan_id,
+        pr_number,
+        sha: head_sha.to_string(),
+        status: plan_status,
+        raw_output: comment_body,
+        diff_summary: None,
+        created_at: Utc::now(),
+    };
+    if let Err(e) = state.db.insert_plan_result(&plan_result).await {
+        warn!(pr = pr_number, error = %e, "Failed to persist plan result");
+    }
+
+    // Refresh dashboard cache; emit events
+    if let Err(e) = crate::api::dashboard::refresh_dashboard_cache(&state.api_state).await {
+        warn!(error = %e, "Failed to refresh dashboard cache after plan");
+        let _ = state.api_state.event_tx.send(
+            crate::api::events::Event::DashboardFailed {
+                reason: crate::api::events::sanitize_reason(&e),
+            },
+        );
+    } else {
+        let _ = state
+            .api_state
+            .event_tx
+            .send(crate::api::events::Event::DashboardRefreshed);
+    }
+    let _ = state
+        .api_state
+        .event_tx
+        .send(crate::api::events::Event::WebhookReceived);
+
+    StatusCode::OK
+}
+
 async fn handle_webhook(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -126,8 +236,25 @@ async fn handle_webhook(
             pr_number,
             head_sha,
             clone_url,
-            target_filter: _target_filter,
+            target_filter,
         } => {
+            // Resolve empty head_sha for comment-triggered plans
+            let head_sha = if head_sha.is_empty() {
+                match state
+                    .github_client
+                    .get_pr_head_sha(&owner, &repo, pr_number)
+                    .await
+                {
+                    Ok(sha) => sha,
+                    Err(e) => {
+                        error!(pr = pr_number, "Failed to resolve PR head SHA: {e}");
+                        return StatusCode::INTERNAL_SERVER_ERROR;
+                    }
+                }
+            } else {
+                head_sha
+            };
+
             info!(
                 pr = pr_number,
                 sha = %head_sha,
@@ -135,7 +262,7 @@ async fn handle_webhook(
                 "Running yard plan"
             );
 
-            // Persist the webhook event
+            // Persist webhook event
             let webhook_event = WebhookEvent {
                 id: uuid::Uuid::new_v4().to_string(),
                 pr_number,
@@ -152,99 +279,16 @@ async fn handle_webhook(
                 warn!(pr = pr_number, error = %e, "Failed to persist webhook event");
             }
 
-            // Clone and run plan via yard-core — token passed via env, not in URL
-            let plan_result: Result<String, String> = match clone_at_sha(
-                &clone_url,
+            run_plan_pipeline(
+                &state,
+                &owner,
+                &repo,
+                pr_number,
                 &head_sha,
-                Some(&state.api_state.github_token),
+                &clone_url,
+                target_filter.as_deref(),
             )
             .await
-            {
-                Ok(workdir_path) => {
-                    let workdir = WorkdirGuard::new(workdir_path);
-                    match yard_core::resolve::resolve_project(workdir.path()).await {
-                        Ok(project) => {
-                            match yard_core::calculate_diff(
-                                &project.manifest,
-                                &project.current_state,
-                            ) {
-                                Ok(diffs) => Ok(format_plan_output(&diffs, &project.manifest.project)),
-                                Err(e) => {
-                                    error!(pr = pr_number, "yard plan failed: {e}");
-                                    Err(format!("yard plan failed:\n{e}"))
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!(pr = pr_number, "yard plan failed: {e}");
-                            Err(format!("yard plan failed:\n{e}"))
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(pr = pr_number, "Clone failed: {e}");
-                    Err(format!("Failed to clone repo:\n{e}"))
-                }
-            };
-
-            let status = if plan_result.is_ok() {
-                PlanStatus::Success
-            } else {
-                PlanStatus::Failure
-            };
-            let plan_output = match plan_result {
-                Ok(output) | Err(output) => output,
-            };
-
-            // Persist the plan result
-            let plan_result = PlanResultRow {
-                id: uuid::Uuid::new_v4().to_string(),
-                pr_number,
-                sha: head_sha.clone(),
-                status,
-                raw_output: plan_output.clone(),
-                diff_summary: None,
-                created_at: Utc::now(),
-            };
-            if let Err(e) = state.db.insert_plan_result(&plan_result).await {
-                warn!(pr = pr_number, error = %e, "Failed to persist plan result");
-            }
-
-            let status = match state
-                .github_client
-                .post_comment(&owner, &repo, pr_number, &plan_output, CommentMode::Plan)
-                .await
-            {
-                Ok(_) => {
-                    info!(pr = pr_number, "Posted plan comment");
-                    StatusCode::OK
-                }
-                Err(e) => {
-                    warn!(pr = pr_number, error = %e, "Failed to post plan comment");
-                    StatusCode::INTERNAL_SERVER_ERROR
-                }
-            };
-
-            // Refresh dashboard cache; emit events for the outcome.
-            if let Err(e) = crate::api::dashboard::refresh_dashboard_cache(&state.api_state).await {
-                warn!(error = %e, "Failed to refresh dashboard cache after plan");
-                let _ = state.api_state.event_tx.send(
-                    crate::api::events::Event::DashboardFailed {
-                        reason: crate::api::events::sanitize_reason(&e),
-                    },
-                );
-            } else {
-                let _ = state
-                    .api_state
-                    .event_tx
-                    .send(crate::api::events::Event::DashboardRefreshed);
-            }
-            let _ = state
-                .api_state
-                .event_tx
-                .send(crate::api::events::Event::WebhookReceived);
-
-            status
         }
         WebhookAction::Apply {
             owner,
@@ -253,13 +297,12 @@ async fn handle_webhook(
             head_sha,
             clone_url,
         } => {
-            // Resolve head SHA if not provided (issue_comment events don't include it).
-            // WR-04: use GitHubApi trait method instead of free function so the
-            // Apply path goes through the same auth/mock surface as Plan.
             let head_sha = if head_sha.is_empty() {
-                match state.github_client.get_pr_head_sha(
-                    &owner, &repo, pr_number,
-                ).await {
+                match state
+                    .github_client
+                    .get_pr_head_sha(&owner, &repo, pr_number)
+                    .await
+                {
                     Ok(sha) => sha,
                     Err(e) => {
                         error!(pr = pr_number, "Failed to resolve PR head SHA: {e}");
@@ -277,7 +320,74 @@ async fn handle_webhook(
                 "Running yard apply (triggered by comment)"
             );
 
-            // Persist the webhook event
+            // Stale-plan detection (D-08, D-09)
+            match state.db.get_latest_plan_result(pr_number).await {
+                Ok(None) => {
+                    // D-09: no plan exists — reject
+                    let msg = format!(
+                        "{PLAN_COMMENT_MARKER}\n\
+                         :x: **No plan found for this PR.** Run `yard plan` first."
+                    );
+                    let _ = find_and_upsert_plan_comment(
+                        state.github_client.as_ref(),
+                        &owner,
+                        &repo,
+                        pr_number,
+                        &msg,
+                    )
+                    .await;
+                    return StatusCode::OK;
+                }
+                Ok(Some(plan)) if plan.sha != head_sha => {
+                    // D-08: stale plan — reject and auto-replan
+                    let plan_sha_short = &plan.sha[..std::cmp::min(7, plan.sha.len())];
+                    let head_sha_short = &head_sha[..std::cmp::min(7, head_sha.len())];
+                    let msg = format!(
+                        "{PLAN_COMMENT_MARKER}\n\
+                         :warning: **Plan is stale** (planned at `{plan_sha_short}`, \
+                         HEAD is now `{head_sha_short}`). Re-planning automatically \u{2014} \
+                         apply again after the new plan completes."
+                    );
+                    let _ = find_and_upsert_plan_comment(
+                        state.github_client.as_ref(),
+                        &owner,
+                        &repo,
+                        pr_number,
+                        &msg,
+                    )
+                    .await;
+
+                    // Spawn auto-replan
+                    let state_clone = state.clone();
+                    let owner_clone = owner.clone();
+                    let repo_clone = repo.clone();
+                    let sha_clone = head_sha.clone();
+                    let clone_url_clone = clone_url.clone();
+                    tokio::spawn(async move {
+                        run_plan_pipeline(
+                            &state_clone,
+                            &owner_clone,
+                            &repo_clone,
+                            pr_number,
+                            &sha_clone,
+                            &clone_url_clone,
+                            None,
+                        )
+                        .await;
+                    });
+
+                    return StatusCode::OK;
+                }
+                Ok(Some(_)) => {
+                    // SHA matches — proceed to apply (Phase 42 will implement)
+                }
+                Err(e) => {
+                    error!(pr = pr_number, error = %e, "Failed to check latest plan result");
+                    return StatusCode::INTERNAL_SERVER_ERROR;
+                }
+            }
+
+            // Persist webhook event
             let webhook_event = WebhookEvent {
                 id: uuid::Uuid::new_v4().to_string(),
                 pr_number,
@@ -294,7 +404,7 @@ async fn handle_webhook(
                 warn!(pr = pr_number, error = %e, "Failed to persist webhook event");
             }
 
-            // Clone and run apply via yard-core — token passed via env, not in URL
+            // Clone and run apply via yard-core
             let apply_output = match clone_at_sha(
                 &clone_url,
                 &head_sha,
@@ -337,7 +447,6 @@ async fn handle_webhook(
                 }
             };
 
-            // Post apply result as PR comment
             let status = match state
                 .github_client
                 .post_comment(&owner, &repo, pr_number, &apply_output, CommentMode::Apply)
@@ -353,7 +462,7 @@ async fn handle_webhook(
                 }
             };
 
-            // Refresh dashboard cache; emit events for the outcome.
+            // Refresh dashboard cache; emit events
             if let Err(e) = crate::api::dashboard::refresh_dashboard_cache(&state.api_state).await {
                 warn!(error = %e, "Failed to refresh dashboard cache after apply");
                 let _ = state.api_state.event_tx.send(
@@ -447,8 +556,10 @@ mod tests {
     use crate::api::dashboard::ApiState;
     use crate::db::Database;
     use crate::db::test_support::InMemoryDb;
-    use crate::github::client::{CommentMode, GitHubApi};
+    use crate::github::client::GitHubApi;
     use crate::github::client::test_support::InMemoryGitHubApi;
+    use crate::db::PlanStatus;
+    use chrono::Utc;
     use crate::secrets::SecretStore;
     use crate::secrets::test_support::InMemorySecretStore;
     use axum::body::Body;
@@ -494,41 +605,29 @@ mod tests {
         }
     }
 
-    /// Build a fixture git repo on disk: a single Glue job at
-    /// `<root>/jobs/example/config.yaml` in a project named `yard-fixture`
-    /// with `state.type: local` (empty state dir) — yields a Create-only
-    /// diff per D-07/D-08/D-09 with discoverable job_name `example-config`
-    /// (post-verification corrected per resolve.rs:237-256). Returns the
-    /// tempdir (caller holds it for lifetime) and the HEAD SHA from
-    /// `git rev-parse HEAD` (D-02 — runtime-computed, not hardcoded).
+    /// Build a fixture git repo with per-environment structure:
+    /// `<root>/production/us-east-1/jobs/example/config.yaml`
+    /// Returns the tempdir and the HEAD SHA.
     fn build_fixture_repo() -> (TempDir, String) {
         let tmp = TempDir::new();
         let dir = tmp.path();
 
-        // Minimal yard.yaml — local state, no providers needed for the
-        // PLAN code path.
         fs::write(
             dir.join("yard.yaml"),
             "project: yard-fixture\nstate:\n  type: local\n  path: .yard/state/\n",
         )
         .unwrap();
 
-        // account.yaml + region.yaml are REQUIRED by yard-core's
-        // `find_and_parse_context` (resolve.rs:445-447). Both files are
-        // searched up from the job directory and must exist somewhere up
-        // the tree. Place at the project root with minimal stub content
-        // so the cascade has something to flatten without provider-specific
-        // requirements.
-        fs::write(dir.join("account.yaml"), "account_id: \"000000000000\"\n").unwrap();
-        fs::write(dir.join("region.yaml"), "region: us-east-1\n").unwrap();
+        // Per-env structure for discover_environments
+        let env_dir = dir.join("production");
+        fs::create_dir_all(&env_dir).unwrap();
+        fs::write(env_dir.join("account.yaml"), "account_id: \"000000000000\"\n").unwrap();
 
-        // Single Glue job at <root>/jobs/example/config.yaml so
-        // resolve_project's job_name = folder + base_name = "example-config"
-        // (per yard-core/src/resolve.rs:237-256 — folder is unconditionally
-        // appended when present, so the fixture must accept the joined
-        // form; D-21 substring set is adjusted to "+ Create job [example-config]"
-        // per the inline note in the plan's <action> block).
-        let example_dir = dir.join("jobs").join("example");
+        let region_dir = env_dir.join("us-east-1");
+        fs::create_dir_all(&region_dir).unwrap();
+        fs::write(region_dir.join("region.yaml"), "region: us-east-1\n").unwrap();
+
+        let example_dir = region_dir.join("jobs").join("example");
         fs::create_dir_all(&example_dir).unwrap();
         fs::write(
             example_dir.join("config.yaml"),
@@ -536,8 +635,6 @@ mod tests {
         )
         .unwrap();
 
-        // Initialize git repo + commit fixture. Inline -c flags so the
-        // test is independent of the runner's ~/.gitconfig (D-03).
         std::process::Command::new("git")
             .arg("init")
             .current_dir(dir)
@@ -550,13 +647,9 @@ mod tests {
             .unwrap();
         std::process::Command::new("git")
             .args([
-                "-c",
-                "user.email=test@test",
-                "-c",
-                "user.name=test",
-                "commit",
-                "-m",
-                "fixture",
+                "-c", "user.email=test@test",
+                "-c", "user.name=test",
+                "commit", "-m", "fixture",
             ])
             .current_dir(dir)
             .output()
@@ -587,21 +680,11 @@ mod tests {
 
     #[tokio::test]
     async fn webhook_to_comment_e2e_pull_request_plan_posts_comment() {
-        // Install rustls crypto provider before any TLS clients are created.
-        // Mirrors main.rs:83 — required because refresh_dashboard_cache
-        // builds an octocrab client (which uses reqwest → rustls). Without
-        // this, the dashboard-refresh code path panics on first TLS use
-        // instead of fail-and-warning per D-24. Best-effort install (idempotent
-        // across concurrent tests sharing a process — `let _ =` swallows
-        // the AlreadyInstalled error).
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        // ---- Build the fixture git repo + read its HEAD SHA (D-01..D-06).
         let (fixture, head_sha) = build_fixture_repo();
         let clone_url = fixture.path().to_string_lossy().to_string();
 
-        // ---- Construct ApiState by hand (D-32). Mirrors the precedent
-        // at api/events.rs:250-272 (events_router_compiles_with_api_state).
         let (event_tx, _event_rx) = new_event_channel();
         let db: Arc<dyn Database> = Arc::new(InMemoryDb::new());
         let secret_store: Arc<dyn SecretStore> =
@@ -615,19 +698,21 @@ mod tests {
             secret_store,
         });
 
-        // ---- Construct AppState (D-34). Hold mock_gh separately so the
-        // test can read posted comments after the request completes (D-16).
         let mock_gh = Arc::new(InMemoryGitHubApi::new());
+        // Seed changed_files so filter_affected_environments finds "production"
+        {
+            let mut files = mock_gh.changed_files.lock().await;
+            files.push("production/us-east-1/jobs/example/config.yaml".to_string());
+        }
+
         let webhook_state = Arc::new(AppState {
             github_client: mock_gh.clone() as Arc<dyn GitHubApi>,
             webhook_secret: "test-webhook-secret".to_string(),
             db: db.clone(),
             api_state: api_state.clone(),
+            dashboard_url: None,
         });
 
-        // ---- Construct synthetic pull_request.opened payload (D-36 +
-        // critical correction: Repository uses full_name, not owner.login
-        // + name, per webhook.rs:80-84).
         let payload = serde_json::json!({
             "action": "opened",
             "number": 42,
@@ -643,8 +728,6 @@ mod tests {
         let payload_bytes = serde_json::to_vec(&payload).unwrap();
         let sig = sign_webhook("test-webhook-secret", &payload_bytes);
 
-        // ---- Send the request through github_router (D-17, D-19) +
-        // measure wall-clock for the SC #4 timing assertion (D-29..D-31).
         let start = tokio::time::Instant::now();
         let response = github_router(webhook_state)
             .oneshot(
@@ -661,57 +744,169 @@ mod tests {
             .unwrap();
         let elapsed = start.elapsed();
 
-        // ---- Assert handler returned 200 (D-25: status comes from
-        // post_comment outcome, NOT from refresh_dashboard_cache —
-        // D-24 allows the dashboard refresh to fail-and-warn).
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "handle_webhook should return 200 OK for a successful Plan path"
-        );
-
-        // ---- Assert SC #4 timing budget (D-29..D-31). 10s ceiling
-        // matches Phase 27 SC #4 exactly.
+        assert_eq!(response.status(), StatusCode::OK);
         assert!(
             elapsed < Duration::from_secs(10),
-            "e2e test took {elapsed:?}; SC #4 budget is 10s"
+            "e2e test took {elapsed:?}; budget is 10s"
         );
 
-        // ---- Assert the mock GitHubApi captured exactly one comment.
-        let posts = mock_gh.posts.lock().await;
+        // Plan now uses post_comment_raw via find_and_upsert_plan_comment
+        let raw_posts = mock_gh.raw_posts.lock().await;
         assert_eq!(
-            posts.len(),
+            raw_posts.len(),
             1,
-            "expected exactly one post_comment call; got {}",
-            posts.len()
+            "expected exactly one raw plan comment; got {}",
+            raw_posts.len()
         );
-        let body = &posts[0].body;
+        let body = &raw_posts[0].body;
 
-        // ---- Assert the four D-21 substrings (post-verification
-        // correction: the discoverable job_name is "example-config",
-        // not pure "example", per resolve.rs:237-256 — see the inline
-        // comment in build_fixture_repo).
+        // New per-env format assertions
         assert!(
-            body.contains("### yard plan for "),
-            "missing formatter header substring; body was:\n{body}"
+            body.starts_with("<!-- yard-plan-comment -->"),
+            "missing plan comment marker; body was:\n{body}"
         );
         assert!(
-            body.contains("yard-fixture"),
-            "missing project-name substring (exercises manifest resolution); body was:\n{body}"
+            body.contains("### yard plan (SHA:"),
+            "missing plan header; body was:\n{body}"
         );
         assert!(
-            body.contains("1 job(s) changed."),
-            "missing diff-count substring; body was:\n{body}"
+            body.contains("production"),
+            "missing environment name; body was:\n{body}"
         );
-        assert!(
-            body.contains("+ Create job [example-config]"),
-            "missing Create-branch substring; body was:\n{body}"
-        );
+    }
 
-        // ---- Assert the comment was posted with Plan mode (WR-01 regression).
+    #[tokio::test]
+    async fn test_apply_no_plan_found_rejects() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let (event_tx, _event_rx) = new_event_channel();
+        let db: Arc<dyn Database> = Arc::new(InMemoryDb::new());
+        let secret_store: Arc<dyn SecretStore> =
+            Arc::new(InMemorySecretStore::new(HashMap::new()));
+        let api_state = Arc::new(ApiState {
+            github_token: "test-token".to_string(),
+            repo_owner: "o".to_string(),
+            repo_name: "r".to_string(),
+            db: db.clone(),
+            event_tx,
+            secret_store,
+        });
+
+        let mock_gh = Arc::new(InMemoryGitHubApi::new());
+        let webhook_state = Arc::new(AppState {
+            github_client: mock_gh.clone() as Arc<dyn GitHubApi>,
+            webhook_secret: "s".to_string(),
+            db: db.clone(),
+            api_state,
+            dashboard_url: None,
+        });
+
+        let payload = serde_json::json!({
+            "action": "created",
+            "comment": {"body": "yard apply"},
+            "issue": {"number": 42, "pull_request": {"url": "https://api.github.com/pulls/42"}},
+            "repository": {"full_name": "o/r", "clone_url": "https://x.com"}
+        });
+        let payload_bytes = serde_json::to_vec(&payload).unwrap();
+        let sig = sign_webhook("s", &payload_bytes);
+
+        let response = github_router(webhook_state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/webhook/github")
+                    .header("X-GitHub-Event", "issue_comment")
+                    .header("X-Hub-Signature-256", &sig)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload_bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let raw_posts = mock_gh.raw_posts.lock().await;
+        assert_eq!(raw_posts.len(), 1);
         assert!(
-            matches!(posts[0].mode, CommentMode::Plan),
-            "expected CommentMode::Plan for Plan-path comment"
+            raw_posts[0].body.contains("No plan found"),
+            "expected rejection message; got: {}",
+            raw_posts[0].body
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_stale_plan_rejects() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let (event_tx, _event_rx) = new_event_channel();
+        let db: Arc<dyn Database> = Arc::new(InMemoryDb::new());
+        let secret_store: Arc<dyn SecretStore> =
+            Arc::new(InMemorySecretStore::new(HashMap::new()));
+        let api_state = Arc::new(ApiState {
+            github_token: "test-token".to_string(),
+            repo_owner: "o".to_string(),
+            repo_name: "r".to_string(),
+            db: db.clone(),
+            event_tx,
+            secret_store,
+        });
+
+        // Insert a plan with an old SHA
+        let old_plan = crate::db::PlanResultRow {
+            id: "plan-1".to_string(),
+            pr_number: 42,
+            sha: "old-sha-1234567".to_string(),
+            status: PlanStatus::Success,
+            raw_output: "old plan".to_string(),
+            diff_summary: None,
+            created_at: Utc::now(),
+        };
+        db.insert_plan_result(&old_plan).await.unwrap();
+
+        let mock_gh = Arc::new(InMemoryGitHubApi::new());
+        // The mock returns "test-sha-abc123" from get_pr_head_sha (different from "old-sha-1234567")
+        let webhook_state = Arc::new(AppState {
+            github_client: mock_gh.clone() as Arc<dyn GitHubApi>,
+            webhook_secret: "s".to_string(),
+            db: db.clone(),
+            api_state,
+            dashboard_url: None,
+        });
+
+        let payload = serde_json::json!({
+            "action": "created",
+            "comment": {"body": "yard apply"},
+            "issue": {"number": 42, "pull_request": {"url": "https://api.github.com/pulls/42"}},
+            "repository": {"full_name": "o/r", "clone_url": "https://x.com"}
+        });
+        let payload_bytes = serde_json::to_vec(&payload).unwrap();
+        let sig = sign_webhook("s", &payload_bytes);
+
+        let response = github_router(webhook_state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/webhook/github")
+                    .header("X-GitHub-Event", "issue_comment")
+                    .header("X-Hub-Signature-256", &sig)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload_bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Give the spawned auto-replan task a moment to start
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let raw_posts = mock_gh.raw_posts.lock().await;
+        assert!(
+            raw_posts.iter().any(|p| p.body.contains("Plan is stale")),
+            "expected stale plan rejection; got: {:?}",
+            raw_posts.iter().map(|p| &p.body).collect::<Vec<_>>()
         );
     }
 }
