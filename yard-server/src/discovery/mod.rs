@@ -208,10 +208,20 @@ pub async fn run_discovery(
     Ok(())
 }
 
+/// RAII guard that removes a directory on drop.
+struct TempDirGuard(std::path::PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Clone a repository and run discovery.
 ///
 /// Generates a fresh installation token (T-40-09), clones the repo into a
-/// temp directory (D-03), then runs the full discovery + credential health flow.
+/// unique temp directory (D-03), then runs the full discovery + credential
+/// health flow. The temp directory is cleaned up on return (success or error).
 ///
 /// # Arguments
 /// * `app_id` - GitHub App ID
@@ -229,19 +239,22 @@ pub async fn clone_and_discover(
     db: &dyn Database,
     credential_provider: &dyn CredentialProvider,
 ) -> Result<()> {
-    let temp_dir = std::env::temp_dir().join("yard-server-repo");
-
-    // D-03: re-clone on every cycle (stateless)
-    if temp_dir.exists() {
-        std::fs::remove_dir_all(&temp_dir)
-            .with_context(|| format!("failed to remove existing temp dir: {}", temp_dir.display()))?;
-    }
+    let temp_dir = std::env::temp_dir().join(format!(
+        "yard-server-repo-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let _guard = TempDirGuard(temp_dir.clone());
 
     // T-40-09: fresh token per cycle
     let token = repo::generate_installation_token(app_id, private_key_pem, installation_id)
         .await
         .context("failed to generate installation token")?;
 
+    // D-03: unique dir per cycle, cleaned up by _guard on drop
     repo::clone_repo(repo_url, &temp_dir, &token)
         .await
         .context("failed to clone repository")?;

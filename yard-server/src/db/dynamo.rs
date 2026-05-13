@@ -201,22 +201,48 @@ impl Database for DynamoDatabase {
         limit: u32,
     ) -> Result<Vec<WebhookEvent>> {
         let pk = format!("PR#{pr_number}");
+        let capped_limit = std::cmp::min(limit, i32::MAX as u32) as i32;
+        let mut events = Vec::new();
+        let mut exclusive_start_key: Option<HashMap<String, AttributeValue>> = None;
 
-        let resp = self
-            .client
-            .query()
-            .table_name(&self.table_name)
-            .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
-            .expression_attribute_values(":pk", AttributeValue::S(pk))
-            .expression_attribute_values(":sk_prefix", AttributeValue::S("WEBHOOK#".to_string()))
-            .scan_index_forward(false)
-            .limit(limit as i32)
-            .send()
-            .await
-            .context("list webhook events")?;
+        loop {
+            let mut query = self
+                .client
+                .query()
+                .table_name(&self.table_name)
+                .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
+                .expression_attribute_values(":pk", AttributeValue::S(pk.clone()))
+                .expression_attribute_values(
+                    ":sk_prefix",
+                    AttributeValue::S("WEBHOOK#".to_string()),
+                )
+                .scan_index_forward(false)
+                .limit(capped_limit);
 
-        let items = resp.items();
-        Ok(items.iter().filter_map(parse_webhook_event).collect())
+            if let Some(start_key) = exclusive_start_key {
+                query = query.set_exclusive_start_key(Some(start_key));
+            }
+
+            let resp = query.send().await.context("list webhook events")?;
+
+            for item in resp.items() {
+                if let Some(event) = parse_webhook_event(item) {
+                    events.push(event);
+                    if events.len() >= limit as usize {
+                        return Ok(events);
+                    }
+                }
+            }
+
+            match resp.last_evaluated_key() {
+                Some(key) if !key.is_empty() => {
+                    exclusive_start_key = Some(key.to_owned());
+                }
+                _ => break,
+            }
+        }
+
+        Ok(events)
     }
 
     // ---- Plan Results ----
@@ -285,21 +311,43 @@ impl Database for DynamoDatabase {
     }
 
     async fn list_plan_results(&self, limit: u32) -> Result<Vec<PlanResultRow>> {
-        let resp = self
-            .client
-            .query()
-            .table_name(&self.table_name)
-            .index_name("GSI1")
-            .key_condition_expression("GSI1PK = :gsi1pk")
-            .expression_attribute_values(":gsi1pk", AttributeValue::S("PLAN".to_string()))
-            .scan_index_forward(false)
-            .limit(limit as i32)
-            .send()
-            .await
-            .context("list plan results")?;
+        let capped_limit = std::cmp::min(limit, i32::MAX as u32) as i32;
+        let mut results = Vec::new();
+        let mut exclusive_start_key: Option<HashMap<String, AttributeValue>> = None;
 
-        let items: Vec<PlanResultRow> = resp.items().iter().map(parse_plan_result).collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(items)
+        loop {
+            let mut query = self
+                .client
+                .query()
+                .table_name(&self.table_name)
+                .index_name("GSI1")
+                .key_condition_expression("GSI1PK = :gsi1pk")
+                .expression_attribute_values(":gsi1pk", AttributeValue::S("PLAN".to_string()))
+                .scan_index_forward(false)
+                .limit(capped_limit);
+
+            if let Some(start_key) = exclusive_start_key {
+                query = query.set_exclusive_start_key(Some(start_key));
+            }
+
+            let resp = query.send().await.context("list plan results")?;
+
+            for item in resp.items() {
+                results.push(parse_plan_result(item)?);
+                if results.len() >= limit as usize {
+                    return Ok(results);
+                }
+            }
+
+            match resp.last_evaluated_key() {
+                Some(key) if !key.is_empty() => {
+                    exclusive_start_key = Some(key.to_owned());
+                }
+                _ => break,
+            }
+        }
+
+        Ok(results)
     }
 
     // ---- Drift Snapshots ----
@@ -371,29 +419,52 @@ impl Database for DynamoDatabase {
         drifted_only: bool,
         limit: u32,
     ) -> Result<Vec<DriftSnapshot>> {
-        let mut query = self
-            .client
-            .query()
-            .table_name(&self.table_name)
-            .index_name("GSI1")
-            .key_condition_expression("GSI1PK = :gsi1pk")
-            .expression_attribute_values(":gsi1pk", AttributeValue::S("DRIFT".to_string()))
-            .scan_index_forward(false)
-            .limit(limit as i32);
+        let capped_limit = std::cmp::min(limit, i32::MAX as u32) as i32;
+        let mut snapshots = Vec::new();
+        let mut exclusive_start_key: Option<HashMap<String, AttributeValue>> = None;
 
-        if drifted_only {
-            query = query
-                .filter_expression("drifted = :drifted")
-                .expression_attribute_values(":drifted", AttributeValue::Bool(true));
+        loop {
+            let mut query = self
+                .client
+                .query()
+                .table_name(&self.table_name)
+                .index_name("GSI1")
+                .key_condition_expression("GSI1PK = :gsi1pk")
+                .expression_attribute_values(":gsi1pk", AttributeValue::S("DRIFT".to_string()))
+                .scan_index_forward(false);
+
+            if drifted_only {
+                query = query
+                    .filter_expression("drifted = :drifted")
+                    .expression_attribute_values(":drifted", AttributeValue::Bool(true));
+            } else {
+                query = query.limit(capped_limit);
+            }
+
+            if let Some(start_key) = exclusive_start_key {
+                query = query.set_exclusive_start_key(Some(start_key));
+            }
+
+            let resp = query.send().await.context("list drift snapshots")?;
+
+            for item in resp.items() {
+                if let Some(snap) = parse_drift_snapshot(item) {
+                    snapshots.push(snap);
+                    if snapshots.len() >= limit as usize {
+                        return Ok(snapshots);
+                    }
+                }
+            }
+
+            match resp.last_evaluated_key() {
+                Some(key) if !key.is_empty() => {
+                    exclusive_start_key = Some(key.to_owned());
+                }
+                _ => break,
+            }
         }
 
-        let resp = query.send().await.context("list drift snapshots")?;
-
-        Ok(resp
-            .items()
-            .iter()
-            .filter_map(parse_drift_snapshot)
-            .collect())
+        Ok(snapshots)
     }
 
     // ---- Settings ----
