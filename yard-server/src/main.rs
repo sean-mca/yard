@@ -258,11 +258,14 @@ fn start_api_server() {
             // Clone db for the discovery task before it's moved into webhook_state
             let discovery_db = db.clone();
 
+            let dashboard_url = std::env::var("YARD_DASHBOARD_URL").ok();
+
             let webhook_state = Arc::new(AppState {
                 github_client,
                 webhook_secret,
                 db,
                 api_state: api_state.clone(),
+                dashboard_url,
             });
 
             // BL-01: scope CORS to the cookie-auth model's same-origin

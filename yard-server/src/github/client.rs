@@ -3,9 +3,18 @@ use octocrab::Octocrab;
 
 /// Determines the header/footer text injected around plan/apply output.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub enum CommentMode {
     Plan,
     Apply,
+}
+
+/// A PR/issue comment returned by the GitHub API.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct PrComment {
+    pub id: u64,
+    pub body: String,
 }
 
 /// Trait for GitHub API operations, enabling mock implementations in tests.
@@ -37,6 +46,32 @@ pub trait GitHubApi: Send + Sync {
         repo: &str,
         pr_number: u64,
     ) -> Result<String, octocrab::Error>;
+
+    /// List comments on a PR/issue.
+    async fn list_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<Vec<PrComment>, octocrab::Error>;
+
+    /// Update an existing comment by ID.
+    async fn update_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        comment_id: u64,
+        body: &str,
+    ) -> Result<(), octocrab::Error>;
+
+    /// Post a comment with the body used verbatim (no template wrapping).
+    async fn post_comment_raw(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        body: &str,
+    ) -> Result<(), octocrab::Error>;
 }
 
 /// Wrapper around octocrab for yard-specific GitHub operations.
@@ -127,21 +162,64 @@ impl GitHubApi for GitHubClient {
 
         Ok(pr.head.sha)
     }
+
+    async fn list_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<Vec<PrComment>, octocrab::Error> {
+        let page = self.octo
+            .issues(owner, repo)
+            .list_comments(pr_number)
+            .per_page(100)
+            .send()
+            .await?;
+
+        Ok(page.items.into_iter().map(|c| PrComment {
+            id: c.id.into_inner(),
+            body: c.body.unwrap_or_default(),
+        }).collect())
+    }
+
+    async fn update_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        comment_id: u64,
+        body: &str,
+    ) -> Result<(), octocrab::Error> {
+        self.octo
+            .issues(owner, repo)
+            .update_comment(octocrab::models::CommentId(comment_id), body)
+            .await?;
+        Ok(())
+    }
+
+    async fn post_comment_raw(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        body: &str,
+    ) -> Result<(), octocrab::Error> {
+        self.octo
+            .issues(owner, repo)
+            .create_comment(pr_number, body)
+            .await?;
+        Ok(())
+    }
 }
 
 // ---- Test Support ----
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{CommentMode, GitHubApi};
+    use super::{CommentMode, GitHubApi, PrComment};
     use async_trait::async_trait;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
-    /// Record of a single `post_comment` invocation captured by
-    /// `InMemoryGitHubApi`. Fields beyond `body` are kept for diagnostic
-    /// value when an assertion fails — a regression that posts to the
-    /// wrong owner/repo/pr is informative against the recorded record.
     #[derive(Debug, Clone)]
     #[allow(dead_code)]
     pub struct PostedComment {
@@ -152,19 +230,25 @@ pub(crate) mod test_support {
         pub mode: CommentMode,
     }
 
-    /// In-memory `GitHubApi` impl: captures `post_comment` calls into
-    /// `posts` (so the test can assert on them after the handler returns)
-    /// and returns safe defaults from the two unused-by-Plan-path methods
-    /// (D-15: full method record keeps the impl complete + future-proofs
-    /// against the test ever exercising the Apply path).
+    #[allow(dead_code)]
     pub struct InMemoryGitHubApi {
         pub posts: Arc<Mutex<Vec<PostedComment>>>,
+        pub comments: Arc<Mutex<Vec<PrComment>>>,
+        pub updated_comments: Arc<Mutex<Vec<(u64, String)>>>,
+        pub raw_posts: Arc<Mutex<Vec<PostedComment>>>,
+        pub changed_files: Arc<Mutex<Vec<String>>>,
+        pub head_sha: Arc<Mutex<String>>,
     }
 
     impl InMemoryGitHubApi {
         pub fn new() -> Self {
             Self {
                 posts: Arc::new(Mutex::new(Vec::new())),
+                comments: Arc::new(Mutex::new(Vec::new())),
+                updated_comments: Arc::new(Mutex::new(Vec::new())),
+                raw_posts: Arc::new(Mutex::new(Vec::new())),
+                changed_files: Arc::new(Mutex::new(Vec::new())),
+                head_sha: Arc::new(Mutex::new("test-sha-abc123".to_string())),
             }
         }
     }
@@ -179,11 +263,6 @@ pub(crate) mod test_support {
             output: &str,
             mode: CommentMode,
         ) -> Result<(), octocrab::Error> {
-            // NOTE: The mock stores raw output directly. The real
-            // GitHubClient::post_comment wraps output in a markdown template
-            // (header, details/summary, code fences, footer) and applies
-            // backtick sanitization. Tests asserting on `body` here see
-            // pre-template content, not what GitHub actually receives.
             self.posts.lock().await.push(PostedComment {
                 owner: owner.to_string(),
                 repo: repo.to_string(),
@@ -200,8 +279,7 @@ pub(crate) mod test_support {
             _repo: &str,
             _pr_number: u64,
         ) -> Result<Vec<String>, octocrab::Error> {
-            // Not exercised by the Plan path; returned default (D-15).
-            Ok(Vec::new())
+            Ok(self.changed_files.lock().await.clone())
         }
 
         async fn get_pr_head_sha(
@@ -210,10 +288,44 @@ pub(crate) mod test_support {
             _repo: &str,
             _pr_number: u64,
         ) -> Result<String, octocrab::Error> {
-            // WR-05 fix: return a test SHA instead of empty string so
-            // Apply-path tests can exercise get_pr_head_sha without
-            // getting a misleading empty value.
-            Ok("test-sha-abc123".to_string())
+            Ok(self.head_sha.lock().await.clone())
+        }
+
+        async fn list_comments(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _pr_number: u64,
+        ) -> Result<Vec<PrComment>, octocrab::Error> {
+            Ok(self.comments.lock().await.clone())
+        }
+
+        async fn update_comment(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            comment_id: u64,
+            body: &str,
+        ) -> Result<(), octocrab::Error> {
+            self.updated_comments.lock().await.push((comment_id, body.to_string()));
+            Ok(())
+        }
+
+        async fn post_comment_raw(
+            &self,
+            owner: &str,
+            repo: &str,
+            pr_number: u64,
+            body: &str,
+        ) -> Result<(), octocrab::Error> {
+            self.raw_posts.lock().await.push(PostedComment {
+                owner: owner.to_string(),
+                repo: repo.to_string(),
+                pr_number,
+                body: body.to_string(),
+                mode: CommentMode::Plan,
+            });
+            Ok(())
         }
     }
 }
@@ -222,8 +334,7 @@ pub(crate) mod test_support {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::test_support::InMemoryGitHubApi;
-    use super::CommentMode;
-    use super::GitHubApi;
+    use super::{CommentMode, GitHubApi, PrComment};
 
     #[tokio::test]
     async fn post_comment_plan_mode_records_correctly() {
@@ -250,7 +361,42 @@ mod tests {
     async fn get_pr_head_sha_returns_test_sha() {
         let api = InMemoryGitHubApi::new();
         let sha = api.get_pr_head_sha("owner", "repo", 1).await.unwrap();
-        assert!(!sha.is_empty(), "Should return a non-empty test SHA");
+        assert!(!sha.is_empty());
         assert_eq!(sha, "test-sha-abc123");
+    }
+
+    #[tokio::test]
+    async fn list_comments_returns_seeded_comments() {
+        let api = InMemoryGitHubApi::new();
+        {
+            let mut comments = api.comments.lock().await;
+            comments.push(PrComment { id: 1, body: "first".to_string() });
+            comments.push(PrComment { id: 2, body: "second".to_string() });
+        }
+        let result = api.list_comments("o", "r", 1).await.unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].id, 1);
+        assert_eq!(result[1].body, "second");
+    }
+
+    #[tokio::test]
+    async fn update_comment_records_call() {
+        let api = InMemoryGitHubApi::new();
+        api.update_comment("o", "r", 42, "new body").await.unwrap();
+        let updated = api.updated_comments.lock().await;
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0], (42, "new body".to_string()));
+    }
+
+    #[tokio::test]
+    async fn get_pr_changed_files_returns_seeded_files() {
+        let api = InMemoryGitHubApi::new();
+        {
+            let mut files = api.changed_files.lock().await;
+            files.push("production/us-east-1/jobs/foo.yaml".to_string());
+        }
+        let result = api.get_pr_changed_files("o", "r", 1).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], "production/us-east-1/jobs/foo.yaml");
     }
 }
