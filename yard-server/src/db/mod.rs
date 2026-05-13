@@ -77,6 +77,17 @@ pub struct Setting {
     pub value: String,
 }
 
+/// A discovered environment cached in DynamoDB.
+/// Stored as DynamoDB entity: PK=ENV#{name}, SK=ENV#{name}.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Environment {
+    pub name: String,
+    pub regions: Vec<String>,
+    pub job_count: u64,
+    pub last_scanned: DateTime<Utc>,
+}
+
 /// A region within a discovered environment (D-14).
 /// Stored as DynamoDB sub-entity: PK=ENV#{env}, SK=REGION#{region}.
 #[allow(dead_code)]
@@ -133,6 +144,9 @@ pub trait Database: Send + Sync {
     // Cache
     async fn set_cache(&self, key: &str, data: &str) -> anyhow::Result<()>;
     async fn get_cache(&self, key: &str) -> anyhow::Result<Option<String>>;
+    // Environments
+    async fn upsert_environment(&self, env: &Environment) -> anyhow::Result<()>;
+    async fn list_environments(&self) -> anyhow::Result<Vec<Environment>>;
     // Regions (D-14)
     async fn upsert_region(&self, env_name: &str, region: &RegionEntity) -> anyhow::Result<()>;
     async fn list_regions(&self, env_name: &str) -> anyhow::Result<Vec<RegionEntity>>;
@@ -195,6 +209,7 @@ pub mod test_support {
         drift: Mutex<Vec<DriftSnapshot>>,
         settings: Mutex<HashMap<String, String>>,
         cache: Mutex<HashMap<String, String>>,
+        environments: Mutex<Vec<Environment>>,
         regions: Mutex<Vec<RegionEntity>>,
         job_summaries: Mutex<Vec<JobSummaryEntity>>,
         account_health: Mutex<HashMap<String, AccountHealth>>,
@@ -208,6 +223,7 @@ pub mod test_support {
                 drift: Mutex::new(Vec::new()),
                 settings: Mutex::new(HashMap::new()),
                 cache: Mutex::new(HashMap::new()),
+                environments: Mutex::new(Vec::new()),
                 regions: Mutex::new(Vec::new()),
                 job_summaries: Mutex::new(Vec::new()),
                 account_health: Mutex::new(HashMap::new()),
@@ -280,6 +296,22 @@ pub mod test_support {
         }
         async fn get_cache(&self, key: &str) -> anyhow::Result<Option<String>> {
             Ok(self.cache.lock().await.get(key).cloned())
+        }
+
+        // Environments
+
+        async fn upsert_environment(&self, env: &Environment) -> anyhow::Result<()> {
+            let mut envs = self.environments.lock().await;
+            if let Some(existing) = envs.iter_mut().find(|e| e.name == env.name) {
+                *existing = env.clone();
+            } else {
+                envs.push(env.clone());
+            }
+            Ok(())
+        }
+
+        async fn list_environments(&self) -> anyhow::Result<Vec<Environment>> {
+            Ok(self.environments.lock().await.clone())
         }
 
         // Regions (D-14)
