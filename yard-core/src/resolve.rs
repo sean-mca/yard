@@ -538,10 +538,12 @@ pub fn discover_environments(root_path: &Path) -> Result<Vec<DiscoveredEnvironme
 
         // 3. Parse account.yaml to extract account_id and role_arn.
         let account_config = find_and_parse_context(&entry_path, "account.yaml", false)?;
-        let account_id = account_config
-            .get("account_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let account_id = account_config.get("account_id").and_then(|v| {
+            v.as_str()
+                .map(|s| s.to_string())
+                .or_else(|| v.as_u64().map(|n| n.to_string()))
+                .or_else(|| v.as_i64().map(|n| n.to_string()))
+        });
         let role_arn = account_config
             .pointer("/aws/assume_role")
             .and_then(|v| v.as_str())
@@ -1203,6 +1205,25 @@ mod tests {
         let envs = discover_environments(&tmp.0).unwrap();
         assert_eq!(envs[0].regions[0].dag_count, 1);
         assert_eq!(envs[0].regions[0].job_count, 1); // dag.yaml not counted as job
+    }
+
+    #[test]
+    fn discover_environments_numeric_account_id() {
+        let tmp = TempDir::new();
+        make_yard_project(&tmp.0);
+
+        let env_dir = tmp.0.join("production");
+        let region_dir = env_dir.join("us-east-1");
+        fs::create_dir_all(&region_dir).unwrap();
+        fs::write(
+            env_dir.join("account.yaml"),
+            "account_id: 123456789012\n",
+        )
+        .unwrap();
+        fs::write(region_dir.join("region.yaml"), "{}").unwrap();
+
+        let envs = discover_environments(&tmp.0).unwrap();
+        assert_eq!(envs[0].account_id.as_deref(), Some("123456789012"));
     }
 
     #[test]
