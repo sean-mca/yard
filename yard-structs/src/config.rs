@@ -104,6 +104,50 @@ impl AwsCredentialConfig {
     }
 }
 
+/// Summary of a discovered environment from the `root/{env}/{region}/**`
+/// directory convention (D-05, D-06, D-12, D-13). Carries summary data only
+/// — name, optional account_id/role_arn, and per-region summaries. Lives in
+/// yard-structs so both yard-core (discovery logic) and yard-server
+/// (caching/display) share the same type.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct DiscoveredEnvironment {
+    /// Logical directory name under the project root (e.g. "production").
+    /// This is NOT the AWS account ID — see D-12.
+    pub name: String,
+    /// AWS account ID extracted from account.yaml, if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    /// IAM role ARN from account.yaml `aws.assume_role`, if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_arn: Option<String>,
+    /// Per-region summaries within this environment.
+    pub regions: Vec<RegionSummary>,
+}
+
+/// Summary of a single region within a discovered environment.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct RegionSummary {
+    /// Region directory name (e.g. "us-east-1").
+    pub name: String,
+    /// Number of job YAML files in this region directory (excluding reserved
+    /// files like yard.yaml, account.yaml, region.yaml, transforms.yaml,
+    /// dag.yaml).
+    pub job_count: u64,
+    /// Number of dag.yaml marker files found in this region directory.
+    pub dag_count: u64,
+    /// Per-job summaries within this region.
+    pub jobs: Vec<JobSummary>,
+}
+
+/// Lightweight summary of a single job within a region.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct JobSummary {
+    /// Job name derived from the YAML filename (without `.yaml` extension).
+    pub name: String,
+    /// Job type parsed from the `type:` field in the job YAML.
+    pub job_type: JobType,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum StateBackend {
@@ -1063,5 +1107,59 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("unknown field"), "got: {msg}");
         assert!(msg.contains("typo_field"), "got: {msg}");
+    }
+
+    // --- DiscoveredEnvironment / RegionSummary / JobSummary (Phase 40) ---
+
+    #[test]
+    fn discovered_environment_serde_round_trip() {
+        let env = DiscoveredEnvironment {
+            name: "production".to_string(),
+            account_id: Some("123456789012".to_string()),
+            role_arn: Some("arn:aws:iam::123456789012:role/YardServer".to_string()),
+            regions: vec![RegionSummary {
+                name: "us-east-1".to_string(),
+                job_count: 3,
+                dag_count: 1,
+                jobs: vec![
+                    JobSummary {
+                        name: "orders".to_string(),
+                        job_type: JobType::Glue,
+                    },
+                    JobSummary {
+                        name: "deploy".to_string(),
+                        job_type: JobType::Bash,
+                    },
+                ],
+            }],
+        };
+        let serialized = serde_json::to_value(&env).unwrap();
+        let deserialized: DiscoveredEnvironment =
+            serde_json::from_value(serialized.clone()).unwrap();
+        assert_eq!(deserialized, env);
+        // Verify structure
+        assert_eq!(serialized["name"], "production");
+        assert_eq!(serialized["account_id"], "123456789012");
+        assert_eq!(serialized["regions"][0]["name"], "us-east-1");
+        assert_eq!(serialized["regions"][0]["job_count"], 3);
+        assert_eq!(serialized["regions"][0]["dag_count"], 1);
+        assert_eq!(serialized["regions"][0]["jobs"][0]["name"], "orders");
+        assert_eq!(serialized["regions"][0]["jobs"][0]["job_type"], "glue");
+    }
+
+    #[test]
+    fn discovered_environment_optional_fields_skipped() {
+        let env = DiscoveredEnvironment {
+            name: "dev".to_string(),
+            account_id: None,
+            role_arn: None,
+            regions: vec![],
+        };
+        let serialized = serde_json::to_value(&env).unwrap();
+        assert!(serialized.get("account_id").is_none());
+        assert!(serialized.get("role_arn").is_none());
+        let deserialized: DiscoveredEnvironment =
+            serde_json::from_value(serialized).unwrap();
+        assert_eq!(deserialized, env);
     }
 }

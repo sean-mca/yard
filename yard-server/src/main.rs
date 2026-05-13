@@ -13,6 +13,8 @@ mod auth;
 #[cfg(not(target_arch = "wasm32"))]
 mod secrets;
 #[cfg(not(target_arch = "wasm32"))]
+mod discovery;
+#[cfg(not(target_arch = "wasm32"))]
 mod polling;
 mod types;
 mod ui;
@@ -253,6 +255,9 @@ fn start_api_server() {
                 secret_store: secret_store.clone(),
             });
 
+            // Clone db for the discovery task before it's moved into webhook_state
+            let discovery_db = db.clone();
+
             let webhook_state = Arc::new(AppState {
                 github_client,
                 webhook_secret,
@@ -334,6 +339,66 @@ fn start_api_server() {
                 .layer(rate_limit)
                 .layer(cors)
                 .layer(TraceLayer::new_for_http());
+
+            // ---- Phase 40: Environment discovery startup scan ----
+            // Read discovery-specific env vars. These are required for the
+            // initial discovery scan but NOT for the server to start (T-40-11:
+            // discovery failure is non-fatal).
+            let discovery_task = async move {
+                let repo_url = match required_env("YARD_REPO_URL") {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "skipping initial discovery scan (missing env var)");
+                        return;
+                    }
+                };
+                let app_id: u64 = match required_env("YARD_GITHUB_APP_ID")
+                    .and_then(|v| v.parse::<u64>().map_err(|e| anyhow::anyhow!("YARD_GITHUB_APP_ID must be a valid u64: {e}")))
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "skipping initial discovery scan (invalid env var)");
+                        return;
+                    }
+                };
+                let installation_id: u64 = match required_env("YARD_GITHUB_INSTALLATION_ID")
+                    .and_then(|v| v.parse::<u64>().map_err(|e| anyhow::anyhow!("YARD_GITHUB_INSTALLATION_ID must be a valid u64: {e}")))
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "skipping initial discovery scan (invalid env var)");
+                        return;
+                    }
+                };
+                let private_key = match required_env("YARD_GITHUB_PRIVATE_KEY") {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "skipping initial discovery scan (missing env var)");
+                        return;
+                    }
+                };
+
+                let credential_provider = discovery::credentials::StsCredentialProvider::new().await;
+                match discovery::clone_and_discover(
+                    app_id,
+                    &private_key,
+                    installation_id,
+                    &repo_url,
+                    discovery_db.as_ref(),
+                    &credential_provider,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        tracing::info!("initial discovery scan completed successfully");
+                    }
+                    Err(e) => {
+                        // T-40-11: discovery failure is non-fatal — log error but do NOT exit
+                        tracing::error!(error = %e, "initial discovery scan failed");
+                    }
+                }
+            };
+            tokio::spawn(discovery_task);
 
             // Spawn background polling tasks
             tokio::spawn(drift_poll_loop(api_state.clone(), poll_timeout_secs));
