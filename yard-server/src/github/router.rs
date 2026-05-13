@@ -126,6 +126,7 @@ async fn handle_webhook(
             pr_number,
             head_sha,
             clone_url,
+            target_filter: _target_filter,
         } => {
             info!(
                 pr = pr_number,

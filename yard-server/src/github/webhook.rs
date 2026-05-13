@@ -100,6 +100,7 @@ pub enum WebhookAction {
         pr_number: u64,
         head_sha: String,
         clone_url: String,
+        target_filter: Option<String>,
     },
     /// User commented "yard apply" — run yard apply
     Apply {
@@ -156,9 +157,23 @@ fn parse_pull_request_event(body: &Bytes) -> Result<WebhookAction, StatusCode> {
             pr_number: event.number,
             head_sha: event.pull_request.head.sha.clone(),
             clone_url,
+            target_filter: None,
         }),
         // Merge does not trigger apply — use "yard apply" comment instead
         _ => Ok(WebhookAction::Ignore),
+    }
+}
+
+/// Parse `--target <name>` from a command string. Returns None if not present
+/// or if the target name contains invalid characters.
+fn parse_target_flag(input: &str) -> Option<String> {
+    let parts: Vec<&str> = input.split_whitespace().collect();
+    let pos = parts.iter().position(|&p| p == "--target")?;
+    let target = parts.get(pos + 1)?;
+    if target.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        Some(target.to_string())
+    } else {
+        None
     }
 }
 
@@ -166,34 +181,48 @@ fn parse_issue_comment_event(body: &Bytes) -> Result<WebhookAction, StatusCode> 
     let event: IssueCommentEvent =
         serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    // Only act on new comments (not edits or deletions)
     if event.action != "created" {
         return Ok(WebhookAction::Ignore);
     }
 
-    // Only act on PR comments (issues have no pull_request field)
     if event.issue.pull_request.is_none() {
         return Ok(WebhookAction::Ignore);
     }
 
-    // Check for "yard apply" command
-    let body_trimmed = event.comment.body.trim().to_lowercase();
-    if body_trimmed != "yard apply" {
-        return Ok(WebhookAction::Ignore);
-    }
+    let body_raw = event.comment.body.trim();
+    let body_lower = body_raw.to_lowercase();
 
     let (owner, repo) = event.repository.owner_repo();
     let clone_url = event.repository.clone_url.clone().unwrap_or_default();
 
-    // issue_comment events don't include the head SHA — we need to fetch it.
-    // Return the action with an empty SHA; the handler will resolve it via GitHub API.
-    Ok(WebhookAction::Apply {
-        owner: owner.to_string(),
-        repo: repo.to_string(),
-        pr_number: event.issue.number,
-        head_sha: String::new(), // resolved by handler
-        clone_url,
-    })
+    // Check "yard plan" before "yard apply" to avoid prefix collisions
+    if body_lower.starts_with("yard plan") {
+        let target_filter = parse_target_flag(body_raw);
+        // Reject if --target was present but had invalid characters
+        if body_lower.contains("--target") && target_filter.is_none() {
+            return Ok(WebhookAction::Ignore);
+        }
+        return Ok(WebhookAction::Plan {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            pr_number: event.issue.number,
+            head_sha: String::new(), // resolved by handler
+            clone_url,
+            target_filter,
+        });
+    }
+
+    if body_lower == "yard apply" {
+        return Ok(WebhookAction::Apply {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            pr_number: event.issue.number,
+            head_sha: String::new(), // resolved by handler
+            clone_url,
+        });
+    }
+
+    Ok(WebhookAction::Ignore)
 }
 
 #[cfg(test)]
@@ -235,9 +264,10 @@ mod tests {
         let result = parse_webhook(&headers, &body_bytes.into(), secret);
         assert!(result.is_ok());
         match result.unwrap() {
-            WebhookAction::Plan { pr_number, head_sha, .. } => {
+            WebhookAction::Plan { pr_number, head_sha, target_filter, .. } => {
                 assert_eq!(pr_number, 42);
                 assert_eq!(head_sha, "abc123");
+                assert!(target_filter.is_none());
             }
             other => panic!("Expected Plan, got {:?}", other),
         }
@@ -335,5 +365,89 @@ mod tests {
     #[test]
     fn test_verify_signature_bad_prefix() {
         assert!(!verify_signature("secret", b"payload", "sha1=abc"));
+    }
+
+    fn issue_comment_payload(action: &str, body: &str, is_pr: bool) -> serde_json::Value {
+        let pr_field = if is_pr {
+            serde_json::json!({"url": "https://api.github.com/pulls/10"})
+        } else {
+            serde_json::Value::Null
+        };
+        serde_json::json!({
+            "action": action,
+            "comment": {"body": body},
+            "issue": {"number": 10, "pull_request": pr_field},
+            "repository": {"full_name": "o/r", "clone_url": "https://x.com"}
+        })
+    }
+
+    #[test]
+    fn test_issue_comment_yard_plan_routes_to_plan() {
+        let secret = "s";
+        let payload = issue_comment_payload("created", "yard plan", true);
+        let body_bytes = serde_json::to_vec(&payload).unwrap();
+        let sig = sign(secret, &body_bytes);
+        let headers = webhook_headers("issue_comment", &sig);
+        let result = parse_webhook(&headers, &body_bytes.into(), secret).unwrap();
+        match result {
+            WebhookAction::Plan { pr_number, target_filter, .. } => {
+                assert_eq!(pr_number, 10);
+                assert!(target_filter.is_none());
+            }
+            other => panic!("Expected Plan, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_issue_comment_yard_plan_target_routes_to_plan_with_filter() {
+        let secret = "s";
+        let payload = issue_comment_payload("created", "yard plan --target my-job", true);
+        let body_bytes = serde_json::to_vec(&payload).unwrap();
+        let sig = sign(secret, &body_bytes);
+        let headers = webhook_headers("issue_comment", &sig);
+        let result = parse_webhook(&headers, &body_bytes.into(), secret).unwrap();
+        match result {
+            WebhookAction::Plan { target_filter, .. } => {
+                assert_eq!(target_filter, Some("my-job".to_string()));
+            }
+            other => panic!("Expected Plan with target_filter, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_issue_comment_yard_plan_not_on_pr_ignored() {
+        let secret = "s";
+        let payload = issue_comment_payload("created", "yard plan", false);
+        let body_bytes = serde_json::to_vec(&payload).unwrap();
+        let sig = sign(secret, &body_bytes);
+        let headers = webhook_headers("issue_comment", &sig);
+        let result = parse_webhook(&headers, &body_bytes.into(), secret).unwrap();
+        assert!(matches!(result, WebhookAction::Ignore));
+    }
+
+    #[test]
+    fn test_issue_comment_yard_plan_edited_ignored() {
+        let secret = "s";
+        let payload = issue_comment_payload("edited", "yard plan", true);
+        let body_bytes = serde_json::to_vec(&payload).unwrap();
+        let sig = sign(secret, &body_bytes);
+        let headers = webhook_headers("issue_comment", &sig);
+        let result = parse_webhook(&headers, &body_bytes.into(), secret).unwrap();
+        assert!(matches!(result, WebhookAction::Ignore));
+    }
+
+    #[test]
+    fn test_parse_target_flag_valid() {
+        assert_eq!(parse_target_flag("yard plan --target foo"), Some("foo".to_string()));
+    }
+
+    #[test]
+    fn test_parse_target_flag_missing() {
+        assert_eq!(parse_target_flag("yard plan"), None);
+    }
+
+    #[test]
+    fn test_parse_target_flag_invalid_chars() {
+        assert_eq!(parse_target_flag("yard plan --target foo;rm"), None);
     }
 }
