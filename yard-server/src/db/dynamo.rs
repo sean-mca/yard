@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use tracing::info;
 
 use super::{
-    AccountHealth, Database, DriftSnapshot, JobSummaryEntity, PlanResultRow, PlanStatus,
-    RegionEntity, Setting, WebhookEvent,
+    AccountHealth, Database, DriftSnapshot, Environment, JobSummaryEntity, PlanResultRow,
+    PlanStatus, RegionEntity, Setting, WebhookEvent,
 };
 
 pub struct DynamoDatabase {
@@ -500,6 +500,76 @@ impl Database for DynamoDatabase {
             .map(|s| s.to_string()))
     }
 
+    // ---- Environments ----
+
+    async fn upsert_environment(&self, env: &Environment) -> Result<()> {
+        validate_key_component(&env.name, "env.name")?;
+
+        let pk = format!("ENV#{}", env.name);
+        let regions_json =
+            serde_json::to_string(&env.regions).context("serialize environment regions")?;
+
+        self.client
+            .put_item()
+            .table_name(&self.table_name)
+            .item("PK", AttributeValue::S(pk.clone()))
+            .item("SK", AttributeValue::S(pk))
+            .item("GSI1PK", AttributeValue::S("TYPE#ENV".to_string()))
+            .item("GSI1SK", AttributeValue::S(env.name.clone()))
+            .item("name", AttributeValue::S(env.name.clone()))
+            .item("regions", AttributeValue::S(regions_json))
+            .item(
+                "job_count",
+                AttributeValue::N(env.job_count.to_string()),
+            )
+            .item(
+                "last_scanned",
+                AttributeValue::S(env.last_scanned.to_rfc3339()),
+            )
+            .send()
+            .await
+            .context("upsert environment")?;
+
+        Ok(())
+    }
+
+    async fn list_environments(&self) -> Result<Vec<Environment>> {
+        let mut environments = Vec::new();
+        let mut exclusive_start_key: Option<HashMap<String, AttributeValue>> = None;
+
+        loop {
+            let mut query = self
+                .client
+                .query()
+                .table_name(&self.table_name)
+                .index_name("GSI1")
+                .key_condition_expression("GSI1PK = :gsi1pk")
+                .expression_attribute_values(
+                    ":gsi1pk",
+                    AttributeValue::S("TYPE#ENV".to_string()),
+                );
+
+            if let Some(start_key) = exclusive_start_key {
+                query = query.set_exclusive_start_key(Some(start_key));
+            }
+
+            let resp = query.send().await.context("list environments")?;
+
+            for item in resp.items() {
+                environments.push(parse_environment(item)?);
+            }
+
+            match resp.last_evaluated_key() {
+                Some(key) if !key.is_empty() => {
+                    exclusive_start_key = Some(key.to_owned());
+                }
+                _ => break,
+            }
+        }
+
+        Ok(environments)
+    }
+
     // ---- Regions (D-14) ----
 
     async fn upsert_region(&self, env_name: &str, region: &RegionEntity) -> Result<()> {
@@ -754,6 +824,22 @@ fn parse_drift_snapshot(item: &HashMap<String, AttributeValue>) -> Option<DriftS
         state_hash: get_s(item, "state_hash")?,
         drifted: item.get("drifted")?.as_bool().ok().copied()?,
         checked_at: get_dt(item, "checked_at")?,
+    })
+}
+
+#[allow(dead_code)]
+fn parse_environment(item: &HashMap<String, AttributeValue>) -> Result<Environment> {
+    let regions_json = get_s(item, "regions").unwrap_or_else(|| "[]".to_string());
+    let regions: Vec<String> =
+        serde_json::from_str(&regions_json).unwrap_or_default();
+
+    Ok(Environment {
+        name: get_s(item, "name")
+            .ok_or_else(|| anyhow::anyhow!("environment row missing name field"))?,
+        regions,
+        job_count: get_n_u64(item, "job_count").unwrap_or(0),
+        last_scanned: get_dt(item, "last_scanned")
+            .ok_or_else(|| anyhow::anyhow!("environment row missing last_scanned field"))?,
     })
 }
 
