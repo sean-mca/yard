@@ -10,7 +10,10 @@ use serde_json::Value;
 use std::collections::HashMap;
 use tracing::info;
 
-use super::{Database, DriftSnapshot, PlanResultRow, PlanStatus, Setting, WebhookEvent};
+use super::{
+    AccountHealth, Database, DriftSnapshot, JobSummaryEntity, PlanResultRow, PlanStatus,
+    RegionEntity, Setting, WebhookEvent,
+};
 
 pub struct DynamoDatabase {
     client: Client,
@@ -496,6 +499,187 @@ impl Database for DynamoDatabase {
             .and_then(|v| v.as_s().ok())
             .map(|s| s.to_string()))
     }
+
+    // ---- Regions (D-14) ----
+
+    async fn upsert_region(&self, env_name: &str, region: &RegionEntity) -> Result<()> {
+        validate_key_component(env_name, "env_name")?;
+        validate_key_component(&region.name, "region.name")?;
+
+        let pk = format!("ENV#{env_name}");
+        let sk = format!("REGION#{}", region.name);
+
+        self.client
+            .put_item()
+            .table_name(&self.table_name)
+            .item("PK", AttributeValue::S(pk))
+            .item("SK", AttributeValue::S(sk))
+            .item("GSI1PK", AttributeValue::S("TYPE#REGION".to_string()))
+            .item(
+                "GSI1SK",
+                AttributeValue::S(format!("{}#{}", env_name, region.name)),
+            )
+            .item("name", AttributeValue::S(region.name.clone()))
+            .item(
+                "job_count",
+                AttributeValue::N(region.job_count.to_string()),
+            )
+            .item(
+                "dag_count",
+                AttributeValue::N(region.dag_count.to_string()),
+            )
+            .send()
+            .await
+            .context("upsert region")?;
+
+        Ok(())
+    }
+
+    async fn list_regions(&self, env_name: &str) -> Result<Vec<RegionEntity>> {
+        validate_key_component(env_name, "env_name")?;
+
+        let pk = format!("ENV#{env_name}");
+        let mut regions = Vec::new();
+        let mut exclusive_start_key: Option<HashMap<String, AttributeValue>> = None;
+
+        loop {
+            let mut query = self
+                .client
+                .query()
+                .table_name(&self.table_name)
+                .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
+                .expression_attribute_values(":pk", AttributeValue::S(pk.clone()))
+                .expression_attribute_values(
+                    ":sk_prefix",
+                    AttributeValue::S("REGION#".to_string()),
+                );
+
+            if let Some(start_key) = exclusive_start_key {
+                query = query.set_exclusive_start_key(Some(start_key));
+            }
+
+            let resp = query.send().await.context("list regions")?;
+
+            for item in resp.items() {
+                regions.push(parse_region(env_name, item)?);
+            }
+
+            match resp.last_evaluated_key() {
+                Some(key) if !key.is_empty() => {
+                    exclusive_start_key = Some(key.to_owned());
+                }
+                _ => break,
+            }
+        }
+
+        Ok(regions)
+    }
+
+    // ---- Job Summaries (D-15) ----
+
+    async fn upsert_job_summary(&self, env_name: &str, job: &JobSummaryEntity) -> Result<()> {
+        validate_key_component(env_name, "env_name")?;
+        validate_key_component(&job.name, "job.name")?;
+
+        let pk = format!("ENV#{env_name}");
+        let sk = format!("JOB#{}", job.name);
+
+        self.client
+            .put_item()
+            .table_name(&self.table_name)
+            .item("PK", AttributeValue::S(pk))
+            .item("SK", AttributeValue::S(sk))
+            .item("GSI1PK", AttributeValue::S("TYPE#JOB".to_string()))
+            .item(
+                "GSI1SK",
+                AttributeValue::S(format!("{}#{}", env_name, job.name)),
+            )
+            .item("name", AttributeValue::S(job.name.clone()))
+            .item("job_type", AttributeValue::S(job.job_type.clone()))
+            .item(
+                "region_name",
+                AttributeValue::S(job.region_name.clone()),
+            )
+            .send()
+            .await
+            .context("upsert job summary")?;
+
+        Ok(())
+    }
+
+    // ---- Account Health (D-11) ----
+
+    async fn set_account_health(&self, health: &AccountHealth) -> Result<()> {
+        validate_key_component(&health.account_id, "health.account_id")?;
+
+        let pk = format!("HEALTH#{}", health.account_id);
+
+        let mut put = self
+            .client
+            .put_item()
+            .table_name(&self.table_name)
+            .item("PK", AttributeValue::S(pk))
+            .item("SK", AttributeValue::S("STATUS".to_string()))
+            .item("GSI1PK", AttributeValue::S("TYPE#HEALTH".to_string()))
+            .item(
+                "GSI1SK",
+                AttributeValue::S(health.account_id.clone()),
+            )
+            .item(
+                "account_id",
+                AttributeValue::S(health.account_id.clone()),
+            )
+            .item("status", AttributeValue::S(health.status.clone()))
+            .item(
+                "last_checked",
+                AttributeValue::S(health.last_checked.to_rfc3339()),
+            );
+
+        if let Some(ref msg) = health.error_message {
+            put = put.item("error_message", AttributeValue::S(msg.clone()));
+        }
+
+        put.send().await.context("set account health")?;
+
+        Ok(())
+    }
+
+    async fn get_account_health(&self, account_id: &str) -> Result<Option<AccountHealth>> {
+        validate_key_component(account_id, "account_id")?;
+
+        let pk = format!("HEALTH#{account_id}");
+
+        let resp = self
+            .client
+            .get_item()
+            .table_name(&self.table_name)
+            .key("PK", AttributeValue::S(pk))
+            .key("SK", AttributeValue::S("STATUS".to_string()))
+            .send()
+            .await
+            .context("get account health")?;
+
+        match resp.item() {
+            Some(item) => Ok(Some(parse_account_health(item)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+// ---- Key Validation ----
+
+/// Validates that a user-derived value is safe to use as a DynamoDB key component.
+/// Rejects empty strings and strings containing the '#' delimiter to prevent
+/// sort-key injection (T-40-03).
+#[allow(dead_code)]
+fn validate_key_component(value: &str, field_name: &str) -> Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{field_name} must not be empty");
+    }
+    if value.contains('#') {
+        anyhow::bail!("{field_name} must not contain '#' delimiter, got: {value:?}");
+    }
+    Ok(())
 }
 
 // ---- Item Parsers ----
@@ -570,5 +754,29 @@ fn parse_drift_snapshot(item: &HashMap<String, AttributeValue>) -> Option<DriftS
         state_hash: get_s(item, "state_hash")?,
         drifted: item.get("drifted")?.as_bool().ok().copied()?,
         checked_at: get_dt(item, "checked_at")?,
+    })
+}
+
+#[allow(dead_code)]
+fn parse_region(env_name: &str, item: &HashMap<String, AttributeValue>) -> Result<RegionEntity> {
+    Ok(RegionEntity {
+        env_name: env_name.to_string(),
+        name: get_s(item, "name")
+            .ok_or_else(|| anyhow::anyhow!("region row missing name field"))?,
+        job_count: get_n_u64(item, "job_count").unwrap_or(0),
+        dag_count: get_n_u64(item, "dag_count").unwrap_or(0),
+    })
+}
+
+#[allow(dead_code)]
+fn parse_account_health(item: &HashMap<String, AttributeValue>) -> Result<AccountHealth> {
+    Ok(AccountHealth {
+        account_id: get_s(item, "account_id")
+            .ok_or_else(|| anyhow::anyhow!("account_health row missing account_id field"))?,
+        status: get_s(item, "status")
+            .ok_or_else(|| anyhow::anyhow!("account_health row missing status field"))?,
+        last_checked: get_dt(item, "last_checked")
+            .ok_or_else(|| anyhow::anyhow!("account_health row missing last_checked field"))?,
+        error_message: get_s(item, "error_message"),
     })
 }

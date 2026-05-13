@@ -13,6 +13,8 @@ mod auth;
 #[cfg(not(target_arch = "wasm32"))]
 mod secrets;
 #[cfg(not(target_arch = "wasm32"))]
+mod discovery;
+#[cfg(not(target_arch = "wasm32"))]
 mod polling;
 mod types;
 mod ui;
