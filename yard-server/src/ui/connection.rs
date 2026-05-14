@@ -42,6 +42,7 @@ pub struct ConnectionCtx {
     pub dashboard_tick: Signal<u64>,
     pub drift_tick: Signal<u64>,
     pub env_health_tick: Signal<u64>,
+    pub search_index_tick: Signal<u64>,
 }
 
 /// Client mirror of the server's `api::events::Event` enum. Keep variants in

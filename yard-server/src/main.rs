@@ -832,6 +832,7 @@ fn Shell() -> Element {
             dashboard_tick: use_signal(|| 0u64),
             drift_tick: use_signal(|| 0u64),
             env_health_tick: use_signal(|| 0u64),
+            search_index_tick: use_signal(|| 0u64),
         };
         use_context_provider(|| ctx);
 
@@ -876,7 +877,10 @@ fn Shell() -> Element {
             main { class: "flex-1 min-h-screen",
                 div { class: "h-14 flex items-center justify-between px-6 border-b border-zinc-200 dark:border-zinc-800",
                     h1 { class: "text-sm font-semibold", "{title}" }
-                    ui::connection_indicator::ConnectionIndicator {}
+                    div { class: "flex items-center gap-4",
+                        ui::search::GlobalSearch {}
+                        ui::connection_indicator::ConnectionIndicator {}
+                    }
                 }
                 Outlet::<Route> {}
             }
