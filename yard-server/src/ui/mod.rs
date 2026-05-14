@@ -5,6 +5,7 @@ pub mod fetch;
 pub mod jobs;
 pub mod login;
 pub mod metrics;
+pub mod search;
 pub mod settings;
 pub mod sheet;
 pub mod sidebar;

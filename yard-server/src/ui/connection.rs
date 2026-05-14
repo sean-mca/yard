@@ -41,6 +41,8 @@ pub struct ConnectionCtx {
     pub state: Signal<ConnectionState>,
     pub dashboard_tick: Signal<u64>,
     pub drift_tick: Signal<u64>,
+    pub env_health_tick: Signal<u64>,
+    pub search_index_tick: Signal<u64>,
 }
 
 /// Client mirror of the server's `api::events::Event` enum. Keep variants in
@@ -68,6 +70,7 @@ pub enum Event {
         #[allow(dead_code)]
         drifted_count: u32,
     },
+    EnvironmentHealthChanged,
 }
 
 /// Build the WebSocket URL for the events endpoint.
