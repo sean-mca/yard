@@ -101,6 +101,7 @@ pub async fn run_discovery(
                     region_name: region.name.clone(),
                     name: job.name.clone(),
                     job_type: job.job_type.to_string(),
+                    config_yaml: job.config_yaml.clone(),
                 };
 
                 db.upsert_job_summary(&discovered_env.name, &job_entity)

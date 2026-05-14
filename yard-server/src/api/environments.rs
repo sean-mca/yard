@@ -15,6 +15,7 @@ pub fn environments_router(state: Arc<ApiState>) -> Router {
         .route("/api/envs", get(get_environments))
         .route("/api/envs/health", get(get_health))
         .route("/api/envs/{env}/regions", get(get_regions))
+        .route("/api/envs/{env}/jobs/{job}", get(get_job_detail))
         .with_state(state)
 }
 
@@ -136,6 +137,44 @@ async fn get_regions(
     Ok(Json(details))
 }
 
+/// GET /api/envs/:env/jobs/:job - Returns full detail for a single job/DAG.
+async fn get_job_detail(
+    State(state): State<Arc<ApiState>>,
+    Path((env, job)): Path<(String, String)>,
+) -> Result<Json<JobDetailData>, ApiError> {
+    // T-44-07-01: Reject path params containing '#' to prevent DynamoDB key injection.
+    if env.contains('#') {
+        return Err(ApiError::BadRequest("invalid environment name".into()));
+    }
+    if job.contains('#') {
+        return Err(ApiError::BadRequest("invalid job name".into()));
+    }
+
+    let job_entity = state
+        .db
+        .get_job_summary(&env, &job)
+        .await
+        .map_err(|e| ApiError::DatabaseError(format!("Failed to get job summary: {e}")))?
+        .ok_or_else(|| ApiError::NotFound(format!("job '{job}' not found in environment '{env}'")))?;
+
+    // Look up drift status from cache.
+    let drift_data = load_drift_cache(&state).await;
+    let drift = drift_data.and_then(|d| {
+        d.items
+            .into_iter()
+            .find(|i| i.name == job_entity.name && i.environment == env)
+    });
+
+    Ok(Json(JobDetailData {
+        name: job_entity.name,
+        env_name: job_entity.env_name,
+        region_name: job_entity.region_name,
+        job_type: job_entity.job_type,
+        config_yaml: job_entity.config_yaml,
+        drift,
+    }))
+}
+
 /// GET /api/envs/health - Returns all account health records.
 async fn get_health(
     State(state): State<Arc<ApiState>>,
@@ -254,5 +293,100 @@ mod tests {
     async fn environments_router_compiles() {
         let state = test_state();
         let _router: Router = environments_router(state);
+    }
+
+    // ---- get_job_detail tests (DASH-04) ----
+
+    #[tokio::test]
+    async fn get_job_detail_returns_job_with_yaml() {
+        let state = test_state();
+        let job = crate::db::JobSummaryEntity {
+            env_name: "production".to_string(),
+            region_name: "us-east-1".to_string(),
+            name: "etl-users".to_string(),
+            job_type: "glue".to_string(),
+            config_yaml: Some("type: glue\nsources: [s3]".to_string()),
+        };
+        state.db.upsert_job_summary("production", &job).await.unwrap();
+
+        let result = get_job_detail(
+            State(state),
+            Path(("production".to_string(), "etl-users".to_string())),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.0.name, "etl-users");
+        assert_eq!(result.0.env_name, "production");
+        assert_eq!(result.0.region_name, "us-east-1");
+        assert_eq!(result.0.job_type, "glue");
+        assert_eq!(result.0.config_yaml, Some("type: glue\nsources: [s3]".to_string()));
+        assert!(result.0.drift.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_job_detail_not_found() {
+        let state = test_state();
+        let result = get_job_detail(
+            State(state),
+            Path(("production".to_string(), "nonexistent".to_string())),
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_job_detail_rejects_hash_in_name() {
+        let state = test_state();
+        let result = get_job_detail(
+            State(state),
+            Path(("production".to_string(), "bad#job".to_string())),
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_job_detail_includes_drift_when_cached() {
+        let state = test_state();
+
+        // Seed a job
+        let job = crate::db::JobSummaryEntity {
+            env_name: "production".to_string(),
+            region_name: "us-east-1".to_string(),
+            name: "etl-users".to_string(),
+            job_type: "glue".to_string(),
+            config_yaml: None,
+        };
+        state.db.upsert_job_summary("production", &job).await.unwrap();
+
+        // Seed drift cache with a matching item
+        let drift_data = DriftData {
+            items: vec![DriftItem {
+                name: "etl-users".to_string(),
+                environment: "production".to_string(),
+                region: "us-east-1".to_string(),
+                drift_type: DriftType::Modified,
+                fields_changed: vec!["script_location".to_string()],
+                old_config: Some("old".to_string()),
+                new_config: Some("new".to_string()),
+            }],
+            in_sync: 0,
+            drifted: 1,
+        };
+        let cache_json = serde_json::to_string(&drift_data).unwrap();
+        state.db.set_cache("drift", &cache_json).await.unwrap();
+
+        let result = get_job_detail(
+            State(state),
+            Path(("production".to_string(), "etl-users".to_string())),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.0.drift.is_some());
+        let drift = result.0.drift.unwrap();
+        assert_eq!(drift.drift_type, DriftType::Modified);
+        assert_eq!(drift.fields_changed, vec!["script_location".to_string()]);
     }
 }

@@ -146,6 +146,9 @@ pub struct JobSummary {
     pub name: String,
     /// Job type parsed from the `type:` field in the job YAML.
     pub job_type: JobType,
+    /// Raw YAML file content, carried through discovery for detail views.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_yaml: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

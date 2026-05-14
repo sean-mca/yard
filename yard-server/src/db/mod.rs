@@ -108,6 +108,9 @@ pub struct JobSummaryEntity {
     pub region_name: String,
     pub name: String,
     pub job_type: String,
+    /// Raw YAML file content from discovery (DASH-04).
+    #[serde(default)]
+    pub config_yaml: Option<String>,
 }
 
 /// Per-account health status for credential resolution (D-11).
@@ -152,6 +155,8 @@ pub trait Database: Send + Sync {
     async fn list_regions(&self, env_name: &str) -> anyhow::Result<Vec<RegionEntity>>;
     // Job summaries (D-15)
     async fn upsert_job_summary(&self, env_name: &str, job: &JobSummaryEntity) -> anyhow::Result<()>;
+    /// Fetch a single job summary by env+name (DASH-04).
+    async fn get_job_summary(&self, env_name: &str, job_name: &str) -> anyhow::Result<Option<JobSummaryEntity>>;
     // Account health (D-11)
     async fn set_account_health(&self, health: &AccountHealth) -> anyhow::Result<()>;
     async fn get_account_health(&self, account_id: &str) -> anyhow::Result<Option<AccountHealth>>;
@@ -349,6 +354,11 @@ pub mod test_support {
             Ok(())
         }
 
+        async fn get_job_summary(&self, env_name: &str, job_name: &str) -> anyhow::Result<Option<JobSummaryEntity>> {
+            let jobs = self.job_summaries.lock().await;
+            Ok(jobs.iter().find(|j| j.env_name == env_name && j.name == job_name).cloned())
+        }
+
         // Account health (D-11)
 
         async fn set_account_health(&self, health: &AccountHealth) -> anyhow::Result<()> {
@@ -428,6 +438,7 @@ mod tests {
             region_name: region.to_string(),
             name: name.to_string(),
             job_type: "glue".to_string(),
+            config_yaml: None,
         }
     }
 
@@ -712,6 +723,7 @@ mod tests {
             region_name: "us-east-1".to_string(),
             name: "etl-pipeline".to_string(),
             job_type: "emr".to_string(),
+            config_yaml: None,
         };
         db.upsert_job_summary("production", &job_updated).await.unwrap();
 
@@ -763,6 +775,32 @@ mod tests {
         let db = InMemoryDb::new();
         let all = db.list_all_account_health().await.unwrap();
         assert!(all.is_empty(), "fresh DB should return empty vec");
+    }
+
+    // get_job_summary tests (DASH-04)
+
+    #[tokio::test]
+    async fn get_job_summary_returns_matching_job() {
+        let db = InMemoryDb::new();
+        let mut job = make_job_summary("production", "us-east-1", "etl-pipeline");
+        job.config_yaml = Some("type: glue\nsources: [s3]".to_string());
+        db.upsert_job_summary("production", &job).await.unwrap();
+
+        let result = db.get_job_summary("production", "etl-pipeline").await.unwrap();
+        assert!(result.is_some());
+        let found = result.unwrap();
+        assert_eq!(found.name, "etl-pipeline");
+        assert_eq!(found.env_name, "production");
+        assert_eq!(found.region_name, "us-east-1");
+        assert_eq!(found.job_type, "glue");
+        assert_eq!(found.config_yaml, Some("type: glue\nsources: [s3]".to_string()));
+    }
+
+    #[tokio::test]
+    async fn get_job_summary_returns_none_for_missing() {
+        let db = InMemoryDb::new();
+        let result = db.get_job_summary("production", "nonexistent").await.unwrap();
+        assert!(result.is_none());
     }
 
     // list_job_summaries_all tests (DASH-09)

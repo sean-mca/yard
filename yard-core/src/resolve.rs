@@ -633,6 +633,7 @@ pub fn discover_environments(root_path: &Path) -> Result<Vec<DiscoveredEnvironme
                         jobs.push(yard_structs::JobSummary {
                             name: job_name,
                             job_type,
+                            config_yaml: Some(content.clone()),
                         });
                         job_count += 1;
                     }

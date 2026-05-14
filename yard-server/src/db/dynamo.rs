@@ -725,7 +725,8 @@ impl Database for DynamoDatabase {
         let pk = format!("ENV#{env_name}");
         let sk = format!("JOB#{}", job.name);
 
-        self.client
+        let mut put = self
+            .client
             .put_item()
             .table_name(&self.table_name)
             .item("PK", AttributeValue::S(pk))
@@ -740,12 +741,42 @@ impl Database for DynamoDatabase {
             .item(
                 "region_name",
                 AttributeValue::S(job.region_name.clone()),
-            )
-            .send()
+            );
+
+        if let Some(ref yaml) = job.config_yaml {
+            put = put.item("config_yaml", AttributeValue::S(yaml.clone()));
+        }
+
+        put.send()
             .await
             .context("upsert job summary")?;
 
         Ok(())
+    }
+
+    // ---- Job Detail (DASH-04) ----
+
+    async fn get_job_summary(&self, env_name: &str, job_name: &str) -> Result<Option<JobSummaryEntity>> {
+        validate_key_component(env_name, "env_name")?;
+        validate_key_component(job_name, "job_name")?;
+
+        let pk = format!("ENV#{env_name}");
+        let sk = format!("JOB#{job_name}");
+
+        let resp = self
+            .client
+            .get_item()
+            .table_name(&self.table_name)
+            .key("PK", AttributeValue::S(pk))
+            .key("SK", AttributeValue::S(sk))
+            .send()
+            .await
+            .context("get job summary")?;
+
+        match resp.item() {
+            Some(item) => Ok(Some(parse_job_summary(item)?)),
+            None => Ok(None),
+        }
     }
 
     // ---- Account Health (D-11) ----
@@ -1016,6 +1047,7 @@ fn parse_job_summary(item: &HashMap<String, AttributeValue>) -> Result<JobSummar
             .ok_or_else(|| anyhow::anyhow!("job_summary row missing name field"))?,
         job_type: get_s(item, "job_type")
             .ok_or_else(|| anyhow::anyhow!("job_summary row missing job_type field"))?,
+        config_yaml: get_s(item, "config_yaml"),
     })
 }
 
