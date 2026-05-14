@@ -103,22 +103,15 @@ async fn get_regions(
 
     let mut details = Vec::with_capacity(regions.len());
     for region in &regions {
-        let env_jobs: Vec<_> = all_jobs
+        let jobs: Vec<_> = all_jobs
             .iter()
-            .filter(|j| j.env_name == env && j.region_name == region.name)
-            .collect();
-
-        let jobs: Vec<_> = env_jobs
-            .iter()
-            .filter(|j| j.job_type != "dag")
-            .cloned()
+            .filter(|j| j.env_name == env && j.region_name == region.name && j.job_type != "dag")
             .cloned()
             .collect();
 
-        let dags: Vec<_> = env_jobs
+        let dags: Vec<_> = all_jobs
             .iter()
-            .filter(|j| j.job_type == "dag")
-            .cloned()
+            .filter(|j| j.env_name == env && j.region_name == region.name && j.job_type == "dag")
             .cloned()
             .collect();
 
