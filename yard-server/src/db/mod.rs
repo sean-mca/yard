@@ -155,6 +155,9 @@ pub trait Database: Send + Sync {
     // Account health (D-11)
     async fn set_account_health(&self, health: &AccountHealth) -> anyhow::Result<()>;
     async fn get_account_health(&self, account_id: &str) -> anyhow::Result<Option<AccountHealth>>;
+    async fn list_all_account_health(&self) -> anyhow::Result<Vec<AccountHealth>>;
+    // Job summaries — full list (DASH-09 search composition)
+    async fn list_job_summaries_all(&self) -> anyhow::Result<Vec<JobSummaryEntity>>;
 }
 
 // ---- Configuration ----
@@ -355,6 +358,14 @@ pub mod test_support {
 
         async fn get_account_health(&self, account_id: &str) -> anyhow::Result<Option<AccountHealth>> {
             Ok(self.account_health.lock().await.get(account_id).cloned())
+        }
+
+        async fn list_all_account_health(&self) -> anyhow::Result<Vec<AccountHealth>> {
+            Ok(self.account_health.lock().await.values().cloned().collect())
+        }
+
+        async fn list_job_summaries_all(&self) -> anyhow::Result<Vec<JobSummaryEntity>> {
+            Ok(self.job_summaries.lock().await.clone())
         }
     }
 }
@@ -733,5 +744,35 @@ mod tests {
         let db = InMemoryDb::new();
         let result = db.get_account_health("999999999999").await.unwrap();
         assert!(result.is_none(), "nonexistent account should return None");
+    }
+
+    // list_all_account_health tests (DASH-01)
+
+    #[tokio::test]
+    async fn list_all_account_health_returns_all() {
+        let db = InMemoryDb::new();
+        db.set_account_health(&make_account_health("111111111111", "healthy")).await.unwrap();
+        db.set_account_health(&make_account_health("222222222222", "degraded")).await.unwrap();
+        db.set_account_health(&make_account_health("333333333333", "unknown")).await.unwrap();
+        let all = db.list_all_account_health().await.unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_all_account_health_empty() {
+        let db = InMemoryDb::new();
+        let all = db.list_all_account_health().await.unwrap();
+        assert!(all.is_empty(), "fresh DB should return empty vec");
+    }
+
+    // list_job_summaries_all tests (DASH-09)
+
+    #[tokio::test]
+    async fn list_job_summaries_all_returns_all() {
+        let db = InMemoryDb::new();
+        db.upsert_job_summary("production", &make_job_summary("production", "us-east-1", "etl-job")).await.unwrap();
+        db.upsert_job_summary("staging", &make_job_summary("staging", "eu-west-1", "analytics-job")).await.unwrap();
+        let all = db.list_job_summaries_all().await.unwrap();
+        assert_eq!(all.len(), 2);
     }
 }
