@@ -8,8 +8,6 @@
 //! Debounce uses `gloo_timers::future::sleep` on WASM; on native the
 //! component is a static placeholder (search requires a browser).
 
-#![allow(dead_code)]
-
 use dioxus::prelude::*;
 
 #[cfg(target_arch = "wasm32")]
@@ -42,6 +40,8 @@ pub struct SearchHit {
 const MAX_PER_GROUP: usize = 5;
 
 /// Debounce delay in milliseconds before triggering a search API call.
+/// Used only in the wasm32 build (inside the debounced spawn block).
+#[allow(dead_code)]
 const DEBOUNCE_MS: u32 = 250;
 
 #[component]

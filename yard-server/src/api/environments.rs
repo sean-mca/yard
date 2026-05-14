@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use axum::{
     extract::{Path, State},
     routing::get,
