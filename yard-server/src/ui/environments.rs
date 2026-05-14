@@ -5,6 +5,7 @@ use std::time::Duration;
 use super::components::{Breadcrumb, TabBar};
 use super::drift::{DriftBadge, SummaryCard};
 use super::fetch::get_json;
+use super::percent_encode;
 use super::sheet::Sheet;
 use super::skeleton::{SkeletonCard, SkeletonTable};
 use crate::types::*;
@@ -41,7 +42,7 @@ impl QueryCapability for RegionListQuery {
         get_json::<Vec<RegionDetailData>>(&format!(
             "{}/api/envs/{}/regions",
             api_base(),
-            keys
+            percent_encode(keys)
         ))
         .await
     }

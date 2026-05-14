@@ -16,6 +16,8 @@ use dioxus::prelude::*;
 use super::api_base;
 #[cfg(target_arch = "wasm32")]
 use super::fetch::get_json;
+#[cfg(target_arch = "wasm32")]
+use super::percent_encode;
 
 /// Search result from the `/api/search?q=...` API endpoint.
 /// Mirrors `crate::types::SearchResult` (added by Plan 44-01).
@@ -101,10 +103,11 @@ pub fn GlobalSearch() -> Element {
                             }
 
                             is_loading.set(true);
+                            let encoded_query = percent_encode(&query.read());
                             let url = format!(
                                 "{}/api/search?q={}",
                                 api_base(),
-                                query.read()
+                                encoded_query
                             );
                             let result = get_json::<SearchResult>(&url).await;
                             is_loading.set(false);
