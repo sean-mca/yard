@@ -553,9 +553,9 @@ const CONTEXT_LINES: usize = 3;
 /// Render a YAML panel with changed lines highlighted and unchanged sections collapsed.
 fn render_panel_collapsed(content: &str, changed_lines: &[usize], color: &str) -> String {
     let (highlight_bg, highlight_text) = match color {
-        "blue" => ("bg-blue-50", "text-blue-800"),
-        "violet" => ("bg-violet-50", "text-violet-800"),
-        _ => ("bg-zinc-50", "text-zinc-800"),
+        "blue" => ("bg-blue-50 dark:bg-blue-950", "text-blue-800 dark:text-blue-200"),
+        "violet" => ("bg-violet-50 dark:bg-violet-950", "text-violet-800 dark:text-violet-200"),
+        _ => ("bg-zinc-50 dark:bg-zinc-900", "text-zinc-800 dark:text-zinc-200"),
     };
 
     let lines: Vec<&str> = content.lines().collect();
@@ -590,7 +590,7 @@ fn render_panel_collapsed(content: &str, changed_lines: &[usize], color: &str) -
                 ));
             } else {
                 out.push_str(&format!(
-                    "<div class=\"px-3 py-px text-zinc-600\">{}</div>",
+                    "<div class=\"px-3 py-px text-zinc-600 dark:text-zinc-400\">{}</div>",
                     html_escape(lines[i])
                 ));
             }
@@ -603,7 +603,7 @@ fn render_panel_collapsed(content: &str, changed_lines: &[usize], color: &str) -
             }
             let hidden = i - start;
             out.push_str(&format!(
-                "<div class=\"px-3 py-1 text-zinc-400 bg-zinc-50 text-center text-[11px] border-y border-zinc-100\">{hidden} unchanged line{}</div>",
+                "<div class=\"px-3 py-1 text-zinc-400 dark:text-zinc-500 bg-zinc-50 dark:bg-zinc-900 text-center text-[11px] border-y border-zinc-100 dark:border-zinc-800\">{hidden} unchanged line{}</div>",
                 if hidden == 1 { "" } else { "s" }
             ));
         }
