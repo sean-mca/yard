@@ -7,7 +7,7 @@ use super::drift::{DriftBadge, SummaryCard};
 use super::fetch::get_json;
 use super::percent_encode;
 use super::sheet::Sheet;
-use super::skeleton::{SkeletonCard, SkeletonTable};
+use super::skeleton::{SkeletonCard, SkeletonTable, SkeletonText};
 use crate::types::*;
 
 use super::api_base;
@@ -43,6 +43,25 @@ impl QueryCapability for RegionListQuery {
             "{}/api/envs/{}/regions",
             api_base(),
             percent_encode(keys)
+        ))
+        .await
+    }
+}
+
+#[derive(Clone, PartialEq, Hash, Eq)]
+struct JobDetailQuery;
+
+impl QueryCapability for JobDetailQuery {
+    type Ok = JobDetailData;
+    type Err = String;
+    type Keys = (String, String);
+
+    async fn run(&self, keys: &Self::Keys) -> Result<Self::Ok, Self::Err> {
+        get_json::<JobDetailData>(&format!(
+            "{}/api/envs/{}/jobs/{}",
+            api_base(),
+            percent_encode(&keys.0),
+            percent_encode(&keys.1)
         ))
         .await
     }
@@ -496,6 +515,17 @@ fn JobDetailSheet(mut item: Signal<Option<crate::db::JobSummaryEntity>>) -> Elem
         .map(|i| i.name.clone())
         .unwrap_or_default();
 
+    // Derive query keys from the selected job.
+    let query_keys = item()
+        .as_ref()
+        .map(|j| (j.env_name.clone(), j.name.clone()))
+        .unwrap_or_default();
+
+    let detail = use_query(
+        Query::new(query_keys, JobDetailQuery)
+            .stale_time(Duration::from_secs(30)),
+    );
+
     rsx! {
         Sheet {
             open: is_open,
@@ -504,7 +534,7 @@ fn JobDetailSheet(mut item: Signal<Option<crate::db::JobSummaryEntity>>) -> Elem
             on_close: move |_| item.set(None),
             match &*item.read() {
                 Some(job) => rsx! {
-                    // Meta bar
+                    // Meta bar (instant from signal)
                     div { class: "px-5 py-3 border-b border-zinc-100 dark:border-zinc-800 flex items-center gap-3",
                         span { class: "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium border bg-blue-50 text-blue-700 border-blue-200",
                             "{job.env_name}"
@@ -514,17 +544,108 @@ fn JobDetailSheet(mut item: Signal<Option<crate::db::JobSummaryEntity>>) -> Elem
                             "{job.job_type}"
                         }
                     }
-                    // Detail content
-                    div { class: "px-5 py-4",
-                        div { class: "space-y-3",
-                            DetailRow { label: "Name", value: job.name.clone() }
-                            DetailRow { label: "Environment", value: job.env_name.clone() }
-                            DetailRow { label: "Region", value: job.region_name.clone() }
-                            DetailRow { label: "Type", value: job.job_type.clone() }
+                    // Detail content from async query
+                    {
+                        let detail_state = detail.read();
+                        match &*detail_state.state() {
+                            QueryStateData::Settled { res: Ok(d), .. } => rsx! {
+                                JobDetailContent { detail: d.clone() }
+                            },
+                            QueryStateData::Settled { res: Err(e), .. } => rsx! {
+                                div { class: "px-5 py-4",
+                                    div { class: "rounded-lg border border-red-200 bg-red-50 dark:bg-red-950 dark:border-red-800 px-4 py-3",
+                                        p { class: "text-sm text-red-700 dark:text-red-400",
+                                            "Failed to load job details: {e}"
+                                        }
+                                    }
+                                }
+                            },
+                            _ => rsx! {
+                                div { class: "px-5 py-4 space-y-3",
+                                    SkeletonText { width: "w-3/4".to_string() }
+                                    SkeletonText { width: "w-1/2".to_string() }
+                                    SkeletonText { width: "w-2/3".to_string() }
+                                    div { class: "pt-4 space-y-2",
+                                        for _ in 0..12u32 {
+                                            SkeletonText {}
+                                        }
+                                    }
+                                }
+                            },
                         }
                     }
                 },
                 None => rsx! {},
+            }
+        }
+    }
+}
+
+/// Content sections rendered inside the JobDetailSheet once the detail query resolves.
+#[component]
+fn JobDetailContent(detail: JobDetailData) -> Element {
+    rsx! {
+        div { class: "px-5 py-4 space-y-6",
+            // ---- Drift Status Section ----
+            div {
+                h4 { class: "text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wide mb-2",
+                    "Drift Status"
+                }
+                if let Some(ref drift) = detail.drift {
+                    div { class: "flex items-center gap-3",
+                        DriftBadge { drift_type: drift.drift_type.clone() }
+                        if !drift.fields_changed.is_empty() {
+                            span { class: "text-xs text-zinc-500 dark:text-zinc-400",
+                                "{drift.fields_changed.join(\", \")}"
+                            }
+                        }
+                    }
+                } else {
+                    span { class: "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium border bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950 dark:text-emerald-400 dark:border-emerald-800",
+                        "In Sync"
+                    }
+                }
+            }
+
+            // ---- Configuration Section ----
+            div {
+                h4 { class: "text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wide mb-2",
+                    "Configuration"
+                }
+                if let Some(ref yaml) = detail.config_yaml {
+                    pre { class: "text-xs font-mono bg-zinc-50 dark:bg-zinc-900 rounded-lg p-4 overflow-x-auto border border-zinc-200 dark:border-zinc-800 max-h-[400px] overflow-y-auto whitespace-pre-wrap text-zinc-800 dark:text-zinc-200",
+                        "{yaml}"
+                    }
+                } else {
+                    p { class: "text-sm text-zinc-400 dark:text-zinc-500 italic",
+                        "No configuration data available"
+                    }
+                }
+            }
+
+            // ---- Configuration Changes Section (only when drifted with old/new config) ----
+            if let Some(ref drift) = detail.drift {
+                if drift.old_config.is_some() || drift.new_config.is_some() {
+                    div {
+                        h4 { class: "text-xs font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wide mb-2",
+                            "Configuration Changes"
+                        }
+                        div { class: "grid grid-cols-2 gap-4",
+                            div {
+                                p { class: "text-xs font-medium text-zinc-500 dark:text-zinc-400 mb-1", "Previous" }
+                                pre { class: "text-xs font-mono bg-zinc-50 dark:bg-zinc-900 rounded-lg p-4 overflow-x-auto border border-zinc-200 dark:border-zinc-800 max-h-[300px] overflow-y-auto whitespace-pre-wrap text-zinc-800 dark:text-zinc-200",
+                                    {drift.old_config.as_deref().unwrap_or("(none)")}
+                                }
+                            }
+                            div {
+                                p { class: "text-xs font-medium text-zinc-500 dark:text-zinc-400 mb-1", "Current" }
+                                pre { class: "text-xs font-mono bg-zinc-50 dark:bg-zinc-900 rounded-lg p-4 overflow-x-auto border border-zinc-200 dark:border-zinc-800 max-h-[300px] overflow-y-auto whitespace-pre-wrap text-zinc-800 dark:text-zinc-200",
+                                    {drift.new_config.as_deref().unwrap_or("(none)")}
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
