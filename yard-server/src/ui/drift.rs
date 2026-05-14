@@ -382,6 +382,13 @@ fn extract_field_value(field: &str, config: Option<&str>) -> Option<String> {
         let trimmed = line.trim();
         // Match "field: value" or "field = value" patterns.
         if let Some(rest) = trimmed.strip_prefix(field) {
+            // Ensure field name is a complete word — the next character must be
+            // a delimiter (`:`, `=`, whitespace) or end-of-string. Without this,
+            // a field "timeout" would prefix-match a line "timeout_ms: 5000".
+            let next = rest.chars().next();
+            if !matches!(next, Some(':') | Some('=') | Some(' ') | Some('\t') | None) {
+                continue;
+            }
             let rest = rest.trim_start();
             if let Some(value) = rest.strip_prefix(':') {
                 let val = value.trim();
