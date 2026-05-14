@@ -6,6 +6,7 @@ pub mod jobs;
 pub mod login;
 pub mod metrics;
 pub mod settings;
+pub mod skeleton;
 pub mod sheet;
 pub mod sidebar;
 
