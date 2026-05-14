@@ -1,6 +1,7 @@
 pub mod components;
 pub mod dashboard;
 pub mod drift;
+pub mod environments;
 pub mod fetch;
 pub mod jobs;
 pub mod login;
