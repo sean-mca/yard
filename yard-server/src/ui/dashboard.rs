@@ -138,10 +138,10 @@ pub fn Dashboard() -> Element {
     }
 
     let drift_state = drift_data.read();
-    let drift_status = match &*drift_state.state() {
-        QueryStateData::Settled { res: Ok(0), .. } => DriftStatus::Ok,
-        QueryStateData::Settled { res: Ok(n), .. } => DriftStatus::Drifted(*n),
-        _ => DriftStatus::Ok,
+    let (drift_status, drifted_count) = match &*drift_state.state() {
+        QueryStateData::Settled { res: Ok(0), .. } => (DriftStatus::Ok, 0),
+        QueryStateData::Settled { res: Ok(n), .. } => (DriftStatus::Drifted(*n), *n),
+        _ => (DriftStatus::Ok, 0),
     };
 
     // Extract env summary data for MetricsBar and alerts.
@@ -157,7 +157,7 @@ pub fn Dashboard() -> Element {
     };
 
     // Build alerts from env health data and drift data.
-    let alerts = build_alerts(&env_data_opt, &drift_state);
+    let alerts = build_alerts(&env_data_opt, drifted_count);
 
     let data_state = data.read();
     match &*data_state.state() {
@@ -303,7 +303,7 @@ fn PlanBadge(result: PlanResult) -> Element {
 /// Build alert items from environment health and drift state data.
 fn build_alerts(
     env_data: &Option<EnvironmentListData>,
-    drift_state: &QueryState<u32, String>,
+    drifted_count: u32,
 ) -> Vec<AlertInfo> {
     let mut alerts = Vec::new();
 
@@ -311,8 +311,6 @@ fn build_alerts(
     if let Some(ed) = env_data {
         let unhealthy = ed.total_accounts.saturating_sub(ed.connected_accounts);
         if unhealthy > 0 {
-            // We don't have per-account detail at the dashboard level (only counts),
-            // so generate a summary alert.
             alerts.push(AlertInfo {
                 message: format!(
                     "Circuit breaker tripped for {unhealthy} account{}: unreachable",
@@ -326,15 +324,13 @@ fn build_alerts(
     }
 
     // Drift alerts from drift summary.
-    if let QueryStateData::Settled { res: Ok(n), .. } = &*drift_state.state() {
-        if *n > 0 {
-            alerts.push(AlertInfo {
-                message: format!("Drift detected: {n} job{} changed", if *n == 1 { "" } else { "s" }),
-                severity: "warning".to_string(),
-                timestamp: String::new(),
-                entity: "drift".to_string(),
-            });
-        }
+    if drifted_count > 0 {
+        alerts.push(AlertInfo {
+            message: format!("Drift detected: {drifted_count} job{} changed", if drifted_count == 1 { "" } else { "s" }),
+            severity: "warning".to_string(),
+            timestamp: String::new(),
+            entity: "drift".to_string(),
+        });
     }
 
     alerts

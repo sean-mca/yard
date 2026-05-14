@@ -132,8 +132,13 @@ pub fn ConnectivitySummary(connected: u32, total: u32, #[props(default)] environ
             }
             p { class: "text-2xl font-semibold tracking-tight", "{connected}/{total}" }
             if environment_count > 0 {
-                p { class: "text-xs text-zinc-400 dark:text-zinc-500 mt-0.5",
-                    "{environment_count} environment{}", if environment_count == 1 { "" } else { "s" }
+                {
+                    let suffix = if environment_count == 1 { "" } else { "s" };
+                    rsx! {
+                        p { class: "text-xs text-zinc-400 dark:text-zinc-500 mt-0.5",
+                            "{environment_count} environment{suffix}"
+                        }
+                    }
                 }
             }
         }
