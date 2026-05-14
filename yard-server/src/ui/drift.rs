@@ -31,7 +31,10 @@ impl QueryCapability for DriftQuery {
 // ---- Component ----
 
 #[component]
-pub fn Drift() -> Element {
+pub fn Drift(#[props(default)] env: String) -> Element {
+    // env is accepted for deep-link support (D-08: /drift?env=<name>).
+    // Plan 44-04 T2 will add the environment filter logic that consumes it.
+    let _ = &env;
     // Phase 7: compute polling interval from WS state. Pause when Live.
     #[cfg(target_arch = "wasm32")]
     let ctx: ConnectionCtx = use_context();
@@ -122,7 +125,7 @@ pub fn Drift() -> Element {
 }
 
 #[component]
-fn SummaryCard(label: &'static str, value: String, #[props(default)] accent: String) -> Element {
+pub fn SummaryCard(label: &'static str, value: String, #[props(default)] accent: String) -> Element {
     let border = match accent.as_str() {
         "emerald" => "border-emerald-200",
         "amber" => "border-amber-200",
@@ -193,7 +196,7 @@ fn DriftTable(items: Vec<DriftItem>, mut selected: Signal<Option<DriftItem>>) ->
 }
 
 #[component]
-fn DriftBadge(drift_type: DriftType) -> Element {
+pub fn DriftBadge(drift_type: DriftType) -> Element {
     let (label, classes) = match drift_type {
         DriftType::Modified => ("Modified", "bg-amber-50 text-amber-700 border-amber-200"),
         DriftType::New => ("New", "bg-emerald-50 text-emerald-700 border-emerald-200"),
