@@ -173,6 +173,7 @@ mod tests {
             region_name: "us-east-1".to_string(),
             name: "etl-production-pipeline".to_string(),
             job_type: "glue".to_string(),
+            config_yaml: None,
         };
         state.db.upsert_job_summary("production", &job).await.unwrap();
 
@@ -181,6 +182,7 @@ mod tests {
             region_name: "us-east-1".to_string(),
             name: "production-dag".to_string(),
             job_type: "dag".to_string(),
+            config_yaml: None,
         };
         state.db.upsert_job_summary("production", &dag).await.unwrap();
 

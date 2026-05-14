@@ -112,6 +112,20 @@ pub struct DriftData {
     pub drifted: u32,
 }
 
+// ---- Job Detail API response type (DASH-04) ----
+
+/// Full detail for a single job/DAG, returned by GET /api/envs/:env/jobs/:job.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct JobDetailData {
+    pub name: String,
+    pub env_name: String,
+    pub region_name: String,
+    pub job_type: String,
+    pub config_yaml: Option<String>,
+    pub drift: Option<DriftItem>,
+}
+
 // ---- Dashboard API response types (DASH-01, DASH-02, DASH-03) ----
 
 /// Summary of a single environment for the environment list endpoint.
