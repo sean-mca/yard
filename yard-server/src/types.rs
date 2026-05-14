@@ -127,7 +127,7 @@ pub struct EnvironmentSummary {
 }
 
 /// Top-level response for GET /api/envs.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct EnvironmentListData {
     pub environments: Vec<EnvironmentSummary>,
