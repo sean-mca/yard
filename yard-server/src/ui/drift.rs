@@ -73,20 +73,38 @@ pub fn Drift(#[props(default)] env: String) -> Element {
             // Apply environment filter to items and recalculate summary counts.
             let (filtered_items, filtered_in_sync, filtered_drifted) =
                 apply_env_filter(drift_data, &env_filter());
-            let total = filtered_in_sync + filtered_drifted;
+            let is_filtered = env_filter().is_some();
 
             rsx! {
                 div { class: "p-6",
                     // D-08: Environment filter pills above summary cards.
                     DriftEnvFilter { items: drift_data.items.clone(), selected: env_filter }
 
-                    div { class: "grid grid-cols-3 gap-4 mb-6",
-                        SummaryCard { label: "Total Jobs", value: format!("{total}") }
-                        SummaryCard { label: "In Sync", value: format!("{filtered_in_sync}"), accent: "emerald" }
-                        SummaryCard {
-                            label: "Drifted",
-                            value: format!("{filtered_drifted}"),
-                            accent: if filtered_drifted > 0 { "amber" } else { "emerald" },
+                    // When an env filter is active, "In Sync" and "Total" are
+                    // not derivable from drift items alone (items only contain
+                    // drifted entries). Show only the "Drifted" count.
+                    if is_filtered {
+                        div { class: "grid grid-cols-1 gap-4 mb-6",
+                            SummaryCard {
+                                label: "Drifted",
+                                value: format!("{filtered_drifted}"),
+                                accent: if filtered_drifted > 0 { "amber" } else { "emerald" },
+                            }
+                        }
+                    } else {
+                        {
+                            let total = filtered_in_sync + filtered_drifted;
+                            rsx! {
+                                div { class: "grid grid-cols-3 gap-4 mb-6",
+                                    SummaryCard { label: "Total Jobs", value: format!("{total}") }
+                                    SummaryCard { label: "In Sync", value: format!("{filtered_in_sync}"), accent: "emerald" }
+                                    SummaryCard {
+                                        label: "Drifted",
+                                        value: format!("{filtered_drifted}"),
+                                        accent: if filtered_drifted > 0 { "amber" } else { "emerald" },
+                                    }
+                                }
+                            }
                         }
                     }
 
