@@ -1,4 +1,4 @@
-use crate::db::{AccountHealth, JobSummaryEntity};
+use crate::db::JobSummaryEntity;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -116,7 +116,7 @@ pub struct DriftData {
 
 /// Summary of a single environment for the environment list endpoint.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[allow(dead_code)]
 pub struct EnvironmentSummary {
     pub name: String,
     pub regions: Vec<String>,
@@ -128,7 +128,7 @@ pub struct EnvironmentSummary {
 
 /// Top-level response for GET /api/envs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[allow(dead_code)]
 pub struct EnvironmentListData {
     pub environments: Vec<EnvironmentSummary>,
     pub total_environments: u32,
@@ -136,9 +136,9 @@ pub struct EnvironmentListData {
     pub total_accounts: u32,
 }
 
-/// Per-region detail response for GET /api/envs/:env/regions.
+/// Per-region detail response for GET /api/envs/{env}/regions.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[allow(dead_code)]
 pub struct RegionDetailData {
     pub env_name: String,
     pub region_name: String,
@@ -151,6 +151,7 @@ pub struct RegionDetailData {
 
 /// Grouped search results for GET /api/search?q=...
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct SearchResult {
     pub environments: Vec<SearchHit>,
     pub jobs: Vec<SearchHit>,
@@ -159,6 +160,7 @@ pub struct SearchResult {
 
 /// A single search hit across any entity type.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct SearchHit {
     pub name: String,
     pub environment: Option<String>,
@@ -168,7 +170,7 @@ pub struct SearchHit {
 
 /// Alert information for the dashboard alerts panel.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[allow(dead_code)]
 pub struct AlertInfo {
     pub message: String,
     /// One of: "warning", "error"
@@ -177,7 +179,3 @@ pub struct AlertInfo {
     pub entity: String,
 }
 
-// ---- Re-export DB types used in API responses ----
-
-/// Re-export AccountHealth for API consumers.
-pub use crate::db::AccountHealth as AccountHealthData;

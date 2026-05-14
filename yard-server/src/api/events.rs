@@ -39,6 +39,7 @@ pub enum Event {
     DashboardFailed { reason: String },
     WebhookReceived,
     AlertSent { drifted_count: u32 },
+    EnvironmentHealthChanged,
 }
 
 /// Truncate a failure-reason string to at most `REASON_MAX_CHARS` characters,
@@ -189,6 +190,12 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json, r#"{"event":"dashboard_failed","reason":"x"}"#);
+    }
+
+    #[test]
+    fn event_environment_health_changed_serializes_tagged() {
+        let json = serde_json::to_string(&Event::EnvironmentHealthChanged).unwrap();
+        assert_eq!(json, r#"{"event":"environment_health_changed"}"#);
     }
 
     #[test]
