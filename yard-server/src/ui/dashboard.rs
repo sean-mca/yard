@@ -5,6 +5,7 @@ use std::time::Duration;
 use super::components::Pagination;
 use super::fetch::{get_json, get_json_or_default};
 use super::metrics::{DriftStatus, MetricsBar};
+use super::skeleton::{SkeletonCard, SkeletonTable};
 use crate::types::*;
 
 use super::api_base;
@@ -196,20 +197,15 @@ pub fn Dashboard() -> Element {
             }
         },
         _ => rsx! {
-            div { class: "p-6",
-                div { class: "flex items-center gap-2 text-sm text-zinc-500",
-                    svg {
-                        xmlns: "http://www.w3.org/2000/svg",
-                        width: "16", height: "16",
-                        view_box: "0 0 24 24",
-                        fill: "none",
-                        stroke: "currentColor",
-                        stroke_width: "2",
-                        class: "animate-spin",
-                        path { d: "M21 12a9 9 0 11-6.219-8.56" }
-                    }
-                    "Loading..."
+            div { class: "p-6 space-y-4",
+                div { class: "grid grid-cols-5 gap-4",
+                    SkeletonCard { width: "w-full".to_string(), height: "h-[76px]".to_string() }
+                    SkeletonCard { width: "w-full".to_string(), height: "h-[76px]".to_string() }
+                    SkeletonCard { width: "w-full".to_string(), height: "h-[76px]".to_string() }
+                    SkeletonCard { width: "w-full".to_string(), height: "h-[76px]".to_string() }
+                    SkeletonCard { width: "w-full".to_string(), height: "h-[76px]".to_string() }
                 }
+                SkeletonTable { rows: 5, cols: 6 }
             }
         },
     }

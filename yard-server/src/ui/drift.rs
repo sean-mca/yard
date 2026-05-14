@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use super::fetch::get_json;
 use super::sheet::Sheet;
+use super::skeleton::{SkeletonCard, SkeletonTable};
 use crate::types::*;
 
 use super::api_base;
@@ -123,10 +124,13 @@ pub fn Drift(#[props(default)] env: String) -> Element {
             }
         },
         _ => rsx! {
-            div { class: "p-6",
-                div { class: "rounded-lg border border-zinc-200 dark:border-zinc-800 px-4 py-8 text-center",
-                    p { class: "text-sm text-zinc-500", "Running drift check..." }
+            div { class: "p-6 space-y-4",
+                div { class: "grid grid-cols-3 gap-4",
+                    SkeletonCard { width: "w-full".to_string(), height: "h-[76px]".to_string() }
+                    SkeletonCard { width: "w-full".to_string(), height: "h-[76px]".to_string() }
+                    SkeletonCard { width: "w-full".to_string(), height: "h-[76px]".to_string() }
                 }
+                SkeletonTable { rows: 5, cols: 5 }
             }
         },
     }
