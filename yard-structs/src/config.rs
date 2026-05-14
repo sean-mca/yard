@@ -1128,10 +1128,12 @@ mod tests {
                     JobSummary {
                         name: "orders".to_string(),
                         job_type: JobType::Glue,
+                        config_yaml: None,
                     },
                     JobSummary {
                         name: "deploy".to_string(),
                         job_type: JobType::Bash,
+                        config_yaml: None,
                     },
                 ],
             }],
