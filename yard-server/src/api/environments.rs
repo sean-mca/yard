@@ -166,29 +166,19 @@ async fn load_drift_cache(state: &ApiState) -> Option<DriftData> {
     serde_json::from_str(&cached).ok()
 }
 
-/// Derive a single health status string for an environment based on its associated
-/// account health records. An environment's accounts are matched by convention:
-/// the account_id appears in the environment's health records. For now, we use
-/// a simple heuristic: if any account is "degraded" or has an error, the env is
-/// "degraded"; if all are "healthy", the env is "healthy"; otherwise "unknown".
+/// Derive a single health status string for an environment.
+///
+/// No env-to-account mapping exists in the DB schema yet, so we cannot
+/// determine per-environment health. Return "unknown" rather than a
+/// misleading global aggregate that would mark ALL environments as
+/// "degraded" when any single account is unhealthy.
+///
+/// TODO: When env<->account mapping is added to the schema, filter
+/// `all_health` by the environment's associated accounts and compute
+/// the real per-env status here.
 fn derive_env_health(env_name: &str, all_health: &[AccountHealth]) -> String {
-    // Match accounts to environments by checking if account_id or env association exists.
-    // Since we don't have a direct env<->account mapping in the DB yet, we use
-    // a simple approach: look at all health records. If there are none, it's "unknown".
-    // If any record for this env is degraded, the env is degraded.
-    // This will be refined when env<->account mapping is wired.
-    let _ = env_name; // Placeholder for future env-account mapping
-    if all_health.is_empty() {
-        return "unknown".to_string();
-    }
-    let has_degraded = all_health
-        .iter()
-        .any(|h| h.status != "healthy");
-    if has_degraded {
-        "degraded".to_string()
-    } else {
-        "healthy".to_string()
-    }
+    let _ = (env_name, all_health);
+    "unknown".to_string()
 }
 
 #[cfg(test)]
