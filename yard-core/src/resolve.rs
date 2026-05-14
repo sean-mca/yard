@@ -324,7 +324,11 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
 fn context_field(dir: &Path, filename: &str, field: &str) -> Value {
     find_and_parse_context(dir, filename, false)
         .ok()
-        .and_then(|v| v.get(field).cloned())
+        .and_then(|v| {
+            v.get(field)
+                .or_else(|| v.get("providers").and_then(|p| p.get(field)))
+                .cloned()
+        })
         .unwrap_or(Value::Null)
 }
 

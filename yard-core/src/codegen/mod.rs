@@ -379,7 +379,7 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
             };
             parts.push(format!(
                 "    # --- Sink ---\n{}",
-                render_sink(&effective_sink, default_source, fill_nulls)?
+                render_sink(&effective_sink, default_source, fill_nulls, job_def.config.get("glue").and_then(|g| g.get("catalog_id")).and_then(|v| v.as_str()))?
             ));
         }
         if parts.is_empty() {
@@ -397,13 +397,18 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
 
     // Iceberg warehouse for the glue_catalog Spark catalog, read from merged
     // provider config (`providers.glue.warehouse`, flowed into job.config.glue).
-    let warehouse = job_def
-        .config
-        .get("glue")
+    let glue_cfg = job_def.config.get("glue");
+    let warehouse = glue_cfg
         .and_then(|g| g.get("warehouse"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
     context.insert("iceberg_warehouse", warehouse);
+
+    let catalog_id = glue_cfg
+        .and_then(|g| g.get("catalog_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    context.insert("catalog_id", catalog_id);
 
     let rendered = tera
         .render("script", &context)
@@ -1812,4 +1817,5 @@ mod tests {
         );
         assert!(script.contains("from pyspark.sql.window import Window"));
     }
+
 }

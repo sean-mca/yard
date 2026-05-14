@@ -99,7 +99,7 @@ pub(super) fn render_source(source: &Source, default_engine: &str) -> Result<Str
                 let options_expr = if let Some((user_expr, password_expr, _)) = &auth {
                     let opts_var = format!("_opts_{name}");
                     lines.push(format!(
-                        "    {opts_var} = {{**{base_opts}, \"user\": {user_expr}, \"password\": {password_expr}}}"
+                        "    {opts_var} = {{**{base_opts}, \"user\": {user_expr}, \"password\": {password_expr}, \"ssl\": \"true\", \"sslmode\": \"require\"}}"
                     ));
                     opts_var
                 } else {
@@ -115,7 +115,7 @@ pub(super) fn render_source(source: &Source, default_engine: &str) -> Result<Str
                 );
                 if let Some((user_expr, password_expr, _)) = &auth {
                     chain.push_str(&format!(
-                        ".option(\"user\", {user_expr}).option(\"password\", {password_expr})"
+                        ".option(\"user\", {user_expr}).option(\"password\", {password_expr}).option(\"ssl\", \"true\").option(\"sslmode\", \"require\")"
                     ));
                 }
                 chain.push_str(".load()");

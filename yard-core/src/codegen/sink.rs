@@ -15,7 +15,7 @@ pub(super) const ICEBERG_TABLE_PROPERTIES: &[(&str, &str)] = &[
     ("write.distribution-mode", "hash"),
 ];
 
-pub(super) fn render_sink(sink: &Sink, default_source: &str, fill_nulls: bool) -> Result<String> {
+pub(super) fn render_sink(sink: &Sink, default_source: &str, fill_nulls: bool, catalog_id: Option<&str>) -> Result<String> {
     let source_name = sink.source.as_deref().unwrap_or(default_source);
     let var = format!("df_{source_name}");
     let mut lines = Vec::new();
@@ -104,13 +104,23 @@ pub(super) fn render_sink(sink: &Sink, default_source: &str, fill_nulls: bool) -
                         .map(|p| format!("\n            .tableProperty(\"location\", \"{p}\")")),
                 )
                 .collect::<String>();
-            lines.push(format!(
-                "    _glue = boto3.client(\"glue\")\n    \
-                 try:\n        \
-                     _glue.get_database(Name=\"{db}\")\n    \
-                 except _glue.exceptions.EntityNotFoundException:\n        \
-                     _glue.create_database(DatabaseInput={{\"Name\": \"{db}\"}})"
-            ));
+            if let Some(cid) = catalog_id {
+                lines.push(format!(
+                    "    _glue = boto3.client(\"glue\")\n    \
+                     try:\n        \
+                         _glue.get_database(CatalogId=\"{cid}\", Name=\"{db}\")\n    \
+                     except _glue.exceptions.EntityNotFoundException:\n        \
+                         _glue.create_database(CatalogId=\"{cid}\", DatabaseInput={{\"Name\": \"{db}\"}})"
+                ));
+            } else {
+                lines.push(format!(
+                    "    _glue = boto3.client(\"glue\")\n    \
+                     try:\n        \
+                         _glue.get_database(Name=\"{db}\")\n    \
+                     except _glue.exceptions.EntityNotFoundException:\n        \
+                         _glue.create_database(DatabaseInput={{\"Name\": \"{db}\"}})"
+                ));
+            }
             lines.push(format!("    _tbl = \"glue_catalog.{db}.{table}\""));
             // New-table branch: dataframe-inferred fill (D-04). No live target
             // schema to consult; _yard_fill_nulls coerces voids to source-side
