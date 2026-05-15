@@ -495,10 +495,39 @@ fn extract_session_id_from_cookie(headers: &axum::http::HeaderMap) -> Option<Str
             if value.is_empty() {
                 return None;
             }
+            // WR-03: reject obviously invalid session IDs early. Server-generated
+            // IDs are UUID v4 (36 chars, hex + hyphens). This avoids passing
+            // arbitrary strings (null bytes, megabytes) to DynamoDB.
+            if !is_valid_session_id(value) {
+                return None;
+            }
             return Some(value.to_string());
         }
     }
     None
+}
+
+/// Check that a session ID looks like a UUID v4 (36 chars: 8-4-4-4-12, hex digits + hyphens).
+fn is_valid_session_id(s: &str) -> bool {
+    if s.len() != 36 {
+        return false;
+    }
+    // Expected hyphen positions in a UUID: 8, 13, 18, 23
+    for (i, ch) in s.chars().enumerate() {
+        match i {
+            8 | 13 | 18 | 23 => {
+                if ch != '-' {
+                    return false;
+                }
+            }
+            _ => {
+                if !ch.is_ascii_hexdigit() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Extract the email claim from an OAuth2 ID token.

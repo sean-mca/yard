@@ -226,10 +226,37 @@ fn extract_cookie_token(headers: &HeaderMap) -> Option<Vec<u8>> {
             if value.is_empty() {
                 return None;
             }
+            // WR-03: reject obviously invalid session IDs early. Server-generated
+            // IDs are UUID v4 (36 chars). Avoids passing arbitrary strings to DynamoDB.
+            if !is_valid_session_id(value) {
+                return None;
+            }
             return Some(value.as_bytes().to_vec());
         }
     }
     None
+}
+
+/// Check that a session ID looks like a UUID v4 (36 chars: 8-4-4-4-12, hex digits + hyphens).
+fn is_valid_session_id(s: &str) -> bool {
+    if s.len() != 36 {
+        return false;
+    }
+    for (i, ch) in s.chars().enumerate() {
+        match i {
+            8 | 13 | 18 | 23 => {
+                if ch != '-' {
+                    return false;
+                }
+            }
+            _ => {
+                if !ch.is_ascii_hexdigit() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Extract a Bearer token from the Authorization header.
