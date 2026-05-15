@@ -34,6 +34,8 @@
 //! The `/api/webhook/github` route is HMAC-secured separately and is
 //! merged at the parent router level so this middleware does NOT see it.
 
+pub mod oauth2;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
