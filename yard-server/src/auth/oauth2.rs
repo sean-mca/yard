@@ -341,6 +341,16 @@ pub fn build_providers_from_env() -> ProviderRegistry {
         };
 
         if !secret_arn.is_empty() {
+            // WR-04: warn if the value doesn't look like a Secrets Manager ARN.
+            // The env var name says "CLIENT_SECRET" but should hold an ARN (D-06).
+            if !secret_arn.starts_with("arn:aws:secretsmanager:") {
+                tracing::warn!(
+                    provider = "entra",
+                    "YARD_OAUTH_ENTRA_CLIENT_SECRET does not look like a Secrets Manager ARN \
+                     (expected arn:aws:secretsmanager:...). This variable should contain an ARN, \
+                     not the raw client secret."
+                );
+            }
             match tenant_id {
                 Ok(tid) => {
                     match build_entra_config(&client_id, &tid, &secret_arn, &redirect_url) {
@@ -381,6 +391,15 @@ pub fn build_providers_from_env() -> ProviderRegistry {
         };
 
         if !secret_arn.is_empty() {
+            // WR-04: warn if the value doesn't look like a Secrets Manager ARN.
+            if !secret_arn.starts_with("arn:aws:secretsmanager:") {
+                tracing::warn!(
+                    provider = "google",
+                    "YARD_OAUTH_GOOGLE_CLIENT_SECRET does not look like a Secrets Manager ARN \
+                     (expected arn:aws:secretsmanager:...). This variable should contain an ARN, \
+                     not the raw client secret."
+                );
+            }
             match build_google_config(&client_id, &secret_arn, &redirect_url) {
                 Ok(provider) => {
                     tracing::info!(provider = "google", "OAuth2 provider configured");
