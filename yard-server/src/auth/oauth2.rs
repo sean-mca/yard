@@ -1,43 +1,86 @@
 //! OAuth2 provider configuration for Entra ID and Google Workspace (AUTH-03, AUTH-04).
 //!
 //! Implements PKCE authorization code flow using the `oauth2` crate v5.0.
-//! Client secrets are NOT stored in `BasicClient` -- they are resolved from
+//! Client secrets are NOT stored in the client -- they are resolved from
 //! `SecretStore` (AWS Secrets Manager) at token exchange time per D-06.
 //!
 //! Provider construction from env vars uses graceful degradation (D-07):
 //! a misconfigured provider is logged and skipped; the server starts with
 //! only the successfully-constructed providers.
+//!
+//! Uses a custom `YardTokenResponse` (via `IdTokenExtraFields`) instead of
+//! `BasicTokenResponse` so the OpenID Connect `id_token` is captured during
+//! token exchange and available for email extraction in the callback handler.
 
-// This module is built by Plan 02 but not wired into main.rs until Plan 03
-// (AuthProvider trait integration). Allow dead_code until then; Plan 03
-// removes this attribute when it consumes the public API.
-#![allow(dead_code)]
-
-use oauth2::basic::BasicClient;
-use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointNotSet,
-    EndpointSet, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken, Scope,
-    TokenUrl,
+use oauth2::basic::{
+    BasicErrorResponse, BasicRevocationErrorResponse, BasicTokenIntrospectionResponse,
+    BasicTokenType,
 };
+use oauth2::{
+    AuthUrl, AuthorizationCode, Client, ClientId, ClientSecret, CsrfToken, EndpointNotSet,
+    EndpointSet, ExtraTokenFields, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl,
+    RefreshToken, Scope, StandardRevocableToken, StandardTokenResponse, TokenUrl,
+};
+use serde::{Deserialize, Serialize};
 
-/// A `BasicClient` with auth URL and token URL set (type-state pattern).
+/// Extra fields from the token response that capture `id_token` for
+/// OpenID Connect email extraction (Plan 03). Without this, the oauth2
+/// crate's `EmptyExtraTokenFields` silently drops the `id_token` during
+/// deserialization.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct IdTokenExtraFields {
+    /// The OpenID Connect ID token (JWT). Present when the `openid` scope
+    /// was requested and the provider supports OIDC.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub id_token: Option<String>,
+}
+impl ExtraTokenFields for IdTokenExtraFields {}
+
+/// Token response type that captures the `id_token` field alongside
+/// the standard OAuth2 fields (access_token, refresh_token, etc.).
+pub type YardTokenResponse = StandardTokenResponse<IdTokenExtraFields, BasicTokenType>;
+
+/// OAuth2 client type that produces `YardTokenResponse` (with `id_token` support)
+/// instead of the default `BasicTokenResponse` (which drops unknown fields).
+type YardOAuthClient<
+    HasAuthUrl = EndpointNotSet,
+    HasDeviceAuthUrl = EndpointNotSet,
+    HasIntrospectionUrl = EndpointNotSet,
+    HasRevocationUrl = EndpointNotSet,
+    HasTokenUrl = EndpointNotSet,
+> = Client<
+    BasicErrorResponse,
+    YardTokenResponse,
+    BasicTokenIntrospectionResponse,
+    StandardRevocableToken,
+    BasicRevocationErrorResponse,
+    HasAuthUrl,
+    HasDeviceAuthUrl,
+    HasIntrospectionUrl,
+    HasRevocationUrl,
+    HasTokenUrl,
+>;
+
+/// A `YardOAuthClient` with auth URL and token URL set (type-state pattern).
 /// Device auth, introspection, and revocation URLs are not needed for the
 /// authorization code + PKCE flow.
 type ConfiguredClient =
-    BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
+    YardOAuthClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
 
 /// Configuration for a single OAuth2 provider.
 ///
-/// Each struct holds the `BasicClient` (with auth/token URLs but NO client
-/// secret baked in -- per D-06) and the `client_secret_arn` for deferred
-/// SecretStore resolution at token exchange time.
+/// Each struct holds the client (with auth/token URLs but NO client secret
+/// baked in -- per D-06) and the `client_secret_arn` for deferred SecretStore
+/// resolution at token exchange time.
 pub struct OAuth2ProviderConfig {
     /// Short machine-readable identifier, e.g. "entra" or "google".
     pub name: String,
     /// Human-readable name for the login page, e.g. "Microsoft" or "Google".
     pub display_name: String,
-    /// The `oauth2::basic::BasicClient` pre-configured with auth/token URLs
-    /// and the redirect URI. Client secret is NOT set here (D-06).
+    /// The oauth2 `Client` pre-configured with auth/token URLs and redirect URI.
+    /// Uses `YardTokenResponse` to capture `id_token`. Client secret is NOT
+    /// set here (D-06).
     pub client: ConfiguredClient,
     /// The Secrets Manager ARN (or other SecretStore key) holding the client
     /// secret. Resolved at token exchange time, never at construction.
@@ -51,6 +94,8 @@ pub struct ProviderRegistry {
     /// degradation when all providers are misconfigured or unconfigured).
     pub providers: Vec<OAuth2ProviderConfig>,
     /// The redirect URI shared by all providers. Logged at startup.
+    /// Used by tests and potentially by UI for display.
+    #[allow(dead_code)]
     pub redirect_uri: String,
 }
 
@@ -103,15 +148,15 @@ impl ProviderRegistry {
     /// Exchange an authorization code for tokens. The `client_secret` has
     /// already been resolved from SecretStore by the caller.
     ///
-    /// Returns the token response containing access_token (and optionally
-    /// refresh_token).
+    /// Returns the token response containing access_token, optionally
+    /// refresh_token, and the id_token (if the provider returned one).
     pub async fn exchange_code(
         &self,
         provider_id: &str,
         authorization_code: String,
         pkce_verifier: String,
         client_secret: String,
-    ) -> anyhow::Result<oauth2::basic::BasicTokenResponse> {
+    ) -> anyhow::Result<YardTokenResponse> {
         let provider = self
             .get_provider(provider_id)
             .ok_or_else(|| anyhow::anyhow!("unknown OAuth2 provider: {provider_id}"))?;
@@ -143,7 +188,7 @@ impl ProviderRegistry {
         provider_id: &str,
         refresh_token: String,
         client_secret: String,
-    ) -> anyhow::Result<oauth2::basic::BasicTokenResponse> {
+    ) -> anyhow::Result<YardTokenResponse> {
         let provider = self
             .get_provider(provider_id)
             .ok_or_else(|| anyhow::anyhow!("unknown OAuth2 provider: {provider_id}"))?;
@@ -185,6 +230,13 @@ const ENTRA_TOKEN_URL_TEMPLATE: &str =
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
+/// Create a new `YardOAuthClient` with the given client ID.
+/// This is the equivalent of `BasicClient::new(...)` but uses our custom
+/// token response type.
+fn new_yard_client(client_id: ClientId) -> YardOAuthClient {
+    Client::new(client_id)
+}
+
 /// Pure builder: construct an Entra ID provider from explicit parameters.
 /// No env var reads -- testable without `unsafe`.
 fn build_entra_config(
@@ -201,7 +253,7 @@ fn build_entra_config(
     let token_url = TokenUrl::new(token_url_str)
         .map_err(|e| anyhow::anyhow!("invalid Entra token URL: {e}"))?;
 
-    let client = BasicClient::new(ClientId::new(client_id.to_string()))
+    let client = new_yard_client(ClientId::new(client_id.to_string()))
         .set_auth_uri(auth_url)
         .set_token_uri(token_url)
         .set_redirect_uri(redirect_url.clone());
@@ -226,7 +278,7 @@ fn build_google_config(
     let token_url = TokenUrl::new(GOOGLE_TOKEN_URL.to_string())
         .map_err(|e| anyhow::anyhow!("invalid Google token URL: {e}"))?;
 
-    let client = BasicClient::new(ClientId::new(client_id.to_string()))
+    let client = new_yard_client(ClientId::new(client_id.to_string()))
         .set_auth_uri(auth_url)
         .set_token_uri(token_url)
         .set_redirect_uri(redirect_url.clone());
