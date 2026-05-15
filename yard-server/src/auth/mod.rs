@@ -356,6 +356,14 @@ mod tests {
     use std::collections::HashMap;
     use tower::ServiceExt;
 
+    // Test UUIDs for session IDs (WR-03: must be valid UUID format).
+    const TEST_SESSION_1: &str = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+    const TEST_SESSION_2: &str = "b2c3d4e5-f6a7-8901-bcde-f12345678901";
+    /// UUID-format token for legacy require_bearer tests (token = cookie value).
+    const TEST_LEGACY_TOKEN: &str = "deadbeef-0000-4000-a000-000000000001";
+    /// A non-matching session ID that is still UUID-formatted.
+    const TEST_BAD_SESSION: &str = "00000000-0000-4000-8000-badbadbadbad";
+
     // ---- Mock AuthProvider for tests ----
 
     struct MockAuthProvider {
@@ -535,14 +543,14 @@ mod tests {
     #[tokio::test]
     async fn require_auth_valid_session_cookie_passes() {
         let provider: Arc<dyn AuthProvider> = Arc::new(
-            MockAuthProvider::authenticated(vec![("valid-session-id", "user@example.com")]),
+            MockAuthProvider::authenticated(vec![(TEST_SESSION_1, "user@example.com")]),
         );
         let app = build_auth_router(provider);
         let resp = app
             .oneshot(req_with_header_and_addr(
                 "/api/protected",
                 "Cookie",
-                "yard_session=valid-session-id",
+                &format!("yard_session={TEST_SESSION_1}"),
                 loopback_addr(),
             ))
             .await
@@ -559,7 +567,7 @@ mod tests {
             .oneshot(req_with_header_and_addr(
                 "/api/protected",
                 "Cookie",
-                "yard_session=bad-session",
+                &format!("yard_session={TEST_BAD_SESSION}"),
                 loopback_addr(),
             ))
             .await
@@ -576,7 +584,7 @@ mod tests {
             .oneshot(req_with_header_and_addr(
                 "/html/page",
                 "Cookie",
-                "yard_session=bad-session",
+                &format!("yard_session={TEST_BAD_SESSION}"),
                 loopback_addr(),
             ))
             .await
@@ -643,14 +651,14 @@ mod tests {
     #[tokio::test]
     async fn require_auth_cookie_among_others_passes() {
         let provider: Arc<dyn AuthProvider> = Arc::new(
-            MockAuthProvider::authenticated(vec![("my-session", "user@example.com")]),
+            MockAuthProvider::authenticated(vec![(TEST_SESSION_2, "user@example.com")]),
         );
         let app = build_auth_router(provider);
         let resp = app
             .oneshot(req_with_header_and_addr(
                 "/api/protected",
                 "Cookie",
-                "theme=dark; yard_session=my-session; locale=en",
+                &format!("theme=dark; yard_session={TEST_SESSION_2}; locale=en"),
                 loopback_addr(),
             ))
             .await
@@ -793,14 +801,14 @@ mod tests {
     #[tokio::test]
     async fn cookie_only_returns_200() {
         let app = build_legacy_router(AuthConfig {
-            token: Some("s3cret".into()),
+            token: Some(TEST_LEGACY_TOKEN.into()),
             bypass_loopback: false,
         });
         let resp = app
             .oneshot(req_with_header_and_addr(
                 "/api/protected",
                 "Cookie",
-                "yard_session=s3cret",
+                &format!("yard_session={TEST_LEGACY_TOKEN}"),
                 loopback_addr(),
             ))
             .await
@@ -811,14 +819,14 @@ mod tests {
     #[tokio::test]
     async fn invalid_cookie_returns_401() {
         let app = build_legacy_router(AuthConfig {
-            token: Some("s3cret".into()),
+            token: Some(TEST_LEGACY_TOKEN.into()),
             bypass_loopback: false,
         });
         let resp = app
             .oneshot(req_with_header_and_addr(
                 "/api/protected",
                 "Cookie",
-                "yard_session=wrong",
+                &format!("yard_session={TEST_BAD_SESSION}"),
                 loopback_addr(),
             ))
             .await
@@ -829,13 +837,13 @@ mod tests {
     #[tokio::test]
     async fn header_takes_precedence_over_cookie_valid_header_wins() {
         let app = build_legacy_router(AuthConfig {
-            token: Some("s3cret".into()),
+            token: Some(TEST_LEGACY_TOKEN.into()),
             bypass_loopback: false,
         });
         let mut req = Request::builder()
             .uri("/api/protected")
-            .header("Authorization", "Bearer s3cret")
-            .header("Cookie", "yard_session=wrong")
+            .header("Authorization", &format!("Bearer {TEST_LEGACY_TOKEN}"))
+            .header("Cookie", &format!("yard_session={TEST_BAD_SESSION}"))
             .body(Body::empty())
             .unwrap();
         req.extensions_mut()
@@ -847,14 +855,14 @@ mod tests {
     #[tokio::test]
     async fn cookie_alongside_other_cookies_returns_200() {
         let app = build_legacy_router(AuthConfig {
-            token: Some("s3cret".into()),
+            token: Some(TEST_LEGACY_TOKEN.into()),
             bypass_loopback: false,
         });
         let resp = app
             .oneshot(req_with_header_and_addr(
                 "/api/protected",
                 "Cookie",
-                "theme=dark; yard_session=s3cret; locale=en",
+                &format!("theme=dark; yard_session={TEST_LEGACY_TOKEN}; locale=en"),
                 loopback_addr(),
             ))
             .await

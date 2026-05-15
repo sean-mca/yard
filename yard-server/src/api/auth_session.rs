@@ -796,7 +796,7 @@ mod tests {
 
         // Create a session first.
         let session = Session {
-            session_id: "sess-123".to_string(),
+            session_id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string(),
             email: "user@example.com".to_string(),
             provider: "entra".to_string(),
             refresh_token: None,
@@ -818,7 +818,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/auth/logout")
-                    .header("Cookie", "yard_session=sess-123")
+                    .header("Cookie", "yard_session=a1b2c3d4-e5f6-7890-abcd-ef1234567890")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -838,7 +838,7 @@ mod tests {
         assert!(cookie.contains("Secure"), "missing Secure on clear: {cookie}");
 
         // Verify session is deleted from database.
-        let session_after = db.get_session("sess-123").await.unwrap();
+        let session_after = db.get_session("a1b2c3d4-e5f6-7890-abcd-ef1234567890").await.unwrap();
         assert!(session_after.is_none(), "session should be deleted from db");
     }
 
@@ -871,7 +871,7 @@ mod tests {
 
         // Create a session without a refresh token.
         let session = Session {
-            session_id: "sess-no-refresh".to_string(),
+            session_id: "b2c3d4e5-f6a7-8901-bcde-f12345678901".to_string(),
             email: "user@example.com".to_string(),
             provider: "entra".to_string(),
             refresh_token: None,
@@ -892,7 +892,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/auth/oauth/refresh")
-                    .header("Cookie", "yard_session=sess-no-refresh")
+                    .header("Cookie", "yard_session=b2c3d4e5-f6a7-8901-bcde-f12345678901")
                     .body(Body::empty())
                     .unwrap(),
             )
