@@ -41,6 +41,11 @@ use crate::secrets::SecretStore;
 /// Session duration in seconds: 8 hours (D-09).
 const SESSION_MAX_AGE_SECS: i64 = 28800;
 
+/// Maximum total session lifetime: 24 hours. Refresh cannot extend a session
+/// beyond this horizon from its original `created_at` timestamp. Forces
+/// re-authentication daily even when refresh tokens are available (CR-03).
+const MAX_SESSION_LIFETIME_SECS: i64 = 86400;
+
 /// State shared by all auth session routes.
 pub struct AuthSessionState {
     pub db: Arc<dyn Database>,
@@ -317,6 +322,17 @@ async fn oauth_refresh(
         .await
         .map_err(|e| ApiError::Internal(format!("failed to load session: {e}")))?
         .ok_or_else(|| ApiError::Unauthorized("session not found or expired".into()))?;
+
+    // CR-03: enforce maximum session lifetime — sessions cannot be refreshed
+    // beyond 24 hours from their original creation time.
+    let max_lifetime = session.created_at + Duration::seconds(MAX_SESSION_LIFETIME_SECS);
+    if Utc::now() > max_lifetime {
+        // Delete the expired session so it cannot be retried.
+        let _ = state.db.delete_session(&session_id).await;
+        return Err(ApiError::Unauthorized(
+            "session exceeded maximum lifetime -- please sign in again".into(),
+        ));
+    }
 
     // Check that the session has a refresh token.
     let refresh_token = session
