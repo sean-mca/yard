@@ -1,5 +1,17 @@
-use crate::db::JobSummaryEntity;
 use serde::{Deserialize, Serialize};
+
+/// Summary metadata for a discovered job (D-15).
+/// Shared between server-side DB layer and WASM UI.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobSummaryEntity {
+    pub env_name: String,
+    pub region_name: String,
+    pub name: String,
+    pub job_type: String,
+    #[serde(default)]
+    pub config_yaml: Option<String>,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PrState {

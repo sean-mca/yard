@@ -49,7 +49,8 @@ pub fn GlobalSearch() -> Element {
     let mut query = use_signal(String::new);
     let mut results = use_signal(|| None::<Result<SearchResult, String>>);
     let mut is_open = use_signal(|| false);
-    let is_loading = use_signal(|| false);
+    #[allow(unused_mut)]
+    let mut is_loading = use_signal(|| false);
     let mut debounce_version = use_signal(|| 0u32);
 
     rsx! {

@@ -362,7 +362,7 @@ pub fn RegionDetail(env: String, region: String) -> Element {
     }
 
     let active_tab = use_signal(|| 0usize);
-    let selected_job = use_signal(|| None::<crate::db::JobSummaryEntity>);
+    let selected_job = use_signal(|| None::<crate::types::JobSummaryEntity>);
 
     let breadcrumb_env = env.clone();
     let breadcrumb_region = region.clone();
@@ -453,9 +453,9 @@ pub fn RegionDetail(env: String, region: String) -> Element {
 
 #[component]
 fn JobTable(
-    items: Vec<crate::db::JobSummaryEntity>,
+    items: Vec<crate::types::JobSummaryEntity>,
     drift_items: Vec<DriftItem>,
-    mut selected: Signal<Option<crate::db::JobSummaryEntity>>,
+    mut selected: Signal<Option<crate::types::JobSummaryEntity>>,
 ) -> Element {
     rsx! {
         div { class: "rounded-lg border border-zinc-200 dark:border-zinc-800 overflow-hidden",
@@ -511,7 +511,7 @@ fn JobTable(
 }
 
 #[component]
-fn JobDetailSheet(mut item: Signal<Option<crate::db::JobSummaryEntity>>) -> Element {
+fn JobDetailSheet(mut item: Signal<Option<crate::types::JobSummaryEntity>>) -> Element {
     let current_item = item();
     let is_open = current_item.is_some();
     let title = current_item

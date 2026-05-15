@@ -99,19 +99,7 @@ pub struct RegionEntity {
     pub dag_count: u64,
 }
 
-/// Summary metadata for a discovered job (D-15).
-/// Stored as DynamoDB sub-entity: PK=ENV#{env}, SK=JOB#{job_name}.
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct JobSummaryEntity {
-    pub env_name: String,
-    pub region_name: String,
-    pub name: String,
-    pub job_type: String,
-    /// Raw YAML file content from discovery (DASH-04).
-    #[serde(default)]
-    pub config_yaml: Option<String>,
-}
+pub use crate::types::JobSummaryEntity;
 
 /// Per-account health status for credential resolution (D-11).
 /// Stored as DynamoDB entity: PK=HEALTH#{account_id}, SK=STATUS.

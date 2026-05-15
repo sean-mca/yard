@@ -755,7 +755,8 @@ async fn dashboard_poll_loop(
 }
 
 fn app() -> Element {
-    let theme = use_signal(|| ui::settings::Theme::Light);
+    #[allow(unused_mut)]
+    let mut theme = use_signal(|| ui::settings::Theme::Light);
     use_context_provider(|| theme);
 
     // Phase 44 D-12: restore theme from localStorage on first mount.
