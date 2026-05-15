@@ -1,133 +1,165 @@
-//! Operator login page (Gap A from 25-VERIFICATION.md §1).
+//! OAuth2 login page (Phase 45 Plan 04).
 //!
-//! Renders a single password input + Sign In button. On submit:
-//!   1. POST /api/auth/session with body { "token": "<typed value>" }
-//!   2. The server (Plan 25-04) returns 200 + Set-Cookie: yard_session=...
-//!      (HttpOnly + SameSite=Strict + Path=/ + Secure), or 401 on mismatch.
-//!   3. On 200 navigate to / (Route::Dashboard).
-//!   4. On 401 show inline error.
-//!
-//! The typed token is held in a Dioxus Signal<String> for the duration of
-//! one submit cycle and is cleared (set to String::new()) immediately after
-//! the POST resolves — success or failure. No persistence in JS-readable
-//! storage; the only post-login token store is the browser's HttpOnly
-//! cookie which WASM cannot read.
+//! On mount, fetches GET /api/auth/providers. If the list is empty (NoopAuth
+//! mode), redirects to Dashboard immediately — the login page is never shown.
+//! If providers exist, renders one `ProviderButton` per configured provider.
+//! Clicking a button navigates the full browser to
+//! `/api/auth/oauth/start?provider={id}` which triggers the server-side PKCE
+//! flow. Error display handles OAuth callback failures via the `?error=1`
+//! query parameter set by the callback redirect on failure.
 
 use dioxus::prelude::*;
-use serde::Serialize;
+use serde::Deserialize;
 
 use super::api_base;
+use super::fetch::get_json;
 
-#[derive(Serialize)]
-struct SessionRequest<'a> {
-    token: &'a str,
+#[derive(Deserialize, Default)]
+struct ProvidersResponse {
+    providers: Vec<ProviderInfo>,
 }
 
-/// POST /api/auth/session with the typed token. Returns Ok(()) on 200,
-/// Err with a user-facing message on 401 / network error.
-///
-/// BL-02: the WASM build threads the request through
-/// `RequestBuilder::fetch_credentials_include()` so the browser
-/// stores the `Set-Cookie: yard_session=...` response on cross-origin
-/// dev shapes (`dx serve` on a different port from the API). Without
-/// `credentials: include`, the browser drops Set-Cookie on cross-
-/// origin responses, the cookie never lands in the cookie jar, and
-/// the user appears to authenticate successfully but the next /api/*
-/// call returns 401 — presenting as an "infinite login loop." On
-/// native builds (Dioxus fullstack SSR / prerender path), the
-/// `fetch_credentials_include` setter is not defined on the native
-/// `RequestBuilder`, so the call is gated by
-/// `#[cfg(target_arch = "wasm32")]`.
-async fn post_session(token: &str) -> Result<(), String> {
-    let client = reqwest::Client::new();
-    let builder = client
-        .post(format!("{}/api/auth/session", api_base()))
-        .json(&SessionRequest { token });
-    #[cfg(target_arch = "wasm32")]
-    let builder = builder.fetch_credentials_include();
-    let resp = builder
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {e}"))?;
-
-    match resp.status().as_u16() {
-        200 => Ok(()),
-        401 => Err("Invalid token — check the value and try again".to_string()),
-        other => Err(format!("Unexpected server response: {other}")),
-    }
+#[derive(Deserialize, Clone)]
+struct ProviderInfo {
+    id: String,
+    name: String,
 }
 
 #[component]
 pub fn Login() -> Element {
-    let mut token_input = use_signal(String::new);
     let mut error = use_signal(String::new);
-    let mut submitting = use_signal(|| false);
+    let submitting = use_signal(|| false);
+    let mut providers: Signal<Vec<ProviderInfo>> = use_signal(Vec::new);
+    let mut loaded = use_signal(|| false);
 
-    let on_submit = move |_evt: FormEvent| {
-        // Capture the typed token, clear the input immediately so it's not
-        // sitting in WASM memory longer than the one submit cycle.
-        let typed = token_input();
-        token_input.set(String::new());
-        error.set(String::new());
-        submitting.set(true);
-
+    // Fetch providers + check for callback error on mount.
+    use_effect(move || {
         spawn(async move {
-            match post_session(&typed).await {
-                Ok(()) => {
-                    // Drop the typed string from memory before navigating.
-                    // (The local `typed` goes out of scope at the closure
-                    // end; explicit drop below is belt-and-suspenders.)
-                    drop(typed);
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        use crate::Route;
-                        use dioxus::prelude::navigator;
-                        navigator().push(Route::Dashboard {});
+            // Check URL query param "error" for callback failures.
+            #[cfg(target_arch = "wasm32")]
+            {
+                if let Some(window) = web_sys::window() {
+                    if let Ok(search) = window.location().search() {
+                        if search.contains("error") {
+                            error.set(
+                                "Sign-in could not be completed. Please try again.".to_string(),
+                            );
+                        }
+                    }
+                }
+            }
+
+            match get_json::<ProvidersResponse>(&format!(
+                "{}/api/auth/providers",
+                api_base()
+            ))
+            .await
+            {
+                Ok(resp) => {
+                    if resp.providers.is_empty() {
+                        // NoopAuth — redirect to dashboard immediately.
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            use crate::Route;
+                            use dioxus::prelude::navigator;
+                            navigator().push(Route::Dashboard {});
+                        }
+                    } else {
+                        providers.set(resp.providers);
                     }
                 }
                 Err(msg) => {
-                    error.set(msg);
+                    error.set(format!("Failed to load providers: {msg}"));
                 }
             }
-            submitting.set(false);
+            loaded.set(true);
         });
-    };
+    });
+
+    // Before providers load, render nothing (brief flash).
+    if !loaded() {
+        return rsx! {};
+    }
+
+    // NoopAuth handled above via redirect. If we get here with empty
+    // providers, the non-WASM build path just renders nothing.
+    if providers().is_empty() {
+        return rsx! {};
+    }
 
     rsx! {
         div { class: "min-h-screen flex items-center justify-center bg-zinc-50 dark:bg-zinc-950",
-            form {
+            div {
                 class: "w-full max-w-sm rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-6 shadow-sm",
-                onsubmit: on_submit,
                 h1 { class: "text-base font-semibold mb-1 text-zinc-950 dark:text-zinc-50",
                     "yard-server"
                 }
                 p { class: "text-xs text-zinc-500 mb-4",
-                    "Paste the YARD_API_TOKEN provided by your operator."
-                }
-                label { class: "text-xs font-medium text-zinc-500 dark:text-zinc-400 block mb-1.5",
-                    "API token"
-                }
-                input {
-                    r#type: "password",
-                    autocomplete: "off",
-                    autocapitalize: "off",
-                    spellcheck: "false",
-                    required: true,
-                    class: "w-full px-3 py-1.5 text-sm rounded-md border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 dark:text-zinc-50 focus:outline-none focus:ring-2 focus:ring-zinc-300 dark:focus:ring-zinc-600 mb-3 font-mono",
-                    value: "{token_input}",
-                    oninput: move |e| token_input.set(e.value()),
+                    "Sign in to continue."
                 }
                 if !error().is_empty() {
-                    div { class: "rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 mb-3",
+                    div { class: "rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 mb-3 dark:border-red-800 dark:bg-red-950 dark:text-red-300",
                         "{error}"
                     }
                 }
-                button {
-                    r#type: "submit",
-                    disabled: submitting(),
-                    class: "w-full px-3 py-1.5 text-sm font-medium rounded-md bg-zinc-900 text-white dark:bg-zinc-50 dark:text-zinc-900 hover:opacity-90 disabled:opacity-50 cursor-pointer disabled:cursor-not-allowed transition-opacity",
-                    if submitting() { "Signing in..." } else { "Sign in" }
+                div { class: "space-y-2",
+                    for provider in providers() {
+                        ProviderButton {
+                            key: "{provider.id}",
+                            name: provider.name.clone(),
+                            provider_id: provider.id.clone(),
+                            submitting,
+                        }
+                    }
                 }
+            }
+        }
+    }
+}
+
+#[component]
+fn ProviderButton(
+    name: String,
+    provider_id: String,
+    submitting: Signal<bool>,
+) -> Element {
+    let display_name = name.clone();
+    let pid = provider_id.clone();
+
+    rsx! {
+        button {
+            r#type: "button",
+            disabled: submitting(),
+            class: "w-full flex items-center gap-3 px-4 py-2.5 text-sm font-medium rounded-md border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800 disabled:opacity-50 cursor-pointer disabled:cursor-not-allowed transition-colors",
+            onclick: move |_| {
+                submitting.set(true);
+                let _provider = pid.clone();
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let base = api_base();
+                    let url = format!("{base}/api/auth/oauth/start?provider={_provider}");
+                    if let Some(window) = web_sys::window() {
+                        let _ = window.location().set_href(&url);
+                    }
+                }
+            },
+            // Generic shield/key icon (16x16)
+            svg {
+                xmlns: "http://www.w3.org/2000/svg",
+                width: "16",
+                height: "16",
+                view_box: "0 0 24 24",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "2",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                path { d: "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" }
+            }
+            if submitting() {
+                "Signing in with {display_name}..."
+            } else {
+                "Sign in with {display_name}"
             }
         }
     }

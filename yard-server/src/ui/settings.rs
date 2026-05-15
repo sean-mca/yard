@@ -60,6 +60,20 @@ async fn post_logout() -> Result<(), String> {
     post_no_body(&format!("{}/api/auth/logout", api_base())).await
 }
 
+// ---- Types for auth providers display ----
+
+#[derive(Deserialize, Default)]
+struct ProvidersResponse {
+    providers: Vec<ProviderInfo>,
+}
+
+#[derive(Deserialize, Clone)]
+struct ProviderInfo {
+    #[allow(dead_code)]
+    id: String,
+    name: String,
+}
+
 #[component]
 pub fn Settings(theme: Signal<Theme>) -> Element {
     let mut drift_interval = use_signal(|| "3".to_string());
@@ -178,6 +192,15 @@ pub fn Settings(theme: Signal<Theme>) -> Element {
                         }
                     }
                 }
+
+                Divider {}
+
+                // Authentication (Phase 45 Plan 04)
+                SettingsSection {
+                    title: "Authentication",
+                    description: "Current authentication configuration.",
+                }
+                AuthStatusCard {}
 
                 Divider {}
 
@@ -376,6 +399,9 @@ fn NotificationCard(
     mut field_value: Signal<String>,
     loaded: Signal<bool>,
 ) -> Element {
+    let testing = use_signal(|| false);
+    let test_result: Signal<Option<Result<(), String>>> = use_signal(|| None);
+
     rsx! {
         div { class: "rounded-lg border border-zinc-200 dark:border-zinc-700 p-4 mt-3",
             div { class: "flex items-center justify-between",
@@ -437,6 +463,141 @@ fn NotificationCard(
                                 spawn(async move { let _ = save_setting("slack_webhook_secret_arn", &val).await; });
                             }
                         },
+                    }
+                    // Slack test button (Phase 45 Plan 04 — D-13)
+                    SlackTestButton { testing, test_result }
+                }
+            }
+        }
+    }
+}
+
+/// Slack webhook test button (D-13). Sends a test message via the
+/// `test_slack_webhook` settings action trigger. Shows Testing.../Sent/error
+/// states inline.
+#[component]
+fn SlackTestButton(
+    mut testing: Signal<bool>,
+    mut test_result: Signal<Option<Result<(), String>>>,
+) -> Element {
+    rsx! {
+        div { class: "mt-3",
+            div { class: "flex items-center gap-2",
+                button {
+                    r#type: "button",
+                    disabled: testing(),
+                    class: "px-3 py-1.5 text-xs font-medium rounded-md border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed transition-colors",
+                    onclick: move |_| {
+                        testing.set(true);
+                        test_result.set(None);
+                        spawn(async move {
+                            match save_setting("test_slack_webhook", "").await {
+                                Ok(()) => {
+                                    test_result.set(Some(Ok(())));
+                                    // Clear success after 3 seconds.
+                                    spawn(async move {
+                                        #[cfg(target_arch = "wasm32")]
+                                        {
+                                            gloo_timers::future::TimeoutFuture::new(3_000).await;
+                                        }
+                                        #[cfg(not(target_arch = "wasm32"))]
+                                        {
+                                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                        }
+                                        test_result.set(None);
+                                    });
+                                }
+                                Err(msg) => {
+                                    test_result.set(Some(Err(msg)));
+                                }
+                            }
+                            testing.set(false);
+                        });
+                    },
+                    if testing() {
+                        "Testing..."
+                    } else {
+                        "Test"
+                    }
+                }
+                // Inline success indicator
+                if let Some(Ok(())) = test_result() {
+                    div { class: "flex items-center gap-1 text-xs text-emerald-500",
+                        svg {
+                            xmlns: "http://www.w3.org/2000/svg",
+                            width: "14",
+                            height: "14",
+                            view_box: "0 0 24 24",
+                            fill: "none",
+                            stroke: "currentColor",
+                            stroke_width: "2",
+                            stroke_linecap: "round",
+                            stroke_linejoin: "round",
+                            path { d: "M20 6L9 17l-5-5" }
+                        }
+                        "Sent"
+                    }
+                }
+            }
+            // Inline error display
+            if let Some(Err(msg)) = test_result() {
+                div { class: "mt-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-800 dark:bg-red-950 dark:text-red-300",
+                    "Test failed: {msg}"
+                }
+            }
+        }
+    }
+}
+
+/// Authentication status card (D-11). Fetches /api/auth/providers on mount
+/// and displays the current auth mode + active provider names. Read-only.
+#[component]
+fn AuthStatusCard() -> Element {
+    let mut auth_mode = use_signal(String::new);
+    let mut provider_names: Signal<Vec<String>> = use_signal(Vec::new);
+    let mut loaded = use_signal(|| false);
+
+    use_effect(move || {
+        spawn(async move {
+            match get_json::<ProvidersResponse>(&format!(
+                "{}/api/auth/providers",
+                api_base()
+            ))
+            .await
+            {
+                Ok(resp) => {
+                    if resp.providers.is_empty() {
+                        auth_mode.set("No authentication (VPN-only)".to_string());
+                    } else {
+                        auth_mode.set("OAuth2 SSO".to_string());
+                        provider_names
+                            .set(resp.providers.into_iter().map(|p| p.name).collect());
+                    }
+                }
+                Err(_) => {
+                    auth_mode.set("Unknown".to_string());
+                }
+            }
+            loaded.set(true);
+        });
+    });
+
+    if !loaded() {
+        return rsx! {};
+    }
+
+    rsx! {
+        div { class: "rounded-lg border border-zinc-200 dark:border-zinc-700 p-4 mt-3",
+            p { class: "text-sm font-medium",
+                "Mode: {auth_mode}"
+            }
+            if !provider_names().is_empty() {
+                div { class: "mt-2",
+                    p { class: "text-xs text-zinc-500 mb-1", "Active providers:" }
+                    ul { class: "text-xs text-zinc-500 list-disc list-inside",
+                        for name in provider_names() {
+                            li { "{name}" }
+                        }
                     }
                 }
             }
