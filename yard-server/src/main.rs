@@ -59,7 +59,7 @@ fn required_env(name: &str) -> anyhow::Result<String> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn start_api_server() {
-    use api::auth_session::auth_session_router;
+    use api::auth_session::{auth_session_router, AuthSessionState};
     use api::dashboard::{ApiState, dashboard_router};
     use api::drift::drift_router;
     use api::jobs::jobs_router;
@@ -91,20 +91,6 @@ fn start_api_server() {
             let webhook_secret = required_env("YARD_WEBHOOK_SECRET")?;
             let repo_owner = required_env("YARD_REPO_OWNER")?;
             let repo_name = required_env("YARD_REPO_NAME")?;
-
-            // SRV-01 / D-07 (REVISED by Phase 25 gap-closure plan 03 — REVERSES D-08):
-            // explicit, off-by-default dev bypass that takes effect ONLY for loopback
-            // callers. Trim whitespace + ASCII-lowercase before matching so common
-            // operator inputs ("True", "YES", " 1\n" from a heredoc, etc.) disable
-            // auth predictably.
-            let bypass_loopback = std::env::var("YARD_API_AUTH_DISABLED")
-                .map(|v| {
-                    matches!(
-                        v.trim().to_ascii_lowercase().as_str(),
-                        "1" | "true" | "yes" | "on"
-                    )
-                })
-                .unwrap_or(false);
 
             // SRV-03 / D-03 / D-04: optional override for the polling-loop
             // iteration timeout. Default 60s. Out-of-range or non-numeric
@@ -141,54 +127,16 @@ fn start_api_server() {
                 Err(_) => POLL_ITERATION_TIMEOUT_SECS_DEFAULT,
             };
 
-            if bypass_loopback {
-                // WR-07: single canonical warn surface. Previously this
-                // branch also emitted an eprintln! banner with the same
-                // information, which broke JSON-formatted log shippers
-                // (Loki, CloudWatch, Datadog) that line-parse stderr —
-                // the tracing JSON line and the free-form eprintln!
-                // line shared the same stream. tracing::warn! is the
-                // canonical structured event; the operator's
-                // tracing-subscriber config decides the surface format.
-                tracing::warn!(
-                    "YARD_API_AUTH_DISABLED=1 — /api/* endpoints skip the bearer check \
-                     for LOOPBACK callers (127.0.0.1, ::1) only; non-loopback callers \
-                     still require Authorization: Bearer. DO NOT use in production."
-                );
-            }
-
-            // YARD_API_TOKEN is now ALWAYS required (even when bypass is on) so that
-            // non-loopback callers can authenticate via the standard bearer path
-            // when the bypass is enabled. Boot fails fast if it's unset.
-            let api_token_raw = required_env("YARD_API_TOKEN")?;
-            // WR-02: validate the token charset at BOOT, not at first
-            // login. The token is interpolated into a `Set-Cookie` header
-            // value (yard-server/src/api/auth_session.rs::session_cookie_value),
-            // and `HeaderValue::from_str` rejects non-visible-ASCII at
-            // runtime. Worse, RFC 6265 cookie-value syntax forbids `;`,
-            // `,`, whitespace, double-quote, and control chars; a token
-            // containing `;` would silently parse on the way in (the
-            // cookie parser splits on `;`) but produce a truncated /
-            // attribute-injectable Set-Cookie on the way out.
+            // ---- Phase 45 Plan 03: AuthProvider construction ----
             //
-            // Reject anything outside printable ASCII excluding the
-            // cookie-syntax forbidden set. Error message must NOT echo
-            // the token.
-            if api_token_raw.bytes().any(|b| {
-                !(0x21..=0x7E).contains(&b) || matches!(b, b';' | b',' | b'"' | b'\\')
-            }) {
-                anyhow::bail!(
-                    "YARD_API_TOKEN must contain only printable ASCII (0x21..=0x7E) \
-                     excluding `;`, `,`, `\"`, and `\\` — current value contains a \
-                     forbidden character. See docs/server.md for the allowed charset."
-                );
-            }
-            let api_token: Option<String> = Some(api_token_raw);
+            // YARD_API_TOKEN is optional when OAuth2 is configured. When set, it
+            // enables the bearer token fallback for CLI/automation. When neither
+            // OAuth2 nor API token is configured, NoopAuth is used.
+            let api_token: Option<String> = std::env::var("YARD_API_TOKEN").ok()
+                .filter(|v| !v.is_empty());
 
-            let auth_config = std::sync::Arc::new(crate::auth::AuthConfig {
-                token: api_token,
-                bypass_loopback,
-            });
+            // Build the OAuth2 provider registry from YARD_OAUTH_* env vars.
+            let provider_registry = crate::auth::oauth2::build_providers_from_env();
 
             // SRV-02 / D-18: shared aws_config provider chain. Built once and
             // reused for the SecretsManager client so credentials and region
@@ -260,6 +208,43 @@ fn start_api_server() {
 
             let dashboard_url = std::env::var("YARD_DASHBOARD_URL").ok();
 
+            // ---- Phase 45 Plan 03: AuthProvider dispatch ----
+            // D-02 / D-07: construct the appropriate AuthProvider based on
+            // whether OAuth2 providers are configured.
+            let auth_provider: Arc<dyn crate::auth::AuthProvider> =
+                if provider_registry.providers.is_empty() {
+                    tracing::info!(
+                        "No OAuth2 providers configured -- running with NoopAuth \
+                         (all routes accessible)"
+                    );
+                    Arc::new(crate::auth::NoopAuth)
+                } else {
+                    tracing::info!(
+                        provider_count = provider_registry.providers.len(),
+                        "OAuth2 providers configured -- using OAuth2AuthProvider"
+                    );
+                    Arc::new(crate::auth::OAuth2AuthProvider {
+                        db: db.clone(),
+                        api_token: api_token.clone(),
+                    })
+                };
+
+            // Build the ProviderRegistry Arc for sharing with auth session routes.
+            let provider_registry_opt: Option<Arc<crate::auth::oauth2::ProviderRegistry>> =
+                if provider_registry.providers.is_empty() {
+                    None
+                } else {
+                    Some(Arc::new(provider_registry))
+                };
+
+            // AuthSessionState for the auth session routes.
+            let auth_session_state = Arc::new(AuthSessionState {
+                db: db.clone(),
+                secret_store: secret_store.clone(),
+                provider_registry: provider_registry_opt,
+                api_token,
+            });
+
             let webhook_state = Arc::new(AppState {
                 github_client,
                 webhook_secret,
@@ -269,34 +254,10 @@ fn start_api_server() {
             });
 
             // BL-01: scope CORS to the cookie-auth model's same-origin
-            // assumption. Previously this layer was open (allow_origin(Any)
-            // + allow_methods(Any) + allow_headers(Any)) which (a) let any
-            // origin drive-by probe /api/auth/session at 30 RPS via a
-            // victim's browser, and (b) prevented future CSRF-token-style
-            // mitigations because the server lost the same-origin signal.
-            //
-            // Operator opts in via YARD_CORS_ORIGIN (a single origin, e.g.
-            // `https://dashboard.example.com`). When set, only that origin
-            // gets a successful CORS preflight. When unset, fall back to
-            // AllowOrigin::any() to preserve the current open-by-default
-            // dev-friendly behaviour — but with tighter methods / headers
-            // so the preflight grants only what the UI actually uses.
-            //
-            // Methods: GET (read endpoints, dashboard / drift / settings,
-            // EventSource, WebSocket upgrade), POST (auth/session,
-            // auth/logout, settings writes, GitHub webhook).
-            //
-            // Headers: Content-Type (JSON bodies on POSTs), Authorization
-            // (CLI / automation Bearer header path; the cookie path does
-            // not need a CORS-allowed header since cookies are not
-            // request headers from the application's perspective).
-            //
-            // SameSite=Strict on yard_session still prevents the cookie
-            // from riding cross-origin requests, and AllowOrigin::any()
-            // is incompatible with credentials per the CORS spec, so the
-            // cookie-auth attack surface is unchanged. This fix narrows
-            // the preflight surface and gives operators a knob to scope
-            // origins explicitly.
+            // assumption. Operator opts in via YARD_CORS_ORIGIN (a single
+            // origin). When unset, fall back to AllowOrigin::any() for
+            // dev-friendly default. SameSite=Strict on yard_session still
+            // prevents cross-origin cookie attachment.
             let allow_origin = std::env::var("YARD_CORS_ORIGIN")
                 .ok()
                 .and_then(|s| s.parse::<axum::http::HeaderValue>().ok())
@@ -314,11 +275,9 @@ fn start_api_server() {
                 .expect("Failed to build rate limiter config");
             let rate_limit = GovernorLayer::new(Arc::new(rate_limit_config));
 
-            // SRV-01 / D-05: api routes (everything except the GitHub webhook,
-            // which is HMAC-secured separately) sit behind the bearer layer.
-            // Build them as a sub-router, layer auth, then merge into the
-            // parent. The webhook router is merged at the parent level so its
-            // `POST /api/webhook/github` path bypasses the bearer check.
+            // Phase 45: api routes sit behind the new require_auth middleware
+            // (replaces legacy require_bearer). The webhook router is merged
+            // at the parent level so it bypasses the auth check.
             let api_routes = axum::Router::new()
                 .merge(dashboard_router(api_state.clone()))
                 .merge(jobs_router(api_state.clone()))
@@ -326,18 +285,15 @@ fn start_api_server() {
                 .merge(settings_router(api_state.clone()))
                 .merge(api::events::events_router(api_state.clone()))
                 .layer(axum::middleware::from_fn_with_state(
-                    auth_config.clone(),
-                    crate::auth::require_bearer,
+                    auth_provider,
+                    crate::auth::require_auth,
                 ));
 
             let router = axum::Router::new()
                 .merge(github_router(webhook_state))
-                // Plan 25-04 Gap A: /api/auth/session and /api/auth/logout sit
-                // OUTSIDE the bearer-auth layer (chicken-and-egg — login can't
-                // require login). Both endpoints are still rate-limited by the
-                // .layer(rate_limit) below since rate_limit is on the parent
-                // router.
-                .merge(auth_session_router(auth_config.clone()))
+                // Auth session routes (providers, start, callback, refresh,
+                // session, logout) sit OUTSIDE the require_auth layer.
+                .merge(auth_session_router(auth_session_state))
                 .merge(api_routes)
                 .layer(rate_limit)
                 .layer(cors)

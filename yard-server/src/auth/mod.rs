@@ -51,7 +51,6 @@ pub const COOKIE_NAME: &str = "yard_session";
 /// Implementations:
 ///   - `NoopAuth` — zero-config VPN-only mode (D-02).
 ///   - `OAuth2Provider` (Plan 03) — session-cookie + OAuth2 SSO.
-#[allow(dead_code)]
 #[async_trait]
 pub trait AuthProvider: Send + Sync {
     /// Check if a session ID is valid. Returns the user email if valid,
@@ -73,7 +72,6 @@ pub trait AuthProvider: Send + Sync {
 /// No-op authentication provider for VPN-only deployments (D-02).
 /// All requests pass through without configuration. `validate_session`
 /// always returns `Some("anonymous@noop")`.
-#[allow(dead_code)]
 pub struct NoopAuth;
 
 #[async_trait]
@@ -87,6 +85,50 @@ impl AuthProvider for NoopAuth {
     }
 }
 
+/// OAuth2 authentication provider (D-01, Plan 03).
+///
+/// Validates sessions by looking them up in DynamoDB via the `Database` trait.
+/// Also supports bearer token fallback for CLI/automation (Pitfall 5).
+pub struct OAuth2AuthProvider {
+    pub db: std::sync::Arc<dyn crate::db::Database>,
+    /// Optional YARD_API_TOKEN for bearer fallback. When `Some`, bearer tokens
+    /// are checked via constant-time comparison (T-45-16).
+    pub api_token: Option<String>,
+}
+
+#[async_trait]
+impl AuthProvider for OAuth2AuthProvider {
+    async fn validate_session(&self, session_id: &str) -> Option<String> {
+        match self.db.get_session(session_id).await {
+            Ok(Some(session)) => {
+                if session.expires_at > chrono::Utc::now() {
+                    Some(session.email)
+                } else {
+                    None
+                }
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "session lookup failed");
+                None
+            }
+        }
+    }
+
+    fn is_noop(&self) -> bool {
+        false
+    }
+
+    async fn check_bearer(&self, token: &str) -> Option<String> {
+        let expected = self.api_token.as_deref()?;
+        if ct_eq(token.as_bytes(), expected.as_bytes()) {
+            Some("bearer@cli".to_string())
+        } else {
+            None
+        }
+    }
+}
+
 // ---- Middleware ----
 
 /// Axum middleware that enforces authentication via the `AuthProvider` trait.
@@ -97,7 +139,6 @@ impl AuthProvider for NoopAuth {
 /// 3. Bearer header — validate via `AuthProvider::check_bearer`.
 /// 4. No credential — differentiate HTML (302 to /login) from API (401 JSON)
 ///    per D-04.
-#[allow(dead_code)]
 pub async fn require_auth(
     State(auth): State<Arc<dyn AuthProvider>>,
     ConnectInfo(_addr): ConnectInfo<SocketAddr>,
@@ -143,13 +184,11 @@ pub async fn require_auth(
 
 /// True if the request path starts with `/api/` — JSON error responses
 /// are appropriate. Otherwise (HTML routes), redirect to `/login`.
-#[allow(dead_code)]
 fn is_api_request(path: &str) -> bool {
     path.starts_with("/api/")
 }
 
 /// Build a 302 redirect response to `/login`.
-#[allow(dead_code)]
 fn redirect_to_login_response() -> Response {
     let mut resp = StatusCode::FOUND.into_response();
     resp.headers_mut().insert(
@@ -159,11 +198,11 @@ fn redirect_to_login_response() -> Response {
     resp
 }
 
-// ---- Legacy AuthConfig (kept for api/auth_session.rs compatibility) ----
+// ---- Legacy AuthConfig (retained for backward-compat tests) ----
 
-/// DEPRECATED: Legacy bearer-token configuration. Retained temporarily so
-/// `api/auth_session.rs` compiles until Plan 03 rewrites it. Plan 03 will
-/// remove this struct entirely.
+/// DEPRECATED: Legacy bearer-token configuration. Retained for existing
+/// tests that exercise the `require_bearer` middleware path.
+#[cfg(test)]
 pub struct AuthConfig {
     pub token: Option<String>,
     pub bypass_loopback: bool,
@@ -194,7 +233,6 @@ fn extract_cookie_token(headers: &HeaderMap) -> Option<Vec<u8>> {
 }
 
 /// Extract a Bearer token from the Authorization header.
-#[allow(dead_code)]
 fn extract_bearer(headers: &HeaderMap) -> Option<String> {
     headers
         .get(AUTHORIZATION)
@@ -204,7 +242,7 @@ fn extract_bearer(headers: &HeaderMap) -> Option<String> {
 }
 
 /// True if the SocketAddr's IP is loopback (covers 127.0.0.0/8 and ::1).
-#[allow(dead_code)]
+#[allow(dead_code)]  // Used by legacy require_bearer tests
 fn is_loopback(addr: &SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
@@ -227,11 +265,10 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-// ---- Legacy require_bearer (kept for api/auth_session.rs and main.rs compatibility) ----
+// ---- Legacy require_bearer (retained for backward-compat tests) ----
 
-/// DEPRECATED: Legacy bearer-token middleware. Retained so main.rs compiles
-/// until Plan 03 wires the new `require_auth` middleware. Plan 03 will remove
-/// this function entirely.
+/// DEPRECATED: Legacy bearer-token middleware. Retained for existing tests.
+#[cfg(test)]
 pub async fn require_bearer(
     State(cfg): State<Arc<AuthConfig>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -254,6 +291,7 @@ pub async fn require_bearer(
 }
 
 /// Legacy credential check — header-OR-cookie against a single expected token.
+#[cfg(test)]
 fn check_credential(headers: &HeaderMap, expected: &[u8]) -> Result<(), ApiError> {
     let header_token: Option<Vec<u8>> = headers
         .get(AUTHORIZATION)
