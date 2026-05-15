@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use tracing::info;
 
 use super::{
-    AccountHealth, Database, DriftSnapshot, Environment, JobSummaryEntity, PlanResultRow,
-    PlanStatus, RegionEntity, Setting, WebhookEvent,
+    AccountHealth, Database, DriftSnapshot, Environment, JobSummaryEntity, OAuthState,
+    PlanResultRow, PlanStatus, RegionEntity, Session, Setting, WebhookEvent,
 };
 
 pub struct DynamoDatabase {
@@ -126,6 +126,41 @@ impl DynamoDatabase {
                 } else {
                     return Err(anyhow::anyhow!(
                         "Failed to create DynamoDB table: {service_err}"
+                    ));
+                }
+            }
+        }
+
+        // Enable TTL on the "ttl" attribute for session/OAuth state auto-expiry.
+        // This is idempotent — calling when TTL is already enabled is a no-op
+        // (AWS returns ValidationException with "already enabled" message).
+        match self
+            .client
+            .update_time_to_live()
+            .table_name(&self.table_name)
+            .time_to_live_specification(
+                aws_sdk_dynamodb::types::TimeToLiveSpecification::builder()
+                    .enabled(true)
+                    .attribute_name("ttl")
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("failed to build TTL spec: {e}"))?,
+            )
+            .send()
+            .await
+        {
+            Ok(_) => {
+                info!(table = %self.table_name, "TTL enabled on 'ttl' attribute");
+            }
+            Err(err) => {
+                let service_err = err.into_service_error();
+                let msg = format!("{service_err}");
+                // "TimeToLive is already enabled" or similar validation exception
+                // when TTL is already active — this is expected and safe to ignore.
+                if msg.contains("already enabled") || msg.contains("TimeToLive") {
+                    info!(table = %self.table_name, "TTL already enabled on table");
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "Failed to enable TTL on DynamoDB table: {service_err}"
                     ));
                 }
             }
@@ -805,6 +840,179 @@ impl Database for DynamoDatabase {
             None => Ok(None),
         }
     }
+
+    // ---- Sessions (Phase 45, D-08) ----
+
+    async fn create_session(&self, session: &Session) -> Result<()> {
+        let pk = format!("SESSION#{}", session.session_id);
+        let ttl_epoch = session.expires_at.timestamp();
+
+        let mut put = self
+            .client
+            .put_item()
+            .table_name(&self.table_name)
+            .item("PK", AttributeValue::S(pk))
+            .item("SK", AttributeValue::S("USER".to_string()))
+            .item("email", AttributeValue::S(session.email.clone()))
+            .item("provider", AttributeValue::S(session.provider.clone()))
+            .item(
+                "created_at",
+                AttributeValue::S(session.created_at.to_rfc3339()),
+            )
+            .item("ttl", AttributeValue::N(ttl_epoch.to_string()));
+
+        if let Some(ref token) = session.refresh_token {
+            put = put.item("refresh_token", AttributeValue::S(token.clone()));
+        }
+
+        put.send().await.context("create session")?;
+
+        Ok(())
+    }
+
+    async fn get_session(&self, session_id: &str) -> Result<Option<Session>> {
+        let pk = format!("SESSION#{session_id}");
+
+        let resp = self
+            .client
+            .get_item()
+            .table_name(&self.table_name)
+            .key("PK", AttributeValue::S(pk))
+            .key("SK", AttributeValue::S("USER".to_string()))
+            .send()
+            .await
+            .context("get session")?;
+
+        match resp.item() {
+            Some(item) => {
+                let session = parse_session(item)?;
+                // Belt-and-suspenders TTL check alongside DynamoDB TTL.
+                if session.expires_at < Utc::now() {
+                    Ok(None)
+                } else {
+                    Ok(Some(session))
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn update_session_tokens(
+        &self,
+        session_id: &str,
+        refresh_token: Option<&str>,
+        new_expires_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let pk = format!("SESSION#{session_id}");
+        let ttl_epoch = new_expires_at.timestamp();
+
+        let mut update = self
+            .client
+            .update_item()
+            .table_name(&self.table_name)
+            .key("PK", AttributeValue::S(pk))
+            .key("SK", AttributeValue::S("USER".to_string()))
+            .update_expression("SET #ttl = :ttl, #rt = :rt")
+            .expression_attribute_names("#ttl", "ttl")
+            .expression_attribute_names("#rt", "refresh_token")
+            .expression_attribute_values(":ttl", AttributeValue::N(ttl_epoch.to_string()));
+
+        match refresh_token {
+            Some(token) => {
+                update = update.expression_attribute_values(
+                    ":rt",
+                    AttributeValue::S(token.to_string()),
+                );
+            }
+            None => {
+                // Set to NULL to clear the refresh token.
+                update = update
+                    .expression_attribute_values(":rt", AttributeValue::Null(true));
+            }
+        }
+
+        update.send().await.context("update session tokens")?;
+
+        Ok(())
+    }
+
+    async fn delete_session(&self, session_id: &str) -> Result<()> {
+        let pk = format!("SESSION#{session_id}");
+
+        self.client
+            .delete_item()
+            .table_name(&self.table_name)
+            .key("PK", AttributeValue::S(pk))
+            .key("SK", AttributeValue::S("USER".to_string()))
+            .send()
+            .await
+            .context("delete session")?;
+
+        Ok(())
+    }
+
+    // ---- OAuth State (Phase 45, Pitfall 2) ----
+
+    async fn store_oauth_state(&self, state: &OAuthState) -> Result<()> {
+        let pk = format!("OAUTH_STATE#{}", state.csrf_state);
+        // 10-minute TTL for OAuth state.
+        let ttl_epoch = (Utc::now() + chrono::Duration::minutes(10)).timestamp();
+
+        self.client
+            .put_item()
+            .table_name(&self.table_name)
+            .item("PK", AttributeValue::S(pk))
+            .item("SK", AttributeValue::S("PKCE".to_string()))
+            .item(
+                "pkce_verifier",
+                AttributeValue::S(state.pkce_verifier.clone()),
+            )
+            .item("provider", AttributeValue::S(state.provider.clone()))
+            .item(
+                "created_at",
+                AttributeValue::S(state.created_at.to_rfc3339()),
+            )
+            .item("ttl", AttributeValue::N(ttl_epoch.to_string()))
+            .send()
+            .await
+            .context("store oauth state")?;
+
+        Ok(())
+    }
+
+    async fn get_oauth_state(&self, csrf_state: &str) -> Result<Option<OAuthState>> {
+        let pk = format!("OAUTH_STATE#{csrf_state}");
+
+        let resp = self
+            .client
+            .get_item()
+            .table_name(&self.table_name)
+            .key("PK", AttributeValue::S(pk))
+            .key("SK", AttributeValue::S("PKCE".to_string()))
+            .send()
+            .await
+            .context("get oauth state")?;
+
+        match resp.item() {
+            Some(item) => Ok(Some(parse_oauth_state(item)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn delete_oauth_state(&self, csrf_state: &str) -> Result<()> {
+        let pk = format!("OAUTH_STATE#{csrf_state}");
+
+        self.client
+            .delete_item()
+            .table_name(&self.table_name)
+            .key("PK", AttributeValue::S(pk))
+            .key("SK", AttributeValue::S("PKCE".to_string()))
+            .send()
+            .await
+            .context("delete oauth state")?;
+
+        Ok(())
+    }
 }
 
 // ---- Key Validation ----
@@ -922,6 +1130,64 @@ fn parse_region(env_name: &str, item: &HashMap<String, AttributeValue>) -> Resul
             .ok_or_else(|| anyhow::anyhow!("region row missing name field"))?,
         job_count: get_n_u64(item, "job_count").unwrap_or(0),
         dag_count: get_n_u64(item, "dag_count").unwrap_or(0),
+    })
+}
+
+/// Parse a DDB attribute map into a `Session`.
+///
+/// The `refresh_token` field is optional (absent for NoopAuth or older sessions).
+/// The `ttl` (epoch seconds) is converted back to `expires_at` DateTime.
+#[allow(dead_code)]
+fn parse_session(item: &HashMap<String, AttributeValue>) -> Result<Session> {
+    let ttl_epoch: i64 = item
+        .get("ttl")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("session row missing ttl field"))?;
+
+    let expires_at = DateTime::from_timestamp(ttl_epoch, 0)
+        .ok_or_else(|| anyhow::anyhow!("session row has invalid ttl timestamp"))?;
+
+    // Extract session_id from PK (format: "SESSION#{session_id}").
+    let pk = get_s(item, "PK")
+        .ok_or_else(|| anyhow::anyhow!("session row missing PK field"))?;
+    let session_id = pk
+        .strip_prefix("SESSION#")
+        .ok_or_else(|| anyhow::anyhow!("session PK does not start with SESSION#"))?
+        .to_string();
+
+    Ok(Session {
+        session_id,
+        email: get_s(item, "email")
+            .ok_or_else(|| anyhow::anyhow!("session row missing email field"))?,
+        provider: get_s(item, "provider")
+            .ok_or_else(|| anyhow::anyhow!("session row missing provider field"))?,
+        refresh_token: get_s(item, "refresh_token"),
+        created_at: get_dt(item, "created_at")
+            .ok_or_else(|| anyhow::anyhow!("session row missing created_at field"))?,
+        expires_at,
+    })
+}
+
+/// Parse a DDB attribute map into an `OAuthState`.
+#[allow(dead_code)]
+fn parse_oauth_state(item: &HashMap<String, AttributeValue>) -> Result<OAuthState> {
+    // Extract csrf_state from PK (format: "OAUTH_STATE#{csrf_state}").
+    let pk = get_s(item, "PK")
+        .ok_or_else(|| anyhow::anyhow!("oauth_state row missing PK field"))?;
+    let csrf_state = pk
+        .strip_prefix("OAUTH_STATE#")
+        .ok_or_else(|| anyhow::anyhow!("oauth_state PK does not start with OAUTH_STATE#"))?
+        .to_string();
+
+    Ok(OAuthState {
+        csrf_state,
+        pkce_verifier: get_s(item, "pkce_verifier")
+            .ok_or_else(|| anyhow::anyhow!("oauth_state row missing pkce_verifier field"))?,
+        provider: get_s(item, "provider")
+            .ok_or_else(|| anyhow::anyhow!("oauth_state row missing provider field"))?,
+        created_at: get_dt(item, "created_at")
+            .ok_or_else(|| anyhow::anyhow!("oauth_state row missing created_at field"))?,
     })
 }
 
