@@ -875,6 +875,7 @@ impl Database for DynamoDatabase {
     // ---- Sessions (Phase 45, D-08) ----
 
     async fn create_session(&self, session: &Session) -> Result<()> {
+        validate_key_component(&session.session_id, "session.session_id")?;
         let pk = format!("SESSION#{}", session.session_id);
         let ttl_epoch = session.expires_at.timestamp();
 
@@ -902,6 +903,7 @@ impl Database for DynamoDatabase {
     }
 
     async fn get_session(&self, session_id: &str) -> Result<Option<Session>> {
+        validate_key_component(session_id, "session_id")?;
         let pk = format!("SESSION#{session_id}");
 
         let resp = self
@@ -934,6 +936,7 @@ impl Database for DynamoDatabase {
         refresh_token: Option<&str>,
         new_expires_at: DateTime<Utc>,
     ) -> Result<()> {
+        validate_key_component(session_id, "session_id")?;
         let pk = format!("SESSION#{session_id}");
         let ttl_epoch = new_expires_at.timestamp();
 
@@ -968,6 +971,7 @@ impl Database for DynamoDatabase {
     }
 
     async fn delete_session(&self, session_id: &str) -> Result<()> {
+        validate_key_component(session_id, "session_id")?;
         let pk = format!("SESSION#{session_id}");
 
         self.client
@@ -985,6 +989,7 @@ impl Database for DynamoDatabase {
     // ---- OAuth State (Phase 45, Pitfall 2) ----
 
     async fn store_oauth_state(&self, state: &OAuthState) -> Result<()> {
+        validate_key_component(&state.csrf_state, "oauth_state.csrf_state")?;
         let pk = format!("OAUTH_STATE#{}", state.csrf_state);
         // 10-minute TTL for OAuth state.
         let ttl_epoch = (Utc::now() + chrono::Duration::minutes(10)).timestamp();
@@ -1012,6 +1017,7 @@ impl Database for DynamoDatabase {
     }
 
     async fn get_oauth_state(&self, csrf_state: &str) -> Result<Option<OAuthState>> {
+        validate_key_component(csrf_state, "csrf_state")?;
         let pk = format!("OAUTH_STATE#{csrf_state}");
 
         let resp = self
@@ -1031,6 +1037,7 @@ impl Database for DynamoDatabase {
     }
 
     async fn delete_oauth_state(&self, csrf_state: &str) -> Result<()> {
+        validate_key_component(csrf_state, "csrf_state")?;
         let pk = format!("OAUTH_STATE#{csrf_state}");
 
         self.client
