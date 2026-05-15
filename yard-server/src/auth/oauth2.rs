@@ -325,51 +325,74 @@ pub fn build_providers_from_env() -> ProviderRegistry {
     let mut providers = Vec::new();
 
     // D-07: each provider wrapped in match for graceful degradation.
-    // Entra: requires CLIENT_ID and TENANT_ID (no default to /common/).
+    // Entra: requires CLIENT_ID, TENANT_ID, and CLIENT_SECRET (Secrets Manager ARN).
     if let Ok(client_id) = std::env::var("YARD_OAUTH_ENTRA_CLIENT_ID") {
         let tenant_id = std::env::var("YARD_OAUTH_ENTRA_TENANT_ID");
-        let secret_arn = std::env::var("YARD_OAUTH_ENTRA_CLIENT_SECRET").unwrap_or_default();
-
-        match tenant_id {
-            Ok(tid) => match build_entra_config(&client_id, &tid, &secret_arn, &redirect_url)
-            {
-                Ok(provider) => {
-                    tracing::info!(provider = "entra", "OAuth2 provider configured");
-                    providers.push(provider);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        provider = "entra",
-                        error = %e,
-                        "OAuth2 provider configuration failed; skipping"
-                    );
-                }
-            },
-            Err(_) => {
+        let secret_arn = match std::env::var("YARD_OAUTH_ENTRA_CLIENT_SECRET") {
+            Ok(v) if !v.is_empty() => v,
+            _ => {
                 tracing::warn!(
                     provider = "entra",
-                    "YARD_OAUTH_ENTRA_TENANT_ID not set (no default to /common/); skipping"
+                    "YARD_OAUTH_ENTRA_CLIENT_SECRET not set or empty; skipping provider"
                 );
+                // Skip — an empty ARN would fail at token exchange time, not at startup.
+                String::new()
+            }
+        };
+
+        if !secret_arn.is_empty() {
+            match tenant_id {
+                Ok(tid) => {
+                    match build_entra_config(&client_id, &tid, &secret_arn, &redirect_url) {
+                        Ok(provider) => {
+                            tracing::info!(provider = "entra", "OAuth2 provider configured");
+                            providers.push(provider);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                provider = "entra",
+                                error = %e,
+                                "OAuth2 provider configuration failed; skipping"
+                            );
+                        }
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        provider = "entra",
+                        "YARD_OAUTH_ENTRA_TENANT_ID not set (no default to /common/); skipping"
+                    );
+                }
             }
         }
     }
 
-    // Google: requires CLIENT_ID.
+    // Google: requires CLIENT_ID and CLIENT_SECRET (Secrets Manager ARN).
     if let Ok(client_id) = std::env::var("YARD_OAUTH_GOOGLE_CLIENT_ID") {
-        let secret_arn =
-            std::env::var("YARD_OAUTH_GOOGLE_CLIENT_SECRET").unwrap_or_default();
-
-        match build_google_config(&client_id, &secret_arn, &redirect_url) {
-            Ok(provider) => {
-                tracing::info!(provider = "google", "OAuth2 provider configured");
-                providers.push(provider);
-            }
-            Err(e) => {
+        let secret_arn = match std::env::var("YARD_OAUTH_GOOGLE_CLIENT_SECRET") {
+            Ok(v) if !v.is_empty() => v,
+            _ => {
                 tracing::warn!(
                     provider = "google",
-                    error = %e,
-                    "OAuth2 provider configuration failed; skipping"
+                    "YARD_OAUTH_GOOGLE_CLIENT_SECRET not set or empty; skipping provider"
                 );
+                String::new()
+            }
+        };
+
+        if !secret_arn.is_empty() {
+            match build_google_config(&client_id, &secret_arn, &redirect_url) {
+                Ok(provider) => {
+                    tracing::info!(provider = "google", "OAuth2 provider configured");
+                    providers.push(provider);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        provider = "google",
+                        error = %e,
+                        "OAuth2 provider configuration failed; skipping"
+                    );
+                }
             }
         }
     }
