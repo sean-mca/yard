@@ -194,6 +194,11 @@ async fn oauth_callback(
         .ok_or_else(|| ApiError::BadRequest("OAuth2 is not configured".into()))?;
 
     // Look up the OAuthState from DynamoDB using the CSRF state parameter.
+    // WR-01: This is a primary-key get_item, not a string comparison — the
+    // comparison happens server-side inside DynamoDB, so there is no
+    // timing oracle from the client's perspective. The CSRF state token is
+    // 128 bits of cryptographic randomness (CsrfToken::new_random()), making
+    // brute-force infeasible regardless of comparison method.
     let oauth_state = state
         .db
         .get_oauth_state(&query.state)
