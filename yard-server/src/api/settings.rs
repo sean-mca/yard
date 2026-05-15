@@ -203,9 +203,17 @@ async fn handle_test_slack_webhook(state: &ApiState) -> Result<StatusCode, ApiEr
 
     if !resp.status().is_success() {
         let status = resp.status();
+        // WR-05: log the full response body server-side for debugging, but do
+        // not forward it to the browser — Slack's error body is untrusted
+        // external content.
         let body = resp.text().await.unwrap_or_default();
+        tracing::warn!(
+            http_status = %status,
+            response_body = %body,
+            "Slack webhook test returned non-success status"
+        );
         return Err(ApiError::Internal(format!(
-            "Slack webhook returned {status}: {body}"
+            "Slack webhook returned HTTP {status}"
         )));
     }
 
