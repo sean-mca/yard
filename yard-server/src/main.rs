@@ -259,20 +259,30 @@ fn start_api_server() {
                 dashboard_url,
             });
 
-            // BL-01: scope CORS to the cookie-auth model's same-origin
+            // BL-01 / WR-02: scope CORS to the cookie-auth model's same-origin
             // assumption. Operator opts in via YARD_CORS_ORIGIN (a single
             // origin). When unset, fall back to AllowOrigin::any() for
             // dev-friendly default. SameSite=Strict on yard_session still
             // prevents cross-origin cookie attachment.
-            let allow_origin = std::env::var("YARD_CORS_ORIGIN")
+            //
+            // allow_credentials(true) is required for the browser to send the
+            // yard_session cookie on cross-origin requests, but browsers reject
+            // AllowOrigin::any() + allow_credentials — so we only enable
+            // credentials when a specific origin is configured.
+            let specific_origin = std::env::var("YARD_CORS_ORIGIN")
                 .ok()
-                .and_then(|s| s.parse::<axum::http::HeaderValue>().ok())
+                .and_then(|s| s.parse::<axum::http::HeaderValue>().ok());
+            let has_specific_origin = specific_origin.is_some();
+            let allow_origin = specific_origin
                 .map(AllowOrigin::exact)
                 .unwrap_or_else(AllowOrigin::any);
-            let cors = CorsLayer::new()
+            let mut cors = CorsLayer::new()
                 .allow_origin(allow_origin)
                 .allow_methods([Method::GET, Method::POST])
                 .allow_headers([CONTENT_TYPE, AUTHORIZATION]);
+            if has_specific_origin {
+                cors = cors.allow_credentials(true);
+            }
 
             let rate_limit_config = GovernorConfigBuilder::default()
                 .per_second(30)
