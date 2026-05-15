@@ -57,6 +57,9 @@ impl QueryCapability for JobDetailQuery {
     type Keys = (String, String);
 
     async fn run(&self, keys: &Self::Keys) -> Result<Self::Ok, Self::Err> {
+        if keys.0.is_empty() || keys.1.is_empty() {
+            return Err("no job selected".to_string());
+        }
         get_json::<JobDetailData>(&format!(
             "{}/api/envs/{}/jobs/{}",
             api_base(),
@@ -509,14 +512,13 @@ fn JobTable(
 
 #[component]
 fn JobDetailSheet(mut item: Signal<Option<crate::db::JobSummaryEntity>>) -> Element {
-    let is_open = item().is_some();
-    let title = item()
+    let current_item = item();
+    let is_open = current_item.is_some();
+    let title = current_item
         .as_ref()
         .map(|i| i.name.clone())
         .unwrap_or_default();
-
-    // Derive query keys from the selected job.
-    let query_keys = item()
+    let query_keys = current_item
         .as_ref()
         .map(|j| (j.env_name.clone(), j.name.clone()))
         .unwrap_or_default();
@@ -651,12 +653,3 @@ fn JobDetailContent(detail: JobDetailData) -> Element {
     }
 }
 
-#[component]
-fn DetailRow(label: &'static str, value: String) -> Element {
-    rsx! {
-        div { class: "flex items-baseline gap-3",
-            span { class: "text-xs font-medium text-zinc-500 dark:text-zinc-400 w-24 shrink-0", "{label}" }
-            span { class: "text-sm text-zinc-950 dark:text-zinc-50", "{value}" }
-        }
-    }
-}
