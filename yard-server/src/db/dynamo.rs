@@ -760,7 +760,8 @@ impl Database for DynamoDatabase {
         let pk = format!("ENV#{env_name}");
         let sk = format!("JOB#{}", job.name);
 
-        self.client
+        let mut put = self
+            .client
             .put_item()
             .table_name(&self.table_name)
             .item("PK", AttributeValue::S(pk))
@@ -775,12 +776,42 @@ impl Database for DynamoDatabase {
             .item(
                 "region_name",
                 AttributeValue::S(job.region_name.clone()),
-            )
-            .send()
+            );
+
+        if let Some(ref yaml) = job.config_yaml {
+            put = put.item("config_yaml", AttributeValue::S(yaml.clone()));
+        }
+
+        put.send()
             .await
             .context("upsert job summary")?;
 
         Ok(())
+    }
+
+    // ---- Job Detail (DASH-04) ----
+
+    async fn get_job_summary(&self, env_name: &str, job_name: &str) -> Result<Option<JobSummaryEntity>> {
+        validate_key_component(env_name, "env_name")?;
+        validate_key_component(job_name, "job_name")?;
+
+        let pk = format!("ENV#{env_name}");
+        let sk = format!("JOB#{job_name}");
+
+        let resp = self
+            .client
+            .get_item()
+            .table_name(&self.table_name)
+            .key("PK", AttributeValue::S(pk))
+            .key("SK", AttributeValue::S(sk))
+            .send()
+            .await
+            .context("get job summary")?;
+
+        match resp.item() {
+            Some(item) => Ok(Some(parse_job_summary(item)?)),
+            None => Ok(None),
+        }
     }
 
     // ---- Account Health (D-11) ----
@@ -1013,6 +1044,80 @@ impl Database for DynamoDatabase {
 
         Ok(())
     }
+
+    async fn list_all_account_health(&self) -> Result<Vec<AccountHealth>> {
+        let mut health_records = Vec::new();
+        let mut exclusive_start_key: Option<HashMap<String, AttributeValue>> = None;
+
+        loop {
+            let mut query = self
+                .client
+                .query()
+                .table_name(&self.table_name)
+                .index_name("GSI1")
+                .key_condition_expression("GSI1PK = :gsi1pk")
+                .expression_attribute_values(
+                    ":gsi1pk",
+                    AttributeValue::S("TYPE#HEALTH".to_string()),
+                );
+
+            if let Some(start_key) = exclusive_start_key {
+                query = query.set_exclusive_start_key(Some(start_key));
+            }
+
+            let resp = query.send().await.context("list all account health")?;
+
+            for item in resp.items() {
+                health_records.push(parse_account_health(item)?);
+            }
+
+            match resp.last_evaluated_key() {
+                Some(key) if !key.is_empty() => {
+                    exclusive_start_key = Some(key.to_owned());
+                }
+                _ => break,
+            }
+        }
+
+        Ok(health_records)
+    }
+
+    async fn list_job_summaries_all(&self) -> Result<Vec<JobSummaryEntity>> {
+        let mut jobs = Vec::new();
+        let mut exclusive_start_key: Option<HashMap<String, AttributeValue>> = None;
+
+        loop {
+            let mut query = self
+                .client
+                .query()
+                .table_name(&self.table_name)
+                .index_name("GSI1")
+                .key_condition_expression("GSI1PK = :gsi1pk")
+                .expression_attribute_values(
+                    ":gsi1pk",
+                    AttributeValue::S("TYPE#JOB".to_string()),
+                );
+
+            if let Some(start_key) = exclusive_start_key {
+                query = query.set_exclusive_start_key(Some(start_key));
+            }
+
+            let resp = query.send().await.context("list all job summaries")?;
+
+            for item in resp.items() {
+                jobs.push(parse_job_summary(item)?);
+            }
+
+            match resp.last_evaluated_key() {
+                Some(key) if !key.is_empty() => {
+                    exclusive_start_key = Some(key.to_owned());
+                }
+                _ => break,
+            }
+        }
+
+        Ok(jobs)
+    }
 }
 
 // ---- Key Validation ----
@@ -1188,6 +1293,27 @@ fn parse_oauth_state(item: &HashMap<String, AttributeValue>) -> Result<OAuthStat
             .ok_or_else(|| anyhow::anyhow!("oauth_state row missing provider field"))?,
         created_at: get_dt(item, "created_at")
             .ok_or_else(|| anyhow::anyhow!("oauth_state row missing created_at field"))?,
+    })
+}
+
+#[allow(dead_code)]
+fn parse_job_summary(item: &HashMap<String, AttributeValue>) -> Result<JobSummaryEntity> {
+    // GSI1SK format: "{env}#{name}" — extract env from the composite key.
+    let gsi1sk = get_s(item, "GSI1SK").unwrap_or_default();
+    let env_name = gsi1sk
+        .split('#')
+        .next()
+        .unwrap_or("unknown")
+        .to_string();
+
+    Ok(JobSummaryEntity {
+        env_name,
+        region_name: get_s(item, "region_name").unwrap_or_default(),
+        name: get_s(item, "name")
+            .ok_or_else(|| anyhow::anyhow!("job_summary row missing name field"))?,
+        job_type: get_s(item, "job_type")
+            .ok_or_else(|| anyhow::anyhow!("job_summary row missing job_type field"))?,
+        config_yaml: get_s(item, "config_yaml"),
     })
 }
 

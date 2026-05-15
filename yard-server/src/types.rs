@@ -1,5 +1,18 @@
 use serde::{Deserialize, Serialize};
 
+/// Summary metadata for a discovered job (D-15).
+/// Shared between server-side DB layer and WASM UI.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobSummaryEntity {
+    pub env_name: String,
+    pub region_name: String,
+    pub name: String,
+    pub job_type: String,
+    #[serde(default)]
+    pub config_yaml: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum PrState {
     Open,
@@ -110,3 +123,85 @@ pub struct DriftData {
     pub in_sync: u32,
     pub drifted: u32,
 }
+
+// ---- Job Detail API response type (DASH-04) ----
+
+/// Full detail for a single job/DAG, returned by GET /api/envs/:env/jobs/:job.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct JobDetailData {
+    pub name: String,
+    pub env_name: String,
+    pub region_name: String,
+    pub job_type: String,
+    pub config_yaml: Option<String>,
+    pub drift: Option<DriftItem>,
+}
+
+// ---- Dashboard API response types (DASH-01, DASH-02, DASH-03) ----
+
+/// Summary of a single environment for the environment list endpoint.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct EnvironmentSummary {
+    pub name: String,
+    pub regions: Vec<String>,
+    pub job_count: u64,
+    pub drift_count: u32,
+    /// One of: "healthy", "degraded", "unknown"
+    pub health_status: String,
+}
+
+/// Top-level response for GET /api/envs.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct EnvironmentListData {
+    pub environments: Vec<EnvironmentSummary>,
+    pub total_environments: u32,
+    pub connected_accounts: u32,
+    pub total_accounts: u32,
+}
+
+/// Per-region detail response for GET /api/envs/{env}/regions.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct RegionDetailData {
+    pub env_name: String,
+    pub region_name: String,
+    pub jobs: Vec<JobSummaryEntity>,
+    pub dags: Vec<JobSummaryEntity>,
+    pub drift_items: Vec<DriftItem>,
+}
+
+// ---- Search API response types (DASH-09) ----
+
+/// Grouped search results for GET /api/search?q=...
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct SearchResult {
+    pub environments: Vec<SearchHit>,
+    pub jobs: Vec<SearchHit>,
+    pub dags: Vec<SearchHit>,
+}
+
+/// A single search hit across any entity type.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct SearchHit {
+    pub name: String,
+    pub environment: Option<String>,
+    pub region: Option<String>,
+    pub entity_type: String,
+}
+
+/// Alert information for the dashboard alerts panel.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct AlertInfo {
+    pub message: String,
+    /// One of: "warning", "error"
+    pub severity: String,
+    pub timestamp: String,
+    pub entity: String,
+}
+

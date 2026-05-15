@@ -26,10 +26,16 @@ enum Route {
     #[layout(Shell)]
     #[route("/")]
     Dashboard {},
+    #[route("/envs")]
+    Environments {},
+    #[route("/envs/:env")]
+    EnvironmentDetail { env: String },
+    #[route("/envs/:env/:region")]
+    RegionDetail { env: String, region: String },
     #[route("/jobs")]
     Jobs {},
-    #[route("/drift")]
-    Drift {},
+    #[route("/drift?:env")]
+    Drift { env: String },
     #[route("/settings")]
     Settings {},
     // Plan 25-05 Gap A: /login is reachable WITHOUT auth (it's the page that
@@ -283,6 +289,8 @@ fn start_api_server() {
                 .merge(jobs_router(api_state.clone()))
                 .merge(drift_router(api_state.clone()))
                 .merge(settings_router(api_state.clone()))
+                .merge(api::environments::environments_router(api_state.clone()))
+                .merge(api::search::search_router(api_state.clone()))
                 .merge(api::events::events_router(api_state.clone()))
                 .layer(axum::middleware::from_fn_with_state(
                     auth_provider,
@@ -703,8 +711,40 @@ async fn dashboard_poll_loop(
 }
 
 fn app() -> Element {
-    let theme = use_signal(|| ui::settings::Theme::Light);
+    #[allow(unused_mut)]
+    let mut theme = use_signal(|| ui::settings::Theme::Light);
     use_context_provider(|| theme);
+
+    // Phase 44 D-12: restore theme from localStorage on first mount.
+    #[cfg(target_arch = "wasm32")]
+    {
+        use_hook(move || {
+            // Read persisted theme preference and apply dark class if needed.
+            // Uses dioxus document::eval to avoid web-sys feature requirements.
+            dioxus::prelude::document::eval(
+                r#"
+                (function() {
+                    var stored = localStorage.getItem('yard_theme');
+                    if (stored === 'dark') {
+                        document.documentElement.classList.add('dark');
+                    }
+                })();
+                "#,
+            );
+            // Also update the Signal if the stored theme is dark.
+            spawn(async move {
+                let result = dioxus::prelude::document::eval(
+                    "localStorage.getItem('yard_theme') || 'light'",
+                )
+                .await;
+                if let Ok(serde_json::Value::String(val)) = result {
+                    if val == "dark" {
+                        theme.set(ui::settings::Theme::Dark);
+                    }
+                }
+            });
+        });
+    }
 
     rsx! {
         document::Stylesheet { href: TAILWIND_CSS }
@@ -729,8 +769,11 @@ fn Shell() -> Element {
 
     let title = match &route {
         Route::Dashboard {} => "Dashboard",
+        Route::Environments {} => "Environments",
+        Route::EnvironmentDetail { .. } => "Environments",
+        Route::RegionDetail { .. } => "Environments",
         Route::Jobs {} => "Jobs",
-        Route::Drift {} => "Drift",
+        Route::Drift { .. } => "Drift",
         Route::Settings {} => "Settings",
         // Unreachable: short-circuited above. Kept exhaustive so adding a
         // future Route::* arm doesn't silently break the title bar.
@@ -745,6 +788,8 @@ fn Shell() -> Element {
             state: use_signal(|| ui::connection::ConnectionState::Connecting),
             dashboard_tick: use_signal(|| 0u64),
             drift_tick: use_signal(|| 0u64),
+            env_health_tick: use_signal(|| 0u64),
+            search_index_tick: use_signal(|| 0u64),
         };
         use_context_provider(|| ctx);
 
@@ -754,6 +799,7 @@ fn Shell() -> Element {
         use_hook(|| {
             let dashboard_tick = ctx.dashboard_tick;
             let drift_tick = ctx.drift_tick;
+            let env_health_tick = ctx.env_health_tick;
             ui::connection::spawn_ws_task(ctx.state, move |event| {
                 use ui::connection::Event::*;
                 // `write_unchecked(&self)` permits updates from an `Fn` closure;
@@ -767,6 +813,10 @@ fn Shell() -> Element {
                     }
                     DriftRefreshed | DriftFailed { .. } | AlertSent { .. } => {
                         let mut w = drift_tick.write_unchecked();
+                        *w = w.wrapping_add(1);
+                    }
+                    EnvironmentHealthChanged => {
+                        let mut w = env_health_tick.write_unchecked();
                         *w = w.wrapping_add(1);
                     }
                 }
@@ -784,7 +834,10 @@ fn Shell() -> Element {
             main { class: "flex-1 min-h-screen",
                 div { class: "h-14 flex items-center justify-between px-6 border-b border-zinc-200 dark:border-zinc-800",
                     h1 { class: "text-sm font-semibold", "{title}" }
-                    ui::connection_indicator::ConnectionIndicator {}
+                    div { class: "flex items-center gap-4",
+                        ui::search::GlobalSearch {}
+                        ui::connection_indicator::ConnectionIndicator {}
+                    }
                 }
                 Outlet::<Route> {}
             }
@@ -798,13 +851,28 @@ fn Dashboard() -> Element {
 }
 
 #[component]
+fn Environments() -> Element {
+    rsx! { ui::environments::EnvironmentList {} }
+}
+
+#[component]
+fn EnvironmentDetail(env: String) -> Element {
+    rsx! { ui::environments::EnvironmentDetail { env } }
+}
+
+#[component]
+fn RegionDetail(env: String, region: String) -> Element {
+    rsx! { ui::environments::RegionDetail { env, region } }
+}
+
+#[component]
 fn Jobs() -> Element {
     rsx! { ui::jobs::Jobs {} }
 }
 
 #[component]
-fn Drift() -> Element {
-    rsx! { ui::drift::Drift {} }
+fn Drift(env: String) -> Element {
+    rsx! { ui::drift::Drift { env } }
 }
 
 #[component]

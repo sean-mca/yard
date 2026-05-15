@@ -3,6 +3,7 @@ use dioxus::prelude::*;
 use super::components::Pagination;
 use super::fetch::{get_json, get_text};
 use super::sheet::Sheet;
+use super::skeleton::{SkeletonTable, SkeletonText};
 use crate::types::*;
 
 const PER_PAGE: usize = 15;
@@ -70,19 +71,7 @@ pub fn Jobs() -> Element {
                     }
                 },
                 None => rsx! {
-                    div { class: "flex items-center gap-2 text-sm text-zinc-500",
-                        svg {
-                            xmlns: "http://www.w3.org/2000/svg",
-                            width: "16", height: "16",
-                            view_box: "0 0 24 24",
-                            fill: "none",
-                            stroke: "currentColor",
-                            stroke_width: "2",
-                            class: "animate-spin",
-                            path { d: "M21 12a9 9 0 11-6.219-8.56" }
-                        }
-                        "Loading..."
-                    }
+                    SkeletonTable { rows: 8, cols: 4 }
                 },
             }
         }
@@ -300,18 +289,20 @@ fn JobSheet(mut job: Signal<Option<JobInfo>>) -> Element {
                     div { class: "px-5 py-4 text-sm text-red-600", "Error: {e}" }
                 },
                 _ if is_open => rsx! {
-                    div { class: "px-5 py-4 flex items-center gap-2 text-sm text-zinc-500",
-                        svg {
-                            xmlns: "http://www.w3.org/2000/svg",
-                            width: "14", height: "14",
-                            view_box: "0 0 24 24",
-                            fill: "none",
-                            stroke: "currentColor",
-                            stroke_width: "2",
-                            class: "animate-spin",
-                            path { d: "M21 12a9 9 0 11-6.219-8.56" }
-                        }
-                        "Loading..."
+                    div { class: "px-5 py-4 space-y-2",
+                        SkeletonText { width: "w-1/2".to_string() }
+                        SkeletonText { width: "w-full".to_string() }
+                        SkeletonText { width: "w-full".to_string() }
+                        SkeletonText { width: "w-full".to_string() }
+                        SkeletonText { width: "w-full".to_string() }
+                        SkeletonText { width: "w-full".to_string() }
+                        SkeletonText { width: "w-full".to_string() }
+                        SkeletonText { width: "w-full".to_string() }
+                        SkeletonText { width: "w-full".to_string() }
+                        SkeletonText { width: "w-full".to_string() }
+                        SkeletonText { width: "w-full".to_string() }
+                        SkeletonText { width: "w-full".to_string() }
+                        SkeletonText { width: "w-full".to_string() }
                     }
                 },
                 _ => rsx! {},

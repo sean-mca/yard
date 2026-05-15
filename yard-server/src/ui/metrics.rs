@@ -12,13 +12,17 @@ pub fn MetricsBar(
     plans_running: u32,
     drift: DriftStatus,
     jobs_tracked: u32,
+    #[props(default)] environment_count: u32,
+    #[props(default)] connected_accounts: u32,
+    #[props(default)] total_accounts: u32,
 ) -> Element {
     rsx! {
-        div { class: "grid grid-cols-4 gap-4 mb-6",
+        div { class: "grid grid-cols-5 gap-4 mb-6",
             MetricCard { label: "Open PRs", value: "{open_prs}" }
             MetricCard { label: "Plans Running", value: "{plans_running}" }
             DriftCard { status: drift }
             MetricCard { label: "Jobs Tracked", value: "{jobs_tracked}" }
+            ConnectivitySummary { connected: connected_accounts, total: total_accounts, environment_count }
         }
     }
 }
@@ -93,6 +97,46 @@ fn DriftCard(status: DriftStatus) -> Element {
                         match &status {
                             DriftStatus::Ok => rsx! { "{sublabel}" },
                             DriftStatus::Drifted(count) => rsx! { "{count} {sublabel}" },
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Connectivity summary card showing environment count and Connected N/M with
+/// a colored status dot (D-06).
+#[component]
+pub fn ConnectivitySummary(connected: u32, total: u32, #[props(default)] environment_count: u32) -> Element {
+    let (dot_class, tooltip) = if total == 0 {
+        ("bg-zinc-400 dark:bg-zinc-600", "No accounts discovered".to_string())
+    } else if connected == total {
+        ("bg-emerald-500 dark:bg-emerald-400", "All accounts connected".to_string())
+    } else if connected > 0 {
+        (
+            "bg-amber-400 dark:bg-amber-300 animate-pulse",
+            format!("{connected} of {total} accounts connected"),
+        )
+    } else {
+        ("bg-red-500 dark:bg-red-400", format!("0 of {total} accounts connected"))
+    };
+
+    rsx! {
+        div {
+            class: "rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-4",
+            title: "{tooltip}",
+            div { class: "flex items-center gap-1.5 mb-1",
+                span { class: format!("inline-block w-2 h-2 rounded-full {dot_class}") }
+                p { class: "text-xs font-medium text-zinc-500 dark:text-zinc-400", "Connected" }
+            }
+            p { class: "text-2xl font-semibold tracking-tight", "{connected}/{total}" }
+            if environment_count > 0 {
+                {
+                    let suffix = if environment_count == 1 { "" } else { "s" };
+                    rsx! {
+                        p { class: "text-xs text-zinc-400 dark:text-zinc-500 mt-0.5",
+                            "{environment_count} environment{suffix}"
                         }
                     }
                 }

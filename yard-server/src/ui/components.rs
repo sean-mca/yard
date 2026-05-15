@@ -39,3 +39,75 @@ pub fn Pagination(
         }
     }
 }
+
+#[component]
+pub fn TabBar(tabs: Vec<String>, active: Signal<usize>) -> Element {
+    rsx! {
+        div { class: "flex items-center gap-2 mb-4",
+            for (i, tab) in tabs.iter().enumerate() {
+                {
+                    let tab = tab.clone();
+                    let is_active = i == *active.read();
+                    rsx! {
+                        button {
+                            class: format!(
+                                "px-3 py-1 rounded-full text-xs font-semibold border cursor-pointer transition-colors {}",
+                                if is_active {
+                                    "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900 border-transparent"
+                                } else {
+                                    "bg-white text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300 border-zinc-200 dark:border-zinc-700 hover:bg-zinc-50 dark:hover:bg-zinc-700"
+                                }
+                            ),
+                            onclick: {
+                                let mut active = active;
+                                move |_| active.set(i)
+                            },
+                            "{tab}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+pub fn Breadcrumb(segments: Vec<(String, Option<String>)>) -> Element {
+    let len = segments.len();
+    rsx! {
+        nav { class: "flex items-center gap-1.5 text-sm mb-4",
+            for (i, (label, href)) in segments.iter().enumerate() {
+                {
+                    let is_last = i == len - 1;
+                    let label = label.clone();
+                    let href = href.clone();
+                    rsx! {
+                        if is_last {
+                            span {
+                                class: "text-zinc-950 dark:text-zinc-50 font-semibold",
+                                "{label}"
+                            }
+                        } else if let Some(path) = href {
+                            Link {
+                                to: NavigationTarget::<String>::Internal(path),
+                                class: "text-blue-600 hover:underline cursor-pointer",
+                                "{label}"
+                            }
+                        } else {
+                            span {
+                                class: "text-zinc-500 dark:text-zinc-400",
+                                "{label}"
+                            }
+                        }
+                        if !is_last {
+                            span {
+                                class: "text-zinc-300 dark:text-zinc-600",
+                                ">"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

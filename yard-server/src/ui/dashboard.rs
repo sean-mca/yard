@@ -5,6 +5,7 @@ use std::time::Duration;
 use super::components::Pagination;
 use super::fetch::{get_json, get_json_or_default};
 use super::metrics::{DriftStatus, MetricsBar};
+use super::skeleton::{SkeletonCard, SkeletonTable};
 use crate::types::*;
 
 use super::api_base;
@@ -60,6 +61,23 @@ impl QueryCapability for DriftSummaryQuery {
     }
 }
 
+#[derive(Clone, PartialEq, Hash, Eq)]
+struct EnvSummaryQuery;
+
+impl QueryCapability for EnvSummaryQuery {
+    type Ok = EnvironmentListData;
+    type Err = String;
+    type Keys = ();
+
+    async fn run(&self, _: &Self::Keys) -> Result<Self::Ok, Self::Err> {
+        get_json_or_default::<EnvironmentListData>(&format!(
+            "{}/api/envs",
+            api_base()
+        ))
+        .await
+    }
+}
+
 // ---- Component ----
 
 #[component]
@@ -93,6 +111,12 @@ pub fn Dashboard() -> Element {
             .interval_time(interval),
     );
 
+    let env_summary = use_query(
+        Query::new((), EnvSummaryQuery)
+            .stale_time(Duration::from_secs(60))
+            .interval_time(interval),
+    );
+
     // Phase 7: invalidate queries on WS push events.
     // dashboard_tick drives dashboard data refresh; drift_tick drives drift summary.
     #[cfg(target_arch = "wasm32")]
@@ -107,14 +131,34 @@ pub fn Dashboard() -> Element {
             let _ = ctx.drift_tick.read();
             drift_handle.invalidate();
         });
+        let env_handle = env_summary;
+        use_effect(move || {
+            let _ = ctx.dashboard_tick.read();
+            env_handle.invalidate();
+        });
     }
 
     let drift_state = drift_data.read();
-    let drift_status = match &*drift_state.state() {
-        QueryStateData::Settled { res: Ok(0), .. } => DriftStatus::Ok,
-        QueryStateData::Settled { res: Ok(n), .. } => DriftStatus::Drifted(*n),
-        _ => DriftStatus::Ok,
+    let (drift_status, drifted_count) = match &*drift_state.state() {
+        QueryStateData::Settled { res: Ok(0), .. } => (DriftStatus::Ok, 0),
+        QueryStateData::Settled { res: Ok(n), .. } => (DriftStatus::Drifted(*n), *n),
+        _ => (DriftStatus::Ok, 0),
     };
+
+    // Extract env summary data for MetricsBar and alerts.
+    let env_state = env_summary.read();
+    let (env_count, connected, total_accts, env_data_opt) = match &*env_state.state() {
+        QueryStateData::Settled { res: Ok(ed), .. } => (
+            ed.total_environments,
+            ed.connected_accounts,
+            ed.total_accounts,
+            Some(ed.clone()),
+        ),
+        _ => (0, 0, 0, None),
+    };
+
+    // Build alerts from env health data and drift data.
+    let alerts = build_alerts(&env_data_opt, drifted_count);
 
     let data_state = data.read();
     match &*data_state.state() {
@@ -125,7 +169,11 @@ pub fn Dashboard() -> Element {
                     plans_running: 0,
                     drift: drift_status,
                     jobs_tracked: dashboard.jobs_tracked,
+                    environment_count: env_count,
+                    connected_accounts: connected,
+                    total_accounts: total_accts,
                 }
+                AlertsSection { alerts: alerts }
                 PrTable { rows: dashboard.prs.clone() }
                 Pagination {
                     page: dashboard.page,
@@ -149,20 +197,15 @@ pub fn Dashboard() -> Element {
             }
         },
         _ => rsx! {
-            div { class: "p-6",
-                div { class: "flex items-center gap-2 text-sm text-zinc-500",
-                    svg {
-                        xmlns: "http://www.w3.org/2000/svg",
-                        width: "16", height: "16",
-                        view_box: "0 0 24 24",
-                        fill: "none",
-                        stroke: "currentColor",
-                        stroke_width: "2",
-                        class: "animate-spin",
-                        path { d: "M21 12a9 9 0 11-6.219-8.56" }
-                    }
-                    "Loading..."
+            div { class: "p-6 space-y-4",
+                div { class: "grid grid-cols-5 gap-4",
+                    SkeletonCard { width: "w-full".to_string(), height: "h-[76px]".to_string() }
+                    SkeletonCard { width: "w-full".to_string(), height: "h-[76px]".to_string() }
+                    SkeletonCard { width: "w-full".to_string(), height: "h-[76px]".to_string() }
+                    SkeletonCard { width: "w-full".to_string(), height: "h-[76px]".to_string() }
+                    SkeletonCard { width: "w-full".to_string(), height: "h-[76px]".to_string() }
                 }
+                SkeletonTable { rows: 5, cols: 6 }
             }
         },
     }
@@ -247,6 +290,103 @@ fn PlanBadge(result: PlanResult) -> Element {
     rsx! {
         span { class: format!("inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium border {classes}"),
             "{label}"
+        }
+    }
+}
+
+// ---- Alert helpers ----
+
+/// Build alert items from environment health and drift state data.
+fn build_alerts(
+    env_data: &Option<EnvironmentListData>,
+    drifted_count: u32,
+) -> Vec<AlertInfo> {
+    let mut alerts = Vec::new();
+
+    // Circuit breaker alerts from environment health data.
+    if let Some(ed) = env_data {
+        let unhealthy = ed.total_accounts.saturating_sub(ed.connected_accounts);
+        if unhealthy > 0 {
+            alerts.push(AlertInfo {
+                message: format!(
+                    "Circuit breaker tripped for {unhealthy} account{}: unreachable",
+                    if unhealthy == 1 { "" } else { "s" }
+                ),
+                severity: "error".to_string(),
+                timestamp: String::new(),
+                entity: "connectivity".to_string(),
+            });
+        }
+    }
+
+    // Drift alerts from drift summary.
+    if drifted_count > 0 {
+        alerts.push(AlertInfo {
+            message: format!("Drift detected: {drifted_count} job{} changed", if drifted_count == 1 { "" } else { "s" }),
+            severity: "warning".to_string(),
+            timestamp: String::new(),
+            entity: "drift".to_string(),
+        });
+    }
+
+    alerts
+}
+
+// ---- AlertsSection component (D-05) ----
+
+#[component]
+fn AlertsSection(alerts: Vec<AlertInfo>) -> Element {
+    if alerts.is_empty() {
+        return rsx! {};
+    }
+
+    rsx! {
+        div { class: "mb-6 space-y-2",
+            for alert in alerts.iter() {
+                {
+                    let (border, bg) = match alert.severity.as_str() {
+                        "error" => (
+                            "border-red-200 dark:border-red-800",
+                            "bg-red-50 dark:bg-red-950",
+                        ),
+                        _ => (
+                            "border-amber-200 dark:border-amber-800",
+                            "bg-amber-50 dark:bg-amber-950",
+                        ),
+                    };
+                    let icon_color = match alert.severity.as_str() {
+                        "error" => "text-red-500 dark:text-red-400",
+                        _ => "text-amber-500 dark:text-amber-400",
+                    };
+                    rsx! {
+                        div {
+                            class: format!("rounded-lg border p-3 flex items-center gap-3 {border} {bg}"),
+                            svg {
+                                xmlns: "http://www.w3.org/2000/svg",
+                                width: "16", height: "16",
+                                view_box: "0 0 24 24",
+                                fill: "none",
+                                stroke: "currentColor",
+                                stroke_width: "2",
+                                stroke_linecap: "round",
+                                stroke_linejoin: "round",
+                                class: "{icon_color} flex-shrink-0",
+                                path { d: "M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" }
+                                line { x1: "12", y1: "9", x2: "12", y2: "13" }
+                                line { x1: "12", y1: "17", x2: "12.01", y2: "17" }
+                            }
+                            p { class: "text-sm text-zinc-700 dark:text-zinc-300 flex-1",
+                                "{alert.message}"
+                            }
+                            if !alert.timestamp.is_empty() {
+                                span { class: "text-xs text-zinc-500 dark:text-zinc-400 flex-shrink-0",
+                                    "{alert.timestamp}"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

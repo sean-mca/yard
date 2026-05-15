@@ -102,16 +102,7 @@ pub struct RegionEntity {
     pub dag_count: u64,
 }
 
-/// Summary metadata for a discovered job (D-15).
-/// Stored as DynamoDB sub-entity: PK=ENV#{env}, SK=JOB#{job_name}.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JobSummaryEntity {
-    pub env_name: String,
-    pub region_name: String,
-    pub name: String,
-    pub job_type: String,
-}
+pub use crate::types::JobSummaryEntity;
 
 /// Per-account health status for credential resolution (D-11).
 /// Stored as DynamoDB entity: PK=HEALTH#{account_id}, SK=STATUS.
@@ -155,9 +146,14 @@ pub trait Database: Send + Sync {
     async fn list_regions(&self, env_name: &str) -> anyhow::Result<Vec<RegionEntity>>;
     // Job summaries (D-15)
     async fn upsert_job_summary(&self, env_name: &str, job: &JobSummaryEntity) -> anyhow::Result<()>;
+    /// Fetch a single job summary by env+name (DASH-04).
+    async fn get_job_summary(&self, env_name: &str, job_name: &str) -> anyhow::Result<Option<JobSummaryEntity>>;
     // Account health (D-11)
     async fn set_account_health(&self, health: &AccountHealth) -> anyhow::Result<()>;
     async fn get_account_health(&self, account_id: &str) -> anyhow::Result<Option<AccountHealth>>;
+    async fn list_all_account_health(&self) -> anyhow::Result<Vec<AccountHealth>>;
+    // Job summaries — full list (DASH-09 search composition)
+    async fn list_job_summaries_all(&self) -> anyhow::Result<Vec<JobSummaryEntity>>;
     // Sessions (Phase 45, D-08)
     async fn create_session(&self, session: &Session) -> anyhow::Result<()>;
     async fn get_session(&self, session_id: &str) -> anyhow::Result<Option<Session>>;
@@ -362,6 +358,11 @@ pub mod test_support {
             Ok(())
         }
 
+        async fn get_job_summary(&self, env_name: &str, job_name: &str) -> anyhow::Result<Option<JobSummaryEntity>> {
+            let jobs = self.job_summaries.lock().await;
+            Ok(jobs.iter().find(|j| j.env_name == env_name && j.name == job_name).cloned())
+        }
+
         // Account health (D-11)
 
         async fn set_account_health(&self, health: &AccountHealth) -> anyhow::Result<()> {
@@ -423,6 +424,14 @@ pub mod test_support {
 
         async fn get_oauth_state(&self, csrf_state: &str) -> anyhow::Result<Option<OAuthState>> {
             Ok(self.oauth_states.lock().await.get(csrf_state).cloned())
+        }
+
+        async fn list_all_account_health(&self) -> anyhow::Result<Vec<AccountHealth>> {
+            Ok(self.account_health.lock().await.values().cloned().collect())
+        }
+
+        async fn list_job_summaries_all(&self) -> anyhow::Result<Vec<JobSummaryEntity>> {
+            Ok(self.job_summaries.lock().await.clone())
         }
 
         async fn delete_oauth_state(&self, csrf_state: &str) -> anyhow::Result<()> {
@@ -490,6 +499,7 @@ mod tests {
             region_name: region.to_string(),
             name: name.to_string(),
             job_type: "glue".to_string(),
+            config_yaml: None,
         }
     }
 
@@ -774,6 +784,7 @@ mod tests {
             region_name: "us-east-1".to_string(),
             name: "etl-pipeline".to_string(),
             job_type: "emr".to_string(),
+            config_yaml: None,
         };
         db.upsert_job_summary("production", &job_updated).await.unwrap();
 
@@ -909,5 +920,61 @@ mod tests {
         let db = InMemoryDb::new();
         let result = db.get_account_health("999999999999").await.unwrap();
         assert!(result.is_none(), "nonexistent account should return None");
+    }
+
+    // list_all_account_health tests (DASH-01)
+
+    #[tokio::test]
+    async fn list_all_account_health_returns_all() {
+        let db = InMemoryDb::new();
+        db.set_account_health(&make_account_health("111111111111", "healthy")).await.unwrap();
+        db.set_account_health(&make_account_health("222222222222", "degraded")).await.unwrap();
+        db.set_account_health(&make_account_health("333333333333", "unknown")).await.unwrap();
+        let all = db.list_all_account_health().await.unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_all_account_health_empty() {
+        let db = InMemoryDb::new();
+        let all = db.list_all_account_health().await.unwrap();
+        assert!(all.is_empty(), "fresh DB should return empty vec");
+    }
+
+    // get_job_summary tests (DASH-04)
+
+    #[tokio::test]
+    async fn get_job_summary_returns_matching_job() {
+        let db = InMemoryDb::new();
+        let mut job = make_job_summary("production", "us-east-1", "etl-pipeline");
+        job.config_yaml = Some("type: glue\nsources: [s3]".to_string());
+        db.upsert_job_summary("production", &job).await.unwrap();
+
+        let result = db.get_job_summary("production", "etl-pipeline").await.unwrap();
+        assert!(result.is_some());
+        let found = result.unwrap();
+        assert_eq!(found.name, "etl-pipeline");
+        assert_eq!(found.env_name, "production");
+        assert_eq!(found.region_name, "us-east-1");
+        assert_eq!(found.job_type, "glue");
+        assert_eq!(found.config_yaml, Some("type: glue\nsources: [s3]".to_string()));
+    }
+
+    #[tokio::test]
+    async fn get_job_summary_returns_none_for_missing() {
+        let db = InMemoryDb::new();
+        let result = db.get_job_summary("production", "nonexistent").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    // list_job_summaries_all tests (DASH-09)
+
+    #[tokio::test]
+    async fn list_job_summaries_all_returns_all() {
+        let db = InMemoryDb::new();
+        db.upsert_job_summary("production", &make_job_summary("production", "us-east-1", "etl-job")).await.unwrap();
+        db.upsert_job_summary("staging", &make_job_summary("staging", "eu-west-1", "analytics-job")).await.unwrap();
+        let all = db.list_job_summaries_all().await.unwrap();
+        assert_eq!(all.len(), 2);
     }
 }
