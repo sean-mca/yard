@@ -425,8 +425,9 @@ fn NotificationCard(
                 }
                 // Toggle
                 button {
+                    r#type: "button",
                     class: format!(
-                        "relative w-9 h-5 rounded-full cursor-pointer transition-colors {}",
+                        "relative inline-flex shrink-0 w-9 h-5 rounded-full cursor-pointer transition-colors {}",
                         if enabled() {
                             "bg-zinc-900 dark:bg-white"
                         } else {
@@ -442,7 +443,7 @@ fn NotificationCard(
                     },
                     span {
                         class: format!(
-                            "absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white dark:bg-zinc-900 transition-transform {}",
+                            "block absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white dark:bg-zinc-900 shadow-sm transition-transform {}",
                             if enabled() { "translate-x-4" } else { "" }
                         ),
                     }
@@ -575,7 +576,7 @@ fn AuthStatusCard() -> Element {
                     }
                 }
                 Err(_) => {
-                    auth_mode.set("Unknown".to_string());
+                    auth_mode.set("No authentication (VPN-only)".to_string());
                 }
             }
             loaded.set(true);
