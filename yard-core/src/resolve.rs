@@ -115,12 +115,14 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
                 .unwrap_or("us-east-1")
                 .to_string(),
             key: state_node["key"].as_str().unwrap_or("state/").to_string(),
-            // Plan 02 owns reading `state.aws` from yaml and env-merging
-            // `YARD_STATE_AWS_*`. Until then, default to None so the
-            // `#[serde(default)]` deserialization behavior is preserved here
-            // and nothing in today's codepath changes. (TYPE-02 retypes the
-            // field; the runtime intent is unchanged.)
-            aws: None,
+            aws: {
+                let aws_value = yaml_to_json(&state_node["aws"]);
+                if aws_value.is_null() {
+                    None
+                } else {
+                    serde_json::from_value(aws_value).ok()
+                }
+            },
         },
         _ => return Err(anyhow!("Unsupported state type in root")),
     };
@@ -465,7 +467,16 @@ pub fn load_context(current_dir: &Path) -> Result<YARDContext> {
 
 pub fn yaml_to_json(yaml: &yaml_rust2::Yaml) -> Value {
     match yaml {
-        yaml_rust2::Yaml::Real(s) | yaml_rust2::Yaml::String(s) => Value::String(s.clone()),
+        yaml_rust2::Yaml::Real(s) => {
+            if let Ok(n) = s.parse::<f64>() {
+                serde_json::Number::from_f64(n)
+                    .map(Value::Number)
+                    .unwrap_or_else(|| Value::String(s.clone()))
+            } else {
+                Value::String(s.clone())
+            }
+        }
+        yaml_rust2::Yaml::String(s) => Value::String(s.clone()),
         yaml_rust2::Yaml::Integer(i) => Value::Number((*i).into()),
         yaml_rust2::Yaml::Boolean(b) => Value::Bool(*b),
         yaml_rust2::Yaml::Array(a) => Value::Array(a.iter().map(yaml_to_json).collect()),

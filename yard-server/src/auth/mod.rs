@@ -24,18 +24,21 @@ pub mod session;
 
 pub mod oauth2;
 
+#[cfg(test)]
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::{
-    extract::{ConnectInfo, Request, State},
+    extract::{Request, State},
     http::HeaderMap,
     http::header::{AUTHORIZATION, COOKIE},
     http::{StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
+#[cfg(test)]
+use axum::extract::ConnectInfo;
 
 use crate::api::error::ApiError;
 
@@ -141,7 +144,6 @@ impl AuthProvider for OAuth2AuthProvider {
 ///    per D-04.
 pub async fn require_auth(
     State(auth): State<Arc<dyn AuthProvider>>,
-    ConnectInfo(_addr): ConnectInfo<SocketAddr>,
     req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
@@ -215,7 +217,7 @@ pub struct AuthConfig {
 ///
 /// Cookie parsing is intentionally minimal — split on `;`, trim whitespace,
 /// match the literal prefix `yard_session=`.
-fn extract_cookie_token(headers: &HeaderMap) -> Option<Vec<u8>> {
+pub(crate) fn extract_cookie_token(headers: &HeaderMap) -> Option<Vec<u8>> {
     let raw = headers.get(COOKIE)?.to_str().ok()?;
     let prefix = format!("{COOKIE_NAME}=");
     for piece in raw.split(';') {
@@ -239,24 +241,7 @@ fn extract_cookie_token(headers: &HeaderMap) -> Option<Vec<u8>> {
 
 /// Check that a session ID looks like a UUID v4 (36 chars: 8-4-4-4-12, hex digits + hyphens).
 pub(crate) fn is_valid_session_id(s: &str) -> bool {
-    if s.len() != 36 {
-        return false;
-    }
-    for (i, ch) in s.chars().enumerate() {
-        match i {
-            8 | 13 | 18 | 23 => {
-                if ch != '-' {
-                    return false;
-                }
-            }
-            _ => {
-                if !ch.is_ascii_hexdigit() {
-                    return false;
-                }
-            }
-        }
-    }
-    true
+    uuid::Uuid::parse_str(s).is_ok()
 }
 
 /// Extract a Bearer token from the Authorization header.
@@ -269,7 +254,7 @@ fn extract_bearer(headers: &HeaderMap) -> Option<String> {
 }
 
 /// True if the SocketAddr's IP is loopback (covers 127.0.0.0/8 and ::1).
-#[allow(dead_code)]  // Used by legacy require_bearer tests
+#[cfg(test)]
 fn is_loopback(addr: &SocketAddr) -> bool {
     addr.ip().is_loopback()
 }

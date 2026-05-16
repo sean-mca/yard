@@ -92,7 +92,7 @@ fn start_api_server() {
 
     std::thread::spawn(|| {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-        rt.block_on(async move {
+        if let Err(e) = rt.block_on(async move {
             let github_token = required_env("YARD_GITHUB_TOKEN")?;
             let webhook_secret = required_env("YARD_WEBHOOK_SECRET")?;
             let repo_owner = required_env("YARD_REPO_OWNER")?;
@@ -382,16 +382,16 @@ fn start_api_server() {
             tokio::spawn(dashboard_poll_loop(api_state, poll_timeout_secs));
 
             let port = std::env::var("YARD_PORT").unwrap_or_else(|_| "3001".to_string());
-            let addr: std::net::SocketAddr = format!("0.0.0.0:{port}")
+            let bind_host = std::env::var("YARD_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+            let addr: std::net::SocketAddr = format!("{bind_host}:{port}")
                 .parse()
-                .map_err(|e| anyhow::anyhow!("Invalid listen address (YARD_PORT={port}): {e}"))?;
+                .map_err(|e| anyhow::anyhow!("Invalid listen address ({bind_host}:{port}): {e}"))?;
             eprintln!("API server listening on {addr}");
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to bind to {addr}: {e}"))?;
-            // ConnectInfo<SocketAddr> is required by the auth middleware for the
-            // loopback-bypass enforcement (gap-closure plan 03). into_make_service_with_connect_info
-            // is the axum primitive that surfaces the peer SocketAddr to extractors.
+            // into_make_service_with_connect_info surfaces the peer SocketAddr
+            // to extractors (used by legacy tests and future rate-limiting).
             axum::serve(
                 listener,
                 router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -400,8 +400,9 @@ fn start_api_server() {
             .map_err(|e| anyhow::anyhow!("Server error: {e}"))?;
 
             Ok::<(), anyhow::Error>(())
-        })
-        .expect("API server failed");
+        }) {
+            tracing::error!("API server exited with error: {e:#}");
+        }
     });
 }
 
@@ -615,7 +616,7 @@ async fn drift_poll_loop(
     loop {
         // Read interval from settings (stored as minutes string).
         let interval_mins = match state.db.get_setting("drift_interval").await {
-            Ok(Some(val)) => val.parse::<u64>().unwrap_or(DEFAULT_INTERVAL_MINS),
+            Ok(Some(val)) => val.parse::<u64>().unwrap_or(DEFAULT_INTERVAL_MINS).max(1),
             _ => DEFAULT_INTERVAL_MINS,
         };
         let interval = std::time::Duration::from_secs(interval_mins * 60);
@@ -695,7 +696,7 @@ async fn dashboard_poll_loop(
             .await;
 
         let interval_mins = match state.db.get_setting("dashboard_interval").await {
-            Ok(Some(val)) => val.parse::<u64>().unwrap_or(DEFAULT_INTERVAL_MINS),
+            Ok(Some(val)) => val.parse::<u64>().unwrap_or(DEFAULT_INTERVAL_MINS).max(1),
             _ => DEFAULT_INTERVAL_MINS,
         };
         let interval = std::time::Duration::from_secs(interval_mins * 60);

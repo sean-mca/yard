@@ -42,9 +42,8 @@ pub struct ConnectionCtx {
     pub dashboard_tick: Signal<u64>,
     pub drift_tick: Signal<u64>,
     pub env_health_tick: Signal<u64>,
-    // TODO: Reserved for a future `SearchIndexUpdated` server event. Currently
-    // no server-side event writes to this signal and no component reads it.
-    // Wire it up when search index invalidation is added to api/events.rs.
+    // Reserved for a future `SearchIndexUpdated` server event (not yet wired).
+    #[allow(dead_code)]
     pub search_index_tick: Signal<u64>,
 }
 

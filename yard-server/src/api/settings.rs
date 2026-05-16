@@ -123,6 +123,11 @@ async fn post_settings(
 
     // Handle test_slack_webhook action trigger separately — never persisted.
     if payload.settings.contains_key("test_slack_webhook") {
+        if payload.settings.len() > 1 {
+            return Err(ApiError::BadRequest(
+                "test_slack_webhook cannot be combined with other settings".into(),
+            ));
+        }
         return handle_test_slack_webhook(&state).await;
     }
 

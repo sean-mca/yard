@@ -242,52 +242,57 @@ impl StorageBackend for LocalStorage {
             tokio::fs::create_dir_all(&self.path).await?;
             let lock_path = self.path.join(format!("{job_name}.json.lock"));
 
-            // O_CREAT | O_EXCL — fails if file already exists
-            match tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-                .await
-            {
-                Ok(_file) => {
-                    tokio::fs::write(&lock_path, &json).await?;
-                    Ok(info)
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let existing = self.get_lock(&job_name).await?;
-                    match existing {
-                        Some(held) => {
-                            // D-02: Check if lock is stale (older than TTL)
-                            if let Ok(created) =
-                                chrono::DateTime::parse_from_rfc3339(&held.created_at)
-                            {
-                                let age = chrono::Utc::now().signed_duration_since(created);
-                                if age > chrono::TimeDelta::minutes(LOCK_TTL_MINUTES) {
-                                    eprintln!(
-                                        "Warning: reclaiming stale lock for \"{}\" \
-                                         (held by {} since {}, age {}m)",
-                                        job_name,
-                                        held.who,
-                                        held.created_at,
-                                        age.num_minutes()
-                                    );
-                                    self.force_unlock(&job_name).await?;
-                                    // Retry exactly once (Pitfall 3: no infinite loop)
-                                    return self.lock(&job_name).await;
-                                }
-                            }
-                            Err(anyhow!(
-                                "Job \"{job_name}\" is locked by {} (since {}). \
-                                 Use `yard force-unlock` to override.",
-                                held.who,
-                                held.created_at
-                            ))
-                        }
-                        None => Err(anyhow!("Job \"{job_name}\" is locked (unknown holder)")),
+            // Try up to 2 times: first attempt + one retry after stale reclaim.
+            for attempt in 0..2u8 {
+                match tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&lock_path)
+                    .await
+                {
+                    Ok(file) => {
+                        use tokio::io::AsyncWriteExt;
+                        let mut file = file;
+                        file.write_all(json.as_bytes()).await?;
+                        file.flush().await?;
+                        return Ok(info);
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let existing = self.get_lock(&job_name).await?;
+                        match existing {
+                            Some(held) => {
+                                if attempt == 0
+                                    && let Ok(created) =
+                                        chrono::DateTime::parse_from_rfc3339(&held.created_at)
+                                {
+                                    let age = chrono::Utc::now().signed_duration_since(created);
+                                    if age > chrono::TimeDelta::minutes(LOCK_TTL_MINUTES) {
+                                        eprintln!(
+                                            "Warning: reclaiming stale lock for \"{}\" \
+                                             (held by {} since {}, age {}m)",
+                                            job_name,
+                                            held.who,
+                                            held.created_at,
+                                            age.num_minutes()
+                                        );
+                                        self.force_unlock(&job_name).await?;
+                                        continue;
+                                    }
+                                }
+                                return Err(anyhow!(
+                                    "Job \"{job_name}\" is locked by {} (since {}). \
+                                     Use `yard force-unlock` to override.",
+                                    held.who,
+                                    held.created_at
+                                ));
+                            }
+                            None => return Err(anyhow!("Job \"{job_name}\" is locked (unknown holder)")),
+                        }
+                    }
+                    Err(e) => return Err(e.into()),
                 }
-                Err(e) => Err(e.into()),
             }
+            Err(anyhow!("Job \"{job_name}\" lock acquire failed after stale reclaim"))
         })
     }
 
@@ -498,71 +503,69 @@ impl StorageBackend for S3Storage {
         let job_name = job_name.to_string();
         Box::pin(async move {
             let info = lock_info();
-            let json = serde_json::to_string_pretty(&info)?;
             let key = format!("{}{job_name}.json.lock", self.prefix);
-            let result = self
-                .client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(&key)
-                .body(json.into_bytes().into())
-                .content_type("application/json")
-                .if_none_match("*")
-                .send()
-                .await;
 
-            match result {
-                Ok(_) => Ok(info),
-                Err(e) => {
-                    // Only attempt TTL reclaim when S3 indicates the object
-                    // already exists (precondition failure from if_none_match).
-                    // Non-contention errors (network, throttle, auth, etc.)
-                    // must not enter the reclaim path — doing so could
-                    // incorrectly delete a legitimate lock holder's lock.
-                    let is_contention = e.as_service_error().is_some_and(|se| {
-                        matches!(
-                            se.meta().code(),
-                            Some("PreconditionFailed") | Some("ConditionalRequestConflict")
-                        )
-                    });
-                    if !is_contention {
-                        return Err(e.into());
-                    }
+            // Try up to 2 times: first attempt + one retry after stale reclaim.
+            for attempt in 0..2u8 {
+                let json = serde_json::to_string_pretty(&info)?;
+                let result = self
+                    .client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(&key)
+                    .body(json.into_bytes().into())
+                    .content_type("application/json")
+                    .if_none_match("*")
+                    .send()
+                    .await;
 
-                    // Object already exists — someone holds the lock
-                    let existing = self.get_lock(&job_name).await.ok().flatten();
-                    match existing {
-                        Some(held) => {
-                            // D-02: Check if lock is stale (older than TTL)
-                            if let Ok(created) =
-                                chrono::DateTime::parse_from_rfc3339(&held.created_at)
-                            {
-                                let age = chrono::Utc::now().signed_duration_since(created);
-                                if age > chrono::TimeDelta::minutes(LOCK_TTL_MINUTES) {
-                                    eprintln!(
-                                        "Warning: reclaiming stale lock for \"{}\" \
-                                         (held by {} since {}, age {}m)",
-                                        job_name,
-                                        held.who,
-                                        held.created_at,
-                                        age.num_minutes()
-                                    );
-                                    self.force_unlock(&job_name).await?;
-                                    // Retry exactly once (Pitfall 3: no infinite loop)
-                                    return self.lock(&job_name).await;
-                                }
-                            }
-                            Err(anyhow!(
-                                "Job \"{job_name}\" is locked by {} (since {}). \
-                                 Use `yard force-unlock` to override.",
-                                held.who,
-                                held.created_at
-                            ))
+                match result {
+                    Ok(_) => return Ok(info),
+                    Err(e) => {
+                        let is_contention = e.as_service_error().is_some_and(|se| {
+                            matches!(
+                                se.meta().code(),
+                                Some("PreconditionFailed") | Some("ConditionalRequestConflict")
+                            )
+                        });
+                        if !is_contention {
+                            return Err(e.into());
                         }
-                        None => Err(e.into()),
+
+                        let existing = self.get_lock(&job_name).await.ok().flatten();
+                        match existing {
+                            Some(held) => {
+                                if attempt == 0
+                                    && let Ok(created) =
+                                        chrono::DateTime::parse_from_rfc3339(&held.created_at)
+                                {
+                                    let age = chrono::Utc::now().signed_duration_since(created);
+                                    if age > chrono::TimeDelta::minutes(LOCK_TTL_MINUTES) {
+                                        eprintln!(
+                                            "Warning: reclaiming stale lock for \"{}\" \
+                                             (held by {} since {}, age {}m)",
+                                            job_name,
+                                            held.who,
+                                            held.created_at,
+                                            age.num_minutes()
+                                        );
+                                        self.force_unlock(&job_name).await?;
+                                        continue;
+                                    }
+                                }
+                                return Err(anyhow!(
+                                    "Job \"{job_name}\" is locked by {} (since {}). \
+                                     Use `yard force-unlock` to override.",
+                                    held.who,
+                                    held.created_at
+                                ));
+                            }
+                            None => return Err(e.into()),
+                        }
                     }
                 }
             }
+            Err(anyhow!("Job \"{job_name}\" lock acquire failed after stale reclaim"))
         })
     }
 

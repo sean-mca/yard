@@ -32,7 +32,7 @@ use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::api::error::ApiError;
-use crate::auth::{COOKIE_NAME, ct_eq, is_valid_session_id};
+use crate::auth::{COOKIE_NAME, ct_eq};
 use crate::auth::oauth2::ProviderRegistry;
 use crate::auth::session::{OAuthState, Session};
 use crate::db::Database;
@@ -508,27 +508,8 @@ pub async fn post_logout(
 
 /// Extract the `yard_session` cookie value from request headers.
 fn extract_session_id_from_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
-    let raw = headers
-        .get(axum::http::header::COOKIE)?
-        .to_str()
-        .ok()?;
-    let prefix = format!("{COOKIE_NAME}=");
-    for piece in raw.split(';') {
-        let piece = piece.trim();
-        if let Some(value) = piece.strip_prefix(prefix.as_str()) {
-            if value.is_empty() {
-                return None;
-            }
-            // WR-03: reject obviously invalid session IDs early. Server-generated
-            // IDs are UUID v4 (36 chars, hex + hyphens). This avoids passing
-            // arbitrary strings (null bytes, megabytes) to DynamoDB.
-            if !is_valid_session_id(value) {
-                return None;
-            }
-            return Some(value.to_string());
-        }
-    }
-    None
+    let bytes = crate::auth::extract_cookie_token(headers)?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Extract the email claim from an OAuth2 ID token.

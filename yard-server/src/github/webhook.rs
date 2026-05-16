@@ -84,9 +84,12 @@ pub struct Repository {
 }
 
 impl Repository {
-    pub fn owner_repo(&self) -> (&str, &str) {
-        let (owner, repo) = self.full_name.split_once('/').unwrap_or(("", ""));
-        (owner, repo)
+    pub fn owner_repo(&self) -> Option<(&str, &str)> {
+        let (owner, repo) = self.full_name.split_once('/')?;
+        if owner.is_empty() || repo.is_empty() {
+            return None;
+        }
+        Some((owner, repo))
     }
 }
 
@@ -147,7 +150,7 @@ fn parse_pull_request_event(body: &Bytes) -> Result<WebhookAction, StatusCode> {
     let event: PullRequestEvent =
         serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let (owner, repo) = event.repository.owner_repo();
+    let (owner, repo) = event.repository.owner_repo().ok_or(StatusCode::BAD_REQUEST)?;
     let clone_url = event.repository.clone_url.clone().unwrap_or_default();
 
     match event.action.as_str() {
@@ -192,7 +195,7 @@ fn parse_issue_comment_event(body: &Bytes) -> Result<WebhookAction, StatusCode> 
     let body_raw = event.comment.body.trim();
     let body_lower = body_raw.to_lowercase();
 
-    let (owner, repo) = event.repository.owner_repo();
+    let (owner, repo) = event.repository.owner_repo().ok_or(StatusCode::BAD_REQUEST)?;
     let clone_url = event.repository.clone_url.clone().unwrap_or_default();
 
     // Check "yard plan" before "yard apply" to avoid prefix collisions

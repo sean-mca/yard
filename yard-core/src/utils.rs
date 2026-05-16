@@ -1,7 +1,14 @@
 use anyhow::{Result, anyhow};
 use regex::Regex;
 use serde_json::Value;
+use std::sync::LazyLock;
 use yard_structs::YARDContext;
+
+static VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // SAFETY: this is a compile-time constant pattern that always succeeds.
+    #[allow(clippy::expect_used)]
+    Regex::new(r"\$\{(?P<key>[^}]+)\}").expect("static regex")
+});
 
 pub fn calculate_hash<T: AsRef<[u8]>>(data: T) -> String {
     let hash = blake3::hash(data.as_ref());
@@ -9,41 +16,55 @@ pub fn calculate_hash<T: AsRef<[u8]>>(data: T) -> String {
 }
 
 pub fn calculate_json_hash(val: &Value) -> Result<String> {
-    // We use a stable serialization to ensure the same JSON
-    // always produces the same hash regardless of key order.
-    let s = serde_json::to_string(val)?;
+    let canonical = canonicalize_value(val);
+    let s = serde_json::to_string(&canonical)?;
     Ok(calculate_hash(s))
 }
 
+fn canonicalize_value(val: &Value) -> Value {
+    match val {
+        Value::Object(map) => {
+            let sorted: serde_json::Map<String, Value> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), canonicalize_value(v)))
+                .collect::<std::collections::BTreeMap<_, _>>()
+                .into_iter()
+                .collect();
+            Value::Object(sorted)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(canonicalize_value).collect()),
+        other => other.clone(),
+    }
+}
+
 pub fn resolve_variables(raw_yaml: &str, ctx: &YARDContext) -> Result<String> {
-    let re = Regex::new(r"\$\{(?P<key>[^}]+)\}")?;
-    let mut result = raw_yaml.to_string();
+    let re = &*VAR_RE;
+    let mut err: Option<anyhow::Error> = None;
 
-    // Find all ${account.id} or ${transforms.my_func} patterns
-    for caps in re.captures_iter(raw_yaml) {
-        let full_match = &caps[0];
+    let result = re.replace_all(raw_yaml, |caps: &regex::Captures| {
         let path = &caps["key"];
-
-        // Resolve the path against our context JSON
         match resolve_json_path(ctx, path) {
-            Some(value) => {
-                let val_str = match value {
-                    serde_json::Value::String(s) => s.to_string(),
-                    _ => value.to_string(),
-                };
-                result = result.replace(full_match, &val_str);
-            }
-            // The Second Possibility: Throwing the explicit Error
+            Some(value) => match value {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            },
             None => {
-                return Err(anyhow!(
-                    "Missing Variable: Could not find '{}' in the provided context (account/region/transforms)",
-                    path
-                ));
+                if err.is_none() {
+                    err = Some(anyhow!(
+                        "Missing Variable: Could not find '{}' in the provided context (account/region/transforms)",
+                        path
+                    ));
+                }
+                String::new()
             }
         }
+    });
+
+    if let Some(e) = err {
+        return Err(e);
     }
 
-    Ok(result)
+    Ok(result.into_owned())
 }
 
 pub fn resolve_json_path(ctx: &YARDContext, path: &str) -> Option<serde_json::Value> {
