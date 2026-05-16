@@ -30,12 +30,12 @@ fn validate_setting(key: &str, value: &str) -> Result<(), String> {
                 "invalid drift_interval '{value}': must be 1, 3, 5, or 10"
             )),
         },
-        "dashboard_interval" => value
-            .parse::<u64>()
-            .map(|_| ())
-            .map_err(|_| {
-                format!("invalid dashboard_interval '{value}': must be a positive integer")
-            }),
+        "dashboard_interval" => match value.parse::<u64>() {
+            Ok(n) if n >= 1 => Ok(()),
+            _ => Err(format!(
+                "invalid dashboard_interval '{value}': must be a positive integer >= 1"
+            )),
+        },
         "slack_enabled" => match value {
             "true" | "false" => Ok(()),
             _ => Err(format!(
