@@ -239,7 +239,7 @@ async fn oauth_callback(
         })?;
 
     // Exchange the authorization code for tokens.
-    let token_result = registry
+    let token_result = match registry
         .exchange_code(
             &oauth_state.provider,
             query.code,
@@ -247,15 +247,23 @@ async fn oauth_callback(
             client_secret,
         )
         .await
-        .map_err(|e| {
+    {
+        Ok(result) => result,
+        Err(e) => {
             tracing::error!(
                 provider = %oauth_state.provider,
                 error = %e,
                 "OAuth2 code exchange failed"
             );
-            // T-45-13: redirect to /login with error, not a raw error page.
-            ApiError::BadRequest("auth_failed".into())
-        })?;
+            // T-45-13: redirect to /login with error query param, not raw JSON.
+            let mut resp = StatusCode::FOUND.into_response();
+            resp.headers_mut().insert(
+                axum::http::header::LOCATION,
+                HeaderValue::from_static("/login?error=auth_failed"),
+            );
+            return Ok(resp);
+        }
+    };
 
     // Extract email from the ID token JWT claims (T-45-15).
     // No cryptographic verification — the token came directly from the provider
