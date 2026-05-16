@@ -238,7 +238,7 @@ fn extract_cookie_token(headers: &HeaderMap) -> Option<Vec<u8>> {
 }
 
 /// Check that a session ID looks like a UUID v4 (36 chars: 8-4-4-4-12, hex digits + hyphens).
-fn is_valid_session_id(s: &str) -> bool {
+pub(crate) fn is_valid_session_id(s: &str) -> bool {
     if s.len() != 36 {
         return false;
     }
