@@ -870,14 +870,15 @@ mod tests {
         let secret_store: Arc<dyn SecretStore> =
             Arc::new(InMemorySecretStore::new(HashMap::new()));
 
-        // Create a session without a refresh token.
+        // Create a session without a refresh token, within the refresh window
+        // (expires in 10 minutes, inside the 30-min REFRESH_WINDOW_SECS).
         let session = Session {
             session_id: "b2c3d4e5-f6a7-8901-bcde-f12345678901".to_string(),
             email: "user@example.com".to_string(),
             provider: "entra".to_string(),
             refresh_token: None,
-            created_at: Utc::now(),
-            expires_at: Utc::now() + Duration::hours(8),
+            created_at: Utc::now() - Duration::hours(7),
+            expires_at: Utc::now() + Duration::minutes(10),
         };
         db.create_session(&session).await.unwrap();
 
