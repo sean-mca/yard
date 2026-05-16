@@ -46,6 +46,11 @@ const SESSION_MAX_AGE_SECS: i64 = 28800;
 /// re-authentication daily even when refresh tokens are available (CR-03).
 const MAX_SESSION_LIFETIME_SECS: i64 = 86400;
 
+/// Minimum remaining seconds before expiry at which a refresh is allowed.
+/// Prevents amplification attacks where an attacker floods the refresh
+/// endpoint while the session has plenty of remaining validity (WR-01).
+const REFRESH_WINDOW_SECS: i64 = 1800; // 30 minutes
+
 /// State shared by all auth session routes.
 pub struct AuthSessionState {
     pub db: Arc<dyn Database>,
@@ -344,6 +349,17 @@ async fn oauth_refresh(
         let _ = state.db.delete_session(&session_id).await;
         return Err(ApiError::Unauthorized(
             "session exceeded maximum lifetime -- please sign in again".into(),
+        ));
+    }
+
+    // WR-01: only allow refresh within the last REFRESH_WINDOW_SECS (30 min)
+    // of session validity. Prevents amplification attacks where an attacker
+    // floods the refresh endpoint while the session has plenty of remaining time.
+    let now = Utc::now();
+    let remaining = (session.expires_at - now).num_seconds();
+    if remaining > REFRESH_WINDOW_SECS {
+        return Err(ApiError::BadRequest(
+            "refresh not allowed yet -- session still has sufficient validity".into(),
         ));
     }
 
