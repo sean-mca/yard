@@ -16,6 +16,8 @@ use super::dashboard::ApiState;
 /// Validate a setting key/value pair against the known allowlist.
 fn validate_setting(key: &str, value: &str) -> Result<(), String> {
     match key {
+        // test_slack_webhook is an action trigger — value is ignored.
+        "test_slack_webhook" => Ok(()),
         "theme" => match value {
             "light" | "dark" | "system" => Ok(()),
             _ => Err(format!(
@@ -28,12 +30,12 @@ fn validate_setting(key: &str, value: &str) -> Result<(), String> {
                 "invalid drift_interval '{value}': must be 1, 3, 5, or 10"
             )),
         },
-        "dashboard_interval" => value
-            .parse::<u64>()
-            .map(|_| ())
-            .map_err(|_| {
-                format!("invalid dashboard_interval '{value}': must be a positive integer")
-            }),
+        "dashboard_interval" => match value.parse::<u64>() {
+            Ok(n) if n >= 1 => Ok(()),
+            _ => Err(format!(
+                "invalid dashboard_interval '{value}': must be a positive integer >= 1"
+            )),
+        },
         "slack_enabled" => match value {
             "true" | "false" => Ok(()),
             _ => Err(format!(
@@ -119,6 +121,11 @@ async fn post_settings(
         }
     }
 
+    // Handle test_slack_webhook action trigger separately — never persisted.
+    if payload.settings.contains_key("test_slack_webhook") {
+        return handle_test_slack_webhook(&state).await;
+    }
+
     for (key, value) in &payload.settings {
         state
             .db
@@ -128,6 +135,89 @@ async fn post_settings(
     }
 
     info!(count = payload.settings.len(), "Saved settings");
+    Ok(StatusCode::OK)
+}
+
+/// Resolve the Slack webhook URL from Secrets Manager via the configured ARN,
+/// then send a test message. Returns 200 on success, 400/500 on failure.
+async fn handle_test_slack_webhook(state: &ApiState) -> Result<StatusCode, ApiError> {
+    // Look up the stored ARN from settings.
+    let items = state
+        .db
+        .list_settings()
+        .await
+        .map_err(|e| ApiError::DatabaseError(format!("Failed to fetch settings: {e}")))?;
+    let settings: HashMap<String, String> =
+        items.into_iter().map(|s| (s.key, s.value)).collect();
+
+    let arn = settings
+        .get("slack_webhook_secret_arn")
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            ApiError::BadRequest(
+                "No Slack webhook Secret ARN configured. Set the Secret ARN in Notifications settings first."
+                    .to_string(),
+            )
+        })?;
+
+    // Resolve the ARN to the actual webhook URL via SecretStore.
+    let webhook_url = state
+        .secret_store
+        .resolve(arn)
+        .await
+        .map_err(|e| {
+            ApiError::Internal(format!(
+                "Failed to resolve Slack webhook secret: {e}"
+            ))
+        })?;
+
+    // Send a test message.
+    let test_payload = serde_json::json!({
+        "blocks": [
+            {
+                "type": "header",
+                "text": { "type": "plain_text", "text": "yard-server test notification" }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "This is a test message from yard-server. If you see this, your Slack webhook integration is working correctly."
+                }
+            }
+        ]
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| ApiError::Internal(format!("Failed to create HTTP client: {e}")))?;
+
+    let resp = client
+        .post(&webhook_url)
+        .header("Content-Type", "application/json")
+        .json(&test_payload)
+        .send()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Slack webhook request failed: {e}")))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        // WR-05: log the full response body server-side for debugging, but do
+        // not forward it to the browser — Slack's error body is untrusted
+        // external content.
+        let body = resp.text().await.unwrap_or_default();
+        tracing::warn!(
+            http_status = %status,
+            response_body = %body,
+            "Slack webhook test returned non-success status"
+        );
+        return Err(ApiError::Internal(format!(
+            "Slack webhook returned HTTP {status}"
+        )));
+    }
+
+    info!("Slack webhook test message sent successfully");
     Ok(StatusCode::OK)
 }
 
@@ -435,6 +525,125 @@ mod tests {
         assert!(
             serialized.contains("slack_webhook_secret_arn"),
             "GET response must include the ARN reference: {serialized}"
+        );
+    }
+
+    // ---- test_slack_webhook action trigger tests ----
+
+    #[test]
+    fn validates_test_slack_webhook_key() {
+        // test_slack_webhook is an action trigger — any value is accepted.
+        assert!(validate_setting("test_slack_webhook", "").is_ok());
+        assert!(validate_setting("test_slack_webhook", "ignored").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_slack_webhook_rejects_when_no_arn_configured() {
+        // When no slack_webhook_secret_arn is stored, the test action should
+        // return a 400 telling the operator to configure the ARN first.
+        let state = test_api_state();
+        let payload = SettingsPayload {
+            settings: [("test_slack_webhook".to_string(), String::new())]
+                .into_iter()
+                .collect(),
+        };
+        let result = post_settings(State(state), Json(payload)).await;
+        assert!(result.is_err());
+        let resp = result.unwrap_err().into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_slack_webhook_does_not_persist_key() {
+        // The test_slack_webhook key is an action trigger and must never be
+        // stored in DynamoDB. Verify GET /api/settings does not contain it
+        // after a test_slack_webhook POST (even if the POST itself fails).
+        let state = test_api_state();
+        let payload = SettingsPayload {
+            settings: [("test_slack_webhook".to_string(), String::new())]
+                .into_iter()
+                .collect(),
+        };
+        // POST will fail (no ARN configured), but that's fine — we're testing
+        // that the key is not persisted regardless.
+        let _ = post_settings(State(state.clone()), Json(payload)).await;
+        let resp = get_settings(State(state)).await.unwrap();
+        assert!(
+            !resp.0.settings.contains_key("test_slack_webhook"),
+            "test_slack_webhook must not be persisted to settings"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slack_webhook_resolves_secret_and_posts() {
+        // End-to-end test with a fake Slack HTTP responder, mirroring the
+        // pattern in alerting/slack.rs::resolve_and_post_integration.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use crate::secrets::test_support::InMemorySecretStore;
+
+        // Bind a kernel-chosen port for the fake Slack webhook.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let webhook_url = format!("http://{addr}/test-webhook");
+
+        let captured = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let captured_clone = captured.clone();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap();
+            captured_clone.lock().await.extend_from_slice(&buf[..n]);
+            let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+            stream.write_all(resp).await.unwrap();
+            stream.shutdown().await.ok();
+        });
+
+        let arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:yard/test-slack-X";
+        let mut entries = std::collections::HashMap::new();
+        entries.insert(arn.to_string(), webhook_url);
+        let secret_store: Arc<dyn crate::secrets::SecretStore> =
+            Arc::new(InMemorySecretStore::new(entries));
+
+        let db = Arc::new(InMemoryDb::new());
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
+        let state = Arc::new(ApiState {
+            github_token: "t".into(),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            db: db.clone() as Arc<dyn Database>,
+            event_tx,
+            secret_store,
+        });
+
+        // Store the ARN in settings.
+        db.set_setting("slack_webhook_secret_arn", arn)
+            .await
+            .unwrap();
+
+        let payload = SettingsPayload {
+            settings: [("test_slack_webhook".to_string(), String::new())]
+                .into_iter()
+                .collect(),
+        };
+        let result = post_settings(State(state), Json(payload)).await;
+        assert!(result.is_ok(), "test_slack_webhook should succeed: {result:?}");
+        assert_eq!(result.unwrap(), StatusCode::OK);
+
+        server.await.unwrap();
+        let captured_bytes = captured.lock().await.clone();
+        let captured_str = String::from_utf8_lossy(&captured_bytes);
+
+        // Verify the test payload arrived at the fake webhook.
+        assert!(
+            captured_str.starts_with("POST /test-webhook"),
+            "expected POST /test-webhook, got: {}",
+            &captured_str[..captured_str.len().min(80)]
+        );
+        assert!(
+            captured_str.contains("yard-server test notification"),
+            "test payload must contain the yard-server test notification text"
         );
     }
 }

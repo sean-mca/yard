@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use super::fetch::get_json;
 use super::sheet::Sheet;
+use super::skeleton::{SkeletonCard, SkeletonTable};
 use crate::types::*;
 
 use super::api_base;
@@ -31,7 +32,11 @@ impl QueryCapability for DriftQuery {
 // ---- Component ----
 
 #[component]
-pub fn Drift() -> Element {
+pub fn Drift(#[props(default)] env: String) -> Element {
+    // D-08: Derive initial filter from env prop (deep-link from /drift?env=production).
+    let initial_filter = if env.is_empty() { None } else { Some(env.clone()) };
+    let env_filter = use_signal(|| initial_filter);
+
     // Phase 7: compute polling interval from WS state. Pause when Live.
     #[cfg(target_arch = "wasm32")]
     let ctx: ConnectionCtx = use_context();
@@ -65,20 +70,45 @@ pub fn Drift() -> Element {
     let data_state = data.read();
     match &*data_state.state() {
         QueryStateData::Settled { res: Ok(drift_data), .. } => {
-            let total = drift_data.in_sync + drift_data.drifted;
+            // Apply environment filter to items and recalculate summary counts.
+            let (filtered_items, filtered_in_sync, filtered_drifted) =
+                apply_env_filter(drift_data, &env_filter());
+            let is_filtered = env_filter().is_some();
+
             rsx! {
                 div { class: "p-6",
-                    div { class: "grid grid-cols-3 gap-4 mb-6",
-                        SummaryCard { label: "Total Jobs", value: format!("{total}") }
-                        SummaryCard { label: "In Sync", value: format!("{}", drift_data.in_sync), accent: "emerald" }
-                        SummaryCard {
-                            label: "Drifted",
-                            value: format!("{}", drift_data.drifted),
-                            accent: if drift_data.drifted > 0 { "amber" } else { "emerald" },
+                    // D-08: Environment filter pills above summary cards.
+                    DriftEnvFilter { items: drift_data.items.clone(), selected: env_filter }
+
+                    // When an env filter is active, "In Sync" and "Total" are
+                    // not derivable from drift items alone (items only contain
+                    // drifted entries). Show only the "Drifted" count.
+                    if is_filtered {
+                        div { class: "grid grid-cols-1 gap-4 mb-6",
+                            SummaryCard {
+                                label: "Drifted",
+                                value: format!("{filtered_drifted}"),
+                                accent: if filtered_drifted > 0 { "amber" } else { "emerald" },
+                            }
+                        }
+                    } else {
+                        {
+                            let total = filtered_in_sync + filtered_drifted;
+                            rsx! {
+                                div { class: "grid grid-cols-3 gap-4 mb-6",
+                                    SummaryCard { label: "Total Jobs", value: format!("{total}") }
+                                    SummaryCard { label: "In Sync", value: format!("{filtered_in_sync}"), accent: "emerald" }
+                                    SummaryCard {
+                                        label: "Drifted",
+                                        value: format!("{filtered_drifted}"),
+                                        accent: if filtered_drifted > 0 { "amber" } else { "emerald" },
+                                    }
+                                }
+                            }
                         }
                     }
 
-                    if drift_data.items.is_empty() {
+                    if filtered_items.is_empty() {
                         div { class: "rounded-lg border border-emerald-200 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950 px-4 py-8 text-center",
                             div { class: "flex items-center justify-center gap-2 text-emerald-700 dark:text-emerald-300",
                                 svg {
@@ -97,7 +127,7 @@ pub fn Drift() -> Element {
                             }
                         }
                     } else {
-                        DriftTable { items: drift_data.items.clone(), selected }
+                        DriftTable { items: filtered_items, selected }
                     }
 
                     DriftSheet { item: selected }
@@ -112,17 +142,105 @@ pub fn Drift() -> Element {
             }
         },
         _ => rsx! {
-            div { class: "p-6",
-                div { class: "rounded-lg border border-zinc-200 dark:border-zinc-800 px-4 py-8 text-center",
-                    p { class: "text-sm text-zinc-500", "Running drift check..." }
+            div { class: "p-6 space-y-4",
+                div { class: "grid grid-cols-3 gap-4",
+                    SkeletonCard { width: "w-full".to_string(), height: "h-[76px]".to_string() }
+                    SkeletonCard { width: "w-full".to_string(), height: "h-[76px]".to_string() }
+                    SkeletonCard { width: "w-full".to_string(), height: "h-[76px]".to_string() }
                 }
+                SkeletonTable { rows: 5, cols: 5 }
             }
         },
     }
 }
 
+/// Apply environment filter to drift data. Returns (filtered_items, in_sync_count, drifted_count).
+/// When filter is None ("All"), returns the original data unchanged.
+fn apply_env_filter(drift_data: &DriftData, filter: &Option<String>) -> (Vec<DriftItem>, u32, u32) {
+    match filter {
+        None => (
+            drift_data.items.clone(),
+            drift_data.in_sync,
+            drift_data.drifted,
+        ),
+        Some(env) => {
+            let filtered: Vec<DriftItem> = drift_data
+                .items
+                .iter()
+                .filter(|item| item.environment == *env)
+                .cloned()
+                .collect();
+            let drifted = filtered.len() as u32;
+            // in_sync is not directly calculable from items alone (items only
+            // contains drifted entries), so show 0 when filtered.
+            // The total shown = in_sync + drifted still makes sense at the
+            // page level; for filtered view, total == drifted.
+            (filtered, 0, drifted)
+        }
+    }
+}
+
+/// Environment filter pill buttons for the drift page (D-08).
+/// Reuses the EnvFilter pattern from jobs.rs.
 #[component]
-fn SummaryCard(label: &'static str, value: String, #[props(default)] accent: String) -> Element {
+fn DriftEnvFilter(items: Vec<DriftItem>, mut selected: Signal<Option<String>>) -> Element {
+    let mut envs: Vec<String> = items.iter().map(|i| i.environment.clone()).collect();
+    envs.sort();
+    envs.dedup();
+
+    // Don't render filter if there are 0 or 1 environments.
+    if envs.len() <= 1 {
+        return rsx! {};
+    }
+
+    rsx! {
+        div { class: "flex items-center gap-1.5 mb-4",
+            {
+                let is_all = selected().is_none();
+                rsx! {
+                    button {
+                        class: format!(
+                            "px-3 py-1 rounded-full text-xs font-medium border cursor-pointer transition-colors {}",
+                            if is_all {
+                                "bg-zinc-900 text-white border-zinc-900 dark:bg-zinc-50 dark:text-zinc-900 dark:border-zinc-50"
+                            } else {
+                                "bg-white text-zinc-600 border-zinc-200 hover:bg-zinc-50 dark:bg-zinc-900 dark:text-zinc-400 dark:border-zinc-700 dark:hover:bg-zinc-800"
+                            }
+                        ),
+                        onclick: move |_| selected.set(None),
+                        "All"
+                    }
+                }
+            }
+            for env in envs.iter() {
+                {
+                    let env = env.clone();
+                    let is_active = selected().as_ref() == Some(&env);
+                    rsx! {
+                        button {
+                            class: format!(
+                                "px-3 py-1 rounded-full text-xs font-medium border cursor-pointer transition-colors {}",
+                                if is_active {
+                                    "bg-zinc-900 text-white border-zinc-900 dark:bg-zinc-50 dark:text-zinc-900 dark:border-zinc-50"
+                                } else {
+                                    "bg-white text-zinc-600 border-zinc-200 hover:bg-zinc-50 dark:bg-zinc-900 dark:text-zinc-400 dark:border-zinc-700 dark:hover:bg-zinc-800"
+                                }
+                            ),
+                            onclick: {
+                                let env = env.clone();
+                                move |_| selected.set(Some(env.clone()))
+                            },
+                            "{env}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+pub fn SummaryCard(label: &'static str, value: String, #[props(default)] accent: String) -> Element {
     let border = match accent.as_str() {
         "emerald" => "border-emerald-200",
         "amber" => "border-amber-200",
@@ -193,7 +311,7 @@ fn DriftTable(items: Vec<DriftItem>, mut selected: Signal<Option<DriftItem>>) ->
 }
 
 #[component]
-fn DriftBadge(drift_type: DriftType) -> Element {
+pub fn DriftBadge(drift_type: DriftType) -> Element {
     let (label, classes) = match drift_type {
         DriftType::Modified => ("Modified", "bg-amber-50 text-amber-700 border-amber-200"),
         DriftType::New => ("New", "bg-emerald-50 text-emerald-700 border-emerald-200"),
@@ -206,6 +324,86 @@ fn DriftBadge(drift_type: DriftType) -> Element {
             "{label}"
         }
     }
+}
+
+/// D-07: Structured change summary showing field-level old->new pairs above diff panels.
+/// Renders field names with old and new values when they can be extracted from config text.
+/// Falls back to badge-style pills when values cannot be parsed.
+///
+/// SECURITY: T-44-10 -- config strings are rendered as text content via RSX interpolation
+/// (auto-escaped by Dioxus). MUST NOT use dangerous_inner_html.
+#[component]
+fn ChangeSummary(
+    fields: Vec<String>,
+    #[props(default)] old_config: Option<String>,
+    #[props(default)] new_config: Option<String>,
+) -> Element {
+    if fields.is_empty() {
+        return rsx! {};
+    }
+
+    rsx! {
+        div { class: "rounded-md border border-zinc-200 dark:border-zinc-800 p-3 mb-4",
+            p { class: "text-xs font-semibold text-zinc-500 dark:text-zinc-400 mb-2", "Changes" }
+            div { class: "space-y-1.5",
+                for field in fields.iter() {
+                    {
+                        let old_val = extract_field_value(field, old_config.as_deref());
+                        let new_val = extract_field_value(field, new_config.as_deref());
+                        match (old_val, new_val) {
+                            (Some(old_v), Some(new_v)) => rsx! {
+                                div { class: "flex items-center gap-1.5 flex-wrap",
+                                    span { class: "font-mono text-xs text-zinc-700 dark:text-zinc-300", "{field}:" }
+                                    span { class: "font-mono text-xs line-through text-zinc-400", "{old_v}" }
+                                    span { class: "text-zinc-300 dark:text-zinc-600 mx-0.5 text-xs", "->" }
+                                    span { class: "font-mono text-xs text-zinc-900 dark:text-zinc-100", "{new_v}" }
+                                }
+                            },
+                            _ => rsx! {
+                                span {
+                                    class: "px-2 py-0.5 rounded-full text-xs font-medium border bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950 dark:text-amber-400 dark:border-amber-800",
+                                    "{field}"
+                                }
+                            },
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Try to extract a field's value from a YAML-like config string.
+/// Looks for a line matching `field_name: value` or `field_name = value`.
+/// Returns None if the config is absent or the field cannot be found.
+fn extract_field_value(field: &str, config: Option<&str>) -> Option<String> {
+    let config = config?;
+    for line in config.lines() {
+        let trimmed = line.trim();
+        // Match "field: value" or "field = value" patterns.
+        if let Some(rest) = trimmed.strip_prefix(field) {
+            // Ensure field name is a complete word — the next character must be
+            // a delimiter (`:`, `=`, whitespace) or end-of-string. Without this,
+            // a field "timeout" would prefix-match a line "timeout_ms: 5000".
+            let next = rest.chars().next();
+            if !matches!(next, Some(':') | Some('=') | Some(' ') | Some('\t') | None) {
+                continue;
+            }
+            let rest = rest.trim_start();
+            if let Some(value) = rest.strip_prefix(':') {
+                let val = value.trim();
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            } else if let Some(value) = rest.strip_prefix('=') {
+                let val = value.trim();
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 #[component]
@@ -240,17 +438,12 @@ fn DriftSheet(mut item: Signal<Option<DriftItem>>) -> Element {
                             let new_html = render_panel_collapsed(new, &changed_new, "violet");
                             rsx! {
                                 div { class: "px-5 py-4",
-                                    if !drift_item.fields_changed.is_empty() {
-                                        div { class: "mb-4",
-                                            p { class: "text-xs font-medium text-zinc-500 mb-2", "Changed fields" }
-                                            div { class: "flex gap-1.5 flex-wrap",
-                                                for field in drift_item.fields_changed.iter() {
-                                                    span { class: "px-2 py-0.5 rounded-full text-xs font-medium border border-amber-200 bg-amber-50 text-amber-700",
-                                                        "{field}"
-                                                    }
-                                                }
-                                            }
-                                        }
+                                    // D-07: ChangeSummary replaces field badges with structured
+                                    // old->new change rendering.
+                                    ChangeSummary {
+                                        fields: drift_item.fields_changed.clone(),
+                                        old_config: drift_item.old_config.clone(),
+                                        new_config: drift_item.new_config.clone(),
                                     }
                                     ConfigPanel { label: "Deployed", color: "blue", html: old_html }
                                     div { class: "mt-3" }
@@ -385,9 +578,9 @@ const CONTEXT_LINES: usize = 3;
 /// Render a YAML panel with changed lines highlighted and unchanged sections collapsed.
 fn render_panel_collapsed(content: &str, changed_lines: &[usize], color: &str) -> String {
     let (highlight_bg, highlight_text) = match color {
-        "blue" => ("bg-blue-50", "text-blue-800"),
-        "violet" => ("bg-violet-50", "text-violet-800"),
-        _ => ("bg-zinc-50", "text-zinc-800"),
+        "blue" => ("bg-blue-50 dark:bg-blue-950", "text-blue-800 dark:text-blue-200"),
+        "violet" => ("bg-violet-50 dark:bg-violet-950", "text-violet-800 dark:text-violet-200"),
+        _ => ("bg-zinc-50 dark:bg-zinc-900", "text-zinc-800 dark:text-zinc-200"),
     };
 
     let lines: Vec<&str> = content.lines().collect();
@@ -422,7 +615,7 @@ fn render_panel_collapsed(content: &str, changed_lines: &[usize], color: &str) -
                 ));
             } else {
                 out.push_str(&format!(
-                    "<div class=\"px-3 py-px text-zinc-600\">{}</div>",
+                    "<div class=\"px-3 py-px text-zinc-600 dark:text-zinc-400\">{}</div>",
                     html_escape(lines[i])
                 ));
             }
@@ -435,7 +628,7 @@ fn render_panel_collapsed(content: &str, changed_lines: &[usize], color: &str) -
             }
             let hidden = i - start;
             out.push_str(&format!(
-                "<div class=\"px-3 py-1 text-zinc-400 bg-zinc-50 text-center text-[11px] border-y border-zinc-100\">{hidden} unchanged line{}</div>",
+                "<div class=\"px-3 py-1 text-zinc-400 dark:text-zinc-500 bg-zinc-50 dark:bg-zinc-900 text-center text-[11px] border-y border-zinc-100 dark:border-zinc-800\">{hidden} unchanged line{}</div>",
                 if hidden == 1 { "" } else { "s" }
             ));
         }

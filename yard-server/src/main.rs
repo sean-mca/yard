@@ -26,10 +26,16 @@ enum Route {
     #[layout(Shell)]
     #[route("/")]
     Dashboard {},
+    #[route("/envs")]
+    Environments {},
+    #[route("/envs/:env")]
+    EnvironmentDetail { env: String },
+    #[route("/envs/:env/:region")]
+    RegionDetail { env: String, region: String },
     #[route("/jobs")]
     Jobs {},
-    #[route("/drift")]
-    Drift {},
+    #[route("/drift?:env")]
+    Drift { env: String },
     #[route("/settings")]
     Settings {},
     // Plan 25-05 Gap A: /login is reachable WITHOUT auth (it's the page that
@@ -59,7 +65,7 @@ fn required_env(name: &str) -> anyhow::Result<String> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn start_api_server() {
-    use api::auth_session::auth_session_router;
+    use api::auth_session::{auth_session_router, AuthSessionState};
     use api::dashboard::{ApiState, dashboard_router};
     use api::drift::drift_router;
     use api::jobs::jobs_router;
@@ -91,20 +97,6 @@ fn start_api_server() {
             let webhook_secret = required_env("YARD_WEBHOOK_SECRET")?;
             let repo_owner = required_env("YARD_REPO_OWNER")?;
             let repo_name = required_env("YARD_REPO_NAME")?;
-
-            // SRV-01 / D-07 (REVISED by Phase 25 gap-closure plan 03 — REVERSES D-08):
-            // explicit, off-by-default dev bypass that takes effect ONLY for loopback
-            // callers. Trim whitespace + ASCII-lowercase before matching so common
-            // operator inputs ("True", "YES", " 1\n" from a heredoc, etc.) disable
-            // auth predictably.
-            let bypass_loopback = std::env::var("YARD_API_AUTH_DISABLED")
-                .map(|v| {
-                    matches!(
-                        v.trim().to_ascii_lowercase().as_str(),
-                        "1" | "true" | "yes" | "on"
-                    )
-                })
-                .unwrap_or(false);
 
             // SRV-03 / D-03 / D-04: optional override for the polling-loop
             // iteration timeout. Default 60s. Out-of-range or non-numeric
@@ -141,54 +133,16 @@ fn start_api_server() {
                 Err(_) => POLL_ITERATION_TIMEOUT_SECS_DEFAULT,
             };
 
-            if bypass_loopback {
-                // WR-07: single canonical warn surface. Previously this
-                // branch also emitted an eprintln! banner with the same
-                // information, which broke JSON-formatted log shippers
-                // (Loki, CloudWatch, Datadog) that line-parse stderr —
-                // the tracing JSON line and the free-form eprintln!
-                // line shared the same stream. tracing::warn! is the
-                // canonical structured event; the operator's
-                // tracing-subscriber config decides the surface format.
-                tracing::warn!(
-                    "YARD_API_AUTH_DISABLED=1 — /api/* endpoints skip the bearer check \
-                     for LOOPBACK callers (127.0.0.1, ::1) only; non-loopback callers \
-                     still require Authorization: Bearer. DO NOT use in production."
-                );
-            }
-
-            // YARD_API_TOKEN is now ALWAYS required (even when bypass is on) so that
-            // non-loopback callers can authenticate via the standard bearer path
-            // when the bypass is enabled. Boot fails fast if it's unset.
-            let api_token_raw = required_env("YARD_API_TOKEN")?;
-            // WR-02: validate the token charset at BOOT, not at first
-            // login. The token is interpolated into a `Set-Cookie` header
-            // value (yard-server/src/api/auth_session.rs::session_cookie_value),
-            // and `HeaderValue::from_str` rejects non-visible-ASCII at
-            // runtime. Worse, RFC 6265 cookie-value syntax forbids `;`,
-            // `,`, whitespace, double-quote, and control chars; a token
-            // containing `;` would silently parse on the way in (the
-            // cookie parser splits on `;`) but produce a truncated /
-            // attribute-injectable Set-Cookie on the way out.
+            // ---- Phase 45 Plan 03: AuthProvider construction ----
             //
-            // Reject anything outside printable ASCII excluding the
-            // cookie-syntax forbidden set. Error message must NOT echo
-            // the token.
-            if api_token_raw.bytes().any(|b| {
-                !(0x21..=0x7E).contains(&b) || matches!(b, b';' | b',' | b'"' | b'\\')
-            }) {
-                anyhow::bail!(
-                    "YARD_API_TOKEN must contain only printable ASCII (0x21..=0x7E) \
-                     excluding `;`, `,`, `\"`, and `\\` — current value contains a \
-                     forbidden character. See docs/server.md for the allowed charset."
-                );
-            }
-            let api_token: Option<String> = Some(api_token_raw);
+            // YARD_API_TOKEN is optional when OAuth2 is configured. When set, it
+            // enables the bearer token fallback for CLI/automation. When neither
+            // OAuth2 nor API token is configured, NoopAuth is used.
+            let api_token: Option<String> = std::env::var("YARD_API_TOKEN").ok()
+                .filter(|v| !v.is_empty());
 
-            let auth_config = std::sync::Arc::new(crate::auth::AuthConfig {
-                token: api_token,
-                bypass_loopback,
-            });
+            // Build the OAuth2 provider registry from YARD_OAUTH_* env vars.
+            let provider_registry = crate::auth::oauth2::build_providers_from_env();
 
             // SRV-02 / D-18: shared aws_config provider chain. Built once and
             // reused for the SecretsManager client so credentials and region
@@ -260,6 +214,43 @@ fn start_api_server() {
 
             let dashboard_url = std::env::var("YARD_DASHBOARD_URL").ok();
 
+            // ---- Phase 45 Plan 03: AuthProvider dispatch ----
+            // D-02 / D-07: construct the appropriate AuthProvider based on
+            // whether OAuth2 providers are configured.
+            let auth_provider: Arc<dyn crate::auth::AuthProvider> =
+                if provider_registry.providers.is_empty() {
+                    tracing::info!(
+                        "No OAuth2 providers configured -- running with NoopAuth \
+                         (all routes accessible)"
+                    );
+                    Arc::new(crate::auth::NoopAuth)
+                } else {
+                    tracing::info!(
+                        provider_count = provider_registry.providers.len(),
+                        "OAuth2 providers configured -- using OAuth2AuthProvider"
+                    );
+                    Arc::new(crate::auth::OAuth2AuthProvider {
+                        db: db.clone(),
+                        api_token: api_token.clone(),
+                    })
+                };
+
+            // Build the ProviderRegistry Arc for sharing with auth session routes.
+            let provider_registry_opt: Option<Arc<crate::auth::oauth2::ProviderRegistry>> =
+                if provider_registry.providers.is_empty() {
+                    None
+                } else {
+                    Some(Arc::new(provider_registry))
+                };
+
+            // AuthSessionState for the auth session routes.
+            let auth_session_state = Arc::new(AuthSessionState {
+                db: db.clone(),
+                secret_store: secret_store.clone(),
+                provider_registry: provider_registry_opt,
+                api_token,
+            });
+
             let webhook_state = Arc::new(AppState {
                 github_client,
                 webhook_secret,
@@ -268,44 +259,30 @@ fn start_api_server() {
                 dashboard_url,
             });
 
-            // BL-01: scope CORS to the cookie-auth model's same-origin
-            // assumption. Previously this layer was open (allow_origin(Any)
-            // + allow_methods(Any) + allow_headers(Any)) which (a) let any
-            // origin drive-by probe /api/auth/session at 30 RPS via a
-            // victim's browser, and (b) prevented future CSRF-token-style
-            // mitigations because the server lost the same-origin signal.
+            // BL-01 / WR-02: scope CORS to the cookie-auth model's same-origin
+            // assumption. Operator opts in via YARD_CORS_ORIGIN (a single
+            // origin). When unset, fall back to AllowOrigin::any() for
+            // dev-friendly default. SameSite=Strict on yard_session still
+            // prevents cross-origin cookie attachment.
             //
-            // Operator opts in via YARD_CORS_ORIGIN (a single origin, e.g.
-            // `https://dashboard.example.com`). When set, only that origin
-            // gets a successful CORS preflight. When unset, fall back to
-            // AllowOrigin::any() to preserve the current open-by-default
-            // dev-friendly behaviour — but with tighter methods / headers
-            // so the preflight grants only what the UI actually uses.
-            //
-            // Methods: GET (read endpoints, dashboard / drift / settings,
-            // EventSource, WebSocket upgrade), POST (auth/session,
-            // auth/logout, settings writes, GitHub webhook).
-            //
-            // Headers: Content-Type (JSON bodies on POSTs), Authorization
-            // (CLI / automation Bearer header path; the cookie path does
-            // not need a CORS-allowed header since cookies are not
-            // request headers from the application's perspective).
-            //
-            // SameSite=Strict on yard_session still prevents the cookie
-            // from riding cross-origin requests, and AllowOrigin::any()
-            // is incompatible with credentials per the CORS spec, so the
-            // cookie-auth attack surface is unchanged. This fix narrows
-            // the preflight surface and gives operators a knob to scope
-            // origins explicitly.
-            let allow_origin = std::env::var("YARD_CORS_ORIGIN")
+            // allow_credentials(true) is required for the browser to send the
+            // yard_session cookie on cross-origin requests, but browsers reject
+            // AllowOrigin::any() + allow_credentials — so we only enable
+            // credentials when a specific origin is configured.
+            let specific_origin = std::env::var("YARD_CORS_ORIGIN")
                 .ok()
-                .and_then(|s| s.parse::<axum::http::HeaderValue>().ok())
+                .and_then(|s| s.parse::<axum::http::HeaderValue>().ok());
+            let has_specific_origin = specific_origin.is_some();
+            let allow_origin = specific_origin
                 .map(AllowOrigin::exact)
                 .unwrap_or_else(AllowOrigin::any);
-            let cors = CorsLayer::new()
+            let mut cors = CorsLayer::new()
                 .allow_origin(allow_origin)
                 .allow_methods([Method::GET, Method::POST])
                 .allow_headers([CONTENT_TYPE, AUTHORIZATION]);
+            if has_specific_origin {
+                cors = cors.allow_credentials(true);
+            }
 
             let rate_limit_config = GovernorConfigBuilder::default()
                 .per_second(30)
@@ -314,30 +291,27 @@ fn start_api_server() {
                 .expect("Failed to build rate limiter config");
             let rate_limit = GovernorLayer::new(Arc::new(rate_limit_config));
 
-            // SRV-01 / D-05: api routes (everything except the GitHub webhook,
-            // which is HMAC-secured separately) sit behind the bearer layer.
-            // Build them as a sub-router, layer auth, then merge into the
-            // parent. The webhook router is merged at the parent level so its
-            // `POST /api/webhook/github` path bypasses the bearer check.
+            // Phase 45: api routes sit behind the new require_auth middleware
+            // (replaces legacy require_bearer). The webhook router is merged
+            // at the parent level so it bypasses the auth check.
             let api_routes = axum::Router::new()
                 .merge(dashboard_router(api_state.clone()))
                 .merge(jobs_router(api_state.clone()))
                 .merge(drift_router(api_state.clone()))
                 .merge(settings_router(api_state.clone()))
+                .merge(api::environments::environments_router(api_state.clone()))
+                .merge(api::search::search_router(api_state.clone()))
                 .merge(api::events::events_router(api_state.clone()))
                 .layer(axum::middleware::from_fn_with_state(
-                    auth_config.clone(),
-                    crate::auth::require_bearer,
+                    auth_provider,
+                    crate::auth::require_auth,
                 ));
 
             let router = axum::Router::new()
                 .merge(github_router(webhook_state))
-                // Plan 25-04 Gap A: /api/auth/session and /api/auth/logout sit
-                // OUTSIDE the bearer-auth layer (chicken-and-egg — login can't
-                // require login). Both endpoints are still rate-limited by the
-                // .layer(rate_limit) below since rate_limit is on the parent
-                // router.
-                .merge(auth_session_router(auth_config.clone()))
+                // Auth session routes (providers, start, callback, refresh,
+                // session, logout) sit OUTSIDE the require_auth layer.
+                .merge(auth_session_router(auth_session_state))
                 .merge(api_routes)
                 .layer(rate_limit)
                 .layer(cors)
@@ -747,8 +721,40 @@ async fn dashboard_poll_loop(
 }
 
 fn app() -> Element {
-    let theme = use_signal(|| ui::settings::Theme::Light);
+    #[allow(unused_mut)]
+    let mut theme = use_signal(|| ui::settings::Theme::Light);
     use_context_provider(|| theme);
+
+    // Phase 44 D-12: restore theme from localStorage on first mount.
+    #[cfg(target_arch = "wasm32")]
+    {
+        use_hook(move || {
+            // Read persisted theme preference and apply dark class if needed.
+            // Uses dioxus document::eval to avoid web-sys feature requirements.
+            dioxus::prelude::document::eval(
+                r#"
+                (function() {
+                    var stored = localStorage.getItem('yard_theme');
+                    if (stored === 'dark') {
+                        document.documentElement.classList.add('dark');
+                    }
+                })();
+                "#,
+            );
+            // Also update the Signal if the stored theme is dark.
+            spawn(async move {
+                let result = dioxus::prelude::document::eval(
+                    "localStorage.getItem('yard_theme') || 'light'",
+                )
+                .await;
+                if let Ok(serde_json::Value::String(val)) = result {
+                    if val == "dark" {
+                        theme.set(ui::settings::Theme::Dark);
+                    }
+                }
+            });
+        });
+    }
 
     rsx! {
         document::Stylesheet { href: TAILWIND_CSS }
@@ -773,8 +779,11 @@ fn Shell() -> Element {
 
     let title = match &route {
         Route::Dashboard {} => "Dashboard",
+        Route::Environments {} => "Environments",
+        Route::EnvironmentDetail { .. } => "Environments",
+        Route::RegionDetail { .. } => "Environments",
         Route::Jobs {} => "Jobs",
-        Route::Drift {} => "Drift",
+        Route::Drift { .. } => "Drift",
         Route::Settings {} => "Settings",
         // Unreachable: short-circuited above. Kept exhaustive so adding a
         // future Route::* arm doesn't silently break the title bar.
@@ -789,6 +798,8 @@ fn Shell() -> Element {
             state: use_signal(|| ui::connection::ConnectionState::Connecting),
             dashboard_tick: use_signal(|| 0u64),
             drift_tick: use_signal(|| 0u64),
+            env_health_tick: use_signal(|| 0u64),
+            search_index_tick: use_signal(|| 0u64),
         };
         use_context_provider(|| ctx);
 
@@ -798,6 +809,7 @@ fn Shell() -> Element {
         use_hook(|| {
             let dashboard_tick = ctx.dashboard_tick;
             let drift_tick = ctx.drift_tick;
+            let env_health_tick = ctx.env_health_tick;
             ui::connection::spawn_ws_task(ctx.state, move |event| {
                 use ui::connection::Event::*;
                 // `write_unchecked(&self)` permits updates from an `Fn` closure;
@@ -811,6 +823,10 @@ fn Shell() -> Element {
                     }
                     DriftRefreshed | DriftFailed { .. } | AlertSent { .. } => {
                         let mut w = drift_tick.write_unchecked();
+                        *w = w.wrapping_add(1);
+                    }
+                    EnvironmentHealthChanged => {
+                        let mut w = env_health_tick.write_unchecked();
                         *w = w.wrapping_add(1);
                     }
                 }
@@ -828,7 +844,10 @@ fn Shell() -> Element {
             main { class: "flex-1 min-h-screen",
                 div { class: "h-14 flex items-center justify-between px-6 border-b border-zinc-200 dark:border-zinc-800",
                     h1 { class: "text-sm font-semibold", "{title}" }
-                    ui::connection_indicator::ConnectionIndicator {}
+                    div { class: "flex items-center gap-4",
+                        ui::search::GlobalSearch {}
+                        ui::connection_indicator::ConnectionIndicator {}
+                    }
                 }
                 Outlet::<Route> {}
             }
@@ -842,13 +861,28 @@ fn Dashboard() -> Element {
 }
 
 #[component]
+fn Environments() -> Element {
+    rsx! { ui::environments::EnvironmentList {} }
+}
+
+#[component]
+fn EnvironmentDetail(env: String) -> Element {
+    rsx! { ui::environments::EnvironmentDetail { env } }
+}
+
+#[component]
+fn RegionDetail(env: String, region: String) -> Element {
+    rsx! { ui::environments::RegionDetail { env, region } }
+}
+
+#[component]
 fn Jobs() -> Element {
     rsx! { ui::jobs::Jobs {} }
 }
 
 #[component]
-fn Drift() -> Element {
-    rsx! { ui::drift::Drift {} }
+fn Drift(env: String) -> Element {
+    rsx! { ui::drift::Drift { env } }
 }
 
 #[component]
