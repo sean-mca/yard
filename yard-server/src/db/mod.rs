@@ -163,6 +163,8 @@ pub trait Database: Send + Sync {
     async fn store_oauth_state(&self, state: &OAuthState) -> anyhow::Result<()>;
     async fn get_oauth_state(&self, csrf_state: &str) -> anyhow::Result<Option<OAuthState>>;
     async fn delete_oauth_state(&self, csrf_state: &str) -> anyhow::Result<()>;
+    // Health
+    async fn health_check(&self) -> anyhow::Result<()>;
 }
 
 // ---- Configuration ----
@@ -436,6 +438,12 @@ pub mod test_support {
 
         async fn delete_oauth_state(&self, csrf_state: &str) -> anyhow::Result<()> {
             self.oauth_states.lock().await.remove(csrf_state);
+            Ok(())
+        }
+
+        // Health
+
+        async fn health_check(&self) -> anyhow::Result<()> {
             Ok(())
         }
     }

@@ -72,6 +72,9 @@ pub trait GitHubApi: Send + Sync {
         pr_number: u64,
         body: &str,
     ) -> Result<(), octocrab::Error>;
+
+    /// Health check -- proves token validity and API connectivity via GET /rate_limit.
+    async fn health_check(&self) -> Result<(), octocrab::Error>;
 }
 
 /// Wrapper around octocrab for yard-specific GitHub operations.
@@ -209,6 +212,11 @@ impl GitHubApi for GitHubClient {
             .await?;
         Ok(())
     }
+
+    async fn health_check(&self) -> Result<(), octocrab::Error> {
+        self.octo.ratelimit().get().await?;
+        Ok(())
+    }
 }
 
 // ---- Test Support ----
@@ -325,6 +333,10 @@ pub(crate) mod test_support {
                 body: body.to_string(),
                 mode: CommentMode::Plan,
             });
+            Ok(())
+        }
+
+        async fn health_check(&self) -> Result<(), octocrab::Error> {
             Ok(())
         }
     }
