@@ -17,6 +17,8 @@ mod discovery;
 #[cfg(not(target_arch = "wasm32"))]
 mod polling;
 mod types;
+#[cfg(test)]
+mod test_support;
 mod ui;
 
 const TAILWIND_CSS: Asset = asset!("/assets/tailwind.css");
