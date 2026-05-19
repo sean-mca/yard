@@ -94,17 +94,31 @@ pub(crate) fn build_fixture_repo() -> (TempDir, String) {
     )
     .unwrap();
 
-    std::process::Command::new("git")
+    let init_out = std::process::Command::new("git")
         .arg("init")
         .current_dir(dir)
         .output()
         .unwrap();
-    std::process::Command::new("git")
+    if !init_out.status.success() {
+        panic!(
+            "git init failed in fixture builder:\n{}",
+            String::from_utf8_lossy(&init_out.stderr)
+        );
+    }
+
+    let add_out = std::process::Command::new("git")
         .args(["add", "."])
         .current_dir(dir)
         .output()
         .unwrap();
-    std::process::Command::new("git")
+    if !add_out.status.success() {
+        panic!(
+            "git add failed in fixture builder:\n{}",
+            String::from_utf8_lossy(&add_out.stderr)
+        );
+    }
+
+    let commit_out = std::process::Command::new("git")
         .args([
             "-c", "user.email=test@test",
             "-c", "user.name=test",
@@ -113,12 +127,24 @@ pub(crate) fn build_fixture_repo() -> (TempDir, String) {
         .current_dir(dir)
         .output()
         .unwrap();
+    if !commit_out.status.success() {
+        panic!(
+            "git commit failed in fixture builder:\n{}",
+            String::from_utf8_lossy(&commit_out.stderr)
+        );
+    }
 
     let head_out = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(dir)
         .output()
         .unwrap();
+    if !head_out.status.success() {
+        panic!(
+            "git rev-parse HEAD failed in fixture builder:\n{}",
+            String::from_utf8_lossy(&head_out.stderr)
+        );
+    }
     let head_sha = String::from_utf8(head_out.stdout)
         .unwrap()
         .trim()
@@ -199,17 +225,31 @@ pub(crate) fn build_multi_env_fixture_repo() -> (TempDir, String) {
     )
     .unwrap();
 
-    std::process::Command::new("git")
+    let init_out = std::process::Command::new("git")
         .arg("init")
         .current_dir(dir)
         .output()
         .unwrap();
-    std::process::Command::new("git")
+    if !init_out.status.success() {
+        panic!(
+            "git init failed in multi-env fixture builder:\n{}",
+            String::from_utf8_lossy(&init_out.stderr)
+        );
+    }
+
+    let add_out = std::process::Command::new("git")
         .args(["add", "."])
         .current_dir(dir)
         .output()
         .unwrap();
-    std::process::Command::new("git")
+    if !add_out.status.success() {
+        panic!(
+            "git add failed in multi-env fixture builder:\n{}",
+            String::from_utf8_lossy(&add_out.stderr)
+        );
+    }
+
+    let commit_out = std::process::Command::new("git")
         .args([
             "-c", "user.email=test@test",
             "-c", "user.name=test",
@@ -218,12 +258,24 @@ pub(crate) fn build_multi_env_fixture_repo() -> (TempDir, String) {
         .current_dir(dir)
         .output()
         .unwrap();
+    if !commit_out.status.success() {
+        panic!(
+            "git commit failed in multi-env fixture builder:\n{}",
+            String::from_utf8_lossy(&commit_out.stderr)
+        );
+    }
 
     let head_out = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(dir)
         .output()
         .unwrap();
+    if !head_out.status.success() {
+        panic!(
+            "git rev-parse HEAD failed in multi-env fixture builder:\n{}",
+            String::from_utf8_lossy(&head_out.stderr)
+        );
+    }
     let head_sha = String::from_utf8(head_out.stdout)
         .unwrap()
         .trim()
