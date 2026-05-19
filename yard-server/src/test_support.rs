@@ -65,9 +65,15 @@ pub(crate) fn build_fixture_repo() -> (TempDir, String) {
     let tmp = TempDir::new();
     let dir = tmp.path();
 
+    // Include a unique nonce in yard.yaml so that concurrent calls produce
+    // distinct git SHAs -- clone_at_sha uses `yard-{sha}` as the workdir
+    // name, so identical SHAs from parallel tests cause directory collisions.
+    let nonce = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
     fs::write(
         dir.join("yard.yaml"),
-        "project: yard-fixture\nstate:\n  type: local\n  path: .yard/state/\n",
+        format!(
+            "project: yard-fixture\nstate:\n  type: local\n  path: .yard/state/\n# nonce: {nonce}\n"
+        ),
     )
     .unwrap();
 
@@ -103,6 +109,111 @@ pub(crate) fn build_fixture_repo() -> (TempDir, String) {
             "-c", "user.email=test@test",
             "-c", "user.name=test",
             "commit", "-m", "fixture",
+        ])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+
+    let head_out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    let head_sha = String::from_utf8(head_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    (tmp, head_sha)
+}
+
+/// Build a multi-environment fixture git repo with 3 environments:
+/// - `production/us-east-1/jobs/etl-job/config.yaml`
+/// - `production/eu-west-1/jobs/etl-job/config.yaml`
+/// - `staging/us-east-1/jobs/etl-job/config.yaml`
+///
+/// Returns the tempdir and the HEAD SHA.
+pub(crate) fn build_multi_env_fixture_repo() -> (TempDir, String) {
+    let tmp = TempDir::new();
+    let dir = tmp.path();
+
+    let nonce = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+    fs::write(
+        dir.join("yard.yaml"),
+        format!(
+            "project: yard-multi-env\nstate:\n  type: local\n  path: .yard/state/\n# nonce: {nonce}\n"
+        ),
+    )
+    .unwrap();
+
+    // -- production environment (2 regions) --
+    let prod_dir = dir.join("production");
+    fs::create_dir_all(&prod_dir).unwrap();
+    fs::write(
+        prod_dir.join("account.yaml"),
+        "account_id: \"111111111111\"\n",
+    )
+    .unwrap();
+
+    // production/us-east-1
+    let prod_use1 = prod_dir.join("us-east-1");
+    fs::create_dir_all(&prod_use1).unwrap();
+    fs::write(prod_use1.join("region.yaml"), "region: us-east-1\n").unwrap();
+    let prod_use1_job = prod_use1.join("jobs").join("etl-job");
+    fs::create_dir_all(&prod_use1_job).unwrap();
+    fs::write(
+        prod_use1_job.join("config.yaml"),
+        "type: glue\nrole: arn:aws:iam::111111111111:role/yard-etl\n",
+    )
+    .unwrap();
+
+    // production/eu-west-1
+    let prod_euw1 = prod_dir.join("eu-west-1");
+    fs::create_dir_all(&prod_euw1).unwrap();
+    fs::write(prod_euw1.join("region.yaml"), "region: eu-west-1\n").unwrap();
+    let prod_euw1_job = prod_euw1.join("jobs").join("etl-job");
+    fs::create_dir_all(&prod_euw1_job).unwrap();
+    fs::write(
+        prod_euw1_job.join("config.yaml"),
+        "type: glue\nrole: arn:aws:iam::111111111111:role/yard-etl\n",
+    )
+    .unwrap();
+
+    // -- staging environment --
+    let staging_dir = dir.join("staging");
+    fs::create_dir_all(&staging_dir).unwrap();
+    fs::write(
+        staging_dir.join("account.yaml"),
+        "account_id: \"222222222222\"\n",
+    )
+    .unwrap();
+
+    let staging_use1 = staging_dir.join("us-east-1");
+    fs::create_dir_all(&staging_use1).unwrap();
+    fs::write(staging_use1.join("region.yaml"), "region: us-east-1\n").unwrap();
+    let staging_use1_job = staging_use1.join("jobs").join("etl-job");
+    fs::create_dir_all(&staging_use1_job).unwrap();
+    fs::write(
+        staging_use1_job.join("config.yaml"),
+        "type: glue\nrole: arn:aws:iam::222222222222:role/yard-etl\n",
+    )
+    .unwrap();
+
+    std::process::Command::new("git")
+        .arg("init")
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args([
+            "-c", "user.email=test@test",
+            "-c", "user.name=test",
+            "commit", "-m", "multi-env fixture",
         ])
         .current_dir(dir)
         .output()
