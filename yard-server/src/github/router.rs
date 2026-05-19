@@ -697,14 +697,24 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        // Give the spawned auto-replan task a moment to start
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let raw_posts = mock_gh.raw_posts.lock().await;
-        assert!(
-            raw_posts.iter().any(|p| p.body.contains("Plan is stale")),
-            "expected stale plan rejection; got: {:?}",
-            raw_posts.iter().map(|p| &p.body).collect::<Vec<_>>()
-        );
+        // Poll until the spawned auto-replan task posts the stale-plan comment,
+        // with a generous timeout to avoid flakiness under CI CPU pressure.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let raw_posts = mock_gh.raw_posts.lock().await;
+                if raw_posts.iter().any(|p| p.body.contains("Plan is stale")) {
+                    break;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let raw_posts = mock_gh.raw_posts.lock().await;
+                panic!(
+                    "expected stale plan rejection within 5s; got: {:?}",
+                    raw_posts.iter().map(|p| &p.body).collect::<Vec<_>>()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
