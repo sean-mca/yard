@@ -680,7 +680,11 @@ mod tests {
         db.insert_plan_result(&old_plan).await.unwrap();
 
         let mock_gh = Arc::new(InMemoryGitHubApi::new());
-        // The mock returns "test-sha-abc123" from get_pr_head_sha (different from "old-sha-1234567")
+        // Ensure head SHA differs from plan SHA to trigger stale-plan path.
+        {
+            let mut sha = mock_gh.head_sha.lock().await;
+            *sha = "new-sha-9999999".to_string();
+        }
         let webhook_state = build_test_state(mock_gh.clone(), db.clone(), "s");
 
         let payload = serde_json::json!({
