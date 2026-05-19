@@ -116,8 +116,8 @@ async fn test_apply_happy_path() {
         "expected at least one apply result comment in posts"
     );
     assert!(
-        posts.iter().any(|p| p.body.contains("yard apply")),
-        "expected apply result body to contain 'yard apply'; got: {:?}",
+        posts.iter().any(|p| p.body.starts_with("### yard apply\n\n")),
+        "expected successful apply comment; got: {:?}",
         posts.iter().map(|p| &p.body).collect::<Vec<_>>()
     );
 }
