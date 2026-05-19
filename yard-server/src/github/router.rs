@@ -550,133 +550,17 @@ mod tests {
     }
 
     // ---- e2e webhook → plan → PR comment integration test (Phase 27 / SRV-04) ----
+    // Shared helpers extracted to crate::test_support (Phase 46 / D-07, D-08).
 
-    use super::AppState;
     use super::github_router;
-    use crate::api::dashboard::ApiState;
-    use crate::db::Database;
     use crate::db::test_support::InMemoryDb;
-    use crate::github::client::GitHubApi;
+    use crate::db::{Database, PlanStatus};
     use crate::github::client::test_support::InMemoryGitHubApi;
-    use crate::db::PlanStatus;
+    use crate::test_support::{build_fixture_repo, build_test_state, build_webhook_request};
+    use axum::http::StatusCode;
     use chrono::Utc;
-    use crate::secrets::SecretStore;
-    use crate::secrets::test_support::InMemorySecretStore;
-    use axum::body::Body;
-    use axum::http::{Method, Request, StatusCode, header};
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    use std::collections::HashMap;
-    use std::fs;
-    use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use tower::ServiceExt;
-
-    type HmacSha256 = Hmac<Sha256>;
-
-    /// Hand-rolled scoped temp dir — `tempfile` is NOT a yard-server dep
-    /// (PRES-03 + critical correction in PLAN.md context). Mirrors
-    /// `yard-core/tests/common/mod.rs:24-51` line-for-line.
-    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    struct TempDir {
-        path: PathBuf,
-    }
-
-    impl TempDir {
-        fn new() -> Self {
-            let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir()
-                .join(format!("yard_e2e_fixture_{}_{}", std::process::id(), n));
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).unwrap();
-            TempDir { path }
-        }
-
-        fn path(&self) -> &Path {
-            &self.path
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-
-    /// Build a fixture git repo with per-environment structure:
-    /// `<root>/production/us-east-1/jobs/example/config.yaml`
-    /// Returns the tempdir and the HEAD SHA.
-    fn build_fixture_repo() -> (TempDir, String) {
-        let tmp = TempDir::new();
-        let dir = tmp.path();
-
-        fs::write(
-            dir.join("yard.yaml"),
-            "project: yard-fixture\nstate:\n  type: local\n  path: .yard/state/\n",
-        )
-        .unwrap();
-
-        // Per-env structure for discover_environments
-        let env_dir = dir.join("production");
-        fs::create_dir_all(&env_dir).unwrap();
-        fs::write(env_dir.join("account.yaml"), "account_id: \"000000000000\"\n").unwrap();
-
-        let region_dir = env_dir.join("us-east-1");
-        fs::create_dir_all(&region_dir).unwrap();
-        fs::write(region_dir.join("region.yaml"), "region: us-east-1\n").unwrap();
-
-        let example_dir = region_dir.join("jobs").join("example");
-        fs::create_dir_all(&example_dir).unwrap();
-        fs::write(
-            example_dir.join("config.yaml"),
-            "type: glue\nrole: arn:aws:iam::000000000000:role/yard-fixture\n",
-        )
-        .unwrap();
-
-        std::process::Command::new("git")
-            .arg("init")
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args([
-                "-c", "user.email=test@test",
-                "-c", "user.name=test",
-                "commit", "-m", "fixture",
-            ])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-
-        let head_out = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        let head_sha = String::from_utf8(head_out.stdout)
-            .unwrap()
-            .trim()
-            .to_string();
-
-        (tmp, head_sha)
-    }
-
-    /// HMAC-SHA256-sign a webhook body. Mirrors the inline `sign()`
-    /// helper at `yard-server/src/github/webhook.rs:203-207` (D-43:
-    /// duplicated rather than promoted to a shared helper until a third
-    /// call site appears).
-    fn sign_webhook(secret: &str, payload: &[u8]) -> String {
-        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
-        mac.update(payload);
-        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
-    }
 
     #[tokio::test]
     async fn webhook_to_comment_e2e_pull_request_plan_posts_comment() {
@@ -685,19 +569,7 @@ mod tests {
         let (fixture, head_sha) = build_fixture_repo();
         let clone_url = fixture.path().to_string_lossy().to_string();
 
-        let (event_tx, _event_rx) = new_event_channel();
         let db: Arc<dyn Database> = Arc::new(InMemoryDb::new());
-        let secret_store: Arc<dyn SecretStore> =
-            Arc::new(InMemorySecretStore::new(HashMap::new()));
-        let api_state = Arc::new(ApiState {
-            github_token: "test-token".to_string(),
-            repo_owner: "yard-test-owner".to_string(),
-            repo_name: "yard-test-repo".to_string(),
-            db: db.clone(),
-            event_tx,
-            secret_store,
-        });
-
         let mock_gh = Arc::new(InMemoryGitHubApi::new());
         // Seed changed_files so filter_affected_environments finds "production"
         {
@@ -705,13 +577,7 @@ mod tests {
             files.push("production/us-east-1/jobs/example/config.yaml".to_string());
         }
 
-        let webhook_state = Arc::new(AppState {
-            github_client: mock_gh.clone() as Arc<dyn GitHubApi>,
-            webhook_secret: "test-webhook-secret".to_string(),
-            db: db.clone(),
-            api_state: api_state.clone(),
-            dashboard_url: None,
-        });
+        let webhook_state = build_test_state(mock_gh.clone(), db.clone(), "test-webhook-secret");
 
         let payload = serde_json::json!({
             "action": "opened",
@@ -725,21 +591,10 @@ mod tests {
                 "clone_url": clone_url
             }
         });
-        let payload_bytes = serde_json::to_vec(&payload).unwrap();
-        let sig = sign_webhook("test-webhook-secret", &payload_bytes);
 
         let start = tokio::time::Instant::now();
         let response = github_router(webhook_state)
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/webhook/github")
-                    .header("X-GitHub-Event", "pull_request")
-                    .header("X-Hub-Signature-256", &sig)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(payload_bytes))
-                    .unwrap(),
-            )
+            .oneshot(build_webhook_request("pull_request", &payload, "test-webhook-secret"))
             .await
             .unwrap();
         let elapsed = start.elapsed();
@@ -779,27 +634,9 @@ mod tests {
     async fn test_apply_no_plan_found_rejects() {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let (event_tx, _event_rx) = new_event_channel();
         let db: Arc<dyn Database> = Arc::new(InMemoryDb::new());
-        let secret_store: Arc<dyn SecretStore> =
-            Arc::new(InMemorySecretStore::new(HashMap::new()));
-        let api_state = Arc::new(ApiState {
-            github_token: "test-token".to_string(),
-            repo_owner: "o".to_string(),
-            repo_name: "r".to_string(),
-            db: db.clone(),
-            event_tx,
-            secret_store,
-        });
-
         let mock_gh = Arc::new(InMemoryGitHubApi::new());
-        let webhook_state = Arc::new(AppState {
-            github_client: mock_gh.clone() as Arc<dyn GitHubApi>,
-            webhook_secret: "s".to_string(),
-            db: db.clone(),
-            api_state,
-            dashboard_url: None,
-        });
+        let webhook_state = build_test_state(mock_gh.clone(), db.clone(), "s");
 
         let payload = serde_json::json!({
             "action": "created",
@@ -807,20 +644,9 @@ mod tests {
             "issue": {"number": 42, "pull_request": {"url": "https://api.github.com/pulls/42"}},
             "repository": {"full_name": "o/r", "clone_url": "https://x.com"}
         });
-        let payload_bytes = serde_json::to_vec(&payload).unwrap();
-        let sig = sign_webhook("s", &payload_bytes);
 
         let response = github_router(webhook_state)
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/webhook/github")
-                    .header("X-GitHub-Event", "issue_comment")
-                    .header("X-Hub-Signature-256", &sig)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(payload_bytes))
-                    .unwrap(),
-            )
+            .oneshot(build_webhook_request("issue_comment", &payload, "s"))
             .await
             .unwrap();
 
@@ -839,18 +665,7 @@ mod tests {
     async fn test_apply_stale_plan_rejects() {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let (event_tx, _event_rx) = new_event_channel();
         let db: Arc<dyn Database> = Arc::new(InMemoryDb::new());
-        let secret_store: Arc<dyn SecretStore> =
-            Arc::new(InMemorySecretStore::new(HashMap::new()));
-        let api_state = Arc::new(ApiState {
-            github_token: "test-token".to_string(),
-            repo_owner: "o".to_string(),
-            repo_name: "r".to_string(),
-            db: db.clone(),
-            event_tx,
-            secret_store,
-        });
 
         // Insert a plan with an old SHA
         let old_plan = crate::db::PlanResultRow {
@@ -865,14 +680,12 @@ mod tests {
         db.insert_plan_result(&old_plan).await.unwrap();
 
         let mock_gh = Arc::new(InMemoryGitHubApi::new());
-        // The mock returns "test-sha-abc123" from get_pr_head_sha (different from "old-sha-1234567")
-        let webhook_state = Arc::new(AppState {
-            github_client: mock_gh.clone() as Arc<dyn GitHubApi>,
-            webhook_secret: "s".to_string(),
-            db: db.clone(),
-            api_state,
-            dashboard_url: None,
-        });
+        // Ensure head SHA differs from plan SHA to trigger stale-plan path.
+        {
+            let mut sha = mock_gh.head_sha.lock().await;
+            *sha = "new-sha-9999999".to_string();
+        }
+        let webhook_state = build_test_state(mock_gh.clone(), db.clone(), "s");
 
         let payload = serde_json::json!({
             "action": "created",
@@ -880,33 +693,32 @@ mod tests {
             "issue": {"number": 42, "pull_request": {"url": "https://api.github.com/pulls/42"}},
             "repository": {"full_name": "o/r", "clone_url": "https://x.com"}
         });
-        let payload_bytes = serde_json::to_vec(&payload).unwrap();
-        let sig = sign_webhook("s", &payload_bytes);
 
         let response = github_router(webhook_state)
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/webhook/github")
-                    .header("X-GitHub-Event", "issue_comment")
-                    .header("X-Hub-Signature-256", &sig)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(payload_bytes))
-                    .unwrap(),
-            )
+            .oneshot(build_webhook_request("issue_comment", &payload, "s"))
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        // Give the spawned auto-replan task a moment to start
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let raw_posts = mock_gh.raw_posts.lock().await;
-        assert!(
-            raw_posts.iter().any(|p| p.body.contains("Plan is stale")),
-            "expected stale plan rejection; got: {:?}",
-            raw_posts.iter().map(|p| &p.body).collect::<Vec<_>>()
-        );
+        // Poll until the spawned auto-replan task posts the stale-plan comment,
+        // with a generous timeout to avoid flakiness under CI CPU pressure.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let raw_posts = mock_gh.raw_posts.lock().await;
+                if raw_posts.iter().any(|p| p.body.contains("Plan is stale")) {
+                    break;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let raw_posts = mock_gh.raw_posts.lock().await;
+                panic!(
+                    "expected stale plan rejection within 5s; got: {:?}",
+                    raw_posts.iter().map(|p| &p.body).collect::<Vec<_>>()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
