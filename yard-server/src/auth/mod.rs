@@ -191,6 +191,7 @@ fn is_api_request(path: &str) -> bool {
 }
 
 /// Build a 302 redirect response to `/login`.
+#[allow(clippy::expect_used)] // static string parse is infallible
 fn redirect_to_login_response() -> Response {
     let mut resp = StatusCode::FOUND.into_response();
     resp.headers_mut().insert(

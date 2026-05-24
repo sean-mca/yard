@@ -3,6 +3,9 @@ name = "yard-core"
 version = "0.7.3"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = "1.0.102"
 aws-config = { version = "1.8.15", features = ["behavior-version-latest"] }

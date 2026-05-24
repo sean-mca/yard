@@ -3,6 +3,7 @@
 //! These exercise the state backend and DAG credential paths end-to-end
 //! through the real AWS SDK (S3 + STS) pointed at LocalStack.
 //!
+#![allow(unsafe_code)] // env mutation requires unsafe in Rust 2024; test-only
 //! Prerequisites:
 //!   docker compose up -d   (ministack on localhost:4566)
 //!
