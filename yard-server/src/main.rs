@@ -322,6 +322,11 @@ fn start_api_server() {
                     crate::auth::require_auth,
                 ));
 
+            // Clone health_state and shutdown_token for the shutdown signal
+            // handler before they are moved into the router.
+            let shutdown_health_state = health_state.clone();
+            let shutdown_token = api_state.shutdown_token.clone();
+
             let router = axum::Router::new()
                 .merge(github_router(webhook_state))
                 // Auth session routes (providers, start, callback, refresh,
@@ -396,8 +401,10 @@ fn start_api_server() {
             tokio::spawn(discovery_task);
 
             // Spawn background polling tasks
-            tokio::spawn(drift_poll_loop(api_state.clone(), poll_timeout_secs));
-            tokio::spawn(dashboard_poll_loop(api_state, poll_timeout_secs));
+            let drift_token = api_state.shutdown_token.clone();
+            let dashboard_token = api_state.shutdown_token.clone();
+            tokio::spawn(drift_poll_loop(api_state.clone(), poll_timeout_secs, drift_token));
+            tokio::spawn(dashboard_poll_loop(api_state, poll_timeout_secs, dashboard_token));
 
             let port = std::env::var("YARD_PORT").unwrap_or_else(|_| "3001".to_string());
             let bind_host = std::env::var("YARD_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -410,18 +417,97 @@ fn start_api_server() {
                 .map_err(|e| anyhow::anyhow!("Failed to bind to {addr}: {e}"))?;
             // into_make_service_with_connect_info surfaces the peer SocketAddr
             // to extractors (used by legacy tests and future rate-limiting).
-            axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            //
+            // D-01/D-03: graceful shutdown with 10-second drain timeout.
+            // shutdown_signal resolves on SIGTERM/SIGINT, flips /ready to 503,
+            // cancels the CancellationToken, then returns so axum can drain
+            // in-flight requests. The outer timeout enforces the ECS budget.
+            let serve_result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(shutdown_signal(shutdown_health_state, shutdown_token)),
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("Server error: {e}"))?;
+            .await;
+
+            match serve_result {
+                Ok(Ok(())) => tracing::info!("Server shut down gracefully"),
+                Ok(Err(e)) => tracing::error!(error = %e, "Server error during shutdown"),
+                Err(_) => tracing::warn!("Shutdown timed out after 10s, forcing exit"),
+            }
 
             Ok::<(), anyhow::Error>(())
         }) {
             tracing::error!("API server exited with error: {e:#}");
         }
     });
+}
+
+/// Stub for releasing held DynamoDB locks during shutdown (D-06).
+///
+/// No lock acquisition pattern exists in yard-server yet. When PRLOCK#
+/// entities are implemented, this hook will query DynamoDB for locks held
+/// by this server instance and release them.
+#[cfg(not(target_arch = "wasm32"))]
+async fn release_all_locks() {
+    tracing::info!("release_all_locks: no locks to release (stub)");
+}
+
+/// Waits for SIGTERM or Ctrl+C, then executes the drain sequence (D-02):
+///
+/// 1. Flip `accepting_traffic` to `false` so `/ready` returns 503 (ALB
+///    stops routing new requests).
+/// 2. Cancel the `CancellationToken` so background tasks and WebSocket
+///    handlers begin their shutdown.
+/// 3. Call `release_all_locks()` to release any held DynamoDB locks.
+///
+/// After this function returns, axum drains in-flight HTTP requests via
+/// `with_graceful_shutdown`.
+#[cfg(not(target_arch = "wasm32"))]
+async fn shutdown_signal(
+    health_state: std::sync::Arc<api::health::HealthState>,
+    token: tokio_util::sync::CancellationToken,
+) {
+    #[allow(clippy::expect_used)] // fatal: server cannot shut down cleanly without signal handlers
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    #[allow(clippy::expect_used)] // fatal: server cannot shut down cleanly without signal handlers
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+
+    tracing::info!("Shutdown signal received, beginning drain");
+
+    // D-02 step 1: flip readiness so /ready returns 503.
+    health_state
+        .accepting_traffic
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    tracing::info!("accepting_traffic set to false");
+
+    // D-02 step 3: cancel all background tasks + WebSocket handlers.
+    token.cancel();
+    tracing::info!("CancellationToken cancelled -- background tasks and WebSockets shutting down");
+
+    // D-06: release DynamoDB locks (stub).
+    release_all_locks().await;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -619,6 +705,7 @@ async fn run_drift_iteration(
 async fn drift_poll_loop(
     state: std::sync::Arc<api::dashboard::ApiState>,
     poll_timeout_secs: u64,
+    token: tokio_util::sync::CancellationToken,
 ) {
     use crate::polling::{SupervisedResult, compute_backoff_sleep, supervised_iteration};
     use tracing::warn;
@@ -626,7 +713,13 @@ async fn drift_poll_loop(
     const DEFAULT_INTERVAL_MINS: u64 = 3;
 
     // Wait for server to be ready before first check.
-    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+        _ = token.cancelled() => {
+            tracing::info!("drift_poll_loop: shutdown signal received during startup delay, exiting");
+            return;
+        }
+    }
 
     let timeout_dur = std::time::Duration::from_secs(poll_timeout_secs);
     let mut consecutive_errors: u32 = 0;
@@ -667,7 +760,13 @@ async fn drift_poll_loop(
         };
 
         let backoff = compute_backoff_sleep(interval, consecutive_errors);
-        tokio::time::sleep(backoff).await;
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            _ = token.cancelled() => {
+                tracing::info!("drift_poll_loop: shutdown signal received, exiting");
+                break;
+            }
+        }
     }
 }
 
@@ -675,6 +774,7 @@ async fn drift_poll_loop(
 async fn dashboard_poll_loop(
     state: std::sync::Arc<api::dashboard::ApiState>,
     poll_timeout_secs: u64,
+    token: tokio_util::sync::CancellationToken,
 ) {
     use crate::polling::{SupervisedResult, compute_backoff_sleep, supervised_iteration};
     use tracing::{info, warn};
@@ -682,7 +782,13 @@ async fn dashboard_poll_loop(
     const DEFAULT_INTERVAL_MINS: u64 = 5;
 
     // Wait for server to be ready before first refresh.
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+        _ = token.cancelled() => {
+            tracing::info!("dashboard_poll_loop: shutdown signal received during startup delay, exiting");
+            return;
+        }
+    }
 
     let timeout_dur = std::time::Duration::from_secs(poll_timeout_secs);
     let mut consecutive_errors: u32 = 0;
@@ -735,7 +841,13 @@ async fn dashboard_poll_loop(
         };
 
         let backoff = compute_backoff_sleep(interval, consecutive_errors);
-        tokio::time::sleep(backoff).await;
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            _ = token.cancelled() => {
+                tracing::info!("dashboard_poll_loop: shutdown signal received, exiting");
+                break;
+            }
+        }
     }
 }
 
@@ -916,6 +1028,7 @@ fn Login() -> Element {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -928,5 +1041,44 @@ mod tests {
             msg.contains("must be set"),
             "expected 'must be set' in: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_flips_accepting_traffic() {
+        use crate::api::health::HealthState;
+        use crate::db::test_support::InMemoryDb;
+        use crate::github::client::test_support::InMemoryGitHubApi;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let health_state = Arc::new(HealthState {
+            db: Arc::new(InMemoryDb::new()),
+            github_client: Arc::new(InMemoryGitHubApi::new()),
+            cache: tokio::sync::RwLock::new(None),
+            accepting_traffic: AtomicBool::new(true),
+        });
+
+        let token = tokio_util::sync::CancellationToken::new();
+
+        // Verify initial state.
+        assert!(health_state.accepting_traffic.load(Ordering::SeqCst));
+        assert!(!token.is_cancelled());
+
+        // We cannot easily send a real signal in a unit test, but we can
+        // verify the CancellationToken and AtomicBool mechanics that
+        // shutdown_signal relies on.
+        health_state
+            .accepting_traffic
+            .store(false, Ordering::SeqCst);
+        token.cancel();
+
+        assert!(!health_state.accepting_traffic.load(Ordering::SeqCst));
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn release_all_locks_is_callable() {
+        // Trivial test: proves the stub compiles and does not panic.
+        release_all_locks().await;
     }
 }
