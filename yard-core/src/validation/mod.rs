@@ -1,3 +1,17 @@
+//! Job and DAG validation orchestration.
+//!
+//! This module is the public entry point for all validation in yard-core.
+//! It re-exports the core validators and adds higher-level checks:
+//!
+//! - [`validate_job_full`] -- schema validation + generated-script syntax check
+//! - [`validate_dag_full`] -- trigger rules (TRIG-04..06), reserved task IDs,
+//!   concurrency bounds, and S3 poke-interval floor
+//! - [`validate_project`] -- cross-DAG broken-link warnings for Dataset triggers
+//!
+//! Sub-modules:
+//! - [`rules`] -- per-job schema validation (sources, transforms, sinks, providers)
+//! - [`syntax`] -- Python syntax validation via `python3 ast.parse`
+
 mod rules;
 mod syntax;
 
@@ -15,7 +29,11 @@ use std::collections::BTreeSet;
 use yard_structs::{AirflowSection, SingleSource, Trigger};
 
 /// Validate a job definition and its generated script.
-/// Runs schema validation, then generates the script and checks Python syntax.
+///
+/// Runs schema validation first, then generates the script and checks
+/// Python syntax. If schema validation fails, syntax checking is
+/// skipped since the generated script would be invalid anyway.
+#[must_use]
 pub fn validate_job_full(job_name: &str, job_def: &JobDefinition) -> Vec<ValidationError> {
     let mut errors = validate_job(job_def);
 
@@ -41,11 +59,13 @@ pub fn validate_job_full(job_name: &str, job_def: &JobDefinition) -> Vec<Validat
 }
 
 /// Validate a resolved DAG's trigger configuration against TRIG-04..TRIG-06.
-/// Caller (orchestrate::plan / orchestrate::apply) iterates `pre_dags` and
-/// rolls up errors per DAG. Empty Vec means "DAG passed all four checks".
+///
+/// Caller (`orchestrate::plan` / `orchestrate::apply`) iterates `pre_dags`
+/// and rolls up errors per DAG. Empty `Vec` means the DAG passed all checks.
+#[must_use]
 pub fn validate_dag_full(dag: &ResolvedDag) -> Vec<ValidationError> {
     let cfg = &dag.config;
-    let mut errors: Vec<ValidationError> = Vec::new();
+    let mut errors: Vec<ValidationError> = Vec::with_capacity(4);
 
     // Rule order locked per CONTEXT D-08 — deterministic output for tests + rollup.
     if let Some(e) = check_mutual_exclusion(cfg.schedule.as_deref(), cfg.trigger.as_ref()) {
@@ -70,6 +90,7 @@ pub fn validate_dag_full(dag: &ResolvedDag) -> Vec<ValidationError> {
 }
 
 /// TRIG-04: top-level schedule and trigger are mutually exclusive.
+#[inline]
 fn check_mutual_exclusion(
     schedule: Option<&str>,
     trigger: Option<&Trigger>,
@@ -86,7 +107,7 @@ fn check_mutual_exclusion(
 
 /// TRIG-05a / TRIG-05b: composite lists must be non-empty.
 fn check_empty_composites(trigger: Option<&Trigger>) -> Vec<ValidationError> {
-    let mut out: Vec<ValidationError> = Vec::new();
+    let mut out: Vec<ValidationError> = Vec::with_capacity(1);
     match trigger {
         Some(Trigger::All(v)) if v.is_empty() => {
             out.push(err(
@@ -174,8 +195,9 @@ fn check_reserved_task_ids(dag: &ResolvedDag) -> Vec<ValidationError> {
 
 /// CONC-02 (Phase 30, plan 30-01): `airflow.max_active_runs` must be >= 1
 /// when explicitly set. Reject 0 at parse with verbatim error
-/// `must be >= 1`. No upper bound. None (unset) is always valid —
+/// `must be >= 1`. No upper bound. None (unset) is always valid --
 /// CONC-01's "event-driven default of 1" applies at codegen time.
+#[inline]
 fn check_max_active_runs(cfg: &AirflowSection) -> Option<ValidationError> {
     match cfg.max_active_runs {
         Some(0) => Some(err("airflow.max_active_runs", "must be >= 1")),
@@ -212,14 +234,17 @@ fn check_s3_poke_interval(trigger: Option<&Trigger>) -> Vec<ValidationError> {
     out
 }
 
-/// Cross-DAG broken-link soft warning. Walks every DAG's `AirflowSection.publishes`
-/// to build the publish-set, then yields a soft warning per `(DAG, missing-URI)`
-/// for every Dataset trigger consumer with no in-project publisher. Sorted by
-/// `(dag_id, uri)` per D-08. Never returns Err — soft warnings only.
+/// Cross-DAG broken-link soft warning.
 ///
-/// Wired symmetrically into `orchestrate::plan` and `orchestrate::apply` after
-/// the `validate_dag_full` rollup. Detection scope is Dataset URIs only (D-09);
-/// S3 / SQS / API consumers do not flow through this check.
+/// Walks every DAG's `AirflowSection.publishes` to build the publish-set,
+/// then yields a soft warning per `(DAG, missing-URI)` for every Dataset
+/// trigger consumer with no in-project publisher. Sorted by `(dag_id, uri)`
+/// per D-08. Never returns `Err` -- soft warnings only.
+///
+/// Wired symmetrically into `orchestrate::plan` and `orchestrate::apply`
+/// after the `validate_dag_full` rollup. Detection scope is Dataset URIs
+/// only (D-09); S3 / SQS / API consumers do not flow through this check.
+#[must_use]
 pub fn validate_project(dags: &[ResolvedDag]) -> Vec<String> {
     let mut published: BTreeSet<&str> = BTreeSet::new();
     for dag in dags {
