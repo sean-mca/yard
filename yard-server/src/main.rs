@@ -419,23 +419,41 @@ fn start_api_server() {
             // to extractors (used by legacy tests and future rate-limiting).
             //
             // D-01/D-03: graceful shutdown with 10-second drain timeout.
-            // shutdown_signal resolves on SIGTERM/SIGINT, flips /ready to 503,
-            // cancels the CancellationToken, then returns so axum can drain
-            // in-flight requests. The outer timeout enforces the ECS budget.
-            let serve_result = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                axum::serve(
-                    listener,
-                    router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-                )
-                .with_graceful_shutdown(shutdown_signal(shutdown_health_state, shutdown_token)),
-            )
-            .await;
+            // The timeout must cover only the drain window (after signal),
+            // not the entire server lifetime (CR-01 fix).
+            //
+            // A oneshot channel bridges shutdown_signal → with_graceful_shutdown.
+            // select! races the server drain against a timer that starts only
+            // after the signal fires, so normal serving is never timed out.
+            let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
 
-            match serve_result {
-                Ok(Ok(())) => tracing::info!("Server shut down gracefully"),
-                Ok(Err(e)) => tracing::error!(error = %e, "Server error during shutdown"),
-                Err(_) => tracing::warn!("Shutdown timed out after 10s, forcing exit"),
+            let signal_task = tokio::spawn(async move {
+                shutdown_signal(shutdown_health_state, shutdown_token).await;
+                let _ = signal_tx.send(());
+            });
+
+            let server = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async { let _ = signal_rx.await; });
+
+            let drain_deadline = async {
+                // Wait for the signal to fire before starting the timer.
+                let _ = signal_task.await;
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            };
+
+            tokio::select! {
+                result = server => {
+                    match result {
+                        Ok(()) => tracing::info!("Server shut down gracefully"),
+                        Err(e) => tracing::error!(error = %e, "Server error during shutdown"),
+                    }
+                }
+                _ = drain_deadline => {
+                    tracing::warn!("Shutdown drain exceeded 10s, forcing exit");
+                }
             }
 
             Ok::<(), anyhow::Error>(())
