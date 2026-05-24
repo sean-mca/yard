@@ -20,8 +20,14 @@ use crate::diff::calculate_diff;
 use crate::dag_lifecycle::{apply_dags, destroy_all_dags};
 
 /// Load the current project state by reading all per-job state files.
-/// Errors (permissions, network, corrupt files) are propagated — only
+///
+/// Errors (permissions, network, corrupt files) are propagated -- only
 /// genuinely missing state is treated as "no deployments yet."
+///
+/// # Errors
+///
+/// Returns an error if the state backend cannot be initialized, if listing
+/// jobs fails (permissions, connectivity), or if a state file is corrupt.
 pub async fn load_state(
     backend: &yard_structs::StateBackend,
     project: &str,
@@ -54,9 +60,15 @@ pub async fn load_state(
 }
 
 /// Verify that deployed resources still exist in their target services.
+///
 /// For each deployed job with resources and a known provider, instantiates the
-/// provider and checks each resource. Returns a map of job_name → resource statuses.
+/// provider and checks each resource. Returns a map of job_name to resource statuses.
 /// Jobs without a matching provider config are silently skipped.
+///
+/// # Errors
+///
+/// Returns an error if a provider cannot be instantiated or if resource
+/// verification fails for a job that has a valid provider config.
 pub async fn verify_deployed_resources(
     manifest: &ProjectManifest,
     state: &ProjectState,
@@ -100,33 +112,50 @@ pub async fn verify_deployed_resources(
     Ok(results)
 }
 
-/// Result of applying changes.
+/// Result of applying changes to jobs and DAGs.
+///
+/// Each field lists the names of jobs (or DAGs) that were created, modified,
+/// or deleted during the apply operation.
 #[derive(Debug)]
 pub struct ApplyResult {
+    /// Job names that were newly deployed.
     pub created: Vec<String>,
+    /// Job names whose configuration changed and were redeployed.
     pub modified: Vec<String>,
+    /// Job names that were removed from the manifest and destroyed.
     pub deleted: Vec<String>,
+    /// DAG names that were newly generated/deployed.
     pub dag_created: Vec<String>,
+    /// DAG names whose content changed and were regenerated/redeployed.
     pub dag_modified: Vec<String>,
+    /// DAG names that were removed and destroyed.
     pub dag_deleted: Vec<String>,
     /// Distinct cross-account Airflow connections required by created/modified
     /// DAGs. Operators must configure these in MWAA before the DAG runs.
     pub dag_required_connections: Vec<airflow_dag::RequiredConnection>,
 }
 
-/// Result of planning changes — the already-filtered diff set.
+/// Result of planning changes -- the already-filtered diff set.
+///
 /// Mirrors `ApplyResult` for grep parity; minimal two-field shape per D-06
 /// of Phase 13 (extend only when a concrete consumer needs more).
 #[derive(Debug)]
 pub struct PlanResult {
+    /// Per-job diffs (create, modify, or delete).
     pub job_diffs: Vec<JobDiff>,
+    /// Per-DAG diffs (create, modify, or delete).
     pub dag_diffs: Vec<DagDiff>,
 }
 
 /// Validate that `target` (if Some) matches either a job in `manifest.jobs`
-/// or a DAG in `pre_dags` by name. Returns Ok(()) when target is None.
+/// or a DAG in `pre_dags` by name. Returns `Ok(())` when target is `None`.
+///
 /// Shared by `apply` and `plan` to guarantee an identical user-visible error
 /// contract across both commands (D-01 of Phase 13; mirrors Phase 12 D-01/D-02).
+///
+/// # Errors
+///
+/// Returns an error if the target name does not match any known job or DAG.
 pub fn validate_target(
     manifest: &ProjectManifest,
     pre_dags: &[airflow_dag::ResolvedDag],
@@ -145,10 +174,16 @@ pub fn validate_target(
 }
 
 /// Apply changes: generate scripts, deploy via provider, update state.
+///
 /// `root_dir` is where `.yard/generated/` lives.
 /// All affected jobs are locked upfront before diffing to prevent race conditions.
 /// State is re-read under lock to ensure the diff is computed against fresh data.
 /// All jobs are validated before any changes are made.
+///
+/// # Errors
+///
+/// Returns an error if validation fails, if locks cannot be acquired, if
+/// provider deployment fails, or if state persistence fails.
 pub async fn apply(
     manifest: &ProjectManifest,
     current_state: &ProjectState,
@@ -157,7 +192,7 @@ pub async fn apply(
     target: Option<String>,
 ) -> Result<ApplyResult> {
     // Validate all jobs up front (schema + syntax) — abort before making any changes
-    let mut all_errors: Vec<(String, Vec<yard_structs::ValidationError>)> = Vec::new();
+    let mut all_errors: Vec<(String, Vec<yard_structs::ValidationError>)> = Vec::with_capacity(manifest.jobs.len());
     for (name, job_def) in &manifest.jobs {
         let errors = validation::validate_job_full(name, job_def);
         if !errors.is_empty() {
@@ -175,7 +210,8 @@ pub async fn apply(
     }
 
     // Validate orphan airflow blocks (airflow: on jobs outside any DAG dir)
-    let pre_dags = airflow_dag::collect_dags(root_dir, manifest)?;
+    let pre_dags = airflow_dag::collect_dags(root_dir, manifest)
+        .context("failed to collect DAGs for apply")?;
     let orphans = airflow_dag::validate_orphan_airflow_blocks(manifest, &pre_dags);
     if !orphans.is_empty() {
         let mut msg = String::from("Validation failed:\n");
@@ -213,10 +249,12 @@ pub async fn apply(
     // Target validation: shared helper, identical contract for apply + plan (D-02).
     validate_target(manifest, &pre_dags, target.as_deref())?;
 
-    let storage = storage::get_storage(&manifest.state).await?;
+    let storage = storage::get_storage(&manifest.state).await
+        .context("failed to initialize storage for apply")?;
 
     // Preliminary diff to identify which jobs need locking
-    let mut preliminary_diffs = calculate_diff(manifest, current_state)?;
+    let mut preliminary_diffs = calculate_diff(manifest, current_state)
+        .context("failed to compute preliminary diff for apply")?;
     if let Some(ref name) = target {
         preliminary_diffs.retain(|d| &d.name == name);
     }
@@ -290,9 +328,11 @@ pub async fn apply(
 
                     // Write generated script locally
                     let gen_dir = root_dir.join(".yard/generated");
-                    std::fs::create_dir_all(&gen_dir)?;
+                    std::fs::create_dir_all(&gen_dir)
+                        .context("failed to create .yard/generated directory")?;
                     let script_path = gen_dir.join(format!("{}.py", diff.name));
-                    std::fs::write(&script_path, &script_content)?;
+                    std::fs::write(&script_path, &script_content)
+                        .with_context(|| format!("failed to write generated script for job \"{}\"", diff.name))?;
 
                     // Deploy via provider if configured (skip in dry-run mode).
                     // Task-only job types (bash, ...) have no Provider impl and
@@ -382,7 +422,8 @@ pub async fn apply(
                         }
                     }
 
-                    storage.delete_job(&diff.name).await?;
+                    storage.delete_job(&diff.name).await
+                        .with_context(|| format!("failed to delete state for job \"{}\"", diff.name))?;
 
                     let script_path = root_dir
                         .join(".yard/generated")
@@ -448,10 +489,16 @@ pub async fn apply(
     apply_result
 }
 
-/// Compute the filtered diff set for a project — the read-only mirror of `apply`.
+/// Compute the filtered diff set for a project -- the read-only mirror of `apply`.
+///
 /// Returns already-filtered `job_diffs` and `dag_diffs` per the target contract.
 /// `target=None` returns the full diff set; `target=Some(name)` validates `name`
 /// against jobs+DAGs (D-04) and filters both diff vecs to that name (D-07/D-08 of Phase 13).
+///
+/// # Errors
+///
+/// Returns an error if validation fails, if DAG collection or diff computation
+/// fails, or if the target name does not match any known job or DAG.
 pub async fn plan(
     manifest: &ProjectManifest,
     current_state: &ProjectState,
@@ -459,7 +506,8 @@ pub async fn plan(
     target: Option<String>,
 ) -> Result<PlanResult> {
     // Resolve DAGs from the full manifest (D-10 / TGT-03 invariant — unchanged manifest).
-    let pre_dags = airflow_dag::collect_dags(root_dir, manifest)?;
+    let pre_dags = airflow_dag::collect_dags(root_dir, manifest)
+        .context("failed to collect DAGs for plan")?;
 
     // Orphan-airflow structural validation runs on the full manifest (D-11(c) disposition: KEEP).
     let orphans = airflow_dag::validate_orphan_airflow_blocks(manifest, &pre_dags);
@@ -500,18 +548,21 @@ pub async fn plan(
     validate_target(manifest, &pre_dags, target.as_deref())?;
 
     // Job diffs against the full manifest; filter on output.
-    let mut job_diffs = calculate_diff(manifest, current_state)?;
+    let mut job_diffs = calculate_diff(manifest, current_state)
+        .context("failed to compute job diffs for plan")?;
     if let Some(ref name) = target {
         job_diffs.retain(|d| &d.name == name);
     }
 
     // DAG diffs against the full manifest; filter on output.
-    let dag_state = crate::dag_lifecycle::load_dag_state(&manifest.state).await?;
+    let dag_state = crate::dag_lifecycle::load_dag_state(&manifest.state).await
+        .context("failed to load DAG state for plan")?;
 
     // Pre-load JobStates so the renderer (via calculate_dag_diffs ->
     // generate_dag) can read each Glue task's persisted script_location
     // per DAG-02. Mirrors apply_dags' bulk-load.
-    let script_locations = crate::dag_lifecycle::load_script_locations(&manifest.state).await?;
+    let script_locations = crate::dag_lifecycle::load_script_locations(&manifest.state).await
+        .context("failed to load script locations for plan")?;
 
     let mut dag_diffs = crate::dag_lifecycle::calculate_dag_diffs(
         manifest,
@@ -526,9 +577,15 @@ pub async fn plan(
     Ok(PlanResult { job_diffs, dag_diffs })
 }
 
-/// Validate the state backend is reachable. Local: creates the state directory
-/// if it doesn't exist. S3: runs `head_bucket` to validate credentials and
-/// bucket existence.
+/// Validate the state backend is reachable.
+///
+/// Local: creates the state directory if it doesn't exist.
+/// S3: runs `head_bucket` to validate credentials and bucket existence.
+///
+/// # Errors
+///
+/// Returns an error if the local directory cannot be created, if the S3
+/// bucket cannot be reached, or if the backend variant is unsupported.
 pub async fn init_state_backend(
     backend: &yard_structs::StateBackend,
     aws_cfg: Option<&yard_structs::AwsCredentialConfig>,
@@ -562,26 +619,43 @@ pub async fn init_state_backend(
     Ok(())
 }
 
-/// Force-unlock a job. Returns the LockInfo of the previous holder, or None if not locked.
+/// Force-unlock a job. Returns the `LockInfo` of the previous holder, or `None` if not locked.
+///
+/// # Errors
+///
+/// Returns an error if the state backend cannot be initialized or if
+/// the lock file cannot be read or deleted.
 pub async fn force_unlock(
     backend: &yard_structs::StateBackend,
     job_name: &str,
 ) -> Result<Option<yard_structs::LockInfo>> {
-    let storage = storage::get_storage(backend).await?;
-    let existing = storage.get_lock(job_name).await?;
+    let storage = storage::get_storage(backend).await
+        .context("failed to initialize storage for force-unlock")?;
+    let existing = storage.get_lock(job_name).await
+        .with_context(|| format!("failed to read lock for job \"{job_name}\""))?;
     if existing.is_some() {
-        storage.force_unlock(job_name).await?;
+        storage.force_unlock(job_name).await
+            .with_context(|| format!("failed to force-unlock job \"{job_name}\""))?;
     }
     Ok(existing)
 }
 
 /// Result of destroying jobs and DAGs.
 pub struct DestroyResult {
+    /// Job names that were destroyed.
     pub destroyed: Vec<String>,
+    /// DAG names that were destroyed.
     pub dags_destroyed: Vec<String>,
 }
 
 /// Destroy a single job: tear down provider resources, delete state, delete generated script.
+///
+/// Returns `true` if the job existed and was destroyed, `false` if no state was found.
+///
+/// # Errors
+///
+/// Returns an error if the state backend cannot be initialized, if locking
+/// fails, if provider destruction fails, or if state deletion fails.
 pub async fn destroy_job(
     backend: &yard_structs::StateBackend,
     provider_configs: &HashMap<String, Value>,
@@ -589,14 +663,17 @@ pub async fn destroy_job(
     root_dir: &Path,
     dry_run: bool,
 ) -> Result<bool> {
-    let storage = storage::get_storage(backend).await?;
+    let storage = storage::get_storage(backend).await
+        .context("failed to initialize storage for destroy-job")?;
 
-    let job_state = match storage.read_job(job_name).await? {
+    let job_state = match storage.read_job(job_name).await
+        .with_context(|| format!("failed to read state for job \"{job_name}\""))? {
         Some(s) => s,
         None => return Ok(false),
     };
 
-    let lock = storage.lock(job_name).await?;
+    let lock = storage.lock(job_name).await
+        .with_context(|| format!("failed to acquire lock for job \"{job_name}\""))?;
     let lock_guard = LockGuard::new(&storage, vec![(job_name.to_string(), lock)]);
 
     let result: Result<()> = async {
@@ -650,6 +727,10 @@ pub async fn destroy_job(
 }
 
 /// Destroy all jobs and DAGs that have state.
+///
+/// # Errors
+///
+/// Returns an error if any individual job or DAG destruction fails.
 pub async fn destroy_all(
     backend: &yard_structs::StateBackend,
     provider_configs: &HashMap<String, Value>,
@@ -657,8 +738,10 @@ pub async fn destroy_all(
     root_dir: &Path,
     dry_run: bool,
 ) -> Result<DestroyResult> {
-    let storage = storage::get_storage(backend).await?;
-    let job_names = storage.list_jobs().await?;
+    let storage = storage::get_storage(backend).await
+        .context("failed to initialize storage for destroy-all")?;
+    let job_names = storage.list_jobs().await
+        .context("failed to list jobs for destroy-all")?;
     let mut result = DestroyResult {
         destroyed: Vec::new(),
         dags_destroyed: Vec::new(),

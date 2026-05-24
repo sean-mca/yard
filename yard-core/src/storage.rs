@@ -13,18 +13,28 @@ const LOCK_TTL_MINUTES: i64 = 30;
 
 // --- Storage backends ---
 
+/// Local filesystem storage backend. Persists per-job and per-DAG state
+/// as individual JSON files in a directory.
 pub struct LocalStorage {
-    /// Directory where per-job state files live (e.g. `.yard/state/`)
+    /// Directory where per-job state files live (e.g. `.yard/state/`).
     pub path: PathBuf,
 }
 
+/// S3 object-store storage backend. Persists per-job and per-DAG state
+/// as individual JSON objects under a common prefix.
 pub struct S3Storage {
+    /// Pre-configured S3 client with credentials resolved.
     pub client: Client,
+    /// S3 bucket name.
     pub bucket: String,
-    /// Prefix for per-job state files (e.g. `yard/state/`)
+    /// Prefix for per-job state files (e.g. `yard/state/`).
     pub prefix: String,
 }
 
+/// Facade over a dynamically dispatched [`StorageBackend`].
+///
+/// Provides thin async wrapper methods so consumers can call
+/// `storage.read_job(...)` without knowing which backend is active.
 pub struct Storage {
     backend: Box<dyn StorageBackend + Send + Sync>,
 }
@@ -620,6 +630,8 @@ impl StorageBackend for S3Storage {
 
 // --- Helpers ---
 
+/// Build a [`LockInfo`] for the current user and timestamp.
+#[must_use]
 fn lock_info() -> LockInfo {
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
@@ -735,6 +747,11 @@ impl Storage {
     // --- Convenience methods (D-06: stay on impl Storage, not on the trait) ---
 
     /// Release a lock, but only if we hold it (match on `who`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock is held by a different user, or if
+    /// the underlying force-unlock operation fails.
     pub async fn unlock(&self, job_name: &str, holder: &LockInfo) -> Result<()> {
         let current = self.get_lock(job_name).await?;
         match current {
@@ -751,6 +768,11 @@ impl Storage {
 
     /// Acquire locks for multiple jobs atomically. If any lock fails,
     /// all previously acquired locks are rolled back.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any individual lock acquisition fails. All
+    /// previously acquired locks are rolled back before returning.
     pub async fn lock_jobs(&self, names: &[String]) -> Result<Vec<(String, LockInfo)>> {
         let mut acquired: Vec<(String, LockInfo)> = Vec::new();
 
@@ -783,8 +805,11 @@ impl Storage {
 /// If dropped without release (panic, early return), logs a warning;
 /// the TTL (D-02) covers cleanup on next acquire.
 pub struct LockGuard<'a> {
+    /// The storage handle used to release locks.
     storage: &'a Storage,
+    /// Locks held by this guard: `(job_name, lock_info)`.
     locks: Vec<(String, LockInfo)>,
+    /// Whether `release()` has been called.
     released: bool,
 }
 
@@ -798,9 +823,15 @@ impl<'a> LockGuard<'a> {
     }
 
     /// Explicit release on the normal-exit path.
+    ///
     /// Returns the first unlock error (if any) after attempting all locks,
-    /// so callers can log or propagate.  The TTL backstop (D-02) covers
+    /// so callers can log or propagate. The TTL backstop (D-02) covers
     /// any locks that could not be released here.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first unlock error encountered. All locks are attempted
+    /// regardless of individual failures.
     pub async fn release(mut self) -> Result<()> {
         let mut first_err: Option<anyhow::Error> = None;
         for (name, info) in self.locks.iter().rev() {
@@ -873,6 +904,16 @@ fn merge_state_aws_with_env(
 
 // --- Factory ---
 
+/// Construct a [`Storage`] handle from the configured [`StateBackend`].
+///
+/// For `Local`, wraps a [`LocalStorage`] pointing at the configured path.
+/// For `S3`, resolves credentials (env > yaml > default chain) and creates
+/// an S3 client.
+///
+/// # Errors
+///
+/// Returns an error if credential serialization fails or if the backend
+/// variant is unsupported.
 pub async fn get_storage(backend: &StateBackend) -> Result<Storage> {
     match backend {
         StateBackend::Local { path } => Ok(Storage::new(LocalStorage { path: path.clone() })),
