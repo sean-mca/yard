@@ -1,3 +1,4 @@
+#![warn(missing_docs)]
 //! Business logic crate for **yard** -- a terragrunt-inspired CLI for data
 //! engineering teams.
 //!
@@ -15,22 +16,31 @@
 //! - [`dag_lifecycle`] -- DAG apply/destroy/diff lifecycle
 //! - [`config_merge`] -- provider config deep-merge, task-only classification
 //! - [`parsing`] -- YAML-to-typed-struct parsers for jobs, sources, sinks, airflow blocks
-//! - [`list_targets`] -- deployment target enumeration for CI matrix builders
-//! - [`show`] -- script/DAG preview without deploying
+//! - [`mod@list_targets`] -- deployment target enumeration for CI matrix builders
+//! - [`mod@show`] -- script/DAG preview without deploying
 //! - [`utils`] -- hashing, variable resolution
 
 pub mod airflow_dag;
 pub mod codegen;
+/// Provider config deep-merge and task-only classification.
 pub mod config_merge;
+/// DAG apply/destroy/diff lifecycle orchestration.
 pub mod dag_lifecycle;
+/// Manifest-vs-state diff computation.
 pub mod diff;
 pub mod list_targets;
+/// Top-level `apply`, `plan`, `destroy`, `init` entry points.
 pub mod orchestrate;
+/// YAML-to-typed-struct parsers for jobs, sources, sinks, and airflow blocks.
 pub mod parsing;
 pub mod providers;
+/// Project discovery, YAML config cascade, and variable resolution.
 pub mod resolve;
+/// Script/DAG preview without deploying.
 pub mod show;
+/// Per-job and per-DAG state persistence (local FS, S3).
 pub mod storage;
+/// Hashing, variable resolution, and misc utilities.
 pub mod utils;
 pub mod validation;
 

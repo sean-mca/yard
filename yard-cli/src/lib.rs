@@ -1,3 +1,4 @@
+#![warn(missing_docs)]
 //! Thin CLI wrapper for the YARD engine.
 //!
 //! This crate parses command-line arguments via [`clap`], delegates all

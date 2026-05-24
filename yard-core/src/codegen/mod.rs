@@ -7,10 +7,10 @@
 //! sinks, and proper Glue `job.commit()` teardown.
 //!
 //! Sub-modules handle distinct rendering concerns:
-//! - [`helpers`] — shared utilities (import rendering, Spark options, JDBC auth, partitions)
-//! - [`source`] — reader calls per source type (S3, JDBC, Catalog, Kafka, API)
-//! - [`sink`] — writer calls per sink type (S3, JDBC, Catalog, Iceberg)
-//! - [`transform`] — transform operations (filter, SQL, join, aggregate, window, etc.)
+//! - `helpers` -- shared utilities (import rendering, Spark options, JDBC auth, partitions)
+//! - `source` -- reader calls per source type (S3, JDBC, Catalog, Kafka, API)
+//! - `sink` -- writer calls per sink type (S3, JDBC, Catalog, Iceberg)
+//! - `transform` -- transform operations (filter, SQL, join, aggregate, window, etc.)
 
 mod helpers;
 mod sink;

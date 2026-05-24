@@ -3,7 +3,7 @@
 //! This module defines the [`Provider`] trait that each cloud service
 //! (Glue, EMR, etc.) implements, plus shared infrastructure such as
 //! [`S3ScriptOps`] for uploading generated PySpark scripts and
-//! [`aws_config`] for building SDK configs with optional `AssumeRole`.
+//! [`aws_config()`] for building SDK configs with optional `AssumeRole`.
 //!
 //! Sub-modules:
 //! - [`glue`] -- AWS Glue ETL provider

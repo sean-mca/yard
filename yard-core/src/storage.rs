@@ -814,6 +814,7 @@ pub struct LockGuard<'a> {
 }
 
 impl<'a> LockGuard<'a> {
+    /// Create a new lock guard that will release `locks` on drop.
     pub fn new(storage: &'a Storage, locks: Vec<(String, LockInfo)>) -> Self {
         Self {
             storage,
