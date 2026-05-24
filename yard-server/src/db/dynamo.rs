@@ -1125,6 +1125,18 @@ impl Database for DynamoDatabase {
 
         Ok(jobs)
     }
+
+    // ---- Health ----
+
+    async fn health_check(&self) -> Result<()> {
+        self.client
+            .describe_table()
+            .table_name(&self.table_name)
+            .send()
+            .await
+            .context("DynamoDB health check (DescribeTable)")?;
+        Ok(())
+    }
 }
 
 // ---- Key Validation ----

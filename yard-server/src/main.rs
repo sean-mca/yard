@@ -70,6 +70,7 @@ fn start_api_server() {
     use api::auth_session::{auth_session_router, AuthSessionState};
     use api::dashboard::{ApiState, dashboard_router};
     use api::drift::drift_router;
+    use api::health::{health_router, HealthState};
     use api::jobs::jobs_router;
     use api::settings::settings_router;
     use db::DbConfig;
@@ -201,6 +202,15 @@ fn start_api_server() {
                     .map_err(|e| anyhow::anyhow!("Failed to create GitHub client: {e}"))?,
             );
 
+            // Phase 47: health endpoints state. accepting_traffic starts true;
+            // Phase 48 will flip it to false during graceful shutdown.
+            let health_state = Arc::new(HealthState {
+                db: db.clone(),
+                github_client: github_client.clone(),
+                cache: tokio::sync::RwLock::new(None),
+                accepting_traffic: std::sync::atomic::AtomicBool::new(true),
+            });
+
             let (event_tx, _seed_rx) = api::events::new_event_channel();
 
             let api_state = Arc::new(ApiState {
@@ -316,6 +326,9 @@ fn start_api_server() {
                 // Auth session routes (providers, start, callback, refresh,
                 // session, logout) sit OUTSIDE the require_auth layer.
                 .merge(auth_session_router(auth_session_state))
+                // Health endpoints sit OUTSIDE require_auth -- ALB/ECS probes
+                // do not carry auth tokens (T-47-04).
+                .merge(health_router(health_state))
                 .merge(api_routes)
                 .layer(rate_limit)
                 .layer(cors)

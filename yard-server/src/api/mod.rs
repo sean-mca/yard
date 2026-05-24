@@ -4,6 +4,7 @@ pub mod drift;
 pub mod environments;
 pub mod error;
 pub mod events;
+pub mod health;
 pub mod jobs;
 pub mod search;
 pub mod settings;
