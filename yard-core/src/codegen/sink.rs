@@ -1,12 +1,25 @@
+//! Sink-writing codegen: renders PySpark/Glue writer calls for each
+//! sink type (S3, JDBC, Catalog, Iceberg).
+
+use std::fmt::Write;
+
 use anyhow::{Result, anyhow};
 use yard_structs::Sink;
 
 use super::helpers::{derive_jdbc_url, quoted_list, render_jdbc_auth, render_secret_fetch};
 
+/// Return `value` if present, or an error naming the missing `field` on
+/// the sink.
+///
+/// # Errors
+///
+/// Returns an error when `value` is `None`.
+#[inline]
 pub(super) fn require_sink_str<'a>(value: Option<&'a str>, sink_type: &str, field: &str) -> Result<&'a str> {
     value.ok_or_else(|| anyhow!("sink: '{field}' is required for {sink_type} sink"))
 }
 
+/// Default Iceberg table properties emitted on `.create()` calls.
 pub(super) const ICEBERG_TABLE_PROPERTIES: &[(&str, &str)] = &[
     ("format-version", "2"),
     ("write.spark.accept-any-schema", "true"),
@@ -15,6 +28,16 @@ pub(super) const ICEBERG_TABLE_PROPERTIES: &[(&str, &str)] = &[
     ("write.distribution-mode", "hash"),
 ];
 
+/// Render the sink as Python/PySpark write statements.
+///
+/// Dispatches by `sink.sink_type` (s3, jdbc, catalog, iceberg) and
+/// generates the appropriate writer chain including auth, partition,
+/// and Iceberg table-property wiring.
+///
+/// # Errors
+///
+/// Returns an error when required fields are missing for the given
+/// sink type.
 pub(super) fn render_sink(sink: &Sink, default_source: &str, fill_nulls: bool, catalog_id: Option<&str>) -> Result<String> {
     let source_name = sink.source.as_deref().unwrap_or(default_source);
     let var = format!("df_{source_name}");
@@ -32,9 +55,11 @@ pub(super) fn render_sink(sink: &Sink, default_source: &str, fill_nulls: bool, c
             let path = require_sink_str(sink.path.as_deref(), "s3", "path")?;
             let mut write = format!("    {var}.write.format(\"{format}\").mode(\"{mode}\")");
             if !sink.partition_by.is_empty() {
-                write.push_str(&format!(".partitionBy({})", quoted_list(&sink.partition_by)));
+                // write to String is infallible
+                let _ = write!(write, ".partitionBy({})", quoted_list(&sink.partition_by));
             }
-            write.push_str(&format!(".save(\"{path}\")"));
+            // write to String is infallible
+            let _ = write!(write, ".save(\"{path}\")");
             lines.push(write);
         }
         "jdbc" => {

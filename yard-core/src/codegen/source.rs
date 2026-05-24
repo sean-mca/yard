@@ -1,3 +1,8 @@
+//! Source-reading codegen: renders PySpark/Glue reader calls for each
+//! source type (S3, JDBC, Catalog, Kafka, API).
+
+use std::fmt::Write;
+
 use anyhow::Result;
 use yard_structs::Source;
 
@@ -6,8 +11,9 @@ use super::helpers::{
     python_literal, render_jdbc_auth, render_secret_fetch, require_str,
 };
 
-/// Render a `glueContext.create_dynamic_frame.from_options(...).toDF()` call.
-/// `options_expr` may be a literal dict or a variable name.
+/// Render a `glueContext.create_dynamic_frame.from_options(...).toDF()`
+/// call. `options_expr` may be a literal dict or a variable name.
+#[must_use]
 pub(super) fn glue_from_options(
     var: &str,
     connection_type: &str,
@@ -26,6 +32,15 @@ pub(super) fn glue_from_options(
     )
 }
 
+/// Render a single source as Python/PySpark read statements.
+///
+/// Dispatches by `source.source_type` (s3, jdbc, catalog, kafka, api)
+/// and generates the appropriate reader chain including auth wiring.
+///
+/// # Errors
+///
+/// Returns an error when required fields are missing for the given
+/// source type.
 pub(super) fn render_source(source: &Source, default_engine: &str) -> Result<String> {
     let name = &source.name;
     let var = format!("df_{name}");
@@ -54,7 +69,8 @@ pub(super) fn render_source(source: &Source, default_engine: &str) -> Result<Str
             } else {
                 let mut chain = format!("spark.read.format(\"{format}\")");
                 append_spark_options(&mut chain, &[], &source.options);
-                chain.push_str(&format!(".load(\"{path}\")"));
+                // write to String is infallible
+                let _ = write!(chain, ".load(\"{path}\")");
                 lines.push(format!("    {var} = {chain}"));
             }
         }
@@ -114,9 +130,11 @@ pub(super) fn render_source(source: &Source, default_engine: &str) -> Result<Str
                     &source.options,
                 );
                 if let Some((user_expr, password_expr, _)) = &auth {
-                    chain.push_str(&format!(
+                    // write to String is infallible
+                    let _ = write!(
+                        chain,
                         ".option(\"user\", {user_expr}).option(\"password\", {password_expr}).option(\"ssl\", \"true\").option(\"sslmode\", \"require\")"
-                    ));
+                    );
                 }
                 chain.push_str(".load()");
                 lines.push(format!("    {var} = {chain}"));
@@ -164,6 +182,11 @@ pub(super) fn render_source(source: &Source, default_engine: &str) -> Result<Str
     Ok(lines.join("\n"))
 }
 
+/// Render all sources as a newline-joined block of Python read statements.
+///
+/// # Errors
+///
+/// Returns an error if any individual source is missing required fields.
 pub(super) fn render_sources(sources: &[Source], default_engine: &str) -> Result<String> {
     let rendered: Vec<String> = sources
         .iter()

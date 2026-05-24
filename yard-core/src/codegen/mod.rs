@@ -1,3 +1,17 @@
+//! PySpark/Glue script codegen from yard job definitions.
+//!
+//! This module generates complete Python scripts for AWS Glue and EMR
+//! Serverless jobs by combining Tera templates with dynamic source,
+//! transform, and sink rendering. The generated scripts include import
+//! management, Spark session setup, null-handling helpers for Iceberg
+//! sinks, and proper Glue `job.commit()` teardown.
+//!
+//! Sub-modules handle distinct rendering concerns:
+//! - [`helpers`] — shared utilities (import rendering, Spark options, JDBC auth, partitions)
+//! - [`source`] — reader calls per source type (S3, JDBC, Catalog, Kafka, API)
+//! - [`sink`] — writer calls per sink type (S3, JDBC, Catalog, Iceberg)
+//! - [`transform`] — transform operations (filter, SQL, join, aggregate, window, etc.)
+
 mod helpers;
 mod sink;
 mod source;
@@ -14,7 +28,10 @@ use sink::render_sink;
 use source::render_sources;
 use transform::render_transforms;
 
+/// Tera template for AWS Glue PySpark jobs.
 const GLUE_TEMPLATE: &str = include_str!("../templates/glue.py.tera");
+
+/// Tera template for EMR Serverless PySpark jobs.
 const EMR_TEMPLATE: &str = include_str!("../templates/emr.py.tera");
 
 /// Emitted inline at module scope when an iceberg sink is writing with
@@ -259,6 +276,20 @@ def _yard_conform_to_target_schema(df, spark, tbl):
     return df
 "#;
 
+/// Generate a complete PySpark script for the given job definition.
+///
+/// For Glue and EMR job types, renders sources, transforms, sink, and
+/// import management into a Tera template. Task-only types (Bash) return
+/// an empty string. If `job_file` is set, returns the external file
+/// contents verbatim.
+///
+/// # Errors
+///
+/// Returns an error when:
+/// - Required source/sink fields are missing
+/// - The Tera template fails to render
+/// - An external `job_file` cannot be read
+/// - The job type has no codegen template (e.g. Bash)
 pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result<String> {
     // Task-only job types (bash, ...) don't produce a standalone PySpark script;
     // they participate in Airflow DAG codegen instead. Return an empty string so
@@ -303,8 +334,8 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
 
     let default_engine = default_engine_for(job_def);
 
-    // Build extra imports needed by template features
-    let mut extra_imports = Vec::new();
+    // Build extra imports needed by template features (at most ~8 entries)
+    let mut extra_imports = Vec::with_capacity(8);
     let iceberg = has_iceberg_sink(job_def);
     let partitioning = !job_def.partition_by.is_empty();
     if needs_secrets_imports(job_def) || needs_jdbc_auth_imports(job_def) || iceberg {
@@ -354,7 +385,7 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
     let run_body = if let Some(body) = &job_def.body {
         indent_body(body)
     } else {
-        let mut parts = Vec::new();
+        let mut parts = Vec::with_capacity(3);
         if !job_def.sources.is_empty() {
             parts.push(format!(
                 "    # --- Sources ---\n{}",

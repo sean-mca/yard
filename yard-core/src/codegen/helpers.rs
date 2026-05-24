@@ -1,8 +1,23 @@
+//! Codegen helper functions for rendering Python/PySpark fragments.
+//!
+//! These helpers are called by [`source`], [`sink`], [`transform`], and
+//! [`super::generate_python_script`] to emit import blocks, Spark option
+//! chains, JDBC/Secrets Manager boilerplate, and partition derivation
+//! logic. All string-building loops use [`std::fmt::Write`] to avoid
+//! per-iteration allocations.
+
+use std::fmt::Write;
+
 use anyhow::{Result, anyhow};
 use yard_structs::{Import, JdbcAuth, JobDefinition, RdsIamAuth, Source};
 
 // --- Import rendering ---
 
+/// Render a single [`Import`] as a Python import statement.
+///
+/// Returns `"from <module> import <name>"` when `import.from` is set,
+/// otherwise `"import <name>"`.
+#[inline]
 pub(super) fn render_import(import: &Import) -> String {
     match &import.from {
         Some(module) => format!("from {} import {}", module, import.name),
@@ -10,19 +25,23 @@ pub(super) fn render_import(import: &Import) -> String {
     }
 }
 
+/// Render a slice of [`Import`]s as newline-separated Python import
+/// statements.
 pub(super) fn render_imports(imports: &[Import]) -> String {
-    imports
-        .iter()
-        .map(render_import)
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut rendered = Vec::with_capacity(imports.len());
+    for imp in imports {
+        rendered.push(render_import(imp));
+    }
+    rendered.join("\n")
 }
 
 // --- Source rendering helpers ---
 
-/// Render a serde_json::Value as a Python literal. Strings, numbers, bools,
-/// and null map directly; arrays and objects recurse. Used for opaque
-/// `options:` passthrough.
+/// Render a [`serde_json::Value`] as a Python literal.
+///
+/// Strings, numbers, bools, and null map directly; arrays and objects
+/// recurse. Used for opaque `options:` passthrough in Spark reader/writer
+/// chains.
 pub(super) fn python_literal(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::Null => "None".to_string(),
@@ -45,6 +64,9 @@ pub(super) fn python_literal(v: &serde_json::Value) -> String {
     }
 }
 
+/// Return the engine for a source, falling back to `default_engine` when
+/// the source does not specify one explicitly.
+#[inline]
 pub(super) fn effective_engine(source: &Source, default_engine: &str) -> String {
     source
         .engine
@@ -52,6 +74,13 @@ pub(super) fn effective_engine(source: &Source, default_engine: &str) -> String 
         .unwrap_or_else(|| default_engine.to_string())
 }
 
+/// Return `value` if present, or an error naming the missing `field` on
+/// the given source.
+///
+/// # Errors
+///
+/// Returns an error when `value` is `None`.
+#[inline]
 pub(super) fn require_str<'a>(value: Option<&'a str>, source_name: &str, field: &str) -> Result<&'a str> {
     value.ok_or_else(|| anyhow!("source '{source_name}': '{field}' is required"))
 }
@@ -72,23 +101,31 @@ pub(super) fn build_options_dict(
     python_literal(&serde_json::Value::Object(opts))
 }
 
-/// Append `.option(k, v)` calls onto a Spark reader chain. `seed` pairs are
-/// emitted as literal strings; `extra` entries use `python_literal`.
+/// Append `.option(k, v)` calls onto a Spark reader chain.
+///
+/// `seed` pairs are emitted as literal strings; `extra` entries use
+/// [`python_literal`]. Writes directly into `chain` to avoid
+/// per-iteration allocations.
 pub(super) fn append_spark_options(
     chain: &mut String,
     seed: &[(&str, &str)],
     extra: &std::collections::HashMap<String, serde_json::Value>,
 ) {
     for (k, v) in seed {
-        chain.push_str(&format!(".option(\"{k}\", \"{v}\")"));
+        // write to String is infallible
+        let _ = write!(chain, ".option(\"{k}\", \"{v}\")");
     }
     for (k, v) in extra {
-        chain.push_str(&format!(".option(\"{}\", {})", k, python_literal(v)));
+        // write to String is infallible
+        let _ = write!(chain, ".option(\"{}\", {})", k, python_literal(v));
     }
 }
 
 // --- Sink helpers ---
 
+/// Format a slice of column names as a comma-separated list of
+/// double-quoted Python strings (e.g. `"col_a", "col_b"`).
+#[inline]
 pub(super) fn quoted_list(cols: &[String]) -> String {
     cols.iter()
         .map(|c| format!("\"{c}\""))
@@ -98,6 +135,8 @@ pub(super) fn quoted_list(cols: &[String]) -> String {
 
 // --- Secrets Manager helper ---
 
+/// Emit Python lines that fetch a secret from AWS Secrets Manager and
+/// parse its JSON body into a local variable named `{prefix}_secret`.
 pub(super) fn render_secret_fetch(secret_id: &str, prefix: &str) -> String {
     let var = format!("{prefix}_secret");
     [
@@ -108,6 +147,9 @@ pub(super) fn render_secret_fetch(secret_id: &str, prefix: &str) -> String {
     .join("\n")
 }
 
+/// True when any source or the sink references a `secret_id`, meaning
+/// the generated script needs `import boto3` and `import json`.
+#[inline]
 pub(super) fn needs_secrets_imports(job_def: &JobDefinition) -> bool {
     let source_has = job_def.sources.iter().any(|s| s.secret_id.is_some());
     let sink_has = job_def.sink.as_ref().is_some_and(|s| s.secret_id.is_some());
@@ -116,12 +158,19 @@ pub(super) fn needs_secrets_imports(job_def: &JobDefinition) -> bool {
 
 // --- JDBC auth (RDS IAM) ---
 
+/// True when any source or the sink uses JDBC auth (RDS IAM), meaning
+/// the generated script needs `import boto3` for token generation.
+#[inline]
 pub(super) fn needs_jdbc_auth_imports(job_def: &JobDefinition) -> bool {
     let source_has = job_def.sources.iter().any(|s| s.auth.is_some());
     let sink_has = job_def.sink.as_ref().is_some_and(|s| s.auth.is_some());
     source_has || sink_has
 }
 
+/// Build a JDBC URL from RDS IAM auth credentials.
+///
+/// For [`JdbcAuth::RdsIam`], produces `jdbc:<connection_type>://<host>:<port>/<database>`.
+/// Returns an empty string for other auth variants.
 pub(super) fn derive_jdbc_url(auth: &JdbcAuth, connection_type: &str, database: &str) -> String {
     match auth {
         JdbcAuth::RdsIam(rds) => {
@@ -170,6 +219,8 @@ pub(super) fn render_jdbc_auth(
     }
 }
 
+/// Emit Python lines that call `generate_db_auth_token` to get a
+/// short-lived RDS IAM authentication token.
 fn render_rds_iam_token_fetch(prefix: &str, rds: &RdsIamAuth, user_expr: &str) -> Vec<String> {
     let RdsIamAuth { host, port, region, .. } = rds;
     let client_var = format!("_{prefix}_rds");
@@ -185,6 +236,8 @@ fn render_rds_iam_token_fetch(prefix: &str, rds: &RdsIamAuth, user_expr: &str) -
     ]
 }
 
+/// True when the job definition includes an Iceberg sink.
+#[inline]
 pub(super) fn has_iceberg_sink(job_def: &JobDefinition) -> bool {
     job_def
         .sink
@@ -201,6 +254,10 @@ pub(super) fn should_fill_nulls(job_def: &JobDefinition) -> bool {
         .is_some_and(|s| s.sink_type == "iceberg" && s.fill_nulls != Some(false))
 }
 
+/// Emit Python lines that derive partition columns (year/month/day) from
+/// a timestamp column, adding them to the dataframe only when absent.
+///
+/// Returns `None` when `job_def.partition_by` is empty.
 pub(super) fn render_partition_derivation(job_def: &JobDefinition, sink_source: &str) -> Option<String> {
     if job_def.partition_by.is_empty() {
         return None;
@@ -235,6 +292,8 @@ pub(super) fn render_partition_derivation(job_def: &JobDefinition, sink_source: 
     Some(lines.join("\n"))
 }
 
+/// True when any transform requires `from pyspark.sql import functions as F`.
+#[inline]
 pub(super) fn needs_functions_import(job_def: &JobDefinition) -> bool {
     job_def
         .transforms
@@ -242,6 +301,9 @@ pub(super) fn needs_functions_import(job_def: &JobDefinition) -> bool {
         .any(|t| matches!(t.transform_type.as_str(), "aggregate" | "window"))
 }
 
+/// True when any transform is a window function, requiring the
+/// `from pyspark.sql.window import Window` import.
+#[inline]
 pub(super) fn needs_window_import(job_def: &JobDefinition) -> bool {
     job_def
         .transforms
@@ -249,6 +311,9 @@ pub(super) fn needs_window_import(job_def: &JobDefinition) -> bool {
         .any(|t| t.transform_type == "window")
 }
 
+/// True when the generated script needs
+/// `from awsglue.dynamicframe import DynamicFrame`.
+#[inline]
 pub(super) fn needs_dynamic_frame_import(job_def: &JobDefinition, default_engine: &str) -> bool {
     job_def
         .sink
@@ -261,10 +326,15 @@ pub(super) fn needs_dynamic_frame_import(job_def: &JobDefinition, default_engine
         })
 }
 
+/// True when any source is an API source, requiring `import requests`.
+#[inline]
 pub(super) fn needs_requests_import(job_def: &JobDefinition) -> bool {
     job_def.sources.iter().any(|s| s.source_type == "api")
 }
 
+/// Determine the default Spark engine (`"spark"` or `"glue"`) for a job
+/// by reading `config.<job_type>.default_engine`, falling back to
+/// `"spark"`.
 pub(super) fn default_engine_for(job_def: &JobDefinition) -> String {
     // The `config` map is keyed by the wire-format string ("glue", "emr",
     // "bash"); JobType::to_string() returns that canonical form.
@@ -277,6 +347,8 @@ pub(super) fn default_engine_for(job_def: &JobDefinition) -> String {
         .to_string()
 }
 
+/// Indent every non-blank line of `body` by four spaces for inclusion
+/// inside the generated `run()` function.
 pub(super) fn indent_body(body: &str) -> String {
     body.lines()
         .map(|line| {
