@@ -14,6 +14,8 @@
 //! returns owned strings via [`TriggerRender`]. Mirror of
 //! `connections.rs`: small, pure, deterministic, in-tree tests (D-04).
 
+use std::fmt::Write;
+
 use yard_structs::{SingleSource, Trigger};
 
 use super::helpers::{python_string_literal, python_var_name};
@@ -31,11 +33,12 @@ pub(super) const VERSION_BANNER: &str = "# Airflow version contract:
 #   - Triggerer process required
 ";
 
-/// D-13 per-source backfill caveat — Dataset arm. Single source of truth for
+/// D-13 per-source backfill caveat -- Dataset arm. Single source of truth for
 /// the Dataset header_docstring text; both single-source (`Trigger::Single`)
 /// and composite-homogeneous (`Trigger::All` / `Trigger::Any` of Datasets) paths
 /// call through here. Datasets have no `logical_date`, so historical re-runs do
-/// NOT replay missed events — backfill must go through API-trigger replay.
+/// NOT replay missed events -- backfill must go through API-trigger replay.
+#[inline]
 fn dataset_header(uri: &str) -> String {
     format!(
         "# Trigger: Dataset ({uri})\n\
@@ -46,9 +49,10 @@ fn dataset_header(uri: &str) -> String {
     )
 }
 
-/// D-13 per-source backfill caveat — S3 arm. The deferrable `S3KeySensor`
+/// D-13 per-source backfill caveat -- S3 arm. The deferrable `S3KeySensor`
 /// re-pokes against current S3 state, so the original landed object is not
 /// replayable from event history.
+#[inline]
 fn s3_header(bucket: &str, key: Option<&str>, prefix: Option<&str>) -> String {
     let target = match (key, prefix) {
         (Some(k), _) => format!("key={k}"),
@@ -63,8 +67,9 @@ fn s3_header(bucket: &str, key: Option<&str>, prefix: Option<&str>) -> String {
     )
 }
 
-/// D-13 per-source backfill caveat — SQS arm. `SqsSensor` drains the real
+/// D-13 per-source backfill caveat -- SQS arm. `SqsSensor` drains the real
 /// queue, so backfill is destructive and unsafe to run against a live queue.
+#[inline]
 fn sqs_header(queue_url: &str) -> String {
     format!(
         "# Trigger: SQS (queue_url={queue_url})\n\
@@ -255,29 +260,22 @@ fn render_single(
                 .unwrap_or("");
 
             // Build the sensor task lines. Indented 4 spaces (inside the
-            // `with DAG(...) as dag:` block).
+            // `with DAG(...) as dag:` block). write!/writeln! into
+            // String never fails; discard the infallible Result.
             let mut sensor = String::new();
             sensor.push_str("    _yard_wait_s3 = S3KeySensor(\n");
             sensor.push_str("        task_id=\"_yard_wait_s3\",\n");
-            sensor.push_str(&format!(
-                "        bucket_name={},\n",
-                python_string_literal(&s3.bucket)
-            ));
-            sensor.push_str(&format!(
-                "        bucket_key={},\n",
-                python_string_literal(bucket_key_value)
-            ));
-            sensor.push_str(&format!("        poke_interval={poke},\n"));
-            sensor.push_str(&format!("        timeout={timeout},\n"));
-            sensor.push_str(&format!(
-                "        deferrable={},\n",
+            let _ = writeln!(&mut sensor, "        bucket_name={},", python_string_literal(&s3.bucket));
+            let _ = writeln!(&mut sensor, "        bucket_key={},", python_string_literal(bucket_key_value));
+            let _ = writeln!(&mut sensor, "        poke_interval={poke},");
+            let _ = writeln!(&mut sensor, "        timeout={timeout},");
+            let _ = writeln!(
+                &mut sensor,
+                "        deferrable={},",
                 if deferrable { "True" } else { "False" }
-            ));
+            );
             if let Some(c) = conn {
-                sensor.push_str(&format!(
-                    "        aws_conn_id={},\n",
-                    python_string_literal(c)
-                ));
+                let _ = writeln!(&mut sensor, "        aws_conn_id={},", python_string_literal(c));
             }
             sensor.push_str("    )");
 
@@ -320,25 +318,22 @@ fn render_single(
             // Build the sensor task lines. 4-space indent = inside the
             // `with DAG(...) as dag:` block. Kwarg order matches the S3 arm
             // for diff-churn minimization: task_id, queue, knobs, conn.
+            // write!/writeln! into String never fails; discard the
+            // infallible Result.
             let mut sensor = String::new();
             sensor.push_str("    _yard_wait_sqs = SqsSensor(\n");
             sensor.push_str("        task_id=\"_yard_wait_sqs\",\n");
-            sensor.push_str(&format!(
-                "        sqs_queue={},\n",
-                python_string_literal(&sqs.queue_url)
-            ));
-            sensor.push_str(&format!("        wait_time_seconds={wait},\n"));
-            sensor.push_str(&format!("        max_messages={max_msgs},\n"));
-            sensor.push_str(&format!(
-                "        delete_message_on_reception={},\n",
+            let _ = writeln!(&mut sensor, "        sqs_queue={},", python_string_literal(&sqs.queue_url));
+            let _ = writeln!(&mut sensor, "        wait_time_seconds={wait},");
+            let _ = writeln!(&mut sensor, "        max_messages={max_msgs},");
+            let _ = writeln!(
+                &mut sensor,
+                "        delete_message_on_reception={},",
                 if del_on_recv { "True" } else { "False" }
-            ));
+            );
             sensor.push_str("        deferrable=True,\n");
             if let Some(c) = conn {
-                sensor.push_str(&format!(
-                    "        aws_conn_id={},\n",
-                    python_string_literal(c)
-                ));
+                let _ = writeln!(&mut sensor, "        aws_conn_id={},", python_string_literal(c));
             }
             sensor.push_str("    )");
 
@@ -371,7 +366,7 @@ fn render_single(
             let mut header = String::new();
             header.push_str("# Trigger: API (manual / external invocation)\n");
             if let Some(desc) = &api.description {
-                header.push_str(&format!("# {desc}\n"));
+                let _ = writeln!(&mut header, "# {desc}");
             }
             header.push_str("#\n");
             header.push_str("# This DAG is triggered manually via Airflow's REST API or CLI.\n");
@@ -396,7 +391,7 @@ fn render_single(
                 // BTreeMap iteration is sorted by key already, locking deterministic
                 // header ordering across runs.
                 for (field, ty) in schema {
-                    header.push_str(&format!("#   {field}: {ty}\n"));
+                    let _ = writeln!(&mut header, "#   {field}: {ty}");
                 }
             }
             TriggerRender {
