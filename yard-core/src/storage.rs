@@ -963,7 +963,7 @@ mod tests {
 
         assert!(loaded.is_some());
         let loaded = loaded.unwrap();
-        assert_eq!(loaded.job_name, "my_job");
+        assert_eq!(loaded.job_name.as_str(), "my_job");
         assert_eq!(loaded.deployment.config_hash, "abc123");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1180,7 +1180,7 @@ mod tests {
 
         assert!(loaded.is_some());
         let loaded = loaded.unwrap();
-        assert_eq!(loaded.dag_name, "my_dag");
+        assert_eq!(loaded.dag_name.as_str(), "my_dag");
         assert_eq!(loaded.deployment.content_hash, "daghash123");
         assert_eq!(loaded.deployment.tasks, vec!["task_a", "task_b"]);
 
@@ -1760,7 +1760,7 @@ mod tests {
         storage.write_job("imem_job", &state).await.unwrap();
         let loaded = storage.read_job("imem_job").await.unwrap();
         assert!(loaded.is_some(), "InMemoryStorage round-trip JobState");
-        assert_eq!(loaded.unwrap().job_name, "imem_job");
+        assert_eq!(loaded.unwrap().job_name.as_str(), "imem_job");
 
         let jobs = storage.list_jobs().await.unwrap();
         assert_eq!(jobs, vec!["imem_job".to_string()]);

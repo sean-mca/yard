@@ -2047,7 +2047,7 @@ mod tests {
                     env: None,
                     config_hash: String::new(),
                     config: serde_json::Value::Null,
-                    status: "deployed".to_string(),
+                    status: DeploymentStatus::Deployed,
                     applied_at: String::new(),
                     resources: vec![Resource {
                         r#type: "s3_object".to_string(),
@@ -2067,7 +2067,7 @@ mod tests {
                     env: None,
                     config_hash: String::new(),
                     config: serde_json::Value::Null,
-                    status: "deployed".to_string(),
+                    status: DeploymentStatus::Deployed,
                     applied_at: String::new(),
                     resources: vec![Resource {
                         r#type: "glue_job".to_string(),
@@ -2087,7 +2087,7 @@ mod tests {
                     env: None,
                     config_hash: String::new(),
                     config: serde_json::Value::Null,
-                    status: "deployed".to_string(),
+                    status: DeploymentStatus::Deployed,
                     applied_at: String::new(),
                     resources: vec![],
                 },
@@ -2112,7 +2112,7 @@ mod tests {
                     env: None,
                     config_hash: String::new(),
                     config: serde_json::Value::Null,
-                    status: "deployed".to_string(),
+                    status: DeploymentStatus::Deployed,
                     applied_at: String::new(),
                     resources: vec![
                         // glue_job FIRST — filter is by type, not position
