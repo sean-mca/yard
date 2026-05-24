@@ -135,7 +135,8 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
                 if aws_value.is_null() {
                     None
                 } else {
-                    serde_json::from_value(aws_value).ok()
+                    Some(serde_json::from_value(aws_value)
+                        .context("failed to parse state.aws credential config")?)
                 }
             },
         },
@@ -179,7 +180,8 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
     let typed_root_aws: Option<yard_structs::AwsCredentialConfig> = if root_aws.is_null() {
         None
     } else {
-        serde_json::from_value(root_aws.clone()).ok()
+        Some(serde_json::from_value(root_aws.clone())
+            .context("failed to parse root aws credential config")?)
     };
 
     let manifest = ProjectManifest {
