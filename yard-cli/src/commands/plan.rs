@@ -1,8 +1,20 @@
+//! Handler for the `yard plan` subcommand.
+
 use super::resolve_project;
 use crate::commands::display::print_plan_summary;
 use anyhow::Result;
 use std::io;
 
+/// Execute `yard plan`: preview infrastructure changes without applying them.
+///
+/// Resolves the project, computes diffs between desired and current state,
+/// and prints a human-readable plan summary. An optional `target`
+/// restricts the diff to a single job.
+///
+/// # Errors
+///
+/// Returns an error if project resolution, state loading, or diff
+/// computation fails.
 pub async fn execute(directory: Option<String>, target: Option<String>) -> Result<()> {
     let project = resolve_project(directory).await?;
 

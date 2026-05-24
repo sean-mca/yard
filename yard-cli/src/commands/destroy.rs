@@ -1,7 +1,20 @@
+//! Handler for the `yard destroy` subcommand.
+
 use super::resolve_project;
 use crate::utils::{bold, color_delete, confirm};
 use anyhow::Result;
 
+/// Execute `yard destroy`: tear down deployed resources and remove state.
+///
+/// When `job_name` is `Some`, destroys a single job or DAG (tries job
+/// first, then DAG). When `None`, destroys all deployed resources.
+/// `dry_run` skips provider teardown; `auto_approve` skips the
+/// confirmation prompt.
+///
+/// # Errors
+///
+/// Returns an error if project resolution, storage access, provider
+/// teardown, or user-confirmation I/O fails.
 pub async fn execute(
     job_name: Option<String>,
     directory: Option<String>,

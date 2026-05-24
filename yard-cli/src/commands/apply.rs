@@ -1,9 +1,21 @@
+//! Handler for the `yard apply` subcommand.
+
 use super::resolve_project;
 use crate::commands::display::print_plan_summary;
 use crate::utils::{color_create, color_delete, color_modify, confirm};
 use anyhow::Result;
 use std::io;
 
+/// Execute `yard apply`: plan changes, prompt for confirmation, then deploy.
+///
+/// When `dry_run` is `true`, changes are planned and displayed but not
+/// applied. When `auto_approve` is `true`, the confirmation prompt is
+/// skipped. An optional `target` restricts the operation to a single job.
+///
+/// # Errors
+///
+/// Returns an error if project resolution, planning, user confirmation
+/// I/O, or the apply operation itself fails.
 pub async fn execute(
     directory: Option<String>,
     dry_run: bool,

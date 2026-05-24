@@ -1,6 +1,18 @@
+//! Handler for the `yard validate` subcommand.
+
 use super::resolve_project;
 use anyhow::{Result, bail};
 
+/// Execute `yard validate`: check all job configurations for errors.
+///
+/// Iterates over every job in the manifest, runs the full validation
+/// suite, and prints `[PASS]` or `[FAIL]` per job. Exits with an error
+/// if any job fails validation.
+///
+/// # Errors
+///
+/// Returns an error if project resolution fails or if one or more jobs
+/// have validation errors.
 pub async fn execute(directory: Option<String>) -> Result<()> {
     let project = resolve_project(directory).await?;
 
