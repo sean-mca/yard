@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::State;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::response::Response;
 use axum::routing::any;
 use serde::Serialize;
@@ -130,6 +130,15 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<ApiState>) {
                     break;
                 }
             },
+            _ = state.shutdown_token.cancelled() => {
+                info!("Shutdown: sending close frame to WebSocket client");
+                let close_frame = CloseFrame {
+                    code: close_code::AWAY,
+                    reason: "server shutting down".into(),
+                };
+                let _ = socket.send(Message::Close(Some(close_frame))).await;
+                break;
+            }
         }
     }
 
@@ -253,6 +262,33 @@ mod tests {
         assert_eq!(EVENT_CHANNEL_CAPACITY, 64);
     }
 
+    #[tokio::test]
+    async fn shutdown_cancels_websocket_with_close_frame() {
+        // Verifies that CancellationToken cancellation is observable and that
+        // the CloseFrame construction compiles with the expected code + reason.
+        // Full WebSocket integration testing requires a real server; this test
+        // validates the cancellation primitive and close frame type graph.
+        let token = tokio_util::sync::CancellationToken::new();
+        assert!(!token.is_cancelled());
+
+        // Cancel the token (simulates SIGTERM handler behaviour).
+        token.cancel();
+        assert!(token.is_cancelled());
+
+        // Verify CloseFrame construction compiles with correct types.
+        let close_frame = CloseFrame {
+            code: close_code::AWAY,
+            reason: "server shutting down".into(),
+        };
+        assert_eq!(close_frame.code, close_code::AWAY);
+        assert_eq!(close_frame.reason, "server shutting down");
+
+        // Verify the cancelled() future resolves immediately after cancel().
+        let cloned = token.clone();
+        let result = timeout(Duration::from_millis(50), cloned.cancelled()).await;
+        assert!(result.is_ok(), "cancelled() should resolve immediately after cancel()");
+    }
+
     #[test]
     fn events_router_compiles_with_api_state() {
         // Compile-check: constructing events_router() with a fake ApiState exercises
@@ -275,6 +311,7 @@ mod tests {
             db,
             event_tx,
             secret_store,
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
         });
         let _router: axum::Router = events_router(state);
         // If we got here, the router typechecked; success.

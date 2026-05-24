@@ -230,6 +230,7 @@ mod tests {
             db: db as Arc<dyn Database>,
             event_tx,
             secret_store,
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
         })
     }
 

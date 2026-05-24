@@ -5,6 +5,7 @@ use axum::{
 };
 use serde::Deserialize;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::error::ApiError;
@@ -25,6 +26,10 @@ pub struct ApiState {
     #[allow(dead_code)]
     pub event_tx: tokio::sync::broadcast::Sender<crate::api::events::Event>,
     pub secret_store: Arc<dyn crate::secrets::SecretStore>,
+    /// Shared cancellation primitive for graceful shutdown (D-07, D-08).
+    /// Cancelled by the SIGTERM/SIGINT signal handler; observed by WebSocket
+    /// handlers and background poll loops via `token.cancelled()`.
+    pub shutdown_token: CancellationToken,
 }
 
 pub fn dashboard_router(state: Arc<ApiState>) -> Router {
@@ -333,6 +338,7 @@ mod tests {
             db: db as Arc<dyn Database>,
             event_tx,
             secret_store,
+            shutdown_token: CancellationToken::new(),
         })
     }
 
