@@ -3,12 +3,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use yard_structs::{JobDefinition, ProjectManifest};
 
-/// Kahn's algorithm with stable (alphabetical) tie-breaking for deterministic
-/// output. Returns the sorted task list and a per-task upstream map.
+/// Kahn's algorithm result: sorted task list and a per-task upstream map.
 pub(super) type TopoResult = (Vec<String>, BTreeMap<String, Vec<String>>);
 
-/// Build a lookup from short name (base_name) to full job name for all tasks
-/// in this DAG. Returns entries only where base_name differs from the full name.
+/// Build a lookup from short name (`base_name`) to full job name for all
+/// tasks in this DAG. Returns entries only where `base_name` differs from
+/// the full name.
 fn build_short_name_index(jobs: &[(String, &JobDefinition)]) -> HashMap<String, Vec<String>> {
     let mut index: HashMap<String, Vec<String>> = HashMap::new();
     for (full_name, job) in jobs {
@@ -22,7 +22,15 @@ fn build_short_name_index(jobs: &[(String, &JobDefinition)]) -> HashMap<String, 
     index
 }
 
-/// Resolve a single depends_on reference to a full task name.
+/// Resolve a single `depends_on` reference to a full task name.
+///
+/// Checks (in order): self-reference, exact match in `task_ids`, short-name
+/// match via `short_index`, cross-DAG reference, and finally unknown task.
+///
+/// # Errors
+///
+/// Returns an error for self-dependencies, ambiguous short names, cross-DAG
+/// references, or missing tasks.
 fn resolve_dep(
     dep: &str,
     task_name: &str,
@@ -130,6 +138,12 @@ pub(super) fn resolve_all_depends_on(
     Ok(resolved)
 }
 
+/// Topologically sort tasks using Kahn's algorithm with stable alphabetical
+/// tie-breaking for deterministic output across runs.
+///
+/// # Errors
+///
+/// Returns an error if a dependency cycle is detected.
 pub(super) fn topo_sort(
     jobs: &[(String, &JobDefinition)],
     deps: &BTreeMap<String, Vec<String>>,

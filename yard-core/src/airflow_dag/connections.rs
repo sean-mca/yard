@@ -33,6 +33,8 @@ pub(super) fn resolve_task_aws_conn_id(job: &JobDefinition, manifest: &ProjectMa
     }
 }
 
+/// Extract an explicit `aws_conn_id` from the job's `_aws` config blob.
+#[inline]
 fn job_aws_conn_id(job: &JobDefinition) -> Option<&str> {
     job.config
         .get("_aws")
@@ -41,6 +43,8 @@ fn job_aws_conn_id(job: &JobDefinition) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// Extract the assume-role ARN from the job's merged `_aws` config blob.
+#[inline]
 fn job_assume_role(job: &JobDefinition) -> Option<&str> {
     // `_aws` is the merged view (root + account.yaml + job-inline) produced by
     // `cascade_provider_defaults`; it's authoritative, no fallbacks needed.
@@ -49,10 +53,14 @@ fn job_assume_role(job: &JobDefinition) -> Option<&str> {
     job.config.get("_aws").and_then(value_assume_role)
 }
 
+/// Extract the `assume_role` field from a raw JSON value blob.
+#[inline]
 fn value_assume_role(v: &Value) -> Option<&str> {
     v.get("assume_role").and_then(|r| r.as_str()).filter(|s| !s.is_empty())
 }
 
+/// Extract the `assume_role` field from a typed `AwsCredentialConfig`.
+#[inline]
 fn typed_assume_role(c: &AwsCredentialConfig) -> Option<&str> {
     c.assume_role.as_deref().filter(|s| !s.is_empty())
 }
