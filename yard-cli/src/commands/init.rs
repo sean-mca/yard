@@ -1,6 +1,9 @@
+//! Handler for the `yard init` subcommand.
+
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
+/// Starter `yard.yaml` scaffolded into new projects.
 const STARTER_YAML: &str = "\
 project: my-yard-project
 
@@ -11,6 +14,16 @@ state:
 providers:
 ";
 
+/// Execute `yard init`: scaffold a new YARD project directory.
+///
+/// Creates the target directory (if needed), writes a starter
+/// `yard.yaml` unless one already exists, and initialises the
+/// configured state backend.
+///
+/// # Errors
+///
+/// Returns an error if directory creation, file writing, project
+/// resolution, or state-backend initialisation fails.
 pub async fn execute(directory: Option<String>) -> Result<()> {
     let base_path = match directory {
         Some(d) => PathBuf::from(d),

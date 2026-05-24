@@ -1,5 +1,9 @@
-// Context loading is now in yard-core::resolve.
-// Re-export for any remaining in-crate callers.
+//! Hierarchical context-file resolution (account, region, transforms).
+//!
+//! All logic lives in [`yard_core::resolve`]; this module re-exports the
+//! public helpers for any remaining in-crate callers and houses the
+//! integration tests that exercise parent-directory traversal.
+
 pub use yard_core::resolve::{find_and_parse_context, find_in_parent_folders, load_context};
 
 #[cfg(test)]

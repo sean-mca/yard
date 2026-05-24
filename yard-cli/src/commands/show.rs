@@ -1,6 +1,17 @@
+//! Handler for the `yard show` subcommand.
+
 use super::resolve_project;
 use anyhow::Result;
 
+/// Execute `yard show <name>`: print the generated script for a job or DAG.
+///
+/// Tries the `name` as a job first; if no matching job exists, falls back
+/// to DAG lookup. The generated script is written to stdout.
+///
+/// # Errors
+///
+/// Returns an error if project resolution fails or if `name` matches
+/// neither a job nor a DAG in the manifest.
 pub async fn execute(name: String, directory: Option<String>) -> Result<()> {
     let project = resolve_project(directory).await?;
 
