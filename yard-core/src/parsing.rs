@@ -148,6 +148,7 @@ const ALLOWED_TRANSFORM: &[&str] = &[
 ];
 
 /// Extract optional body override from a job config.
+#[must_use]
 pub fn parse_body(config: &Value) -> Option<String> {
     config
         .get("body")
@@ -156,6 +157,7 @@ pub fn parse_body(config: &Value) -> Option<String> {
 }
 
 /// Extract optional job_file path from a job config.
+#[must_use]
 pub fn parse_job_file(config: &Value) -> Option<String> {
     config
         .get("job_file")
@@ -303,7 +305,8 @@ pub fn parse_airflow_job_block(config: &Value, path: &str) -> Result<Option<Airf
 /// Shallow-merge two [`AirflowSection`]s: each `Some` field in `overlay`
 /// overrides the corresponding field in `base`. Unset fields in `overlay`
 /// leave `base` unchanged. Used to compose the inheritance chain
-/// `yard.yaml → account → region → dag → job`.
+/// `yard.yaml -> account -> region -> dag -> job`.
+#[must_use]
 pub fn merge_airflow_sections(base: &AirflowSection, overlay: &AirflowSection) -> AirflowSection {
     AirflowSection {
         schedule: overlay.schedule.clone().or_else(|| base.schedule.clone()),
@@ -348,7 +351,8 @@ pub fn merge_airflow_sections(base: &AirflowSection, overlay: &AirflowSection) -
     }
 }
 
-/// Extract imports from a job config's "imports" array.
+/// Extract the `partition_by` column list from a job config.
+#[must_use]
 pub fn parse_partition_by(config: &Value) -> Vec<String> {
     config
         .get("partition_by")
@@ -361,6 +365,8 @@ pub fn parse_partition_by(config: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Extract the optional `partition_timestamp_column` name from a job config.
+#[must_use]
 pub fn parse_partition_timestamp_column(config: &Value) -> Option<String> {
     config
         .get("partition_timestamp_column")
@@ -368,6 +374,8 @@ pub fn parse_partition_timestamp_column(config: &Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Extract the `create_timestamp` flag from a job config. Defaults to `false`.
+#[must_use]
 pub fn parse_create_timestamp(config: &Value) -> bool {
     config
         .get("create_timestamp")
@@ -375,6 +383,8 @@ pub fn parse_create_timestamp(config: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Extract the `imports` array from a job config into typed `Import` structs.
+#[must_use]
 pub fn parse_imports(config: &Value) -> Vec<Import> {
     let mut imports = Vec::new();
     if let Some(arr) = config.get("imports").and_then(|v| v.as_array()) {

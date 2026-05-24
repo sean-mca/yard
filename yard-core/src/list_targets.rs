@@ -30,8 +30,12 @@ use crate::dag_lifecycle;
 /// default credential chain (local dev, no cross-account role).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TargetRow {
+    /// Deployment target name (job name or DAG name).
     pub target: String,
+    /// Either `"job"` or `"dag"`.
     pub kind: &'static str,
+    /// 12-digit AWS account ID from the resolved `assume_role` ARN, or `None`
+    /// when the target uses the default credential chain.
     pub aws_account_id: Option<String>,
 }
 

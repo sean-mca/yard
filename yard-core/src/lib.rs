@@ -1,3 +1,24 @@
+//! Business logic crate for **yard** -- a terragrunt-inspired CLI for data
+//! engineering teams.
+//!
+//! All domain logic lives here; the `yard-cli` crate is a thin wrapper that
+//! parses arguments and displays output. Key modules:
+//!
+//! - [`orchestrate`] -- top-level `apply`, `plan`, `destroy`, `init` entry points
+//! - [`resolve`] -- project discovery, YAML config cascade, variable resolution
+//! - [`codegen`] -- PySpark script generation via Tera templates
+//! - [`airflow_dag`] -- Airflow DAG generation, trigger rendering, connections
+//! - [`storage`] -- per-job and per-DAG state persistence (local FS, S3)
+//! - [`validation`] -- schema and semantic validation rules
+//! - [`providers`] -- AWS Glue / EMR provider implementations
+//! - [`diff`] -- manifest-vs-state diff computation
+//! - [`dag_lifecycle`] -- DAG apply/destroy/diff lifecycle
+//! - [`config_merge`] -- provider config deep-merge, task-only classification
+//! - [`parsing`] -- YAML-to-typed-struct parsers for jobs, sources, sinks, airflow blocks
+//! - [`list_targets`] -- deployment target enumeration for CI matrix builders
+//! - [`show`] -- script/DAG preview without deploying
+//! - [`utils`] -- hashing, variable resolution
+
 pub mod airflow_dag;
 pub mod codegen;
 pub mod config_merge;

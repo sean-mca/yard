@@ -6,10 +6,16 @@ use crate::dag_lifecycle;
 use crate::storage;
 
 /// Generate and return the Python content for a DAG without deploying.
+///
 /// Requires a storage handle so the renderer can read each Glue task's
 /// persisted script URI (DAG-02). On an un-applied Glue task, surfaces
-/// the D-07 "run 'yard apply'" error unfiltered — that is the intended
+/// the D-07 "run 'yard apply'" error unfiltered -- that is the intended
 /// contract per phase CONTEXT.md D-04.
+///
+/// # Errors
+///
+/// Returns an error if the DAG name is not found, if script locations
+/// cannot be loaded, or if DAG generation fails.
 pub async fn show_dag(
     manifest: &ProjectManifest,
     dags: &[crate::airflow_dag::ResolvedDag],
@@ -30,8 +36,14 @@ pub async fn show_dag(
 }
 
 /// CLI-friendly wrapper: open storage from a state backend, then call `show_dag`.
+///
 /// Keeps storage handling inside yard-core per CLAUDE.md "All logic in yard-core;
 /// CLI just parses args and displays."
+///
+/// # Errors
+///
+/// Returns an error if the storage backend cannot be initialized or if
+/// `show_dag` fails.
 pub async fn show_dag_with_state(
     manifest: &ProjectManifest,
     dags: &[crate::airflow_dag::ResolvedDag],
@@ -43,6 +55,11 @@ pub async fn show_dag_with_state(
 }
 
 /// Generate and return the script for a job without deploying or modifying state.
+///
+/// # Errors
+///
+/// Returns an error if the job name is not found in the manifest or if
+/// script generation fails.
 pub fn show(manifest: &ProjectManifest, job_name: &str) -> Result<String> {
     let job_def = manifest
         .jobs

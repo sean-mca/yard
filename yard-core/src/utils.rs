@@ -10,17 +10,29 @@ static VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\$\{(?P<key>[^}]+)\}").expect("static regex")
 });
 
+/// Compute a blake3 hash of the input data, returning a hex-encoded string.
+#[must_use]
 pub fn calculate_hash<T: AsRef<[u8]>>(data: T) -> String {
     let hash = blake3::hash(data.as_ref());
     hash.to_hex().to_string()
 }
 
+/// Compute a blake3 hash of a JSON value after key-order canonicalization.
+///
+/// Keys are sorted recursively so that structurally equivalent values
+/// produce identical hashes regardless of insertion order.
+///
+/// # Errors
+///
+/// Returns an error if JSON serialization of the canonicalized value fails.
 pub fn calculate_json_hash(val: &Value) -> Result<String> {
     let canonical = canonicalize_value(val);
     let s = serde_json::to_string(&canonical)?;
     Ok(calculate_hash(s))
 }
 
+/// Recursively sort object keys so structurally equal values serialize identically.
+#[must_use]
 fn canonicalize_value(val: &Value) -> Value {
     match val {
         Value::Object(map) => {
@@ -37,6 +49,13 @@ fn canonicalize_value(val: &Value) -> Value {
     }
 }
 
+/// Replace `${...}` variable references in raw YAML with values from the
+/// YARD context (account, region, transforms, dag).
+///
+/// # Errors
+///
+/// Returns an error if any referenced variable path cannot be found in
+/// the provided context.
 pub fn resolve_variables(raw_yaml: &str, ctx: &YARDContext) -> Result<String> {
     let re = &*VAR_RE;
     let mut err: Option<anyhow::Error> = None;
@@ -67,6 +86,11 @@ pub fn resolve_variables(raw_yaml: &str, ctx: &YARDContext) -> Result<String> {
     Ok(result.into_owned())
 }
 
+/// Resolve a dotted path (e.g. `account.id`) against the YARD context.
+///
+/// Returns `None` if the root segment is unknown or if any segment in the
+/// path does not exist.
+#[must_use]
 pub fn resolve_json_path(ctx: &YARDContext, path: &str) -> Option<serde_json::Value> {
     let parts: Vec<&str> = path.split('.').collect();
     if parts.len() < 2 {

@@ -57,12 +57,25 @@ fn job_doc_allowed_keys() -> Vec<String> {
     all
 }
 
+/// A fully resolved project: the merged manifest, current deployment state,
+/// and the root directory containing `yard.yaml`.
 pub struct ResolvedProject {
+    /// The merged project manifest with all jobs discovered and provider
+    /// defaults cascaded.
     pub manifest: ProjectManifest,
+    /// The current deployment state loaded from the state backend.
     pub current_state: ProjectState,
+    /// The directory containing `yard.yaml`.
     pub root_dir: PathBuf,
 }
 
+/// Resolve a complete project from `base_path`: find `yard.yaml`, discover
+/// all jobs, cascade provider defaults, and load current state.
+///
+/// # Errors
+///
+/// Returns an error if `yard.yaml` is missing, if job discovery fails
+/// (invalid YAML, missing required fields), or if state loading fails.
 pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
     // 1. Find yard.yaml
     let root_path = find_in_parent_folders(base_path, "yard.yaml")
@@ -72,8 +85,10 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
         .context("yard.yaml path has no parent directory")?
         .to_path_buf();
 
-    let root_content = fs::read_to_string(&root_path)?;
-    let root_docs = YamlLoader::load_from_str(&root_content)?;
+    let root_content = fs::read_to_string(&root_path)
+        .with_context(|| format!("failed to read {}", root_path.display()))?;
+    let root_docs = YamlLoader::load_from_str(&root_content)
+        .with_context(|| format!("failed to parse YAML in {}", root_path.display()))?;
     let root_doc = root_docs
         .first()
         .ok_or_else(|| anyhow!("yard.yaml is empty"))?;
@@ -229,10 +244,13 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
             }
         };
 
-        let raw_job_content = fs::read_to_string(path)?;
-        let resolved_job_str = crate::utils::resolve_variables(&raw_job_content, ctx)?;
+        let raw_job_content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read job file {}", path.display()))?;
+        let resolved_job_str = crate::utils::resolve_variables(&raw_job_content, ctx)
+            .with_context(|| format!("failed to resolve variables in {}", path.display()))?;
 
-        let job_docs = YamlLoader::load_from_str(&resolved_job_str)?;
+        let job_docs = YamlLoader::load_from_str(&resolved_job_str)
+            .with_context(|| format!("failed to parse YAML in {}", path.display()))?;
         let job_doc = job_docs
             .first()
             .ok_or_else(|| anyhow!("Job file {} is empty", file_name))?;
@@ -404,6 +422,9 @@ fn cascade_merge(layers: &[&Value]) -> Value {
 
 // ---- Context loading ----
 
+/// Walk from `start_path` upward looking for `filename`. Returns the first
+/// match found, or `None` if the filesystem root is reached.
+#[must_use]
 pub fn find_in_parent_folders(start_path: &Path, filename: &str) -> Option<PathBuf> {
     let mut current = start_path.to_path_buf();
     loop {
@@ -418,6 +439,14 @@ pub fn find_in_parent_folders(start_path: &Path, filename: &str) -> Option<PathB
     None
 }
 
+/// Find and parse a YAML context file (`account.yaml`, `region.yaml`, etc.)
+/// by walking from `start_path` upward. If `required` is `true`, returns an
+/// error when the file is not found; otherwise returns an empty JSON object.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, if the YAML is invalid,
+/// or if `required` is `true` and the file is not found.
 pub fn find_and_parse_context(start_path: &Path, filename: &str, required: bool) -> Result<Value> {
     let mut current = start_path.to_path_buf();
 
@@ -449,6 +478,12 @@ pub fn find_and_parse_context(start_path: &Path, filename: &str, required: bool)
     }
 }
 
+/// Load the full YARD context for a directory: account, region, transforms,
+/// and dag settings from their respective YAML files.
+///
+/// # Errors
+///
+/// Returns an error if `account.yaml` or `region.yaml` is missing or invalid.
 pub fn load_context(current_dir: &Path) -> Result<YARDContext> {
     let account = find_and_parse_context(current_dir, "account.yaml", true)?;
     let region = find_and_parse_context(current_dir, "region.yaml", true)?;
@@ -465,6 +500,11 @@ pub fn load_context(current_dir: &Path) -> Result<YARDContext> {
 
 // ---- YAML to JSON conversion ----
 
+/// Convert a `yaml_rust2::Yaml` value to a `serde_json::Value`.
+///
+/// Handles all YAML types: strings, integers, floats, booleans, arrays,
+/// objects, and null. Unknown variants map to `Value::Null`.
+#[must_use]
 pub fn yaml_to_json(yaml: &yaml_rust2::Yaml) -> Value {
     match yaml {
         yaml_rust2::Yaml::Real(s) => {

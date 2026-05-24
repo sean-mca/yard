@@ -7,6 +7,7 @@ use crate::codegen;
 use crate::utils;
 
 /// Compute the diff between the manifest and the current state.
+///
 /// Used by both plan (read-only) and apply (before executing changes).
 ///
 /// Phase 28 / D-14: iterates `manifest.jobs` and `state.deployments` via
@@ -14,6 +15,11 @@ use crate::utils;
 /// (DIFF-01 invariant). The BTreeMap-collect idiom matches
 /// `airflow_dag::connections::required_connections_for_dag` (the in-tree
 /// precedent at line 96).
+///
+/// # Errors
+///
+/// Returns an error if script generation or config serialization fails
+/// for any job in the manifest.
 pub fn calculate_diff(manifest: &ProjectManifest, state: &ProjectState) -> Result<Vec<JobDiff>> {
     let mut diffs = Vec::new();
 
@@ -71,6 +77,8 @@ pub fn calculate_diff(manifest: &ProjectManifest, state: &ProjectState) -> Resul
     Ok(diffs)
 }
 
+/// Compare two JSON objects and return a map of changed keys to `(old, new)` value strings.
+#[must_use]
 fn compare_json(old: &Value, new: &Value) -> BTreeMap<String, (String, String)> {
     let mut changes = BTreeMap::new();
     if let (Value::Object(old_obj), Value::Object(new_obj)) = (old, new) {
