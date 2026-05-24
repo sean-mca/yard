@@ -396,8 +396,10 @@ fn start_api_server() {
             tokio::spawn(discovery_task);
 
             // Spawn background polling tasks
-            tokio::spawn(drift_poll_loop(api_state.clone(), poll_timeout_secs));
-            tokio::spawn(dashboard_poll_loop(api_state, poll_timeout_secs));
+            let drift_token = api_state.shutdown_token.clone();
+            let dashboard_token = api_state.shutdown_token.clone();
+            tokio::spawn(drift_poll_loop(api_state.clone(), poll_timeout_secs, drift_token));
+            tokio::spawn(dashboard_poll_loop(api_state, poll_timeout_secs, dashboard_token));
 
             let port = std::env::var("YARD_PORT").unwrap_or_else(|_| "3001".to_string());
             let bind_host = std::env::var("YARD_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -619,6 +621,7 @@ async fn run_drift_iteration(
 async fn drift_poll_loop(
     state: std::sync::Arc<api::dashboard::ApiState>,
     poll_timeout_secs: u64,
+    token: tokio_util::sync::CancellationToken,
 ) {
     use crate::polling::{SupervisedResult, compute_backoff_sleep, supervised_iteration};
     use tracing::warn;
@@ -626,7 +629,13 @@ async fn drift_poll_loop(
     const DEFAULT_INTERVAL_MINS: u64 = 3;
 
     // Wait for server to be ready before first check.
-    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+        _ = token.cancelled() => {
+            tracing::info!("drift_poll_loop: shutdown signal received during startup delay, exiting");
+            return;
+        }
+    }
 
     let timeout_dur = std::time::Duration::from_secs(poll_timeout_secs);
     let mut consecutive_errors: u32 = 0;
@@ -667,7 +676,13 @@ async fn drift_poll_loop(
         };
 
         let backoff = compute_backoff_sleep(interval, consecutive_errors);
-        tokio::time::sleep(backoff).await;
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            _ = token.cancelled() => {
+                tracing::info!("drift_poll_loop: shutdown signal received, exiting");
+                break;
+            }
+        }
     }
 }
 
@@ -675,6 +690,7 @@ async fn drift_poll_loop(
 async fn dashboard_poll_loop(
     state: std::sync::Arc<api::dashboard::ApiState>,
     poll_timeout_secs: u64,
+    token: tokio_util::sync::CancellationToken,
 ) {
     use crate::polling::{SupervisedResult, compute_backoff_sleep, supervised_iteration};
     use tracing::{info, warn};
@@ -682,7 +698,13 @@ async fn dashboard_poll_loop(
     const DEFAULT_INTERVAL_MINS: u64 = 5;
 
     // Wait for server to be ready before first refresh.
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+        _ = token.cancelled() => {
+            tracing::info!("dashboard_poll_loop: shutdown signal received during startup delay, exiting");
+            return;
+        }
+    }
 
     let timeout_dur = std::time::Duration::from_secs(poll_timeout_secs);
     let mut consecutive_errors: u32 = 0;
@@ -735,7 +757,13 @@ async fn dashboard_poll_loop(
         };
 
         let backoff = compute_backoff_sleep(interval, consecutive_errors);
-        tokio::time::sleep(backoff).await;
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            _ = token.cancelled() => {
+                tracing::info!("dashboard_poll_loop: shutdown signal received, exiting");
+                break;
+            }
+        }
     }
 }
 
