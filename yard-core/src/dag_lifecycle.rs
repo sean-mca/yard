@@ -19,21 +19,33 @@ use crate::parsing::parse_airflow_section;
 /// Result of applying DAG changes.
 #[derive(Debug)]
 pub struct DagApplyResult {
+    /// DAG names that were newly generated/deployed.
     pub created: Vec<String>,
+    /// DAG names whose content changed and were regenerated/redeployed.
     pub modified: Vec<String>,
+    /// DAG names that were removed and destroyed.
     pub deleted: Vec<String>,
+    /// Cross-account Airflow connections required by created/modified DAGs.
     pub required_connections: Vec<airflow_dag::RequiredConnection>,
 }
 
 /// Load the current DAG deployment state from the state backend.
+///
+/// # Errors
+///
+/// Returns an error if the storage backend cannot be initialized or if
+/// reading any DAG state file fails.
 pub async fn load_dag_state(
     backend: &yard_structs::StateBackend,
 ) -> Result<HashMap<String, DagDeployment>> {
-    let storage = storage::get_storage(backend).await?;
-    let dag_names = storage.list_dags().await?;
+    let storage = storage::get_storage(backend).await
+        .context("failed to initialize storage for load_dag_state")?;
+    let dag_names = storage.list_dags().await
+        .context("failed to list DAGs from state backend")?;
     let mut deployments = HashMap::new();
     for name in dag_names {
-        if let Some(state) = storage.read_dag(&name).await? {
+        if let Some(state) = storage.read_dag(&name).await
+            .with_context(|| format!("failed to read state for DAG \"{name}\""))? {
             deployments.insert(name, state.deployment);
         }
     }
@@ -63,6 +75,11 @@ pub(crate) async fn load_script_locations_from_storage(
 /// projection. Kept as the public entry point so CLI callers don't need to
 /// know about `storage::Storage` directly (per CLAUDE.md "all logic in
 /// yard-core").
+///
+/// # Errors
+///
+/// Returns an error if the storage backend cannot be initialized or if
+/// reading job state files fails.
 pub async fn load_script_locations(
     backend: &yard_structs::StateBackend,
 ) -> Result<HashMap<String, String>> {
@@ -71,6 +88,10 @@ pub async fn load_script_locations(
 }
 
 /// Compute the diff between resolved DAGs and stored DAG state.
+///
+/// # Errors
+///
+/// Returns an error if DAG content generation or config serialization fails.
 pub fn calculate_dag_diffs(
     manifest: &ProjectManifest,
     dags: &[airflow_dag::ResolvedDag],
@@ -170,6 +191,10 @@ fn compare_dag_config(
 }
 
 /// Apply DAG changes: generate Python files, upload to S3, persist state.
+///
+/// # Errors
+///
+/// Returns an error if DAG generation, S3 upload, or state persistence fails.
 pub async fn apply_dags(
     manifest: &ProjectManifest,
     dags: &[airflow_dag::ResolvedDag],
@@ -480,10 +505,19 @@ fn extract_airflow_region(manifest: &ProjectManifest) -> Result<String> {
 
 /// Result of destroying DAGs.
 pub struct DagDestroyResult {
+    /// DAG names that were destroyed.
     pub destroyed: Vec<String>,
 }
 
 /// Destroy a single DAG: delete S3 file, delete state, delete generated script.
+///
+/// Returns `true` if the DAG existed and was destroyed, `false` if no state
+/// was found.
+///
+/// # Errors
+///
+/// Returns an error if locking fails, if S3 deletion fails, or if state
+/// deletion fails.
 pub async fn destroy_dag(
     backend: &yard_structs::StateBackend,
     provider_configs: &HashMap<String, Value>,
@@ -565,6 +599,10 @@ pub async fn destroy_dag(
 }
 
 /// Destroy all DAGs that have state.
+///
+/// # Errors
+///
+/// Returns an error if any individual DAG destruction fails.
 pub async fn destroy_all_dags(
     backend: &yard_structs::StateBackend,
     provider_configs: &HashMap<String, Value>,

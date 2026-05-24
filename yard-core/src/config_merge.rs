@@ -1,10 +1,11 @@
 use serde_json::Value;
 use yard_structs::JobType;
 
-/// Job types that are Airflow tasks only — they don't have a Spark artifact to
+/// Job types that are Airflow tasks only -- they don't have a Spark artifact to
 /// generate and no provider to deploy through. Used in validation, codegen,
-/// and apply to short-circuit the Spark path. **Single source of truth** —
+/// and apply to short-circuit the Spark path. **Single source of truth** --
 /// callers must use this helper instead of hard-coding the list.
+#[must_use]
 pub fn is_task_only(job_type: JobType) -> bool {
     matches!(job_type, JobType::Bash)
 }
@@ -12,6 +13,7 @@ pub fn is_task_only(job_type: JobType) -> bool {
 /// Build the `Value` passed to `get_provider`: provider defaults shallow-
 /// merged with the job's `<job_type>:` block, plus the per-job `_aws` block
 /// (resolved at discovery time) injected alongside.
+#[must_use]
 pub fn build_provider_config(
     provider_defaults: &Value,
     full_config: &Value,
@@ -28,10 +30,12 @@ pub fn build_provider_config(
 }
 
 /// Merge provider-level defaults with job-level overrides.
+///
 /// Provider config from yard.yaml is the base, job-level block wins on conflicts.
 /// Recurses into nested objects so a job overriding a single key of a nested
 /// map (e.g. `glue.default_arguments.--job-language`) preserves the sibling
 /// keys the provider defined. Arrays and scalars are replaced wholesale.
+#[must_use]
 pub fn merge_provider_config(provider_defaults: &Value, job_overrides: &Value) -> Value {
     match (provider_defaults, job_overrides) {
         (Value::Object(base), Value::Object(overrides)) => {
