@@ -200,6 +200,7 @@ pub struct ProjectManifest {
     /// Each value is the raw provider config block from yard.yaml.
     #[serde(default)]
     pub providers: HashMap<String, serde_json::Value>,
+    /// Job definitions keyed by fully-qualified job name.
     #[serde(default)]
     pub jobs: HashMap<String, JobDefinition>,
     /// Root-level `aws:` block (TYPE-02). Per-job and per-DAG account.yaml
@@ -327,6 +328,7 @@ pub struct Sink {
     pub mode: Option<String>,
     /// Partition columns for the output.
     pub partition_by: Vec<String>,
+    /// JDBC connection type (e.g. `"mysql"`, `"postgresql"`).
     #[serde(default)]
     pub connection_type: Option<String>,
     /// For iceberg sinks only: coerce nulls/voids to type-appropriate defaults
@@ -402,8 +404,11 @@ pub struct JobDefinition {
     pub body: Option<String>,
     /// Path to an external Python file that replaces YARD's generated script entirely.
     pub job_file: Option<String>,
+    /// Data sources read by this job (S3 paths, catalog tables, etc.).
     pub sources: Vec<Source>,
+    /// Output destination (S3 path, catalog table, JDBC endpoint, etc.).
     pub sink: Option<Sink>,
+    /// In-flight data transformations applied between source reads and sink write.
     pub transforms: Vec<Transform>,
     /// Per-job Airflow metadata, parsed from the optional `airflow:` block.
     /// `None` means the job does not participate in any DAG.
@@ -421,6 +426,7 @@ pub struct JobDefinition {
     /// `partition_timestamp_column`.
     #[serde(default)]
     pub create_timestamp: bool,
+    /// Provider-specific configuration blob (Glue kwargs, EMR config, etc.).
     pub config: serde_json::Value,
     /// Directory containing the job's YAML file. Populated during discovery;
     /// not serialized to state. Used to locate the nearest ancestor `dag.yaml`
@@ -488,10 +494,15 @@ pub struct YARDContext {
 /// rename-pointer error (D-21).
 #[derive(Debug, Serialize, Clone, Default, PartialEq)]
 pub struct AirflowSection {
+    /// Cron or preset schedule expression for the DAG (e.g. `"@daily"`).
     pub schedule: Option<String>,
+    /// DAG owner name rendered in Airflow metadata.
     pub owner: Option<String>,
+    /// Number of task-level retries before marking a run as failed.
     pub retries: Option<i32>,
+    /// S3 bucket where generated DAG files are uploaded.
     pub dags_bucket: Option<String>,
+    /// S3 key prefix within `dags_bucket` for DAG file uploads.
     pub dags_prefix: Option<String>,
     /// Typed event-driven trigger (S3 file drop, Airflow Dataset, SQS,
     /// manual API, or `all:` / `any:` composite). Mutually exclusive with
@@ -583,12 +594,15 @@ impl<'de> serde::Deserialize<'de> for AirflowSection {
 /// and emits an actionable rename-pointer error (D-21).
 #[derive(Debug, Serialize, Clone, Default, PartialEq)]
 pub struct AirflowJobBlock {
+    /// Upstream task names this job depends on within its DAG.
     #[serde(default)]
     pub depends_on: Vec<String>,
     /// Dataset URIs this task publishes. Emitted as `outlets=[Dataset(...)]`
     /// on the Airflow operator so downstream DAGs are triggered on completion.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub publishes: Vec<String>,
+    /// Inherited Airflow config overrides (schedule, owner, retries, etc.)
+    /// flattened from the parent `AirflowSection` cascade.
     #[serde(flatten, default)]
     pub overrides: AirflowSection,
 }

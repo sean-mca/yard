@@ -45,7 +45,9 @@ const AIRFLOW_DAG_TEMPLATE: &str = include_str!("../templates/airflow_dag.py.ter
 /// up in MWAA.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RequiredConnection {
+    /// Airflow connection identifier (e.g. `"aws_conn_123456789012"`).
     pub conn_id: String,
+    /// IAM role ARN assumed via this connection for cross-account access.
     pub role_arn: String,
 }
 

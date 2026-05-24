@@ -9,8 +9,8 @@
 //! - [`validate_project`] -- cross-DAG broken-link warnings for Dataset triggers
 //!
 //! Sub-modules:
-//! - [`rules`] -- per-job schema validation (sources, transforms, sinks, providers)
-//! - [`syntax`] -- Python syntax validation via `python3 ast.parse`
+//! - `rules` -- per-job schema validation (sources, transforms, sinks, providers)
+//! - `syntax` -- Python syntax validation via `python3 ast.parse`
 
 mod rules;
 mod syntax;
