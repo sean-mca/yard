@@ -439,7 +439,15 @@ fn render_composite(
     let (items, separator) = match t {
         Trigger::All(v) => (v, " & "),
         Trigger::Any(v) => (v, " | "),
-        Trigger::Single(_) | _ => unreachable!("normalized away in render_trigger"),
+        Trigger::Single(s) => return render_single(s, default_aws_conn_id, roots),
+        _ => return TriggerRender {
+            schedule_expr: "None".to_string(),
+            sensor_tasks: Vec::new(),
+            sensor_deps: Vec::new(),
+            extra_imports: Vec::new(),
+            max_active_runs: None,
+            header_docstring: String::new(),
+        },
     };
 
     // DS-02 / DS-03: homogeneous Datasets — alpha-sort URIs and join.

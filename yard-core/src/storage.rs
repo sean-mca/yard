@@ -124,7 +124,8 @@ impl StorageBackend for LocalStorage {
             let content = tokio::fs::read_to_string(&path)
                 .await
                 .with_context(|| format!("Failed to read state for job {job_name}"))?;
-            let state: JobState = serde_json::from_str(&content)?;
+            let state: JobState = serde_json::from_str(&content)
+                .with_context(|| format!("failed to deserialize job state for {job_name}"))?;
             Ok(Some(state))
         })
     }
@@ -190,7 +191,8 @@ impl StorageBackend for LocalStorage {
             let content = tokio::fs::read_to_string(&path)
                 .await
                 .with_context(|| format!("Failed to read state for DAG {dag_name}"))?;
-            let state: DagState = serde_json::from_str(&content)?;
+            let state: DagState = serde_json::from_str(&content)
+                .with_context(|| format!("failed to deserialize DAG state for {dag_name}"))?;
             Ok(Some(state))
         })
     }
@@ -331,7 +333,8 @@ impl StorageBackend for LocalStorage {
                 return Ok(None);
             }
             let content = tokio::fs::read_to_string(&lock_path).await?;
-            let info: LockInfo = serde_json::from_str(&content)?;
+            let info: LockInfo = serde_json::from_str(&content)
+                .with_context(|| format!("failed to deserialize lock info for {job_name}"))?;
             Ok(Some(info))
         })
     }
@@ -358,7 +361,8 @@ impl StorageBackend for S3Storage {
             match result {
                 Ok(resp) => {
                     let data = resp.body.collect().await?.into_bytes();
-                    let state: JobState = serde_json::from_slice(&data)?;
+                    let state: JobState = serde_json::from_slice(&data)
+                        .with_context(|| format!("failed to deserialize job state for {job_name}"))?;
                     Ok(Some(state))
                 }
                 Err(e) => {
@@ -443,7 +447,8 @@ impl StorageBackend for S3Storage {
             match result {
                 Ok(resp) => {
                     let data = resp.body.collect().await?.into_bytes();
-                    let state: DagState = serde_json::from_slice(&data)?;
+                    let state: DagState = serde_json::from_slice(&data)
+                        .with_context(|| format!("failed to deserialize DAG state for {dag_name}"))?;
                     Ok(Some(state))
                 }
                 Err(e) => {
@@ -542,7 +547,8 @@ impl StorageBackend for S3Storage {
                             return Err(e.into());
                         }
 
-                        let existing = self.get_lock(&job_name).await.ok().flatten();
+                        let existing = self.get_lock(&job_name).await
+                            .with_context(|| format!("failed to read existing lock for {job_name}"))?;
                         match existing {
                             Some(held) => {
                                 if attempt == 0
@@ -613,7 +619,8 @@ impl StorageBackend for S3Storage {
             match result {
                 Ok(resp) => {
                     let data = resp.body.collect().await?.into_bytes();
-                    let info: LockInfo = serde_json::from_slice(&data)?;
+                    let info: LockInfo = serde_json::from_slice(&data)
+                        .with_context(|| format!("failed to deserialize lock info for {job_name}"))?;
                     Ok(Some(info))
                 }
                 Err(e) => {

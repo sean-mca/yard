@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::path::Path;
 use yard_structs::{
     DagDiff, Deployment, DeploymentStatus, DiffType, JobDiff, JobName, JobState, JobType,
@@ -203,7 +204,7 @@ pub async fn apply(
         let mut msg = String::from("Validation failed:\n");
         for (name, errors) in &all_errors {
             for e in errors {
-                msg.push_str(&format!("  [{}] {}: {}\n", name, e.field, e.message));
+                let _ = writeln!(msg, "  [{}] {}: {}", name, e.field, e.message);
             }
         }
         return Err(anyhow!("{msg}"));
@@ -216,7 +217,7 @@ pub async fn apply(
     if !orphans.is_empty() {
         let mut msg = String::from("Validation failed:\n");
         for (name, err) in &orphans {
-            msg.push_str(&format!("  [{name}] {err}\n"));
+            let _ = writeln!(msg, "  [{name}] {err}");
         }
         return Err(anyhow!("{msg}"));
     }
@@ -234,7 +235,7 @@ pub async fn apply(
         let mut msg = String::from("Validation failed:\n");
         for (name, errors) in &all_dag_errors {
             for e in errors {
-                msg.push_str(&format!("  [{}] {}: {}\n", name, e.field, e.message));
+                let _ = writeln!(msg, "  [{}] {}: {}", name, e.field, e.message);
             }
         }
         return Err(anyhow!("{msg}"));
@@ -514,7 +515,7 @@ pub async fn plan(
     if !orphans.is_empty() {
         let mut msg = String::from("Validation failed:\n");
         for (name, err) in &orphans {
-            msg.push_str(&format!("  [{name}] {err}\n"));
+            let _ = writeln!(msg, "  [{name}] {err}");
         }
         return Err(anyhow!("{msg}"));
     }
@@ -532,7 +533,7 @@ pub async fn plan(
         let mut msg = String::from("Validation failed:\n");
         for (name, errors) in &all_dag_errors {
             for e in errors {
-                msg.push_str(&format!("  [{}] {}: {}\n", name, e.field, e.message));
+                let _ = writeln!(msg, "  [{}] {}: {}", name, e.field, e.message);
             }
         }
         return Err(anyhow!("{msg}"));
