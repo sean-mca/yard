@@ -920,6 +920,7 @@ pub async fn get_storage(backend: &StateBackend) -> Result<Storage> {
                 prefix,
             }))
         }
+        _ => anyhow::bail!("unsupported state backend variant"),
     }
 }
 
@@ -928,17 +929,17 @@ pub async fn get_storage(backend: &StateBackend) -> Result<Storage> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use yard_structs::{DagDeployment, Deployment};
+    use yard_structs::{DagDeployment, DagDeploymentStatus, DeploymentStatus, Deployment, JobName, DagName};
 
     fn test_job_state(job_name: &str) -> JobState {
         JobState {
-            job_name: job_name.to_string(),
+            job_name: JobName::new(job_name),
             project: "test-project".to_string(),
             deployment: Deployment {
                 env: None,
                 config_hash: "abc123".to_string(),
                 config: serde_json::json!({"type": "glue"}),
-                status: "generated".to_string(),
+                status: DeploymentStatus::Generated,
                 applied_at: "2025-01-01T00:00:00Z".to_string(),
                 resources: Vec::new(),
             },
@@ -962,7 +963,7 @@ mod tests {
 
         assert!(loaded.is_some());
         let loaded = loaded.unwrap();
-        assert_eq!(loaded.job_name, "my_job");
+        assert_eq!(loaded.job_name.as_str(), "my_job");
         assert_eq!(loaded.deployment.config_hash, "abc123");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1155,13 +1156,13 @@ mod tests {
 
     fn test_dag_state(dag_name: &str) -> DagState {
         DagState {
-            dag_name: dag_name.to_string(),
+            dag_name: DagName::new(dag_name),
             project: "test-project".to_string(),
             deployment: DagDeployment {
                 content_hash: "daghash123".to_string(),
                 config: serde_json::json!({"schedule": "@daily"}),
                 tasks: vec!["task_a".to_string(), "task_b".to_string()],
-                status: "generated".to_string(),
+                status: DagDeploymentStatus::Generated,
                 applied_at: "2025-01-01T00:00:00Z".to_string(),
                 s3_uri: None,
             },
@@ -1179,7 +1180,7 @@ mod tests {
 
         assert!(loaded.is_some());
         let loaded = loaded.unwrap();
-        assert_eq!(loaded.dag_name, "my_dag");
+        assert_eq!(loaded.dag_name.as_str(), "my_dag");
         assert_eq!(loaded.deployment.content_hash, "daghash123");
         assert_eq!(loaded.deployment.tasks, vec!["task_a", "task_b"]);
 
@@ -1484,7 +1485,7 @@ mod tests {
         let storage = Storage::new(LocalStorage { path: dir.clone() });
 
         let state = JobState {
-            job_name: "byte_test".to_string(),
+            job_name: JobName::new("byte_test"),
             project: "test-project".to_string(),
             deployment: Deployment {
                 env: None,
@@ -1493,7 +1494,7 @@ mod tests {
                     "type": "glue",
                     "role": "arn:aws:iam::111111111111:role/X"
                 }),
-                status: "applied".to_string(),
+                status: DeploymentStatus::Deployed,
                 applied_at: "2025-01-01T00:00:00Z".to_string(),
                 resources: Vec::new(),
             },
@@ -1759,7 +1760,7 @@ mod tests {
         storage.write_job("imem_job", &state).await.unwrap();
         let loaded = storage.read_job("imem_job").await.unwrap();
         assert!(loaded.is_some(), "InMemoryStorage round-trip JobState");
-        assert_eq!(loaded.unwrap().job_name, "imem_job");
+        assert_eq!(loaded.unwrap().job_name.as_str(), "imem_job");
 
         let jobs = storage.list_jobs().await.unwrap();
         assert_eq!(jobs, vec!["imem_job".to_string()]);

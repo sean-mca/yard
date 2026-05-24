@@ -409,6 +409,14 @@ fn render_single(
                 header_docstring: header,
             }
         }
+        _ => TriggerRender {
+            schedule_expr: "None".to_string(),
+            sensor_tasks: Vec::new(),
+            sensor_deps: Vec::new(),
+            extra_imports: Vec::new(),
+            max_active_runs: None,
+            header_docstring: "# Trigger: unknown source type\n".to_string(),
+        },
     }
 }
 
@@ -436,7 +444,7 @@ fn render_composite(
     let (items, separator) = match t {
         Trigger::All(v) => (v, " & "),
         Trigger::Any(v) => (v, " | "),
-        Trigger::Single(_) => unreachable!("normalized away in render_trigger"),
+        Trigger::Single(_) | _ => unreachable!("normalized away in render_trigger"),
     };
 
     // DS-02 / DS-03: homogeneous Datasets — alpha-sort URIs and join.
@@ -555,7 +563,7 @@ fn render_composite(
                 // Dataset / Schedule cannot appear in non_datasets — Dataset
                 // was filtered out into dataset_uris above; Schedule is
                 // rejected at validation in heterogeneous composites.
-                SingleSource::Dataset(_) | SingleSource::Schedule(_) => None,
+                SingleSource::Dataset(_) | SingleSource::Schedule(_) | _ => None,
             };
             if let Some(id) = sensor_id {
                 sensor_deps.push(format!("{id} >> _yard_join"));

@@ -27,7 +27,8 @@
 use aws_sdk_s3::Client as S3Client;
 use serde_json::json;
 use yard_structs::{
-    AwsCredentialConfig, DagDeployment, DagState, Deployment, JobState, StateBackend,
+    AwsCredentialConfig, DagDeployment, DagDeploymentStatus, DagName, DagState, Deployment,
+    DeploymentStatus, JobName, JobState, StateBackend,
 };
 
 const REGION: &str = "us-east-1";
@@ -49,13 +50,13 @@ async fn ensure_bucket() {
 
 fn sample_job_state(name: &str) -> JobState {
     JobState {
-        job_name: name.to_string(),
+        job_name: JobName::new(name),
         project: "phase9-test".to_string(),
         deployment: Deployment {
             env: None,
             config_hash: "deadbeef".to_string(),
             config: json!({"type": "glue"}),
-            status: "generated".to_string(),
+            status: DeploymentStatus::Generated,
             applied_at: "2026-04-22T00:00:00Z".to_string(),
             resources: Vec::new(),
         },
@@ -64,13 +65,13 @@ fn sample_job_state(name: &str) -> JobState {
 
 fn sample_dag_state(name: &str, aws: Option<AwsCredentialConfig>) -> DagState {
     DagState {
-        dag_name: name.to_string(),
+        dag_name: DagName::new(name),
         project: "phase9-test".to_string(),
         deployment: DagDeployment {
             content_hash: "feedface".to_string(),
             config: json!({"schedule": "@daily"}),
             tasks: vec!["task_a".to_string()],
-            status: "deployed".to_string(),
+            status: DagDeploymentStatus::Deployed,
             applied_at: "2026-04-22T00:00:00Z".to_string(),
             s3_uri: Some(format!("s3://phase9-dags/dags/{name}.py")),
         },
@@ -98,12 +99,12 @@ async fn state_backend_s3_null_aws_roundtrip() {
 
     let job = sample_job_state("job_null_aws");
     storage
-        .write_job(&job.job_name, &job)
+        .write_job(job.job_name.as_str(), &job)
         .await
         .expect("write_job");
 
     let readback = storage
-        .read_job(&job.job_name)
+        .read_job(job.job_name.as_str())
         .await
         .expect("read_job")
         .expect("job must exist");
@@ -112,7 +113,7 @@ async fn state_backend_s3_null_aws_roundtrip() {
     assert_eq!(readback.deployment.config_hash, job.deployment.config_hash);
 
     // Cleanup
-    storage.delete_job(&job.job_name).await.ok();
+    storage.delete_job(job.job_name.as_str()).await.ok();
 }
 
 // ---- Test 2: state backend S3 with populated aws.assume_role ----
@@ -189,17 +190,17 @@ async fn state_backend_s3_assume_role_s3_write_attempt() {
         .expect("get_storage");
 
     let job = sample_job_state("job_assume_role_write");
-    let write_result = storage.write_job(&job.job_name, &job).await;
+    let write_result = storage.write_job(job.job_name.as_str(), &job).await;
 
     match write_result {
         Ok(()) => {
             // STS reached LocalStack; verify the read path too.
-            let readback = storage.read_job(&job.job_name).await;
+            let readback = storage.read_job(job.job_name.as_str()).await;
             assert!(
                 readback.is_ok() && readback.unwrap().is_some(),
                 "read_job must succeed after successful write through AssumeRole"
             );
-            storage.delete_job(&job.job_name).await.ok();
+            storage.delete_job(job.job_name.as_str()).await.ok();
             eprintln!("[phase9] AssumeRole S3 write SUCCEEDED — STS honored AWS_ENDPOINT_URL");
         }
         Err(e) => {
@@ -279,12 +280,12 @@ async fn dag_state_aws_roundtrips_through_s3_storage() {
 
     let dag = sample_dag_state("dag_with_aws", expected_aws.clone());
     storage
-        .write_dag(&dag.dag_name, &dag)
+        .write_dag(dag.dag_name.as_str(), &dag)
         .await
         .expect("write_dag");
 
     let readback = storage
-        .read_dag(&dag.dag_name)
+        .read_dag(dag.dag_name.as_str())
         .await
         .expect("read_dag")
         .expect("dag must exist");
@@ -300,7 +301,7 @@ async fn dag_state_aws_roundtrips_through_s3_storage() {
     );
 
     // Cleanup
-    storage.delete_dag(&dag.dag_name).await.ok();
+    storage.delete_dag(dag.dag_name.as_str()).await.ok();
 }
 
 // ---- Test 5: DagState with aws: Null (pre-Phase-9 compatibility) ----
@@ -326,12 +327,12 @@ async fn dag_state_null_aws_roundtrips_through_s3_storage() {
 
     let dag = sample_dag_state("dag_null_aws", None);
     storage
-        .write_dag(&dag.dag_name, &dag)
+        .write_dag(dag.dag_name.as_str(), &dag)
         .await
         .expect("write_dag");
 
     let readback = storage
-        .read_dag(&dag.dag_name)
+        .read_dag(dag.dag_name.as_str())
         .await
         .expect("read_dag")
         .expect("dag must exist");
@@ -342,5 +343,5 @@ async fn dag_state_null_aws_roundtrips_through_s3_storage() {
     );
 
     // Cleanup
-    storage.delete_dag(&dag.dag_name).await.ok();
+    storage.delete_dag(dag.dag_name.as_str()).await.ok();
 }

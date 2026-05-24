@@ -1,8 +1,15 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+/// A single validation error found during config or DAG validation.
+///
+/// Carries the field path that failed validation and a human-readable
+/// message describing the constraint that was violated. Displayed as
+/// `"{field}: {message}"`.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ValidationError {
+    /// Dot-separated path to the invalid field (e.g. `"sources[0].path"`).
     pub field: String,
+    /// Human-readable description of the validation failure.
     pub message: String,
 }
 

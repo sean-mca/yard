@@ -73,6 +73,9 @@ pub fn print_plan_summary(
                     color_delete(&format!("  - Delete job [{}]", diff.name))
                 )?;
             }
+            _ => {
+                writeln!(out, "  ? Changed job [{}]", diff.name)?;
+            }
         }
     }
 
@@ -101,6 +104,9 @@ pub fn print_plan_summary(
                     "{}",
                     color_delete(&format!("  - Delete DAG [{}]", diff.name))
                 )?;
+            }
+            _ => {
+                writeln!(out, "  ? Changed DAG [{}]", diff.name)?;
             }
         }
     }

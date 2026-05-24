@@ -1,26 +1,41 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Classification of a change detected between the desired config and the
+/// persisted state for a job or DAG.
+#[non_exhaustive]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum DiffType {
+    /// A new resource that does not yet exist in state.
     Create,
+    /// An existing resource whose config has changed. `changes` maps each
+    /// modified field name to its `(old_value, new_value)` pair, sorted by
+    /// key via `BTreeMap`.
     Modify {
+        /// Per-field `(old, new)` pairs, sorted by key.
         changes: BTreeMap<String, (String, String)>,
     },
+    /// A resource present in state but absent from the current config.
     Delete,
 }
 
+/// A single diff entry representing one job or DAG that changed between the
+/// desired config and the persisted state.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Diff {
+    /// Job or DAG name this diff applies to.
     pub name: String,
+    /// Classification of the change (create, modify, or delete).
     pub diff_type: DiffType,
+    /// blake3 hash of the previous config, if any.
     pub old_hash: Option<String>,
+    /// blake3 hash of the new config, if any.
     pub new_hash: Option<String>,
 }
 
-/// Alias preserved for callers; structurally identical to `Diff`.
+/// Alias preserved for callers; structurally identical to [`Diff`].
 pub type JobDiff = Diff;
-/// Alias preserved for callers; structurally identical to `Diff`.
+/// Alias preserved for callers; structurally identical to [`Diff`].
 pub type DagDiff = Diff;
 
 #[cfg(test)]

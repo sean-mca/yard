@@ -24,70 +24,106 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 
+/// A cron-style schedule trigger (e.g. `"@daily"`, `"0 8 * * *"`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScheduleTrigger {
+    /// Cron expression or Airflow preset string.
     pub value: String,
 }
 
+/// S3 file-drop trigger via `S3KeySensor`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct S3Trigger {
+    /// S3 bucket to watch.
     pub bucket: String,
+    /// Exact S3 key to wait for (mutually exclusive with `prefix`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// S3 key prefix to watch (mutually exclusive with `key`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
+    /// Sensor polling interval in seconds (minimum 10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poke_interval: Option<u64>,
+    /// Sensor timeout in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
+    /// Airflow connection ID override for S3 access.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aws_conn_id: Option<String>,
+    /// Whether to use deferrable mode (defaults to true).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferrable: Option<bool>,
 }
 
+/// Airflow Dataset trigger for cross-DAG dependency scheduling.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatasetTrigger {
+    /// Dataset URI (e.g. `"s3://bucket/path"`).
     pub uri: String,
 }
 
+/// SQS queue trigger via `SqsSensor`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SqsTrigger {
+    /// SQS queue URL to poll.
     pub queue_url: String,
+    /// Long-poll wait time in seconds (defaults to 20).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_time_seconds: Option<u64>,
+    /// Maximum messages per poll (defaults to 5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_messages: Option<u32>,
+    /// Whether to delete messages after receipt (defaults to true).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete_message_on_reception: Option<bool>,
 }
 
+/// Manual API trigger (DAG runs via Airflow REST API).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ApiTrigger {
+    /// Human-readable description of when/why to trigger this DAG.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Expected payload schema (field name to type description).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_schema: Option<BTreeMap<String, String>>,
 }
 
+/// Top-level trigger configuration for an Airflow DAG.
+///
+/// A trigger is either a single source, or a composite (`all` / `any`) of
+/// multiple sources. Hand-rolled `Serialize` and `Deserialize` impls enforce
+/// canonical wire forms and actionable error messages.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Trigger {
+    /// A single trigger source (schedule, S3, Dataset, SQS, or API).
     Single(SingleSource),
+    /// All listed sources must fire before the DAG runs.
     All(Vec<SingleSource>),
+    /// Any one of the listed sources firing triggers the DAG.
     Any(Vec<SingleSource>),
 }
 
+/// A single trigger source variant.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum SingleSource {
+    /// Cron-style schedule trigger.
     Schedule(ScheduleTrigger),
+    /// S3 file-drop sensor trigger.
     S3(S3Trigger),
+    /// Airflow Dataset dependency trigger.
     Dataset(DatasetTrigger),
+    /// SQS queue sensor trigger.
     Sqs(SqsTrigger),
+    /// Manual API invocation trigger.
     Api(ApiTrigger),
 }
 

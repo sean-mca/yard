@@ -187,6 +187,7 @@ pub async fn get_provider(job_type: JobType, provider_config: &Value) -> Result<
         JobType::Bash => Err(anyhow!(
             "No provider for job type: {job_type} (bash is task-only — should not reach get_provider)"
         )),
+        _ => Err(anyhow!("unsupported job type: {job_type}")),
     }
 }
 
@@ -212,5 +213,6 @@ pub fn validate_provider_config(
             }
         }
         JobType::Bash => {}
+        _ => {}
     }
 }

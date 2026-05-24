@@ -165,6 +165,9 @@ fn format_env_section(result: &EnvPlanResult) -> String {
                     DiffType::Delete => {
                         section.push_str(&format!("  - Delete job [{}]\n", diff.name));
                     }
+                    _ => {
+                        section.push_str(&format!("  ? Changed job [{}]\n", diff.name));
+                    }
                 }
             }
             section.push_str("```\n\n</details>\n\n");

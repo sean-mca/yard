@@ -196,7 +196,7 @@ fn check_s3_poke_interval(trigger: Option<&Trigger>) -> Vec<ValidationError> {
     let sources: Vec<&SingleSource> = match trigger {
         Some(Trigger::Single(s)) => vec![s],
         Some(Trigger::All(v)) | Some(Trigger::Any(v)) => v.iter().collect(),
-        None => return out,
+        None | Some(_) => return out,
     };
     for s in sources {
         if let SingleSource::S3(s3) = s
