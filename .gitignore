@@ -19,3 +19,5 @@ CLAUDE.md
 
 dist/
 target-linux-x86_64/
+rules/
+scripts/
