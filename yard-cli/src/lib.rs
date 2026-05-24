@@ -1,3 +1,17 @@
+//! Thin CLI wrapper for the YARD engine.
+//!
+//! This crate parses command-line arguments via [`clap`], delegates all
+//! business logic to [`yard_core`], and formats output for the terminal.
+//! No domain logic lives here -- see [`yard_core`] for orchestration,
+//! codegen, storage, and validation.
+//!
+//! # Modules
+//!
+//! - [`commands`] -- Per-subcommand handlers (`apply`, `plan`, `show`, etc.)
+//! - [`context`] -- Re-exports of context-loading helpers from `yard_core`
+//! - [`parser`] -- Clap argument definitions ([`parser::Cli`], [`parser::Commands`])
+//! - [`utils`] -- Terminal color helpers and user-confirmation prompt
+
 pub mod commands;
 pub mod context;
 pub mod parser;
@@ -6,6 +20,15 @@ pub mod utils;
 use anyhow::Result;
 use clap::Parser;
 
+/// Parse CLI arguments and dispatch to the appropriate command handler.
+///
+/// Respects `--no-color` / `NO_COLOR` env var for plain output and
+/// `--colorblind` for an accessible palette.
+///
+/// # Errors
+///
+/// Returns an error if the dispatched command fails (e.g. project
+/// resolution, state access, provider operations, or I/O errors).
 pub async fn run() -> Result<()> {
     let cli = parser::Cli::parse();
 

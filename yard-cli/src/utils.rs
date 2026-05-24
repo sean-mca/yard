@@ -1,13 +1,22 @@
+//! Terminal color helpers and user-confirmation prompt.
+//!
+//! Provides TTY-aware ANSI coloring via a process-wide [`AtomicU8`]
+//! color mode (`0` = normal, `1` = no color, `2` = colorblind palette).
+//! The mode is set once at startup from `--no-color` / `--colorblind`
+//! flags and the `NO_COLOR` env var.
+
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicU8, Ordering};
 
-// 0 = normal colors, 1 = no color, 2 = colorblind mode
+/// Color mode: `0` = normal ANSI, `1` = plain (no escapes), `2` = colorblind palette.
 static COLOR_MODE: AtomicU8 = AtomicU8::new(0);
 
+/// Switch to plain output (no ANSI escape codes).
 pub fn disable_color() {
     COLOR_MODE.store(1, Ordering::Relaxed);
 }
 
+/// Switch to the colorblind-friendly palette (cyan/blue/magenta).
 pub fn enable_colorblind_mode() {
     COLOR_MODE.store(2, Ordering::Relaxed);
 }
@@ -40,6 +49,7 @@ pub fn color_delete(s: &str) -> String {
     colorize(s, "31", "35")
 }
 
+/// Wraps `s` in ANSI bold (identical in normal and colorblind mode).
 pub fn bold(s: &str) -> String {
     colorize(s, "1", "1")
 }
@@ -53,6 +63,7 @@ pub fn confirm(prompt: &str) -> io::Result<bool> {
     Ok(matches!(input.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
+/// Re-export of the YAML-to-JSON conversion helper from [`yard_core`].
 pub use yard_core::resolve::yaml_to_json;
 
 #[cfg(test)]

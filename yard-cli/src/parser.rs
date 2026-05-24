@@ -1,5 +1,15 @@
+//! CLI argument definitions for YARD.
+//!
+//! Uses [`clap`] derive macros to define the top-level [`Cli`] struct,
+//! the [`Commands`] enum of subcommands, and the [`ListTarget`] nested
+//! subcommand. Doc comments on variants double as `--help` text.
+
 use clap::{Parser, Subcommand};
 
+/// Top-level CLI arguments parsed by [`clap`].
+///
+/// Global flags (`--no-color`, `--colorblind`) are propagated to all
+/// subcommands.
 #[derive(Parser)]
 #[command(name = "yard")]
 #[command(about = "YAML Architecture for Rapid Development", long_about = None)]
@@ -13,19 +23,26 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub colorblind: bool,
 
+    /// The subcommand to execute.
     #[command(subcommand)]
     pub command: Commands,
 }
 
+/// Available YARD subcommands.
+///
+/// Each variant maps to a handler in [`crate::commands`].
 #[derive(Subcommand)]
 pub enum Commands {
     /// Initialize a new YARD project
     Init {
+        /// Project directory (defaults to current working directory).
         #[arg(index = 1)]
         directory: Option<String>,
     },
 
+    /// Preview infrastructure changes without applying them
     Plan {
+        /// Project directory (defaults to current working directory).
         #[arg(index = 1)]
         directory: Option<String>,
 
@@ -34,7 +51,9 @@ pub enum Commands {
         target: Option<String>,
     },
 
+    /// Apply infrastructure changes (codegen + deploy)
     Apply {
+        /// Project directory (defaults to current working directory).
         #[arg(index = 1)]
         directory: Option<String>,
 
@@ -57,12 +76,14 @@ pub enum Commands {
         #[arg(index = 1)]
         job_name: String,
 
+        /// Project directory (defaults to current working directory).
         #[arg(index = 2)]
         directory: Option<String>,
     },
 
     /// Validate all job configurations
     Validate {
+        /// Project directory (defaults to current working directory).
         #[arg(index = 1)]
         directory: Option<String>,
     },
@@ -73,6 +94,7 @@ pub enum Commands {
         #[arg(index = 1)]
         job_name: Option<String>,
 
+        /// Project directory (defaults to current working directory).
         #[arg(index = 2)]
         directory: Option<String>,
 
@@ -91,17 +113,20 @@ pub enum Commands {
         #[arg(index = 1)]
         job_name: String,
 
+        /// Project directory (defaults to current working directory).
         #[arg(index = 2)]
         directory: Option<String>,
     },
 
     /// List deployment targets (jobs + DAGs) as JSON for CI matrix builders
     List {
+        /// The list sub-command to run.
         #[command(subcommand)]
         target: ListTarget,
     },
 }
 
+/// Sub-commands for `yard list`.
 #[derive(Subcommand)]
 pub enum ListTarget {
     /// Emit all deployment targets as a JSON array to stdout
