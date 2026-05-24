@@ -1,3 +1,9 @@
+//! AWS EMR Serverless provider implementation.
+//!
+//! Handles submitting Spark steps to an EMR cluster, including S3
+//! script uploads and provider-specific config validation. The
+//! [`EmrProvider`] implements the [`Provider`] trait.
+
 use super::{Provider, S3ScriptOps, aws_config, validation_err};
 use anyhow::{Context, Result, anyhow};
 use aws_sdk_emr::Client as EmrClient;
@@ -8,22 +14,31 @@ use std::future::Future;
 use std::pin::Pin;
 use yard_structs::{Resource, ResourceStatus, ValidationError};
 
+/// Default AWS region when none is specified in config.
+#[inline]
 fn default_region() -> String {
     "us-east-1".to_string()
 }
 
+/// Default S3 key prefix for uploaded scripts.
+#[inline]
 fn default_script_prefix() -> String {
     "yard-scripts/".to_string()
 }
 
+/// Default Spark deploy mode.
+#[inline]
 fn default_deploy_mode() -> String {
     "cluster".to_string()
 }
 
+/// Default action on step failure.
+#[inline]
 fn default_action_on_failure() -> String {
     "CONTINUE".to_string()
 }
 
+/// Raw deserialized EMR provider config from the `providers.emr` YAML block.
 #[derive(Deserialize)]
 struct EmrRawConfig {
     #[serde(default = "default_region")]
@@ -38,6 +53,10 @@ struct EmrRawConfig {
     aws: Option<serde_json::Value>,
 }
 
+/// AWS EMR provider -- deploys PySpark scripts as EMR steps.
+///
+/// Constructed from the `providers.emr` config block, which supplies
+/// the cluster ID, deploy mode, and action-on-failure defaults.
 pub struct EmrProvider {
     emr_client: EmrClient,
     s3: S3ScriptOps,
@@ -47,6 +66,12 @@ pub struct EmrProvider {
 }
 
 impl EmrProvider {
+    /// Create a new EMR provider from the `providers.emr` config JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `script_bucket` or `cluster_id` is missing,
+    /// or the config fails deserialization.
     pub async fn new(config: &Value) -> Result<Self> {
         // Pre-extract script_bucket and cluster_id BEFORE serde deserialization
         // so the legacy error strings survive byte-for-byte (SC #4, D-06 option a).
@@ -82,6 +107,12 @@ impl EmrProvider {
         })
     }
 
+    /// Submit a Spark step to the EMR cluster and return the step ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `AddJobFlowSteps` API call fails or
+    /// returns no step ID.
     async fn submit_step(
         &self,
         job_name: &str,
@@ -138,6 +169,8 @@ impl EmrProvider {
         Ok(step_id)
     }
 
+    /// Best-effort cancel of an EMR step. The step may have already
+    /// completed -- errors from the cancel call are silently ignored.
     async fn cancel_step(&self, step_id: &str) -> Result<()> {
         // Best effort — step may have already completed
         let _ = self
@@ -213,7 +246,7 @@ impl Provider for EmrProvider {
         let resources = resources.to_vec();
 
         Box::pin(async move {
-            let mut statuses = Vec::new();
+            let mut statuses = Vec::with_capacity(resources.len());
 
             for resource in &resources {
                 let exists = match resource.r#type.as_str() {
@@ -245,6 +278,9 @@ impl Provider for EmrProvider {
 const VALID_ACTION_ON_FAILURE: &[&str] =
     &["CONTINUE", "CANCEL_AND_WAIT", "TERMINATE_CLUSTER"];
 
+/// Validate EMR-specific fields in the inner `emr` config block.
+///
+/// Checks `action_on_failure` and `deploy_mode` against known values.
 pub(crate) fn validate_config(config: &Value, errors: &mut Vec<ValidationError>) {
     if let Some(aof) = config.get("action_on_failure").and_then(|v| v.as_str())
         && !VALID_ACTION_ON_FAILURE.contains(&aof)

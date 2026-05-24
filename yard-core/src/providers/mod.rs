@@ -1,3 +1,14 @@
+//! AWS provider implementations for yard job deployment.
+//!
+//! This module defines the [`Provider`] trait that each cloud service
+//! (Glue, EMR, etc.) implements, plus shared infrastructure such as
+//! [`S3ScriptOps`] for uploading generated PySpark scripts and
+//! [`aws_config`] for building SDK configs with optional `AssumeRole`.
+//!
+//! Sub-modules:
+//! - [`glue`] -- AWS Glue ETL provider
+//! - [`emr`]  -- AWS EMR Serverless provider
+
 pub mod emr;
 pub mod glue;
 
@@ -62,12 +73,17 @@ pub async fn aws_config(region: &str, aws_cfg: Option<&Value>) -> aws_config::Sd
 /// Shared S3 script operations used by all providers that upload
 /// generated PySpark scripts to S3.
 pub struct S3ScriptOps {
+    /// The S3 client used for script upload/download/delete operations.
     pub s3_client: S3Client,
+    /// The S3 bucket name where scripts are stored.
     pub script_bucket: String,
+    /// The key prefix (folder path) within the bucket.
     pub script_prefix: String,
 }
 
 impl S3ScriptOps {
+    /// Build the full S3 key for a job's generated PySpark script.
+    #[inline]
     pub fn script_key(&self, job_name: &str) -> String {
         let prefix = if self.script_prefix.ends_with('/') {
             &self.script_prefix
@@ -77,6 +93,11 @@ impl S3ScriptOps {
         format!("{prefix}{job_name}.py")
     }
 
+    /// Upload a generated PySpark script to S3 and return its `s3://` URI.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the S3 `PutObject` call fails.
     pub async fn upload_script(&self, job_name: &str, artifact: &str) -> Result<String> {
         let key = self.script_key(job_name);
 
@@ -98,6 +119,11 @@ impl S3ScriptOps {
         Ok(format!("s3://{}/{}", self.script_bucket, key))
     }
 
+    /// Delete a previously uploaded PySpark script from S3.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the S3 `DeleteObject` call fails.
     pub async fn delete_script(&self, job_name: &str) -> Result<()> {
         let key = self.script_key(job_name);
 
@@ -117,6 +143,10 @@ impl S3ScriptOps {
         Ok(())
     }
 
+    /// Check whether an S3 object exists in the script bucket.
+    ///
+    /// Returns `true` if the `HeadObject` call succeeds, `false` if
+    /// the object is not found, or an error for other failures.
     pub async fn s3_object_exists(&self, key: &str) -> Result<bool> {
         let result = self
             .s3_client
@@ -141,6 +171,11 @@ impl S3ScriptOps {
     }
 }
 
+/// Construct a [`ValidationError`] with the given field name and message.
+///
+/// This is the single canonical constructor shared by all provider and
+/// validation modules.
+#[must_use]
 pub fn validation_err(field: &str, message: &str) -> ValidationError {
     ValidationError {
         field: field.to_string(),

@@ -1,3 +1,9 @@
+//! AWS Glue ETL provider implementation.
+//!
+//! Handles creating, updating, and deleting AWS Glue jobs, including
+//! S3 script uploads and provider-specific config validation. The
+//! [`GlueProvider`] implements the [`Provider`] trait.
+
 use super::{Provider, S3ScriptOps, aws_config, validation_err};
 use anyhow::{Context, Result, anyhow};
 use aws_sdk_glue::Client as GlueClient;
@@ -9,26 +15,37 @@ use std::future::Future;
 use std::pin::Pin;
 use yard_structs::{Resource, ResourceStatus, ValidationError};
 
+/// Default AWS region when none is specified in config.
+#[inline]
 fn default_region() -> String {
     "us-east-1".to_string()
 }
 
+/// Default S3 key prefix for uploaded scripts.
+#[inline]
 fn default_script_prefix() -> String {
     "yard-scripts/".to_string()
 }
 
+/// Default Glue ETL version.
+#[inline]
 fn default_glue_version() -> String {
     "4.0".to_string()
 }
 
+/// Default Glue worker type.
+#[inline]
 fn default_worker_type() -> String {
     "G.1X".to_string()
 }
 
+/// Default number of Glue workers.
+#[inline]
 fn default_number_of_workers() -> i32 {
     2
 }
 
+/// Raw deserialized Glue provider config from the `providers.glue` YAML block.
 #[derive(Deserialize)]
 struct GlueRawConfig {
     #[serde(default = "default_region")]
@@ -57,6 +74,11 @@ struct GlueRawConfig {
     aws: Option<serde_json::Value>,
 }
 
+/// AWS Glue ETL provider -- deploys PySpark scripts as Glue jobs.
+///
+/// Constructed from the `providers.glue` config block, which supplies
+/// defaults for worker type, Glue version, timeout, etc. Per-job
+/// overrides come from the job-level `config` object at deploy time.
 pub struct GlueProvider {
     glue_client: GlueClient,
     s3: S3ScriptOps,
@@ -73,6 +95,12 @@ pub struct GlueProvider {
 }
 
 impl GlueProvider {
+    /// Create a new Glue provider from the `providers.glue` config JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `script_bucket` is missing or the config
+    /// fails deserialization.
     pub async fn new(config: &Value) -> Result<Self> {
         // Pre-extract script_bucket BEFORE serde deserialization so the
         // legacy error string survives byte-for-byte (SC #4, D-06 option a).
@@ -108,6 +136,9 @@ impl GlueProvider {
         })
     }
 
+    /// Build the default arguments map for a Glue job, merging
+    /// user-supplied defaults with yard's Iceberg-first conventions
+    /// and the optional bookmark setting.
     fn build_default_arguments(&self) -> HashMap<String, String> {
         let mut args = self.default_arguments.clone();
 
@@ -132,6 +163,15 @@ impl GlueProvider {
         args
     }
 
+    /// Create or update a Glue job via the AWS API.
+    ///
+    /// Tries `UpdateJob` first; if the job does not exist yet
+    /// (`EntityNotFoundException`), falls back to `CreateJob`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `role` field is missing or the AWS API
+    /// call fails.
     async fn create_or_update_glue_job(
         &self,
         job_name: &str,
@@ -249,6 +289,11 @@ impl GlueProvider {
         }
     }
 
+    /// Delete a Glue job by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `DeleteJob` API call fails.
     async fn delete_glue_job(&self, job_name: &str) -> Result<()> {
         self.glue_client
             .delete_job()
@@ -260,6 +305,10 @@ impl GlueProvider {
         Ok(())
     }
 
+    /// Check whether a Glue job exists by name.
+    ///
+    /// Returns `true` if `GetJob` succeeds, `false` if the job is not
+    /// found, or an error for other failures.
     async fn glue_job_exists(&self, job_name: &str) -> Result<bool> {
         let result = self
             .glue_client
@@ -344,7 +393,7 @@ impl Provider for GlueProvider {
         let resources = resources.to_vec();
 
         Box::pin(async move {
-            let mut statuses = Vec::new();
+            let mut statuses = Vec::with_capacity(resources.len());
 
             for resource in &resources {
                 let exists = match resource.r#type.as_str() {
@@ -376,6 +425,10 @@ impl Provider for GlueProvider {
 const VALID_WORKER_TYPES: &[&str] = &["G.025X", "G.1X", "G.2X", "G.4X", "G.8X", "Z.2X"];
 const VALID_BOOKMARK_VALUES: &[&str] = &["enabled", "disabled"];
 
+/// Validate Glue-specific fields in the job config.
+///
+/// Checks the top-level `role` requirement and validates inner `glue`
+/// block fields (worker type, version, timeout, etc.).
 pub(crate) fn validate_config(config: &serde_json::Value, errors: &mut Vec<ValidationError>) {
     // Glue-specific top-level requirement: a `role` (execution role ARN) must be set.
     // Glue-specific rules live in the Glue module rather than in the workspace-wide
