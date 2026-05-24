@@ -1,14 +1,33 @@
+//! Transform codegen: renders PySpark transform operations (filter, SQL,
+//! join, drop_columns, select, rename, add_column, aggregate, window).
+
+use std::fmt::Write;
+
 use anyhow::{Result, anyhow};
 use yard_structs::Transform;
 
 use super::helpers::quoted_list;
 
+/// Resolve the input and output dataframe variable names for a transform.
+///
+/// Falls back to `default_source` when the transform does not specify
+/// explicit `source` / `output` fields.
+#[inline]
 pub(super) fn resolve_df(transform: &Transform, default_source: &str) -> (String, String) {
     let input = transform.source.as_deref().unwrap_or(default_source);
     let output = transform.output.as_deref().unwrap_or(input);
     (format!("df_{input}"), format!("df_{output}"))
 }
 
+/// Render a single transform step as a Python statement.
+///
+/// Dispatches by `transform.transform_type` (filter, sql, join,
+/// drop_columns, select, rename, add_column, aggregate, window).
+///
+/// # Errors
+///
+/// Returns an error when required fields are missing for the given
+/// transform type.
 pub(super) fn render_transform(
     transform: &Transform,
     default_source: &str,
@@ -126,10 +145,8 @@ pub(super) fn render_transform(
             let window_var = format!("_w_{col_name}");
             let mut spec = String::from("Window");
             if !transform.partition_by.is_empty() {
-                spec.push_str(&format!(
-                    ".partitionBy({})",
-                    quoted_list(&transform.partition_by)
-                ));
+                write!(spec, ".partitionBy({})", quoted_list(&transform.partition_by))
+                    .expect("write to String is infallible");
             }
             if !transform.order_by.is_empty() {
                 let orders = transform
@@ -141,7 +158,7 @@ pub(super) fn render_transform(
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                spec.push_str(&format!(".orderBy({orders})"));
+                write!(spec, ".orderBy({orders})").expect("write to String is infallible");
             }
             let line1 = format!("    {window_var} = {spec}");
             let line2 = format!(
@@ -156,6 +173,12 @@ pub(super) fn render_transform(
     }
 }
 
+/// Render all transforms as a newline-joined block of Python statements.
+///
+/// # Errors
+///
+/// Returns an error if any individual transform is missing required
+/// fields.
 pub(super) fn render_transforms(
     transforms: &[Transform],
     default_source: &str,
