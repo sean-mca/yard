@@ -1,8 +1,22 @@
+//! Python syntax validation via `python3 ast.parse`.
+//!
+//! This module shells out to the system `python3` interpreter to
+//! validate generated PySpark scripts. It does not execute the
+//! scripts -- only parses them for syntax errors.
+
 use std::process::Command;
 
 /// Validate that a generated Python script is syntactically valid.
-/// Shells out to `python3` using `ast.parse`. Returns None if valid,
-/// or Some(error message) if the script has a syntax error.
+///
+/// Shells out to `python3` using `ast.parse`. Returns `None` if valid,
+/// or `Some(error_message)` if the script has a syntax error.
+///
+/// # Errors
+///
+/// Returns `Some` with a descriptive message if:
+/// - `python3` is not installed or cannot be spawned
+/// - The script contains a Python syntax error
+#[must_use]
 pub fn validate_python_syntax(script: &str) -> Option<String> {
     let result = Command::new("python3")
         .args(["-c", "import ast, sys; ast.parse(sys.stdin.read())"])

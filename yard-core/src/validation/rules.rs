@@ -1,11 +1,25 @@
+//! Per-job schema validation rules.
+//!
+//! This module validates individual [`JobDefinition`] structs against
+//! yard's schema rules -- checking source types, transform field
+//! requirements, sink configuration, Iceberg partitioning, and
+//! provider-specific config. Errors are collected (never short-circuit)
+//! so users see every violation in a single pass.
+
 use std::collections::HashSet;
 use yard_structs::{JdbcAuth, JobDefinition, JobType, ValidationError};
 
+/// Supported source types for Spark jobs.
 const SUPPORTED_SOURCE_TYPES: &[&str] = &["s3", "jdbc", "catalog", "kafka", "api"];
+/// Valid engine values for JDBC sources.
 const VALID_ENGINES: &[&str] = &["spark", "glue"];
+/// Supported sink types for Spark jobs.
 const SUPPORTED_SINK_TYPES: &[&str] = &["s3", "jdbc", "catalog", "iceberg"];
+/// Valid time-based partition units for Iceberg.
 const VALID_PARTITION_UNITS: &[&str] = &["year", "month", "day"];
+/// Valid write modes for Iceberg sinks.
 const VALID_ICEBERG_MODES: &[&str] = &["append", "overwrite"];
+/// Supported transform types.
 const SUPPORTED_TRANSFORM_TYPES: &[&str] = &[
     "filter",
     "sql",
@@ -22,8 +36,13 @@ const SUPPORTED_TRANSFORM_TYPES: &[&str] = &[
 // Re-exported here as `err` so the existing call sites in this module stay terse.
 pub use crate::providers::validation_err as err;
 
+/// Validate a job definition against yard's schema rules.
+///
+/// Returns a (possibly empty) list of validation errors. Errors are
+/// collected without short-circuiting so every violation is reported.
+#[must_use]
 pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
-    let mut errors = Vec::new();
+    let mut errors = Vec::with_capacity(4);
 
     // Note: job-type validity (one of `glue`, `emr`, `bash`) is now enforced
     // by serde at deserialize time via the `JobType` enum's `rename_all =
@@ -459,8 +478,10 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
 }
 
 /// Validate a task-only job (bash, ... future: python, sensor, dbt).
-/// These jobs must not carry Spark-job fields (sources/sink/transforms/body/job_file)
-/// and must carry their task-type-specific required fields.
+///
+/// These jobs must not carry Spark-job fields
+/// (sources/sink/transforms/body/job_file) and must carry their
+/// task-type-specific required fields.
 fn validate_task_only_job(job: &JobDefinition, errors: &mut Vec<ValidationError>) {
     // Reject Spark-shaped fields on task-only jobs — they're meaningless here.
     if !job.sources.is_empty() {
@@ -516,13 +537,15 @@ fn validate_task_only_job(job: &JobDefinition, errors: &mut Vec<ValidationError>
 }
 
 /// Validate the interplay between `secret_id` and `auth` on a jdbc source/sink.
-/// Caller has already confirmed source_type/sink_type is "jdbc".
+///
+/// Caller has already confirmed `source_type`/`sink_type` is `"jdbc"`.
+/// At most one error is returned (mutual exclusion or missing username).
 fn validate_jdbc_auth(
     prefix: &str,
     secret_id: Option<&str>,
     auth: Option<&JdbcAuth>,
 ) -> Vec<ValidationError> {
-    let mut errors = Vec::new();
+    let mut errors = Vec::with_capacity(1);
     if let Some(JdbcAuth::RdsIam(rds)) = auth {
         match (secret_id.is_some(), rds.username.is_some()) {
             (true, true) => errors.push(err(
