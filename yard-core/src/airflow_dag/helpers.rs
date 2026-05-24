@@ -6,6 +6,7 @@ use super::ResolvedDag;
 /// Sanitize a string into a Python identifier fragment: keep `[A-Za-z0-9_]`,
 /// replace everything else with `_`, and prepend `_` if the first char is a
 /// digit. Used for DAG names and task variable names.
+#[inline]
 pub(super) fn sanitize_identifier(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for (i, c) in s.chars().enumerate() {
@@ -21,12 +22,16 @@ pub(super) fn sanitize_identifier(s: &str) -> String {
     out
 }
 
+/// Convert a task id to a Python variable name by prefixing `t_` and
+/// sanitizing the identifier portion.
+#[inline]
 pub(super) fn python_var_name(task_id: &str) -> String {
     format!("t_{}", sanitize_identifier(task_id))
 }
 
 /// JSON strings are a subset of valid Python string literals, so we piggy-back
 /// on serde_json to produce a correctly-escaped double-quoted literal.
+#[inline]
 pub(super) fn python_string_literal(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }

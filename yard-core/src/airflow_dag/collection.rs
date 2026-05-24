@@ -104,6 +104,8 @@ pub fn collect_dags(root_dir: &Path, manifest: &ProjectManifest) -> Result<Vec<R
     Ok(resolved)
 }
 
+/// Walk the directory tree under `root` and return paths to every directory
+/// containing a `dag.yaml` marker file.
 fn find_dag_marker_dirs(root: &Path) -> Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
     for entry in walkdir::WalkDir::new(root)
@@ -122,10 +124,13 @@ fn find_dag_marker_dirs(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(dirs)
 }
 
+/// Return `true` if `descendant` is a strict child of `ancestor` (not equal).
+#[inline]
 fn is_strict_ancestor(ancestor: &Path, descendant: &Path) -> bool {
     descendant != ancestor && descendant.starts_with(ancestor)
 }
 
+/// Walk up from `start` and return the first directory that exists in `set`.
 fn nearest_ancestor_in(start: &Path, set: &BTreeSet<PathBuf>) -> Option<PathBuf> {
     let mut current = start.to_path_buf();
     loop {
@@ -138,6 +143,9 @@ fn nearest_ancestor_in(start: &Path, set: &BTreeSet<PathBuf>) -> Option<PathBuf>
     }
 }
 
+/// Return `true` if the section contains any DAG-level override fields
+/// (schedule, owner, retries, dags_bucket, dags_prefix).
+#[inline]
 fn section_has_dag_level_fields(s: &AirflowSection) -> bool {
     s.schedule.is_some()
         || s.owner.is_some()
@@ -146,6 +154,12 @@ fn section_has_dag_level_fields(s: &AirflowSection) -> bool {
         || s.dags_prefix.is_some()
 }
 
+/// Validate that at most one task in a DAG declares DAG-level override fields.
+///
+/// # Errors
+///
+/// Returns an error if two or more tasks in the same DAG both set DAG-level
+/// fields (schedule, owner, retries, dags_bucket, or dags_prefix).
 fn enforce_single_dag_level_override(
     jobs: &[(String, &JobDefinition)],
     dag_dir: &Path,
@@ -171,6 +185,15 @@ fn enforce_single_dag_level_override(
     Ok(())
 }
 
+/// Build the fully-merged DAG-level Airflow config by walking the
+/// inheritance chain: project-level -> account -> region -> dag.yaml ->
+/// optional per-task DAG-level overrides.
+///
+/// # Errors
+///
+/// Returns an error if any `airflow:` block in the chain contains unknown
+/// fields (`deny_unknown_fields`) or if the context hierarchy cannot be
+/// loaded from disk.
 fn resolve_dag_airflow_config(
     manifest: &ProjectManifest,
     dag_dir: &Path,

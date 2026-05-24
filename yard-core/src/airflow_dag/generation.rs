@@ -1,6 +1,7 @@
 use anyhow::{Context as AnyhowContext, Result, anyhow};
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::fmt::Write;
 use tera::{Context, Tera};
 use yard_structs::{AirflowSection, JobDefinition, JobType, ProjectManifest};
 
@@ -196,7 +197,8 @@ pub fn generate_dag(
         let mut out =
             String::from("# Required Airflow connections (create in MWAA before running):\n");
         for rc in &required {
-            out.push_str(&format!("#   - {}  ->  {}\n", rc.conn_id, rc.role_arn));
+            // write! to String never fails; the Ok arm is the only reachable path.
+            let _ = writeln!(&mut out, "#   - {}  ->  {}", rc.conn_id, rc.role_arn);
         }
         out
     };
@@ -309,6 +311,10 @@ pub fn generate_dag(
         .context("Failed to render Airflow DAG template")
 }
 
+/// Render the `default_args` dict for the Airflow DAG constructor.
+///
+/// Only includes fields that are explicitly set (owner, retries). Returns
+/// `"{}"` when no default args are configured.
 fn render_default_args(cfg: &AirflowSection) -> String {
     let mut entries: Vec<String> = Vec::new();
     if let Some(owner) = &cfg.owner {
@@ -324,6 +330,14 @@ fn render_default_args(cfg: &AirflowSection) -> String {
     }
 }
 
+/// Render a single task assignment inside the `with DAG(...)` block.
+///
+/// Dispatches to operator-specific rendering by job type (Bash, Glue).
+///
+/// # Errors
+///
+/// Returns an error if the job type is unsupported, required config fields
+/// are missing, or the script location cannot be resolved.
 fn render_task(
     task_id: &str,
     job_type: JobType,
@@ -389,6 +403,11 @@ fn render_task(
     }
 }
 
+/// Render the per-task `outlets=[Dataset(...)]` kwarg fragment for PUB-02.
+///
+/// Returns an empty string when the job has no `airflow.publishes` entries,
+/// so callers can unconditionally interpolate the result.
+#[inline]
 fn render_outlets(job: &JobDefinition) -> String {
     job.airflow
         .as_ref()
