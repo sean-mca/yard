@@ -24,6 +24,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -312,6 +313,7 @@ pub(crate) fn build_test_state(
         db: db.clone(),
         event_tx,
         secret_store,
+        shutdown_token: CancellationToken::new(),
     });
 
     Arc::new(AppState {

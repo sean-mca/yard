@@ -220,6 +220,7 @@ fn start_api_server() {
                 db: db.clone(),
                 event_tx,
                 secret_store: secret_store.clone(),
+                shutdown_token: tokio_util::sync::CancellationToken::new(),
             });
 
             // Clone db for the discovery task before it's moved into webhook_state

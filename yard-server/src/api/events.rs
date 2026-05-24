@@ -275,6 +275,7 @@ mod tests {
             db,
             event_tx,
             secret_store,
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
         });
         let _router: axum::Router = events_router(state);
         // If we got here, the router typechecked; success.

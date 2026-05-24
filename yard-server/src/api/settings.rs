@@ -247,6 +247,7 @@ mod tests {
             db: db as Arc<dyn Database>,
             event_tx,
             secret_store,
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
         })
     }
 
@@ -620,6 +621,7 @@ mod tests {
             db: db.clone() as Arc<dyn Database>,
             event_tx,
             secret_store,
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
         });
 
         // Store the ARN in settings.
