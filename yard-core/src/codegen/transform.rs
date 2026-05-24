@@ -145,8 +145,8 @@ pub(super) fn render_transform(
             let window_var = format!("_w_{col_name}");
             let mut spec = String::from("Window");
             if !transform.partition_by.is_empty() {
-                write!(spec, ".partitionBy({})", quoted_list(&transform.partition_by))
-                    .expect("write to String is infallible");
+                // write to String is infallible
+                let _ = write!(spec, ".partitionBy({})", quoted_list(&transform.partition_by));
             }
             if !transform.order_by.is_empty() {
                 let orders = transform
@@ -158,7 +158,8 @@ pub(super) fn render_transform(
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                write!(spec, ".orderBy({orders})").expect("write to String is infallible");
+                // write to String is infallible
+                let _ = write!(spec, ".orderBy({orders})");
             }
             let line1 = format!("    {window_var} = {spec}");
             let line2 = format!(

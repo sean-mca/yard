@@ -69,7 +69,8 @@ pub(super) fn render_source(source: &Source, default_engine: &str) -> Result<Str
             } else {
                 let mut chain = format!("spark.read.format(\"{format}\")");
                 append_spark_options(&mut chain, &[], &source.options);
-                write!(chain, ".load(\"{path}\")").expect("write to String is infallible");
+                // write to String is infallible
+                let _ = write!(chain, ".load(\"{path}\")");
                 lines.push(format!("    {var} = {chain}"));
             }
         }
@@ -129,10 +130,11 @@ pub(super) fn render_source(source: &Source, default_engine: &str) -> Result<Str
                     &source.options,
                 );
                 if let Some((user_expr, password_expr, _)) = &auth {
-                    write!(
+                    // write to String is infallible
+                    let _ = write!(
                         chain,
                         ".option(\"user\", {user_expr}).option(\"password\", {password_expr}).option(\"ssl\", \"true\").option(\"sslmode\", \"require\")"
-                    ).expect("write to String is infallible");
+                    );
                 }
                 chain.push_str(".load()");
                 lines.push(format!("    {var} = {chain}"));

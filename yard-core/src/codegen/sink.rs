@@ -55,10 +55,11 @@ pub(super) fn render_sink(sink: &Sink, default_source: &str, fill_nulls: bool, c
             let path = require_sink_str(sink.path.as_deref(), "s3", "path")?;
             let mut write = format!("    {var}.write.format(\"{format}\").mode(\"{mode}\")");
             if !sink.partition_by.is_empty() {
-                write!(write, ".partitionBy({})", quoted_list(&sink.partition_by))
-                    .expect("write to String is infallible");
+                // write to String is infallible
+                let _ = write!(write, ".partitionBy({})", quoted_list(&sink.partition_by));
             }
-            write!(write, ".save(\"{path}\")").expect("write to String is infallible");
+            // write to String is infallible
+            let _ = write!(write, ".save(\"{path}\")");
             lines.push(write);
         }
         "jdbc" => {

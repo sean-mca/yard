@@ -112,11 +112,12 @@ pub(super) fn append_spark_options(
     extra: &std::collections::HashMap<String, serde_json::Value>,
 ) {
     for (k, v) in seed {
-        write!(chain, ".option(\"{k}\", \"{v}\")").expect("write to String is infallible");
+        // write to String is infallible
+        let _ = write!(chain, ".option(\"{k}\", \"{v}\")");
     }
     for (k, v) in extra {
-        write!(chain, ".option(\"{}\", {})", k, python_literal(v))
-            .expect("write to String is infallible");
+        // write to String is infallible
+        let _ = write!(chain, ".option(\"{}\", {})", k, python_literal(v));
     }
 }
 
