@@ -13,8 +13,6 @@
 //! - [`trigger`] -- Typed Airflow trigger model (`Trigger`, `SingleSource`)
 //!   supporting S3, Dataset, SQS, API, and composite triggers.
 
-#![warn(clippy::unwrap_used, clippy::expect_used)]
-
 pub mod config;
 pub mod diff;
 pub mod error;

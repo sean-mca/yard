@@ -1266,6 +1266,7 @@ mod tests {
     /// Used here only inside `#[cfg(test)]` and serialized through a
     /// module-local Mutex — CLAUDE.md "no unsafe {}" exception per
     /// Phase 9 Plan 02 (option a in the Task 1 checkpoint).
+    #[allow(unsafe_code)] // env mutation requires unsafe in Rust 2024; serialized via Mutex
     fn scoped_env<F: FnOnce()>(pairs: &[(&str, Option<&str>)], f: F) {
         use std::sync::Mutex;
         static ENV_LOCK: Mutex<()> = Mutex::new(());

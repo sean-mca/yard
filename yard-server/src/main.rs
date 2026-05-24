@@ -93,6 +93,7 @@ fn start_api_server() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     std::thread::spawn(|| {
+        #[allow(clippy::expect_used)] // fatal: server cannot run without a runtime
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         if let Err(e) = rt.block_on(async move {
             let github_token = required_env("YARD_GITHUB_TOKEN")?;
@@ -286,6 +287,7 @@ fn start_api_server() {
                 cors = cors.allow_credentials(true);
             }
 
+            #[allow(clippy::expect_used)] // static config with known-valid values
             let rate_limit_config = GovernorConfigBuilder::default()
                 .per_second(30)
                 .burst_size(60)

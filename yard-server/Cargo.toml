@@ -3,8 +3,8 @@ name = "yard-server"
 version = "0.2.2"
 edition = "2024"
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("server"))'] }
+[lints]
+workspace = true
 
 [dependencies]
 dioxus = { version = "0.7", features = ["fullstack", "router"] }
