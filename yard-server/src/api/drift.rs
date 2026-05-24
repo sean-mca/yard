@@ -103,6 +103,7 @@ pub async fn run_drift_check(state: &ApiState) -> Result<DriftData, String> {
             yard_structs::DiffType::Create => DriftType::New,
             yard_structs::DiffType::Modify { .. } => DriftType::Modified,
             yard_structs::DiffType::Delete => DriftType::Deleted,
+            _ => DriftType::Modified,
         };
 
         let fields_changed = match &diff.diff_type {

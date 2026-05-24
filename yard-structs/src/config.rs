@@ -12,11 +12,15 @@ fn default_path_buf() -> PathBuf {
 /// type requires (1) a new variant here, (2) a `FromStr` arm below, (3) a new
 /// provider impl in `yard-core/src/providers/`, and (4) a new validation arm
 /// in `yard-core/src/validation/rules.rs`.
+#[non_exhaustive]
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum JobType {
+    /// AWS Glue ETL job.
     Glue,
+    /// AWS EMR step.
     Emr,
+    /// Shell/bash script execution.
     Bash,
 }
 
@@ -63,14 +67,19 @@ impl std::str::FromStr for JobType {
 /// `assume_role` or falls back to `aws_default`.
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
 pub struct AwsCredentialConfig {
+    /// IAM role ARN to assume (e.g. `"arn:aws:iam::111111111111:role/Foo"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assume_role: Option<String>,
+    /// STS external ID for cross-account assume-role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
+    /// STS session name for assume-role calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_name: Option<String>,
+    /// AWS region override (e.g. `"us-east-1"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+    /// Airflow connection ID override for Glue tasks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aws_conn_id: Option<String>,
 }
@@ -81,6 +90,7 @@ impl AwsCredentialConfig {
     /// `dag_lifecycle::resolve_aws_for_dir` (root yaml ← account.yaml) and
     /// `storage::merge_state_aws_with_env` (yaml ← envs). Mirrors the shape
     /// of `merge_airflow_sections` in yard-core/src/parsing.rs.
+    #[must_use]
     pub fn merge(base: &Self, overlay: &Self) -> Self {
         Self {
             assume_role: overlay
@@ -151,15 +161,23 @@ pub struct JobSummary {
     pub config_yaml: Option<String>,
 }
 
+/// Backend for persisting per-job and per-DAG state files.
+#[non_exhaustive]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum StateBackend {
+    /// Local filesystem backend.
     Local {
+        /// Directory path for state files.
         path: PathBuf,
     },
+    /// AWS S3 backend.
     S3 {
+        /// S3 bucket name.
         bucket: String,
+        /// AWS region for the S3 bucket.
         region: String,
+        /// S3 key prefix for state files.
         key: String,
         /// Optional per-state-backend `aws:` sub-block (TYPE-02). `None` falls
         /// through to `YARD_STATE_AWS_*` envs, then the default AWS credential
@@ -170,10 +188,13 @@ pub enum StateBackend {
     },
 }
 
+/// Top-level project manifest parsed from `yard.yaml`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectManifest {
+    /// Project name used as a namespace in state storage.
     pub project: String,
+    /// State backend configuration (local or S3).
     pub state: StateBackend,
     /// Per-provider config, keyed by job type (e.g. "glue", "emr").
     /// Each value is the raw provider config block from yard.yaml.
@@ -197,9 +218,12 @@ pub struct ProjectManifest {
     pub aws: Option<AwsCredentialConfig>,
 }
 
+/// A Python import statement to inject into generated scripts.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Import {
+    /// Module or symbol name to import.
     pub name: String,
+    /// Optional `from` module (e.g. `from pyspark.sql import SparkSession`).
     pub from: Option<String>,
 }
 
@@ -207,12 +231,15 @@ pub struct Import {
 /// `kind: rds_iam` selects RDS IAM auth via `boto3 rds.generate_db_auth_token`.
 /// May coexist with `secret_id` — in that case the username comes from the
 /// secret and `RdsIamAuth.username` must be unset.
+#[non_exhaustive]
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum JdbcAuth {
+    /// RDS IAM authentication via `boto3 rds.generate_db_auth_token`.
     RdsIam(RdsIamAuth),
 }
 
+/// Configuration for RDS IAM authentication.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RdsIamAuth {
@@ -221,22 +248,34 @@ pub struct RdsIamAuth {
     /// Required otherwise. Setting both is a validation error.
     #[serde(default)]
     pub username: Option<String>,
+    /// RDS endpoint hostname.
     pub host: String,
+    /// RDS endpoint port.
     pub port: u16,
+    /// AWS region for the RDS instance.
     pub region: String,
 }
 
+/// A data source definition within a job (e.g. S3, JDBC, Glue Catalog).
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Source {
-    pub name: String,                   // variable name: produces df_<name>
-    pub source_type: String,            // s3, jdbc, catalog, kafka, api
-    pub format: Option<String>,         // parquet, csv, json, orc
-    pub path: Option<String>,           // s3 path
-    pub connection_url: Option<String>, // jdbc url; kafka bootstrap servers
-    pub table: Option<String>,          // jdbc or catalog
-    pub database: Option<String>,       // catalog
-    pub secret_id: Option<String>,      // Secrets Manager secret
+    /// Variable name in generated code; produces `df_<name>`.
+    pub name: String,
+    /// Source type discriminator: `"s3"`, `"jdbc"`, `"catalog"`, `"kafka"`, `"api"`.
+    pub source_type: String,
+    /// Data format: `"parquet"`, `"csv"`, `"json"`, `"orc"`.
+    pub format: Option<String>,
+    /// S3 path for `source_type: s3`.
+    pub path: Option<String>,
+    /// JDBC connection URL or Kafka bootstrap servers.
+    pub connection_url: Option<String>,
+    /// Table name for `source_type: jdbc` or `source_type: catalog`.
+    pub table: Option<String>,
+    /// Database name for `source_type: catalog`.
+    pub database: Option<String>,
+    /// AWS Secrets Manager secret ID for credential lookup.
+    pub secret_id: Option<String>,
     /// "spark" (SparkSession.read) or "glue" (DynamicFrame). Defaults to the
     /// provider-level `default_engine` when unset; "spark" if that's also unset.
     /// Only meaningful for source_types where both paths exist (s3, jdbc).
@@ -264,19 +303,30 @@ pub struct Source {
     pub auth: Option<JdbcAuth>,
 }
 
+/// A data sink definition within a job (e.g. S3, JDBC, Glue Catalog).
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Sink {
-    pub source: Option<String>, // which df to write (defaults to first/only source)
-    pub sink_type: String,      // s3, jdbc, catalog
-    pub format: Option<String>, // parquet, csv, json, orc
-    pub path: Option<String>,   // s3 path
-    pub connection_url: Option<String>, // jdbc
-    pub table: Option<String>,  // jdbc or catalog
-    pub database: Option<String>, // catalog
-    pub secret_id: Option<String>, // Secrets Manager secret
-    pub mode: Option<String>,   // overwrite, append, error
-    pub partition_by: Vec<String>, // partition columns
+    /// Which DataFrame to write (defaults to first/only source).
+    pub source: Option<String>,
+    /// Sink type discriminator: `"s3"`, `"jdbc"`, `"catalog"`.
+    pub sink_type: String,
+    /// Data format: `"parquet"`, `"csv"`, `"json"`, `"orc"`.
+    pub format: Option<String>,
+    /// S3 path for `sink_type: s3`.
+    pub path: Option<String>,
+    /// JDBC connection URL for `sink_type: jdbc`.
+    pub connection_url: Option<String>,
+    /// Table name for `sink_type: jdbc` or `sink_type: catalog`.
+    pub table: Option<String>,
+    /// Database name for `sink_type: catalog`.
+    pub database: Option<String>,
+    /// AWS Secrets Manager secret ID for credential lookup.
+    pub secret_id: Option<String>,
+    /// Write mode: `"overwrite"`, `"append"`, `"error"`.
+    pub mode: Option<String>,
+    /// Partition columns for the output.
+    pub partition_by: Vec<String>,
     #[serde(default)]
     pub connection_type: Option<String>,
     /// For iceberg sinks only: coerce nulls/voids to type-appropriate defaults
@@ -290,42 +340,65 @@ pub struct Sink {
     pub auth: Option<JdbcAuth>,
 }
 
+/// Column ordering specification for window transforms.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct OrderBySpec {
+    /// Column name to order by.
     pub column: String,
+    /// If true, sort descending; otherwise ascending.
     pub desc: bool,
 }
 
+/// A data transformation step within a job pipeline.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Transform {
-    pub transform_type: String, // filter, sql, drop_columns, rename, select, add_column, join, aggregate, window
-    pub source: Option<String>, // which df to operate on (defaults to first/only source)
-    pub output: Option<String>, // name for result df (defaults to same as source)
-    pub condition: Option<String>, // filter
-    pub query: Option<String>,  // sql
-    pub columns: Vec<String>,   // drop_columns, select
-    pub mapping: HashMap<String, String>, // rename (old -> new)
-    pub name: Option<String>,   // add_column, window (new column name)
-    pub expression: Option<String>, // add_column, window (window expression)
-    // join fields
-    pub left: Option<String>,  // join: left df name
-    pub right: Option<String>, // join: right df name
-    pub on: Option<String>,    // join: column to join on
-    pub how: Option<String>,   // join: inner, left, right, outer
-    // aggregate fields
-    pub group_by: Vec<String>,         // aggregate: grouping columns
-    pub aggs: HashMap<String, String>, // aggregate: alias -> expression (e.g. "total" -> "sum(amount)")
-    // window fields
-    pub partition_by: Vec<String>,  // window: partition columns
-    pub order_by: Vec<OrderBySpec>, // window: order spec
+    /// Transform type: `"filter"`, `"sql"`, `"drop_columns"`, `"rename"`,
+    /// `"select"`, `"add_column"`, `"join"`, `"aggregate"`, `"window"`.
+    pub transform_type: String,
+    /// Which DataFrame to operate on (defaults to first/only source).
+    pub source: Option<String>,
+    /// Name for the result DataFrame (defaults to same as source).
+    pub output: Option<String>,
+    /// Filter condition expression.
+    pub condition: Option<String>,
+    /// SQL query string.
+    pub query: Option<String>,
+    /// Column names for `drop_columns` / `select` transforms.
+    pub columns: Vec<String>,
+    /// Rename mapping (old name to new name).
+    pub mapping: HashMap<String, String>,
+    /// New column name for `add_column` / `window` transforms.
+    pub name: Option<String>,
+    /// Expression for `add_column` / `window` transforms.
+    pub expression: Option<String>,
+    /// Left DataFrame name for `join` transforms.
+    pub left: Option<String>,
+    /// Right DataFrame name for `join` transforms.
+    pub right: Option<String>,
+    /// Join column name.
+    pub on: Option<String>,
+    /// Join type: `"inner"`, `"left"`, `"right"`, `"outer"`.
+    pub how: Option<String>,
+    /// Grouping columns for `aggregate` transforms.
+    pub group_by: Vec<String>,
+    /// Aggregation expressions keyed by alias (e.g. `"total"` -> `"sum(amount)"`).
+    pub aggs: HashMap<String, String>,
+    /// Partition columns for `window` transforms.
+    pub partition_by: Vec<String>,
+    /// Ordering specification for `window` transforms.
+    pub order_by: Vec<OrderBySpec>,
 }
 
+/// Complete definition of a single job parsed from a job YAML file.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct JobDefinition {
+    /// The provider type for this job.
     pub job_type: JobType,
+    /// Additional Python imports to inject into generated scripts.
     pub imports: Vec<Import>,
+    /// Inline Python body to embed in the generated script.
     pub body: Option<String>,
     /// Path to an external Python file that replaces YARD's generated script entirely.
     pub job_file: Option<String>,
@@ -389,10 +462,14 @@ impl Default for JobDefinition {
     }
 }
 
+/// Hierarchical context gathered from the directory tree during config resolution.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct YARDContext {
+    /// Account-level config from `account.yaml`.
     pub account: serde_json::Value,
+    /// Region-level config from `region.yaml`.
     pub region: serde_json::Value,
+    /// Shared transforms from `transforms.yaml`.
     pub transforms: serde_json::Value,
     /// Loaded from the optional `dag.yaml` marker file in a job's directory
     /// (or the nearest ancestor). Presence marks the directory as a DAG grouping.

@@ -39,7 +39,7 @@ pub fn generate_dag(
         match ty {
             JobType::Bash => needs_bash = true,
             JobType::Glue => needs_glue = true,
-            JobType::Emr => {
+            JobType::Emr | _ => {
                 return Err(anyhow!(
                     "DAG '{}' task '{}': job type '{}' is not supported in Airflow codegen yet",
                     dag.name,
@@ -383,7 +383,7 @@ fn render_task(
                 outlets = outlets,
             ))
         }
-        JobType::Emr => Err(anyhow!(
+        JobType::Emr | _ => Err(anyhow!(
             "job type '{job_type}' is not supported in Airflow codegen yet"
         )),
     }

@@ -3,8 +3,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 use yard_structs::{
-    DagDiff, Deployment, DiffType, JobDiff, JobState, JobType, ProjectManifest, ProjectState,
-    ResourceStatus,
+    DagDiff, Deployment, DeploymentStatus, DiffType, JobDiff, JobName, JobState, JobType,
+    ProjectManifest, ProjectState, ResourceStatus,
 };
 
 use crate::airflow_dag;
@@ -320,15 +320,15 @@ pub async fn apply(
                     };
 
                     let status = if resources.is_empty() {
-                        "generated"
+                        DeploymentStatus::Generated
                     } else {
-                        "deployed"
+                        DeploymentStatus::Deployed
                     };
 
                     let deployment = Deployment {
                         config_hash: script_hash,
                         config: job_def.config.clone(),
-                        status: status.to_string(),
+                        status,
                         applied_at: chrono::Utc::now().to_rfc3339(),
                         resources,
                         env: None,
@@ -338,7 +338,7 @@ pub async fn apply(
                         .write_job(
                             &diff.name,
                             &JobState {
-                                job_name: diff.name.clone(),
+                                job_name: JobName::new(diff.name.clone()),
                                 project: manifest.project.clone(),
                                 deployment,
                             },
@@ -393,6 +393,7 @@ pub async fn apply(
 
                     result.deleted.push(diff.name.clone());
                 }
+                _ => {}
             }
         }
 
@@ -556,6 +557,7 @@ pub async fn init_state_backend(
                 .with_context(|| format!("Failed to reach S3 bucket {bucket} in {region}"))?;
             println!("Verified S3 state bucket {bucket} ({region})");
         }
+        _ => anyhow::bail!("unsupported state backend variant"),
     }
     Ok(())
 }
@@ -748,7 +750,7 @@ mod tests {
             env: None,
             config_hash: config_hash.to_string(),
             config,
-            status: "generated".to_string(),
+            status: DeploymentStatus::Generated,
             applied_at: "2025-01-01T00:00:00Z".to_string(),
             resources: Vec::new(),
         }
@@ -982,8 +984,8 @@ mod tests {
         assert!(job_state_path.exists());
         let job_state: yard_structs::JobState =
             serde_json::from_str(&std::fs::read_to_string(&job_state_path).unwrap()).unwrap();
-        assert_eq!(job_state.job_name, "new_job");
-        assert_eq!(job_state.deployment.status, "generated");
+        assert_eq!(job_state.job_name.as_str(), "new_job");
+        assert_eq!(job_state.deployment.status, DeploymentStatus::Generated);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

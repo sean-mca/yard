@@ -282,6 +282,11 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
                 "bash jobs are task-only and have no Spark template"
             ));
         }
+        _ => {
+            return Err(anyhow!(
+                "unsupported job type for codegen: {}", job_def.job_type
+            ));
+        }
     };
 
     let mut tera = Tera::default();

@@ -3,7 +3,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use yard_structs::{
-    AwsCredentialConfig, DagDeployment, DagDiff, DagState, DiffType, JobState, ProjectManifest,
+    AwsCredentialConfig, DagDeployment, DagDeploymentStatus, DagDiff, DagName, DagState, DiffType,
+    JobState, ProjectManifest,
 };
 
 use crate::airflow_dag;
@@ -241,20 +242,20 @@ pub async fn apply_dags(
                 };
 
                 let status = if s3_uri.is_some() {
-                    "deployed"
+                    DagDeploymentStatus::Deployed
                 } else {
-                    "generated"
+                    DagDeploymentStatus::Generated
                 };
 
                 let dag_state = DagState {
-                    dag_name: diff.name.clone(),
+                    dag_name: DagName::new(diff.name.clone()),
                     project: manifest.project.clone(),
                     deployment: DagDeployment {
                         content_hash,
                         config: serde_json::to_value(&dag.config)
                             .context("Failed to serialize DAG config for state persistence")?,
                         tasks: dag.tasks.clone(),
-                        status: status.to_string(),
+                        status,
                         applied_at: chrono::Utc::now().to_rfc3339(),
                         s3_uri,
                     },
@@ -293,6 +294,7 @@ pub async fn apply_dags(
 
                 result.deleted.push(diff.name.clone());
             }
+            _ => {}
         }
     }
 
@@ -697,7 +699,7 @@ mod tests {
             content_hash: content_hash.to_string(),
             config: json!({"schedule": "@daily"}),
             tasks: tasks.iter().map(|s| s.to_string()).collect(),
-            status: "generated".to_string(),
+            status: DagDeploymentStatus::Generated,
             applied_at: "2025-01-01T00:00:00Z".to_string(),
             s3_uri: None,
         }
@@ -1045,13 +1047,13 @@ mod tests {
         // Write a DagState with an s3_uri so destroy_dag enters the S3 branch
         let storage = storage::get_storage(&backend).await.unwrap();
         let dag_state = DagState {
-            dag_name: "test_dag".to_string(),
+            dag_name: DagName::new("test_dag"),
             project: "test".to_string(),
             deployment: DagDeployment {
                 content_hash: "abc123".to_string(),
                 config: json!({"schedule": "@daily"}),
                 tasks: vec!["task_a".to_string()],
-                status: "deployed".to_string(),
+                status: DagDeploymentStatus::Deployed,
                 applied_at: "2025-01-01T00:00:00Z".to_string(),
                 s3_uri: Some("s3://bucket/dags/test_dag.py".to_string()),
             },

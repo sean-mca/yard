@@ -127,6 +127,7 @@ pub(super) fn derive_jdbc_url(auth: &JdbcAuth, connection_type: &str, database: 
         JdbcAuth::RdsIam(rds) => {
             format!("jdbc:{connection_type}://{}:{}/{database}", rds.host, rds.port)
         }
+        _ => String::new(),
     }
 }
 
@@ -165,6 +166,7 @@ pub(super) fn render_jdbc_auth(
             let pre = render_rds_iam_token_fetch(prefix, rds, &user_expr);
             Some((user_expr, token_var, pre))
         }
+        (_, Some(_)) => None,
     }
 }
 

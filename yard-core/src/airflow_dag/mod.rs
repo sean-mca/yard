@@ -106,8 +106,8 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     use yard_structs::{
-        AirflowJobBlock, AwsCredentialConfig, Deployment, JobType, ProjectManifest, Resource,
-        StateBackend,
+        AirflowJobBlock, AwsCredentialConfig, Deployment, DeploymentStatus, JobName, JobType,
+        ProjectManifest, Resource, StateBackend,
     };
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2005,13 +2005,13 @@ mod tests {
             states.insert(
                 name.to_string(),
                 JobState {
-                    job_name: name.to_string(),
+                    job_name: JobName::new(name),
                     project: "test".to_string(),
                     deployment: Deployment {
                         env: None,
                         config_hash: String::new(),
                         config: serde_json::Value::Null,
-                        status: "deployed".to_string(),
+                        status: DeploymentStatus::Deployed,
                         applied_at: String::new(),
                         resources: vec![Resource {
                             r#type: "s3_object".to_string(),
@@ -2041,7 +2041,7 @@ mod tests {
         states.insert(
             "a".to_string(),
             JobState {
-                job_name: "a".to_string(),
+                job_name: JobName::new("a"),
                 project: "test".to_string(),
                 deployment: Deployment {
                     env: None,
@@ -2061,7 +2061,7 @@ mod tests {
         states.insert(
             "b".to_string(),
             JobState {
-                job_name: "b".to_string(),
+                job_name: JobName::new("b"),
                 project: "test".to_string(),
                 deployment: Deployment {
                     env: None,
@@ -2081,7 +2081,7 @@ mod tests {
         states.insert(
             "c".to_string(),
             JobState {
-                job_name: "c".to_string(),
+                job_name: JobName::new("c"),
                 project: "test".to_string(),
                 deployment: Deployment {
                     env: None,
@@ -2106,7 +2106,7 @@ mod tests {
         states.insert(
             "my_job".to_string(),
             JobState {
-                job_name: "my_job".to_string(),
+                job_name: JobName::new("my_job"),
                 project: "test".to_string(),
                 deployment: Deployment {
                     env: None,
