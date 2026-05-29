@@ -53,7 +53,7 @@ Empty diff means `yard apply` would upload the same bytes — useful
 to confirm a yaml change actually changed something.
 
 See [docs/reference/codegen.md](../reference/codegen.md) for the
-full emitted-script structure (helpers like `_yard_fill_nulls`,
+full emitted-script structure (helpers like `_yard_conform`,
 source/sink/transform render order).
 
 ## Inspect a generated DAG .py file

@@ -147,23 +147,38 @@ pub(super) fn render_sink(sink: &Sink, default_source: &str, fill_nulls: bool, c
                 ));
             }
             lines.push(format!("    _tbl = \"glue_catalog.{db}.{table}\""));
-            // New-table branch: dataframe-inferred fill (D-04). No live target
-            // schema to consult; _yard_fill_nulls coerces voids to source-side
-            // defaults so parquet accepts the schema at .create() time.
+            // Single schema-conform path (Spark 3.5 / Glue 5). Voids are dropped,
+            // never invented (D-3).
             //
-            // Existing-table branch: schema-aware conform. _yard_conform_to_target_schema
-            // reads the live Iceberg schema and drives _yard_void_to_target
-            // element-wise for void/void-subtype source columns — uses the
-            // target column type rather than dataframe-inferred type, preserves
-            // non-void cells verbatim, and preserves nulls in nullable real-typed
-            // columns (no 0/False/"" fills against existing tables).
+            // New-table branch: the contract is the void-free inferred schema of
+            // the first batch. Conform the dataframe to it via df.to(target), then
+            // .create() derives the table schema from the conformed frame.
+            //
+            // Existing-table branch: the live Iceberg schema is the contract.
+            // target = merge(live, void_free(batch)) — live types win, genuinely-new
+            // typed fields are added (auto-evolve via merge-schema). A fail-fast
+            // guard refuses the write when an inferred column kind diverges from
+            // the table kind (struct vs list/map, e.g. dynamic-key struct churn),
+            // rather than emitting an expression that detonates in Spark (D-6).
             let new_table_coerce = if fill_nulls {
-                format!("{var} = _yard_fill_nulls({var})\n        ")
+                format!(
+                    "_target = _yard_void_free_schema({var}.schema)\n        \
+                     {var} = _yard_conform({var}, _target)\n        "
+                )
             } else {
                 String::new()
             };
             let existing_table_coerce = if fill_nulls {
-                format!("{var} = _yard_conform_to_target_schema({var}, spark, _tbl)\n        ")
+                format!(
+                    "_live = _yard_read_iceberg_schema(spark, _tbl)\n        \
+                     _batch = _yard_void_free_schema({var}.schema)\n        \
+                     _live_types = {{_f.name: _f.dataType for _f in _live.fields}}\n        \
+                     for _f in _batch.fields:\n            \
+                         if _f.name in _live_types and _yard_kind_mismatch(_f.dataType, _live_types[_f.name]):\n                \
+                             raise ValueError(\"yard: schema kind mismatch for column '\" + _f.name + \"': source kind differs from the Iceberg table kind (struct vs list/map); refusing to write\")\n        \
+                     _target = _yard_merge_schema(_live, _batch)\n        \
+                     {var} = _yard_conform({var}, _target)\n        "
+                )
             } else {
                 String::new()
             };
@@ -173,7 +188,7 @@ pub(super) fn render_sink(sink: &Sink, default_source: &str, fill_nulls: bool, c
                          .using(\"iceberg\"){partition_clause}{tbl_props}\n            \
                          .create())\n    \
                  else:\n        \
-                     {existing_table_coerce}{var}.writeTo(_tbl).option(\"mergeSchema\", \"true\").{write_op}()"
+                     {existing_table_coerce}{var}.writeTo(_tbl).option(\"merge-schema\", \"true\").{write_op}()"
             ));
         }
         other => {

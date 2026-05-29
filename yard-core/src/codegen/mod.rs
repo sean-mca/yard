@@ -35,48 +35,13 @@ const GLUE_TEMPLATE: &str = include_str!("../templates/glue.py.tera");
 const EMR_TEMPLATE: &str = include_str!("../templates/emr.py.tera");
 
 /// Emitted inline at module scope when an iceberg sink is writing with
-/// `fill_nulls` enabled. Coerces null/void-typed columns (common in JSON
-/// ingestion) into type-appropriate defaults so Iceberg writes don't fail on
-/// void schemas or unresolvable nullable nested types. Opt-out via
-/// `fill_nulls: false` on the sink.
-const ICEBERG_FILL_NULLS_HELPERS: &str = r#"def _yard_default_struct(struct_type):
-    if len(struct_type.fields) == 0:
-        return F.lit(None).cast(struct_type)
-    out = []
-    for f in struct_type.fields:
-        dt = f.dataType
-        if isinstance(dt, NullType):
-            continue
-        elif isinstance(dt, StructType):
-            out.append(_yard_default_struct(dt).alias(f.name))
-        elif isinstance(dt, (DoubleType, FloatType)):
-            out.append(F.lit(0.0).cast(dt).alias(f.name))
-        elif isinstance(dt, (IntegerType, LongType, ShortType, ByteType)):
-            out.append(F.lit(0).cast(dt).alias(f.name))
-        elif isinstance(dt, ArrayType):
-            _ddl = _yard_void_free_ddl(dt)
-            if _ddl is None:
-                out.append(F.lit(None).alias(f.name))
-            else:
-                out.append(F.array().cast(_ddl).alias(f.name))
-        elif isinstance(dt, MapType):
-            _ddl = _yard_void_free_ddl(dt)
-            if _ddl is None:
-                out.append(F.lit(None).alias(f.name))
-            else:
-                out.append(F.create_map().cast(_ddl).alias(f.name))
-        elif isinstance(dt, (TimestampType, DateType)):
-            out.append(F.lit(None).cast(dt).alias(f.name))
-        elif isinstance(dt, BooleanType):
-            out.append(F.lit(False).alias(f.name))
-        else:
-            out.append(F.lit("").cast("string").alias(f.name))
-    if not out:
-        return F.lit(None).cast(struct_type)
-    return F.struct(*out)
-
-
-def _yard_has_void(dt):
+/// `fill_nulls` enabled. Provides a single schema-conform path (Spark 3.5 /
+/// Glue 5): voids are dropped recursively (never invented), the batch is
+/// reconciled to a target schema via `DataFrame.to(target)`, and existing
+/// tables auto-evolve by merging the live schema with the void-free batch.
+/// A fail-fast guard refuses writes where the source kind diverges from the
+/// table kind (struct vs list/map). Opt-out via `fill_nulls: false`.
+const ICEBERG_FILL_NULLS_HELPERS: &str = r#"def _yard_has_void(dt):
     if isinstance(dt, NullType):
         return True
     if isinstance(dt, StructType):
@@ -118,162 +83,101 @@ def _yard_void_free_ddl(dt):
     return dt.simpleString()
 
 
-def _yard_coerce_voids(col, dt):
+def _yard_void_free_dt(dt):
+    # Recursively drop void leaves, empty structs, array<void>, map<..void..> at
+    # any depth. Returns a cleaned DataType, or None when the type collapses
+    # entirely (caller drops the field). Voids are dropped, never invented: a
+    # NullType column carries zero inferable type, so the only honest move is to
+    # omit it until a real value re-introduces it via schema evolution.
     if isinstance(dt, NullType):
         return None
     if isinstance(dt, StructType):
-        if len(dt.fields) == 0:
-            return F.lit(None).cast(dt)
         fields = []
         for f in dt.fields:
-            coerced = _yard_coerce_voids(col[f.name], f.dataType)
-            if coerced is not None:
-                fields.append(coerced.alias(f.name))
+            sub = _yard_void_free_dt(f.dataType)
+            if sub is not None:
+                fields.append(StructField(f.name, sub, True))
         if not fields:
-            return F.lit(None).cast(dt)
-        return F.struct(*fields)
+            return None
+        return StructType(fields)
     if isinstance(dt, ArrayType):
-        et = dt.elementType
-        if isinstance(et, NullType):
+        inner = _yard_void_free_dt(dt.elementType)
+        if inner is None:
             return None
-        if _yard_has_void(et):
-            target = _yard_void_free_ddl(dt)
-            if target is None:
-                return None
-            return F.when(col.isNull(), F.lit(None).cast(target)) \
-                .otherwise(F.transform(col, lambda x: _yard_coerce_voids(x, et)))
-        return col
+        return ArrayType(inner, True)
     if isinstance(dt, MapType):
-        if isinstance(dt.keyType, NullType) or isinstance(dt.valueType, NullType):
+        k = _yard_void_free_dt(dt.keyType)
+        v = _yard_void_free_dt(dt.valueType)
+        if k is None or v is None:
             return None
-        if _yard_has_void(dt.valueType):
-            target = _yard_void_free_ddl(dt)
-            if target is None:
-                return None
-            return F.when(col.isNull(), F.lit(None).cast(target)) \
-                .otherwise(F.map_from_arrays(F.map_keys(col),
-                    F.transform(F.map_values(col), lambda v: _yard_coerce_voids(v, dt.valueType))))
-        return col
-    return col
+        return MapType(k, v, True)
+    return dt
 
 
-def _yard_fill_nulls(df):
-    for field in df.schema.fields:
-        dt, name = field.dataType, field.name
-        col = F.col(f"`{name}`")
-        if isinstance(dt, NullType):
-            df = df.drop(name)
-        elif isinstance(dt, StructType):
-            if _yard_has_void(dt):
-                coerced = _yard_coerce_voids(col, dt)
-                if coerced is None:
-                    df = df.drop(name)
-                else:
-                    df = df.withColumn(name, F.when(col.isNull(), _yard_default_struct(dt)).otherwise(coerced))
-            else:
-                df = df.withColumn(name, F.when(col.isNull(), _yard_default_struct(dt)).otherwise(col))
-        elif isinstance(dt, ArrayType):
-            if isinstance(dt.elementType, NullType):
-                df = df.drop(name)
-            elif _yard_has_void(dt):
-                coerced = _yard_coerce_voids(col, dt)
-                if coerced is None:
-                    df = df.drop(name)
-                else:
-                    target = _yard_void_free_ddl(dt)
-                    if target is None:
-                        df = df.drop(name)
-                    else:
-                        df = df.withColumn(name, F.when(col.isNull(), F.array().cast(target)).otherwise(coerced))
-            else:
-                df = df.withColumn(name, F.when(col.isNull(), F.array().cast(dt)).otherwise(col))
-        elif isinstance(dt, MapType):
-            if isinstance(dt.keyType, NullType) or isinstance(dt.valueType, NullType):
-                df = df.drop(name)
-            elif _yard_has_void(dt):
-                coerced = _yard_coerce_voids(col, dt)
-                if coerced is None:
-                    df = df.drop(name)
-                else:
-                    df = df.withColumn(name, coerced)
-        elif isinstance(dt, (DoubleType, FloatType, IntegerType, LongType, ShortType, ByteType)):
-            df = df.withColumn(name, F.coalesce(col, F.lit(0).cast(dt)))
-        elif isinstance(dt, BooleanType):
-            df = df.withColumn(name, F.coalesce(col, F.lit(False)))
-        elif isinstance(dt, (TimestampType, DateType, DecimalType, BinaryType)):
-            pass
+def _yard_void_free_schema(schema):
+    fields = []
+    for f in schema.fields:
+        sub = _yard_void_free_dt(f.dataType)
+        if sub is not None:
+            fields.append(StructField(f.name, sub, True))
+    return StructType(fields)
+
+
+def _yard_kind(dt):
+    if isinstance(dt, StructType):
+        return "struct"
+    if isinstance(dt, ArrayType):
+        return "array"
+    if isinstance(dt, MapType):
+        return "map"
+    return "scalar"
+
+
+def _yard_kind_mismatch(src_dt, tgt_dt):
+    # True when the source-inferred kind diverges from the target kind in a way
+    # df.to() cannot reconcile (struct vs list/map, or scalar vs container).
+    # Scalar-vs-scalar is left to df.to()'s safe up-cast.
+    ks, kt = _yard_kind(src_dt), _yard_kind(tgt_dt)
+    if ks == kt:
+        return False
+    return ks != "scalar" or kt != "scalar"
+
+
+def _yard_merge_dt(live_dt, batch_dt):
+    if isinstance(live_dt, StructType) and isinstance(batch_dt, StructType):
+        return _yard_merge_schema(live_dt, batch_dt)
+    if isinstance(live_dt, ArrayType) and isinstance(batch_dt, ArrayType):
+        return ArrayType(_yard_merge_dt(live_dt.elementType, batch_dt.elementType), True)
+    if isinstance(live_dt, MapType) and isinstance(batch_dt, MapType):
+        return MapType(live_dt.keyType, _yard_merge_dt(live_dt.valueType, batch_dt.valueType), True)
+    return live_dt
+
+
+def _yard_merge_schema(live, batch):
+    # Union: live field types win; genuinely-new typed fields from the batch are
+    # added (including nested); nested structs merge field-by-field. The result
+    # is the auto-evolve target the dataframe is conformed to before writing.
+    batch_map = {f.name: f.dataType for f in batch.fields}
+    out = []
+    seen = set()
+    for f in live.fields:
+        seen.add(f.name)
+        if f.name in batch_map:
+            out.append(StructField(f.name, _yard_merge_dt(f.dataType, batch_map[f.name]), True))
         else:
-            df = df.withColumn(name, F.coalesce(col.cast("string"), F.lit("")))
-    return df
+            out.append(StructField(f.name, f.dataType, True))
+    for f in batch.fields:
+        if f.name not in seen:
+            out.append(StructField(f.name, f.dataType, True))
+    return StructType(out)
 
 
 def _yard_read_iceberg_schema(spark, tbl):
     return spark.read.format("iceberg").load(tbl).schema
 
 
-def _yard_void_to_target(col, src_dt, tgt_dt):
-    if not _yard_has_void(src_dt):
-        return col
-    if isinstance(src_dt, NullType):
-        return F.lit(None).cast(tgt_dt)
-    if isinstance(src_dt, StructType) and isinstance(tgt_dt, StructType):
-        if len(src_dt.fields) == 0:
-            if len(tgt_dt.fields) == 0:
-                return F.lit(None).cast(tgt_dt)
-            return F.when(col.isNull(), F.lit(None)) \
-                .otherwise(F.struct(*[F.lit(None).cast(f.dataType).alias(f.name) for f in tgt_dt.fields]))
-        tgt_fields = {f.name: f.dataType for f in tgt_dt.fields}
-        out = []
-        for f in src_dt.fields:
-            sub = col[f.name]
-            if f.name in tgt_fields:
-                out.append(_yard_void_to_target(sub, f.dataType, tgt_fields[f.name]).alias(f.name))
-            elif not _yard_has_void(f.dataType):
-                out.append(sub.alias(f.name))
-        if not out:
-            return F.lit(None).cast(tgt_dt)
-        return F.when(col.isNull(), F.lit(None)).otherwise(F.struct(*out))
-    if isinstance(src_dt, ArrayType) and isinstance(tgt_dt, ArrayType):
-        src_et, tgt_et = src_dt.elementType, tgt_dt.elementType
-        if isinstance(src_et, NullType):
-            return F.when(col.isNull(), F.lit(None)) \
-                .otherwise(F.transform(col, lambda x: F.lit(None).cast(tgt_et)))
-        if _yard_has_void(src_et):
-            return F.when(col.isNull(), F.lit(None)) \
-                .otherwise(F.transform(col, lambda x: _yard_void_to_target(x, src_et, tgt_et)))
-        return col
-    if isinstance(src_dt, MapType) and isinstance(tgt_dt, MapType):
-        src_kt, src_vt = src_dt.keyType, src_dt.valueType
-        tgt_vt = tgt_dt.valueType
-        if isinstance(src_kt, NullType):
-            return F.lit(None).cast(tgt_dt)
-        if isinstance(src_vt, NullType):
-            return F.when(col.isNull(), F.lit(None)) \
-                .otherwise(F.map_from_arrays(F.map_keys(col),
-                    F.transform(F.map_values(col), lambda v: F.lit(None).cast(tgt_vt))))
-        if _yard_has_void(src_vt):
-            return F.when(col.isNull(), F.lit(None)) \
-                .otherwise(F.map_from_arrays(F.map_keys(col),
-                    F.transform(F.map_values(col), lambda v: _yard_void_to_target(v, src_vt, tgt_vt))))
-        return col
-    if isinstance(src_dt, StructType) and len(src_dt.fields) == 0:
-        return F.lit(None).cast(tgt_dt)
-    return col
-
-
-def _yard_conform_to_target_schema(df, spark, tbl):
-    tgt = _yard_read_iceberg_schema(spark, tbl)
-    tgt_map = {f.name: f.dataType for f in tgt.fields}
-    for field in df.schema.fields:
-        name, src_dt = field.name, field.dataType
-        if name not in tgt_map:
-            if _yard_has_void(src_dt):
-                df = df.drop(name)
-            continue
-        if _yard_has_void(src_dt):
-            col = F.col(f"`{name}`")
-            df = df.withColumn(name, _yard_void_to_target(col, src_dt, tgt_map[name]))
-    return df
+def _yard_conform(df, target_schema):
+    return df.to(target_schema)
 "#;
 
 /// Generate a complete PySpark script for the given job definition.
@@ -356,9 +260,9 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
     }
     if fill_nulls {
         extra_imports.push(
-            "from pyspark.sql.types import (StructType, ArrayType, MapType, DoubleType, FloatType, \
-             IntegerType, LongType, ShortType, ByteType, TimestampType, DateType, DecimalType, \
-             BinaryType, BooleanType, NullType)"
+            "from pyspark.sql.types import (StructType, StructField, ArrayType, MapType, DoubleType, \
+             FloatType, IntegerType, LongType, ShortType, ByteType, TimestampType, DateType, \
+             DecimalType, BinaryType, BooleanType, NullType)"
                 .to_string(),
         );
     }
@@ -753,6 +657,30 @@ mod tests {
         }
     }
 
+    /// Render the canonical single-source iceberg job used by the conform tests.
+    fn iceberg_script() -> String {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        generate_python_script("test_job", &job).unwrap()
+    }
+
+    /// Split a rendered iceberg script into its (new-table, existing-table)
+    /// branches around the `tableExists` `if`/`else`.
+    fn split_branches(script: &str) -> (String, String) {
+        let if_idx = script
+            .find("if not spark.catalog.tableExists(_tbl):")
+            .expect("if/tableExists block must be present");
+        let else_idx = script[if_idx..]
+            .find("\n    else:\n")
+            .map(|o| if_idx + o)
+            .expect("else: branch must follow the tableExists check");
+        (
+            script[if_idx..else_idx].to_string(),
+            script[else_idx..].to_string(),
+        )
+    }
+
     #[test]
     fn iceberg_sink_without_path_omits_location() {
         let mut job = base_job();
@@ -777,7 +705,7 @@ mod tests {
             ".tableProperty(\"location\", \"s3://my-warehouse/analytics/events/\")"
         ));
         // Location only applies on create; unchanged for non-create branch.
-        assert!(script.contains(".writeTo(_tbl).option(\"mergeSchema\", \"true\").append()"));
+        assert!(script.contains(".writeTo(_tbl).option(\"merge-schema\", \"true\").append()"));
     }
 
     #[test]
@@ -789,201 +717,143 @@ mod tests {
         assert!(!script.contains(".tableProperty(\"location\""));
     }
 
-    // --- fill_nulls helper shape (recursive void coercion) ---
+    // --- iceberg schema-conform: emitted helper shape (void-free + df.to) ---
 
     #[test]
-    fn fill_nulls_uses_exact_null_type_check() {
-        let mut job = base_job();
-        job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(iceberg_sink("analytics", "events", None));
-        let script = generate_python_script("test_job", &job).unwrap();
-        // Exact NullType check wired in both _yard_fill_nulls and _yard_coerce_voids
+    fn conform_uses_exact_null_type_check() {
+        let script = iceberg_script();
+        // Void detection stays exact isinstance, never the old substring match.
         assert!(script.contains("isinstance(dt, NullType)"));
-        // Old buggy substring-match fully gone
         assert!(!script.contains("\"void\" in dt.simpleString()"));
     }
 
     #[test]
-    fn fill_nulls_top_level_void_dropped() {
-        let mut job = base_job();
-        job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(iceberg_sink("analytics", "events", None));
-        let script = generate_python_script("test_job", &job).unwrap();
-        assert!(script.contains("df = df.drop(name)"));
+    fn dual_arm_machinery_is_gone() {
+        // Goal-backward: the broken when(isNull, default).otherwise(coerced)
+        // struct reconstruction (the source of the DATA_DIFF_TYPES crash) must
+        // be fully absent. The deleted dual-arm helpers were the only emitters
+        // of these expressions, so their absence proves the machinery is gone
+        // — without re-spelling the dead identifiers into this file.
+        let script = iceberg_script();
+        assert!(!script.contains(".otherwise("));
+        assert!(!script.contains("F.when("));
+        // The single conform pass replaces all of it.
+        assert!(script.contains("_yard_conform("));
     }
 
     #[test]
-    fn fill_nulls_null_struct_still_defaults() {
-        let mut job = base_job();
-        job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(iceberg_sink("analytics", "events", None));
-        let script = generate_python_script("test_job", &job).unwrap();
-        assert!(script.contains("_yard_default_struct(dt)"));
-        assert!(script.contains("F.when(col.isNull(), _yard_default_struct(dt))"));
+    fn voids_are_dropped_never_invented() {
+        // D-3: a void column carries no inferable type — drop it, never fabricate
+        // 0 / "" / False / default structs (the source of Bug 1).
+        let script = iceberg_script();
+        assert!(!script.contains("F.lit(0)"));
+        assert!(!script.contains("F.lit(0.0)"));
+        assert!(!script.contains("F.lit(False)"));
+        assert!(!script.contains("F.lit(\"\")"));
+        assert!(!script.contains("F.coalesce("));
     }
 
     #[test]
-    fn yard_default_struct_handles_short_and_byte_types() {
-        // F-CROSS-002: _yard_default_struct must handle ShortType and ByteType
-        // in its integer branch, matching _yard_coerce_voids (which was already
-        // correct). Without this fix, ShortType/ByteType columns inside structs
-        // fall through to the string-cast else branch, producing wrong defaults.
-        let mut job = base_job();
-        job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(iceberg_sink("analytics", "events", None));
-        let script = generate_python_script("test_job", &job).unwrap();
-
-        // Locate _yard_default_struct and verify its integer branch
-        let ds_start = script.find("def _yard_default_struct(struct_type):")
-            .expect("_yard_default_struct must be present");
-        let ds_end = script[ds_start..].find("\ndef _yard_has_void(")
-            .map(|o| ds_start + o)
-            .unwrap_or(script.len());
-        let ds_body = &script[ds_start..ds_end];
-
-        assert!(
-            ds_body.contains("isinstance(dt, (IntegerType, LongType, ShortType, ByteType))"),
-            "_yard_default_struct integer branch must include ShortType and ByteType, got:\n{ds_body}"
-        );
+    fn conform_helpers_defined_in_prelude() {
+        let script = iceberg_script();
+        // The new schema-conform helpers.
+        assert!(script.contains("def _yard_void_free_schema(schema):"));
+        assert!(script.contains("def _yard_merge_schema(live, batch):"));
+        assert!(script.contains("def _yard_kind_mismatch(src_dt, tgt_dt):"));
+        assert!(script.contains("def _yard_conform(df, target_schema):"));
+        assert!(script.contains("def _yard_read_iceberg_schema(spark, tbl):"));
+        // The single-pass conform delegates to Spark 3.5 DataFrame.to().
+        assert!(script.contains("return df.to(target_schema)"));
     }
 
     #[test]
-    fn fill_nulls_other_branches_intact() {
-        let mut job = base_job();
-        job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(iceberg_sink("analytics", "events", None));
-        let script = generate_python_script("test_job", &job).unwrap();
-        assert!(script.contains("elif isinstance(dt, ArrayType):"));
-        assert!(script.contains("F.array().cast(dt)"));
-        assert!(script.contains("elif isinstance(dt, (DoubleType, FloatType, IntegerType, LongType, ShortType, ByteType)):"));
-        assert!(script.contains("F.coalesce(col, F.lit(0).cast(dt))"));
-        assert!(script.contains("elif isinstance(dt, BooleanType):"));
-        assert!(script.contains("F.coalesce(col, F.lit(False))"));
-        assert!(script.contains("elif isinstance(dt, (TimestampType, DateType, DecimalType, BinaryType)):"));
-        assert!(script.contains("else:\n            df = df.withColumn(name, F.coalesce(col.cast(\"string\"), F.lit(\"\")))"));
-    }
-
-    #[test]
-    fn fill_nulls_does_not_string_cast_timestamp_date_decimal_binary() {
-        let mut job = base_job();
-        job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(iceberg_sink("analytics", "events", None));
-        let script = generate_python_script("test_job", &job).unwrap();
-        // Imports cover every type referenced in the helper body.
-        assert!(script.contains("ShortType, ByteType"));
-        assert!(script.contains("DecimalType, \\\n             BinaryType") || script.contains("DecimalType, BinaryType"));
-        // Pass-through branch exists and uses `pass` (no withColumn cast).
-        assert!(script.contains("elif isinstance(dt, (TimestampType, DateType, DecimalType, BinaryType)):\n            pass\n"));
-    }
-
-    #[test]
-    fn fill_nulls_defines_recursive_helpers() {
-        let mut job = base_job();
-        job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(iceberg_sink("analytics", "events", None));
-        let script = generate_python_script("test_job", &job).unwrap();
-        // Three recursive helpers power the coercion at arbitrary nesting depth
+    fn recursive_void_helpers_kept() {
+        // D-7: _yard_has_void and _yard_void_free_ddl are correct and retained
+        // (the latter backs the documented per-column cast fallback).
+        let script = iceberg_script();
         assert!(script.contains("def _yard_has_void(dt):"));
         assert!(script.contains("def _yard_void_free_ddl(dt):"));
-        assert!(script.contains("def _yard_coerce_voids(col, dt):"));
-        // _yard_has_void recognizes every container type
+        // _yard_has_void still recognizes every container kind.
         assert!(script.contains("isinstance(dt, StructType)"));
         assert!(script.contains("isinstance(dt, ArrayType)"));
         assert!(script.contains("isinstance(dt, MapType)"));
     }
 
     #[test]
-    fn fill_nulls_routes_void_containers_through_coerce_voids() {
-        let mut job = base_job();
-        job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(iceberg_sink("analytics", "events", None));
-        let script = generate_python_script("test_job", &job).unwrap();
-        // Top-level struct/array branches gate on _yard_has_void and dispatch to _yard_coerce_voids
-        assert!(script.contains("if _yard_has_void(dt):"));
-        assert!(script.contains("_yard_coerce_voids(col, dt)"));
-    }
-
-    #[test]
-    fn fill_nulls_handles_maps() {
-        let mut job = base_job();
-        job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(iceberg_sink("analytics", "events", None));
-        let script = generate_python_script("test_job", &job).unwrap();
-        // MapType added to emitted imports
-        assert!(script.contains("StructType, ArrayType, MapType,"));
-        // MapType branch exists in _yard_fill_nulls
-        assert!(script.contains("elif isinstance(dt, MapType):"));
-        // Void map paths: void key or void value → drop column
-        assert!(script.contains("isinstance(dt.keyType, NullType) or isinstance(dt.valueType, NullType)"));
-        assert!(script.contains("df = df.drop(name)"));
-    }
-
-    #[test]
-    fn coerce_voids_recurses_through_arrays_and_maps() {
-        let mut job = base_job();
-        job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(iceberg_sink("analytics", "events", None));
-        let script = generate_python_script("test_job", &job).unwrap();
-        // ArrayType recursion: voidful arrays recurse via F.transform
-        assert!(script.contains("F.transform(col, lambda x: _yard_coerce_voids(x, et))"));
-        // MapType value recursion: structurally-voidful value types recurse through _yard_coerce_voids
-        assert!(script.contains("lambda v: _yard_coerce_voids(v, dt.valueType)"));
-    }
-
-    #[test]
-    fn fill_nulls_handles_empty_structs() {
-        let mut job = base_job();
-        job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(iceberg_sink("analytics", "events", None));
-        let script = generate_python_script("test_job", &job).unwrap();
-        // Empty structs preserve their struct type — cast to null of the original type
-        assert!(script.contains("if len(struct_type.fields) == 0:"));
-        assert!(script.contains("if len(dt.fields) == 0:"));
-        assert!(script.contains("F.lit(None).cast(struct_type)"));
-        assert!(script.contains("F.lit(None).cast(dt)"));
-        assert!(!script.contains("_yard_empty"));
-        // _yard_has_void flags empty structs so they get routed through coercion
-        assert!(script.contains("if len(dt.fields) == 0:\n            return True"));
-        // _yard_void_free_ddl preserves empty struct DDL
-        assert!(script.contains("return \"struct<>\""));
-    }
-
-    #[test]
-    fn void_free_ddl_covers_all_container_types() {
-        let mut job = base_job();
-        job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(iceberg_sink("analytics", "events", None));
-        let script = generate_python_script("test_job", &job).unwrap();
-        // _yard_void_free_ddl returns None for NullType (signals drop)
+    fn void_free_schema_drops_void_leaves_at_any_depth() {
+        let script = iceberg_script();
+        // _yard_void_free_dt returns None for a void leaf (signals drop)…
         assert!(script.contains("if isinstance(dt, NullType):\n        return None"));
-        assert!(script.contains("\"array<\" + inner + \">\""));
-        assert!(script.contains("\"map<\" + k + \",\" + v + \">\""));
-        // Struct DDL backtick-quotes field names and filters out NullType fields
-        assert!(script.contains("\"`\" + f.name.replace(\"`\", \"``\") + \"`:\""));
-        assert!(script.contains("if sub is not None:"));
-    }
-
-    // --- iceberg per-branch coerce: fill_nulls (new-table) vs schema-aware conform (existing-table) ---
-
-    #[test]
-    fn existing_table_branch_uses_schema_aware_conform_append() {
-        let mut job = base_job();
-        job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(iceberg_sink("analytics", "events", None));
-        let script = generate_python_script("test_job", &job).unwrap();
-        // Existing-table branch reads the live target schema rather than
-        // re-running source-side fill_nulls — preserves nulls in nullable
-        // real-typed columns and routes void subtypes through target type.
-        assert!(
-            script.contains("df_events = _yard_conform_to_target_schema(df_events, spark, _tbl)"),
-            "existing-table branch must invoke _yard_conform_to_target_schema"
-        );
-        // Confirm we land in the append arm, not overwritePartitions.
-        assert!(script.contains("df_events.writeTo(_tbl).option(\"mergeSchema\", \"true\").append()"));
+        // …and rebuilds clean container types from surviving children.
+        assert!(script.contains("fields.append(StructField(f.name, sub, True))"));
+        assert!(script.contains("return ArrayType(inner, True)"));
+        assert!(script.contains("return MapType(k, v, True)"));
+        // Top-level driver builds a StructType from non-collapsed fields.
+        assert!(script.contains("def _yard_void_free_schema(schema):"));
+        assert!(script.contains("return StructType(fields)"));
+        // StructField is imported for the schema rebuild.
+        assert!(script.contains("StructType, StructField, ArrayType, MapType"));
     }
 
     #[test]
-    fn existing_table_branch_uses_schema_aware_conform_overwrite() {
+    fn merge_schema_unions_live_and_batch() {
+        let script = iceberg_script();
+        // Live field types win; new typed fields are appended (auto-evolve).
+        assert!(script.contains("def _yard_merge_schema(live, batch):"));
+        assert!(script.contains("batch_map = {f.name: f.dataType for f in batch.fields}"));
+        assert!(script.contains("if f.name not in seen:"));
+        // Nested structs merge field-by-field via _yard_merge_dt recursion.
+        assert!(script.contains("def _yard_merge_dt(live_dt, batch_dt):"));
+        assert!(script.contains("return _yard_merge_schema(live_dt, batch_dt)"));
+    }
+
+    #[test]
+    fn kind_mismatch_predicate_distinguishes_containers() {
+        let script = iceberg_script();
+        // Scalar-vs-scalar is not a mismatch (df.to handles safe up-cast);
+        // any struct/list/map divergence is.
+        assert!(script.contains("def _yard_kind_mismatch(src_dt, tgt_dt):"));
+        assert!(script.contains("return ks != \"scalar\" or kt != \"scalar\""));
+    }
+
+    // --- iceberg per-branch: new-table conform vs existing-table merge+evolve ---
+
+    #[test]
+    fn new_table_branch_conforms_via_void_free_schema() {
+        let script = iceberg_script();
+        let (new_table, _existing) = split_branches(&script);
+        assert!(new_table.contains("_target = _yard_void_free_schema(df_events.schema)"));
+        assert!(new_table.contains("df_events = _yard_conform(df_events, _target)"));
+        assert!(new_table.contains(".create())"));
+        // df.to() is the single conform pass.
+        assert!(script.contains("return df.to(target_schema)"));
+    }
+
+    #[test]
+    fn new_table_branch_does_not_read_live_schema() {
+        // Regression: reading live Iceberg metadata before the table exists errors.
+        // The void-free target is derived purely from the first batch.
+        let script = iceberg_script();
+        let (new_table, _existing) = split_branches(&script);
+        assert!(!new_table.contains("_yard_read_iceberg_schema"));
+        assert!(!new_table.contains("_yard_merge_schema"));
+    }
+
+    #[test]
+    fn existing_table_branch_merges_and_evolves_append() {
+        let script = iceberg_script();
+        let (_new_table, existing) = split_branches(&script);
+        // Live schema is the contract; target = merge(live, void_free(batch)).
+        assert!(existing.contains("_live = _yard_read_iceberg_schema(spark, _tbl)"));
+        assert!(existing.contains("_batch = _yard_void_free_schema(df_events.schema)"));
+        assert!(existing.contains("_target = _yard_merge_schema(_live, _batch)"));
+        assert!(existing.contains("df_events = _yard_conform(df_events, _target)"));
+        // Auto-evolve on append via the merge-schema write option.
+        assert!(existing.contains("df_events.writeTo(_tbl).option(\"merge-schema\", \"true\").append()"));
+    }
+
+    #[test]
+    fn existing_table_branch_overwrite_maps_to_overwrite_partitions() {
         let mut job = base_job();
         job.sources = vec![s3_source("events", "s3://b/in")];
         job.sink = Some(iceberg_sink("analytics", "events", None));
@@ -991,106 +861,38 @@ mod tests {
             s.mode = Some("overwrite".to_string());
         }
         let script = generate_python_script("test_job", &job).unwrap();
-        assert!(script.contains("df_events = _yard_conform_to_target_schema(df_events, spark, _tbl)"));
+        assert!(script.contains("_target = _yard_merge_schema(_live, _batch)"));
         // Overwrite mode maps to overwritePartitions, not append.
-        assert!(script.contains("df_events.writeTo(_tbl).option(\"mergeSchema\", \"true\").overwritePartitions()"));
+        assert!(script.contains("df_events.writeTo(_tbl).option(\"merge-schema\", \"true\").overwritePartitions()"));
     }
 
     #[test]
-    fn new_table_branch_preserves_fill_nulls() {
-        let mut job = base_job();
-        job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(iceberg_sink("analytics", "events", None));
-        let script = generate_python_script("test_job", &job).unwrap();
+    fn existing_table_branch_emits_kind_mismatch_guard() {
+        // D-6 fail-fast: refuse the write when an inferred column kind diverges
+        // from the table kind (struct vs list/map) — stops Bug 2 at the source
+        // rather than emitting an expression that detonates in Spark.
+        let script = iceberg_script();
+        let (new_table, existing) = split_branches(&script);
+        assert!(existing.contains("_yard_kind_mismatch(_f.dataType, _live_types[_f.name])"));
         assert!(
-            script.contains("df_events = _yard_fill_nulls(df_events)"),
-            "new-table branch must still invoke _yard_fill_nulls on the DF (D-04 fallback)"
+            existing.contains("raise ValueError(\"yard: schema kind mismatch for column "),
+            "existing-table branch must emit a clear fail-fast guard message"
         );
-        // Confirm the create-branch itself is still structurally present.
-        assert!(script.contains("if not spark.catalog.tableExists(_tbl):"));
-        assert!(script.contains(".create())"));
-    }
-
-    #[test]
-    fn schema_aware_conform_only_inside_else_branch() {
-        // Regression guard for Sean's gating concern: _yard_conform_to_target_schema
-        // reads the live Iceberg metadata, so it must NEVER fire on the new-table
-        // (.create()) branch — if it does, the read errors before the table exists.
-        let mut job = base_job();
-        job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(iceberg_sink("analytics", "events", None));
-        let script = generate_python_script("test_job", &job).unwrap();
-
-        // Locate the if/else block. The conform call must sit AFTER the `else:`
-        // line and BEFORE the existing-table writeTo on that same arm. The
-        // new-table branch (between `if not ... tableExists(_tbl):` and `else:`)
-        // must contain _yard_fill_nulls but NOT _yard_conform_to_target_schema.
-        let if_idx = script
-            .find("if not spark.catalog.tableExists(_tbl):")
-            .expect("if/tableExists block must be present");
-        let else_idx = script[if_idx..]
-            .find("\n    else:\n")
-            .map(|o| if_idx + o)
-            .expect("else: branch must follow the tableExists check");
-        let new_table_block = &script[if_idx..else_idx];
-        let existing_table_block = &script[else_idx..];
-
-        assert!(
-            new_table_block.contains("_yard_fill_nulls(df_events)"),
-            "new-table branch must call _yard_fill_nulls"
-        );
-        assert!(
-            !new_table_block.contains("_yard_conform_to_target_schema"),
-            "_yard_conform_to_target_schema must NOT appear on the new-table branch — \
-             it reads live Iceberg metadata and would error before the table exists"
-        );
-        assert!(
-            existing_table_block.contains("_yard_conform_to_target_schema(df_events, spark, _tbl)"),
-            "existing-table branch must call _yard_conform_to_target_schema"
-        );
-        assert!(
-            !existing_table_block.contains("_yard_fill_nulls(df_events)"),
-            "existing-table branch must NOT call _yard_fill_nulls — that path drops \
-             schema awareness and overwrites real nulls with typed defaults (0/False/empty)"
-        );
-    }
-
-    #[test]
-    fn schema_aware_helpers_in_prelude() {
-        let mut job = base_job();
-        job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(iceberg_sink("analytics", "events", None));
-        let script = generate_python_script("test_job", &job).unwrap();
-        // The three new helpers that drive the schema-aware existing-table path.
-        assert!(script.contains("def _yard_read_iceberg_schema(spark, tbl):"));
-        assert!(script.contains("def _yard_void_to_target(col, src_dt, tgt_dt):"));
-        assert!(script.contains("def _yard_conform_to_target_schema(df, spark, tbl):"));
-        // Schema-aware empty-struct expansion uses target field shape — when the
-        // target struct has real fields, the existing-table path populates from
-        // target. Empty structs cast to null of their original type.
-        assert!(script.contains("F.lit(None).cast(f.dataType).alias(f.name)"));
+        // The guard is existing-table only (a new table has no prior kinds).
+        assert!(!new_table.contains("_yard_kind_mismatch"));
     }
 
     #[test]
     fn no_try_except_around_write() {
-        let mut job = base_job();
-        job.sources = vec![s3_source("events", "s3://b/in")];
-        job.sink = Some(iceberg_sink("analytics", "events", None));
-        let script = generate_python_script("test_job", &job).unwrap();
-        // SPEC acceptance 7: no try/except wraps .writeTo(...).option("mergeSchema"...).
-        // Two unrelated try/except blocks exist in the rendered script and must not
-        // trip this test: (a) the Glue database-create try/except at sink.rs:89-94
-        // (`except _glue.exceptions.EntityNotFoundException`), and (b) the template's
-        // outer `if __name__ == "__main__":` wrapper in glue.py.tera:44-49
-        // (`try: run(); job.commit() except Exception as e:`). Both are unrelated to
-        // the Iceberg write — we scope this assertion strictly to the writeTo call-site.
+        let script = iceberg_script();
+        // No try/except wraps the Iceberg writeTo on either branch. Two unrelated
+        // try/except blocks exist in the rendered script — the Glue create-database
+        // guard (`except _glue.exceptions.EntityNotFoundException`) and the
+        // template's `__main__` wrapper — neither touches the write call-site.
         assert!(
             !script.contains("try:\n        df_events.writeTo(_tbl)"),
             "writeTo(_tbl) on the existing-table branch must not be wrapped in try:"
         );
-        // No `except` immediately follows the write's terminating call on either
-        // branch (`.append()`, `.overwritePartitions()`, or `.create())`) — which
-        // would be the structural signature of a try/except wrapping the write.
         assert!(
             !script.contains(".append()\n    except"),
             "no exception handler wraps .append() on the existing-table write"
@@ -1114,18 +916,40 @@ mod tests {
             s.fill_nulls = Some(false);
         }
         let script = generate_python_script("test_job", &job).unwrap();
-        // D-07: opt-out preserves verbatim mental model — no yard-side DF rewriting on either branch.
-        assert!(
-            !script.contains("df_events = _yard_fill_nulls(df_events)"),
-            "fill_nulls: false must suppress _yard_fill_nulls on the new-table branch"
-        );
-        assert!(
-            !script.contains("df_events = _yard_conform_to_target_schema(df_events, spark, _tbl)"),
-            "fill_nulls: false must suppress _yard_conform_to_target_schema on the existing-table branch"
-        );
+        // D-8: opt-out emits neither conform path and injects no helpers at all.
+        assert!(!script.contains("_yard_conform("));
+        assert!(!script.contains("_yard_void_free_schema("));
+        assert!(!script.contains("_yard_merge_schema("));
+        assert!(!script.contains("def _yard_"));
         // Structural shape of the sink block is otherwise intact.
         assert!(script.contains("if not spark.catalog.tableExists(_tbl):"));
-        assert!(script.contains("df_events.writeTo(_tbl).option(\"mergeSchema\", \"true\").append()"));
+        assert!(script.contains("df_events.writeTo(_tbl).option(\"merge-schema\", \"true\").append()"));
+    }
+
+    #[test]
+    fn non_iceberg_sink_output_unchanged() {
+        // Regression golden: the iceberg rewrite must not alter non-iceberg
+        // codegen. An s3/parquet sink emits its plain writer and zero schema
+        // -conform machinery or `_yard_` helpers.
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(yard_structs::Sink {
+            source: None,
+            sink_type: "s3".to_string(),
+            format: Some("parquet".to_string()),
+            path: Some("s3://b/out".to_string()),
+            mode: Some("overwrite".to_string()),
+            ..Default::default()
+        });
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(script.contains(
+            "    # --- Sink ---\n    df_events.write.format(\"parquet\").mode(\"overwrite\").save(\"s3://b/out\")"
+        ));
+        // No iceberg helpers, type imports, or conform calls leak in.
+        assert!(!script.contains("_yard_"));
+        assert!(!script.contains("df.to("));
+        assert!(!script.contains("from pyspark.sql.types import"));
+        assert!(!script.contains("glue_catalog"));
     }
 
     // --- Body override still works ---

@@ -245,8 +245,9 @@ pub(super) fn has_iceberg_sink(job_def: &JobDefinition) -> bool {
         .is_some_and(|s| s.sink_type == "iceberg")
 }
 
-/// True when the iceberg sink should be preceded by a `_yard_fill_nulls` pass.
-/// Opt-in by default for iceberg sinks; `fill_nulls: false` opts out.
+/// True when the iceberg sink should emit the schema-conform pass
+/// (`_yard_void_free_schema` + `_yard_conform`). Opt-in by default for iceberg
+/// sinks; `fill_nulls: false` opts out.
 pub(super) fn should_fill_nulls(job_def: &JobDefinition) -> bool {
     job_def
         .sink

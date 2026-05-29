@@ -330,18 +330,41 @@ The `iceberg` sink is the most opinionated path in codegen:
    `spark.catalog.tableExists(_tbl)` at runtime. If absent, it emits a
    full create (`.writeTo(_tbl).using("iceberg").partitionedBy(...)
    .tableProperty(...).create()`). If present, it emits
-   `.writeTo(_tbl).option("mergeSchema", "true").<op>()` where `<op>` is
+   `.writeTo(_tbl).option("merge-schema", "true").<op>()` where `<op>` is
    `overwritePartitions` or `append` per the mode rules above. Location
    and table properties therefore only apply on first-time creation.
-5. **`fill_nulls`.** Defaults to `true` for `iceberg` sinks; explicit
-   `fill_nulls: false` opts out. When enabled, `generate_python_script`
-   injects the `_yard_fill_nulls` and `_yard_default_struct` helpers at
-   module scope (the `ICEBERG_FILL_NULLS_HELPERS` constant in
-   `codegen/mod.rs`) and adds a
-   `df_<src> = _yard_fill_nulls(df_<src>)` call immediately before the
-   writer. The helpers coerce `void`-typed and `NULL`-struct columns into
-   type-appropriate defaults so Iceberg writes don't fail on unresolved
-   schemas — a common issue when ingesting JSON with sparse objects.
+   The `merge-schema` write option, paired with the
+   `write.spark.accept-any-schema=true` table property, is what lets
+   genuinely-new typed fields auto-evolve onto an existing table.
+5. **`fill_nulls` (schema-conform).** Defaults to `true` for `iceberg`
+   sinks; explicit `fill_nulls: false` opts out (yard then emits neither
+   conform path and injects no helpers). When enabled,
+   `generate_python_script` injects the schema-conform helpers at module
+   scope (the `ICEBERG_FILL_NULLS_HELPERS` constant in `codegen/mod.rs`)
+   and wires a single conform pass per branch. This path requires
+   **Spark 3.5 / Glue 5** (it uses `DataFrame.to(target_schema)`).
+
+   - **Voids are dropped, never invented.** A `void`/`NullType` column (or
+     nested leaf, empty struct, `array<void>`, `map<…void…>`) carries zero
+     inferable type, so `_yard_void_free_schema` recursively drops it at
+     any depth. yard never fabricates `0` / `""` / `False` / default
+     structs — that invention was the source of the old
+     `DATA_DIFF_TYPES` crash. A dropped field re-appears automatically once
+     a batch carries a real value for it (via schema evolution).
+   - **New table.** `_target = _yard_void_free_schema(df.schema)`, then
+     `_yard_conform(df, _target)` (`df.to(...)`) before `.create()` — the
+     void-free first batch is the schema contract.
+   - **Existing table.** The live Iceberg schema is the contract.
+     `_target = _yard_merge_schema(_live, _yard_void_free_schema(df.schema))`
+     — live field types win, new typed fields (including nested) are added,
+     missing columns null-fill — then `_yard_conform(df, _target)` reconciles
+     the batch in one pass before the `merge-schema` write.
+   - **Fail-fast guard.** Before an existing-table write, yard checks each
+     column with `_yard_kind_mismatch`: if a source-inferred *kind* diverges
+     from the table kind (struct vs list/map — e.g. dynamic/numeric JSON keys
+     inferred as a struct against a `map`/`array` column), it `raise`s a
+     clear `ValueError` rather than emitting an expression that detonates in
+     Spark or silently grows an unbounded struct.
 6. **Partition mirroring.** Job-level `partition_by` (top-level on the
    `JobDefinition`) is mirrored onto the Iceberg sink's `partition_by`
    so `.partitionedBy(...)` is emitted on first create. See
@@ -647,7 +670,7 @@ implicit imports to add (see the `if needs_*` checks in
 | `needs_requests_import` (any `api` source) | `import requests` |
 | `needs_dynamic_frame_import` (any `catalog` source/sink, or any Glue-engine `s3`/`jdbc` source) | `from awsglue.dynamicframe import DynamicFrame` |
 | `needs_functions_import` (any `aggregate` or `window` transform) **or** `partition_by` non-empty **or** `should_fill_nulls` | `from pyspark.sql import functions as F` |
-| `should_fill_nulls` (Iceberg sink with `fill_nulls != Some(false)`) | `from pyspark.sql.types import (StructType, ArrayType, DoubleType, FloatType, IntegerType, LongType, TimestampType, DateType, BooleanType)` + the `_yard_fill_nulls` / `_yard_default_struct` helper block at module scope |
+| `should_fill_nulls` (Iceberg sink with `fill_nulls != Some(false)`) | `from pyspark.sql.types import (StructType, StructField, ArrayType, MapType, …, NullType)` + the schema-conform helper block (`_yard_void_free_schema` / `_yard_merge_schema` / `_yard_kind_mismatch` / `_yard_conform`) at module scope |
 | `needs_window_import` (any `window` transform) | `from pyspark.sql.window import Window` |
 
 ### Partition derivation
@@ -811,9 +834,19 @@ mangle anything.
   catalog-not-found error. Fix: set `providers.glue.warehouse` in
   `yard.yaml`.
 - **Void-typed columns when writing Iceberg from JSON** — this is why
-  `fill_nulls` defaults to `true`. If you turned it off with
-  `fill_nulls: false` and are seeing `cannot write void type`, turn it
-  back on or cast the columns yourself in a `sql` transform.
+  `fill_nulls` defaults to `true`. With it enabled, void columns are
+  dropped (never invented) and the batch is conformed via
+  `DataFrame.to(...)`. If you turned it off with `fill_nulls: false` and
+  are seeing `cannot write void type`, turn it back on or cast the columns
+  yourself in a `sql` transform. Note the conform path needs **Glue 5 /
+  Spark 3.5** for `DataFrame.to()`.
+- **`yard: schema kind mismatch for column '<x>'`** — the fail-fast guard
+  fired on an existing-table write: the batch inferred a different *kind*
+  (struct vs list/map) than the live Iceberg column. The usual cause is a
+  JSON object with dynamic/numeric keys (e.g. `{"100": [...]}`) inferred as
+  a struct against a `map`/`array` column. Fix it upstream — normalize the
+  dynamic-key object into a `map` (or explode it) in a `sql` transform
+  before the sink — rather than letting it grow an unbounded struct schema.
 - **`yard show` output doesn't match what Glue ran** — usually means
   the state has the old script's URI pinned (providers re-upload on
   every `apply`, so this is rare), or you ran `yard show` from the

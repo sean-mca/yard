@@ -73,7 +73,7 @@ themselves: everything under `def run():` is built in Rust (in
 as a single string. This pushes all the dispatch logic — "is this an
 `s3_csv` source or a `jdbc` source?", "does this transform produce a
 temp view for downstream `sql`?", "does this Iceberg sink need
-`_yard_fill_nulls`?" — into typed Rust code with `match` arms over the
+`_yard_conform`?" — into typed Rust code with `match` arms over the
 `Source` / `Transform` / `Sink` enums in `yard-structs`, where the
 compiler enforces that every variant is handled. The trade-off is that
 adding a new source/sink/transform variant is a Rust edit, not a
