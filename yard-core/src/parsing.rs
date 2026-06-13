@@ -829,6 +829,64 @@ mod tests {
         assert_eq!(aws.region.as_deref(), Some("us-east-1"));
     }
 
+    // --- merge_airflow_sections: version cascade (D-02 / D-19) ---
+
+    #[test]
+    fn merge_airflow_version_flows_through() {
+        // D-19: project sets V3, region unset -> V3 flows through
+        let base = AirflowSection {
+            version: Some(AirflowMajorVersion::V3),
+            ..Default::default()
+        };
+        let overlay = AirflowSection {
+            version: None,
+            ..Default::default()
+        };
+        let merged = merge_airflow_sections(&base, &overlay);
+        assert_eq!(
+            merged.version,
+            Some(AirflowMajorVersion::V3),
+            "project-level V3 must propagate when region is unset"
+        );
+    }
+
+    #[test]
+    fn merge_airflow_version_override() {
+        // D-19: project sets V3, region sets V2 -> V2 wins (overlay overrides)
+        let base = AirflowSection {
+            version: Some(AirflowMajorVersion::V3),
+            ..Default::default()
+        };
+        let overlay = AirflowSection {
+            version: Some(AirflowMajorVersion::V2),
+            ..Default::default()
+        };
+        let merged = merge_airflow_sections(&base, &overlay);
+        assert_eq!(
+            merged.version,
+            Some(AirflowMajorVersion::V2),
+            "lower-level V2 must override project-level V3"
+        );
+    }
+
+    #[test]
+    fn merge_airflow_version_both_none() {
+        // D-19: both unset -> None (default resolution deferred to codegen)
+        let base = AirflowSection {
+            version: None,
+            ..Default::default()
+        };
+        let overlay = AirflowSection {
+            version: None,
+            ..Default::default()
+        };
+        let merged = merge_airflow_sections(&base, &overlay);
+        assert_eq!(
+            merged.version, None,
+            "both-None must remain None (codegen applies default)"
+        );
+    }
+
     // --- validate_unknown_keys (TYPE-03) ---
 
     #[test]
