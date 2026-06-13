@@ -734,6 +734,96 @@ mod tests {
 
     // --- SingleSource::source_kind (Phase 29 wire-key helper, D-19) ---
 
+    // --- Asset alias (Phase 55, ALIAS-01/02/03) ---
+
+    #[test]
+    fn trigger_asset_alias_single_source_round_trip() {
+        // D-10/D-12/D-17: "asset" parses as Dataset, re-serializes as "dataset"
+        for key in ["dataset", "asset"] {
+            let input = serde_json::json!({key: {"uri": "s3://b/k"}});
+            let parsed: SingleSource = serde_json::from_value(input).unwrap();
+            assert_eq!(
+                parsed,
+                SingleSource::Dataset(DatasetTrigger {
+                    uri: "s3://b/k".into(),
+                }),
+                "'{key}' must parse as SingleSource::Dataset"
+            );
+            // ALIAS-02: serialization always emits "dataset"
+            let reser = serde_json::to_value(&parsed).unwrap();
+            assert_eq!(
+                reser,
+                serde_json::json!({"dataset": {"uri": "s3://b/k"}}),
+                "'{key}' input must re-serialize with 'dataset' key"
+            );
+        }
+    }
+
+    #[test]
+    fn trigger_asset_alias_all_composite() {
+        // D-11: "asset" inside all: composite flows through SingleSource
+        let input = serde_json::json!({"all": [
+            {"asset": {"uri": "s3://a"}},
+            {"dataset": {"uri": "s3://b"}}
+        ]});
+        let parsed: Trigger = serde_json::from_value(input).unwrap();
+        match &parsed {
+            Trigger::All(sources) => {
+                assert_eq!(sources.len(), 2);
+                assert_eq!(
+                    sources[0],
+                    SingleSource::Dataset(DatasetTrigger { uri: "s3://a".into() })
+                );
+                assert_eq!(
+                    sources[1],
+                    SingleSource::Dataset(DatasetTrigger { uri: "s3://b".into() })
+                );
+            }
+            other => panic!("expected Trigger::All, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trigger_asset_alias_any_composite() {
+        // D-11: "asset" inside any: composite
+        let input = serde_json::json!({"any": [{"asset": {"uri": "s3://a"}}]});
+        let parsed: Trigger = serde_json::from_value(input).unwrap();
+        match &parsed {
+            Trigger::Any(sources) => {
+                assert_eq!(sources.len(), 1);
+                assert_eq!(
+                    sources[0],
+                    SingleSource::Dataset(DatasetTrigger { uri: "s3://a".into() })
+                );
+            }
+            other => panic!("expected Trigger::Any, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trigger_unknown_source_mentions_asset() {
+        // D-13/D-18: error message must include "dataset (or asset)"
+        let err = serde_json::from_value::<SingleSource>(serde_json::json!({"typo": {}}))
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("dataset (or asset)"),
+            "unknown-source error must mention asset alias, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn trigger_unknown_source_via_trigger_level_mentions_asset() {
+        // D-14: Trigger-level delegation propagates the updated message
+        let err = serde_json::from_value::<Trigger>(serde_json::json!({"typo": {}}))
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("dataset (or asset)"),
+            "Trigger-level unknown-source error must mention asset alias, got: {msg}"
+        );
+    }
+
     #[test]
     fn single_source_kind_returns_wire_keys() {
         assert_eq!(
