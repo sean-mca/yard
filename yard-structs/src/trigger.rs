@@ -173,7 +173,7 @@ impl<'de> Deserialize<'de> for SingleSource {
                             .map_err(serde::de::Error::custom)?;
                         SingleSource::S3(t)
                     }
-                    "dataset" => {
+                    "dataset" | "asset" => {
                         let t: DatasetTrigger = serde_json::from_value(val)
                             .map_err(serde::de::Error::custom)?;
                         SingleSource::Dataset(t)
@@ -190,7 +190,7 @@ impl<'de> Deserialize<'de> for SingleSource {
                     }
                     other => {
                         return Err(serde::de::Error::custom(format!(
-                            "unknown trigger source '{other}' — valid: schedule, s3, dataset, sqs, api, all, any"
+                            "unknown trigger source '{other}' — valid: schedule, s3, dataset (or asset), sqs, api, all, any"
                         )));
                     }
                 };
@@ -477,7 +477,7 @@ mod tests {
             "got: {msg}"
         );
         assert!(
-            msg.contains("valid: schedule, s3, dataset, sqs, api, all, any"),
+            msg.contains("valid: schedule, s3, dataset (or asset), sqs, api, all, any"),
             "got: {msg}"
         );
     }
