@@ -483,6 +483,76 @@ pub struct YARDContext {
     pub dag: serde_json::Value,
 }
 
+/// Major Airflow version discriminator for version-aware codegen (VCFG-01).
+/// Controls import paths and class names in generated DAG files:
+/// V2 emits `Dataset` from `airflow.datasets`, V3 emits `Asset` from
+/// `airflow.sdk`. Default is V2 to preserve existing behavior.
+///
+/// Wire format accepts both string (`"2"`, `"3"`) and integer (`2`, `3`)
+/// forms from YAML; serialization always emits string form for stable
+/// state hashes (VCFG-02, D-07, D-08).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum AirflowMajorVersion {
+    /// Airflow 2.x (Dataset, airflow.datasets, airflow.operators.*).
+    #[default]
+    V2,
+    /// Airflow 3.x (Asset, airflow.sdk, airflow.providers.standard.operators.*).
+    V3,
+}
+
+impl std::fmt::Display for AirflowMajorVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AirflowMajorVersion::V2 => f.write_str("2"),
+            AirflowMajorVersion::V3 => f.write_str("3"),
+        }
+    }
+}
+
+impl serde::Serialize for AirflowMajorVersion {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            AirflowMajorVersion::V2 => s.serialize_str("2"),
+            AirflowMajorVersion::V3 => s.serialize_str("3"),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AirflowMajorVersion {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v: serde_json::Value = serde_json::Value::deserialize(d)?;
+        match &v {
+            serde_json::Value::String(s) => match s.as_str() {
+                "2" => Ok(AirflowMajorVersion::V2),
+                "3" => Ok(AirflowMajorVersion::V3),
+                other => Err(serde::de::Error::custom(format!(
+                    "invalid airflow version '{other}' \u{2014} valid: 2 or 3 (string or integer)"
+                ))),
+            },
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_u64() {
+                    match i {
+                        2 => Ok(AirflowMajorVersion::V2),
+                        3 => Ok(AirflowMajorVersion::V3),
+                        _ => Err(serde::de::Error::custom(format!(
+                            "invalid airflow version '{i}' \u{2014} valid: 2 or 3 (string or integer)"
+                        ))),
+                    }
+                } else {
+                    Err(serde::de::Error::custom(format!(
+                        "invalid airflow version '{n}' \u{2014} valid: 2 or 3 (string or integer)"
+                    )))
+                }
+            }
+            _ => Err(serde::de::Error::custom(format!(
+                "invalid airflow version '{}' \u{2014} valid: 2 or 3 (string or integer)",
+                v
+            ))),
+        }
+    }
+}
+
 /// Airflow config shared across inheritance layers (yard.yaml, region.yaml,
 /// account.yaml, dag.yaml, and the per-job `airflow:` block). Every layer has
 /// the same shape; later layers override earlier ones via shallow merge.
@@ -528,6 +598,11 @@ pub struct AirflowSection {
     /// CONC-02 enforces `>= 1` at validate_dag_full.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_active_runs: Option<u32>,
+    /// Major Airflow version for version-aware codegen (VCFG-01/02).
+    /// `None` = V2 default. Controls `Dataset` vs `Asset` class names and
+    /// import paths in Phase 56.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<AirflowMajorVersion>,
 }
 
 /// Private mirror of `AirflowSection` used by the hand-rolled `Deserialize`
@@ -556,6 +631,8 @@ struct _AirflowSectionRaw {
     aws: Option<AwsCredentialConfig>,
     #[serde(default)]
     max_active_runs: Option<u32>,
+    #[serde(default)]
+    version: Option<AirflowMajorVersion>,
 }
 
 impl<'de> serde::Deserialize<'de> for AirflowSection {
@@ -581,6 +658,7 @@ impl<'de> serde::Deserialize<'de> for AirflowSection {
             publishes: raw.publishes,
             aws: raw.aws,
             max_active_runs: raw.max_active_runs,
+            version: raw.version,
         })
     }
 }
