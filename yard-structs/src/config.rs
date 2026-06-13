@@ -1243,6 +1243,77 @@ mod tests {
         assert_eq!(serialized["regions"][0]["jobs"][0]["job_type"], "glue");
     }
 
+    // --- AirflowMajorVersion (Phase 55, VCFG-01/02/04/05) ---
+
+    #[test]
+    fn airflow_major_version_default_is_v2() {
+        assert_eq!(AirflowMajorVersion::default(), AirflowMajorVersion::V2);
+    }
+
+    #[test]
+    fn airflow_major_version_serde_string_round_trip() {
+        // D-07/D-08: accepts string "2"/"3", serializes as string
+        for (input_str, expected) in [("2", AirflowMajorVersion::V2), ("3", AirflowMajorVersion::V3)] {
+            let input = json!(input_str);
+            let parsed: AirflowMajorVersion = serde_json::from_value(input).unwrap();
+            assert_eq!(parsed, expected);
+            let reser = serde_json::to_value(&parsed).unwrap();
+            assert_eq!(reser, json!(input_str), "must serialize back to string form");
+        }
+    }
+
+    #[test]
+    fn airflow_major_version_serde_integer_round_trip() {
+        // D-07: accepts integer 2/3 from YAML
+        for (input_int, expected) in [(2, AirflowMajorVersion::V2), (3, AirflowMajorVersion::V3)] {
+            let input = json!(input_int);
+            let parsed: AirflowMajorVersion = serde_json::from_value(input).unwrap();
+            assert_eq!(parsed, expected);
+            // D-08: serialization always emits string form
+            let reser = serde_json::to_value(&parsed).unwrap();
+            assert_eq!(reser, json!(input_int.to_string()), "integer input must serialize as string");
+        }
+    }
+
+    #[test]
+    fn airflow_major_version_invalid_string_rejected() {
+        // D-09: actionable error for invalid version values
+        for invalid in ["4", "foo"] {
+            let err = serde_json::from_value::<AirflowMajorVersion>(json!(invalid)).unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(&format!("invalid airflow version '{invalid}'")),
+                "error for '{invalid}' must contain the invalid value, got: {msg}"
+            );
+            assert!(
+                msg.contains("valid: 2 or 3 (string or integer)"),
+                "error for '{invalid}' must mention valid options, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn airflow_section_version_none_omitted_in_serialization() {
+        // VCFG-04: skip_serializing_if = "Option::is_none" preserves wire format
+        let input = json!({"schedule": "@daily"});
+        let parsed: AirflowSection = serde_json::from_value(input).unwrap();
+        assert_eq!(parsed.version, None);
+        let reser = serde_json::to_value(&parsed).unwrap();
+        assert!(
+            reser.get("version").is_none(),
+            "version:None must be skipped on serialize, got: {reser}"
+        );
+    }
+
+    #[test]
+    fn airflow_section_version_v3_round_trips() {
+        let input = json!({"schedule": "@daily", "version": "3"});
+        let parsed: AirflowSection = serde_json::from_value(input).unwrap();
+        assert_eq!(parsed.version, Some(AirflowMajorVersion::V3));
+        let reser = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(reser.get("version"), Some(&json!("3")));
+    }
+
     #[test]
     fn discovered_environment_optional_fields_skipped() {
         let env = DiscoveredEnvironment {
