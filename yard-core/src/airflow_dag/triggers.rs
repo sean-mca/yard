@@ -16,9 +16,10 @@
 
 use std::fmt::Write;
 
-use yard_structs::{SingleSource, Trigger};
+use yard_structs::{AirflowMajorVersion, SingleSource, Trigger};
 
 use super::helpers::{python_string_literal, python_var_name};
+use super::version::VersionCodegen;
 
 /// Phase 32 D-11: fixed Airflow-version contract banner. Renders on every
 /// event-driven DAG (D-12 — `trigger.is_some()` gate). Schedule-only DAGs
@@ -39,12 +40,13 @@ pub(super) const VERSION_BANNER: &str = "# Airflow version contract:
 /// call through here. Datasets have no `logical_date`, so historical re-runs do
 /// NOT replay missed events -- backfill must go through API-trigger replay.
 #[inline]
-fn dataset_header(uri: &str) -> String {
+fn dataset_header(uri: &str, version: AirflowMajorVersion) -> String {
+    let class = version.class_name();
     format!(
-        "# Trigger: Dataset ({uri})\n\
+        "# Trigger: {class} ({uri})\n\
          #\n\
-         # Backfill caveat: Datasets have no logical_date — historical re-runs do NOT\n\
-         # replay missed Dataset events. Use API-trigger replay (see DOC-04) to backfill\n\
+         # Backfill caveat: {class}s have no logical_date — historical re-runs do NOT\n\
+         # replay missed {class} events. Use API-trigger replay (see DOC-04) to backfill\n\
          # this DAG against synthetic dag_run.conf payloads.\n",
     )
 }
@@ -130,6 +132,7 @@ pub(super) fn render_trigger(
     schedule: Option<&str>,
     default_aws_conn_id: Option<&str>,
     roots: &[String],
+    version: AirflowMajorVersion,
 ) -> TriggerRender {
     // D-12: collapse single-element composites to bare-single before branching.
     // The Trigger::Serialize impl already collapses for hashing (HASH-01); we
@@ -144,10 +147,10 @@ pub(super) fn render_trigger(
 
     // Branch 1: bare-single (or collapsed single-element composite).
     let mut result = if let Some(single) = normalized {
-        render_single(single, default_aws_conn_id, roots)
+        render_single(single, default_aws_conn_id, roots, version)
     } else if let Some(t) = trigger {
         // Branch 2: composite (>= 2 elements).
-        render_composite(t, default_aws_conn_id, roots)
+        render_composite(t, default_aws_conn_id, roots, version)
     } else {
         // Branch 3: no trigger — render top-level schedule literal or None.
         TriggerRender {
@@ -180,9 +183,10 @@ pub(super) fn render_trigger(
     // boundary; the Tera template is unchanged — banner flows through the
     // existing `{{ trigger_header_block }}` insertion in airflow_dag.py.tera.
     if trigger.is_some() {
+        let banner = version.version_banner();
         let mut banner_plus_header =
-            String::with_capacity(VERSION_BANNER.len() + result.header_docstring.len() + 1);
-        banner_plus_header.push_str(VERSION_BANNER);
+            String::with_capacity(banner.len() + result.header_docstring.len() + 1);
+        banner_plus_header.push_str(banner);
         if !result.header_docstring.is_empty() {
             // Blank separator line between the banner block and the
             // per-source caveat block (purely aesthetic — both are Python
@@ -216,6 +220,7 @@ fn render_single(
     s: &SingleSource,
     default_aws_conn_id: Option<&str>,
     roots: &[String],
+    version: AirflowMajorVersion,
 ) -> TriggerRender {
     match s {
         SingleSource::Schedule(sched) => TriggerRender {
@@ -227,12 +232,12 @@ fn render_single(
             header_docstring: String::new(),
         },
         SingleSource::Dataset(d) => TriggerRender {
-            schedule_expr: format!("[Dataset({})]", python_string_literal(&d.uri)),
+            schedule_expr: format!("[{}({})]", version.class_name(), python_string_literal(&d.uri)),
             sensor_tasks: Vec::new(),
             sensor_deps: Vec::new(),
-            extra_imports: vec!["from airflow.datasets import Dataset".to_string()],
+            extra_imports: vec![version.class_import().to_string()],
             max_active_runs: None,
-            header_docstring: dataset_header(&d.uri),
+            header_docstring: dataset_header(&d.uri, version),
         },
         SingleSource::S3(s3) => {
             // Knob defaults (S3-02): poke_interval=60, timeout=86400.
@@ -435,11 +440,12 @@ fn render_composite(
     t: &Trigger,
     default_aws_conn_id: Option<&str>,
     roots: &[String],
+    version: AirflowMajorVersion,
 ) -> TriggerRender {
     let (items, separator) = match t {
         Trigger::All(v) => (v, " & "),
         Trigger::Any(v) => (v, " | "),
-        Trigger::Single(s) => return render_single(s, default_aws_conn_id, roots),
+        Trigger::Single(s) => return render_single(s, default_aws_conn_id, roots, version),
         _ => return TriggerRender {
             schedule_expr: "None".to_string(),
             sensor_tasks: Vec::new(),
@@ -463,20 +469,20 @@ fn render_composite(
         uris.sort();
         let chain = uris
             .iter()
-            .map(|u| format!("Dataset({})", python_string_literal(u)))
+            .map(|u| format!("{}({})", version.class_name(), python_string_literal(u)))
             .collect::<Vec<_>>()
             .join(separator);
         // D-13: one per-source caveat block per URI; banner is prepended later
         // in render_trigger via the inline-prepend gate (D-14b).
         let mut header = String::new();
         for u in &uris {
-            header.push_str(&dataset_header(u));
+            header.push_str(&dataset_header(u, version));
         }
         return TriggerRender {
             schedule_expr: format!("({chain})"),
             sensor_tasks: Vec::new(),
             sensor_deps: Vec::new(),
-            extra_imports: vec!["from airflow.datasets import Dataset".to_string()],
+            extra_imports: vec![version.class_import().to_string()],
             max_active_runs: None,
             header_docstring: header,
         };
@@ -506,11 +512,11 @@ fn render_composite(
     let schedule_expr = if dataset_uris.is_empty() {
         "None".to_string()
     } else if dataset_uris.len() == 1 {
-        format!("[Dataset({})]", python_string_literal(dataset_uris[0]))
+        format!("[{}({})]", version.class_name(), python_string_literal(dataset_uris[0]))
     } else {
         let chain = dataset_uris
             .iter()
-            .map(|u| format!("Dataset({})", python_string_literal(u)))
+            .map(|u| format!("{}({})", version.class_name(), python_string_literal(u)))
             .collect::<Vec<_>>()
             .join(" & ");
         format!("({chain})")
@@ -529,11 +535,11 @@ fn render_composite(
     let mut combined_imports: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
     if !dataset_uris.is_empty() {
-        combined_imports.insert("from airflow.datasets import Dataset".to_string());
+        combined_imports.insert(version.class_import().to_string());
     }
     let mut combined_header = String::new();
     for s in &non_dataset_sorted {
-        let r = render_single(s, default_aws_conn_id, empty_roots);
+        let r = render_single(s, default_aws_conn_id, empty_roots, version);
         all_sensor_tasks.extend(r.sensor_tasks);
         combined_imports.extend(r.extra_imports);
         // API contributes header docstring; collect verbatim.
@@ -554,7 +560,7 @@ fn render_composite(
         join_task.push_str("        trigger_rule=\"all_success\",\n");
         join_task.push_str("    )");
         all_sensor_tasks.push(join_task);
-        combined_imports.insert("from airflow.operators.empty import EmptyOperator".to_string());
+        combined_imports.insert(version.empty_op_import().to_string());
 
         // Sensor -> _yard_join edges (alpha-sorted by emission order).
         for s in &non_dataset_sorted {
@@ -610,7 +616,9 @@ fn render_composite(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use yard_structs::{ApiTrigger, DatasetTrigger, S3Trigger, ScheduleTrigger, SqsTrigger};
+    use yard_structs::{
+        AirflowMajorVersion, ApiTrigger, DatasetTrigger, S3Trigger, ScheduleTrigger, SqsTrigger,
+    };
 
     fn ds(uri: &str) -> SingleSource {
         SingleSource::Dataset(DatasetTrigger {
@@ -651,7 +659,7 @@ mod tests {
 
     #[test]
     fn render_trigger_none_with_no_schedule_emits_none() {
-        let out = render_trigger(None, None, None, &[]);
+        let out = render_trigger(None, None, None, &[], AirflowMajorVersion::V2);
         assert_eq!(out.schedule_expr, "None");
         assert!(out.sensor_tasks.is_empty());
         assert!(out.sensor_deps.is_empty());
@@ -661,7 +669,7 @@ mod tests {
 
     #[test]
     fn render_trigger_none_with_schedule_emits_quoted_string() {
-        let out = render_trigger(None, Some("@daily"), None, &[]);
+        let out = render_trigger(None, Some("@daily"), None, &[], AirflowMajorVersion::V2);
         assert_eq!(out.schedule_expr, "\"@daily\"");
         assert!(out.sensor_tasks.is_empty());
         assert!(out.extra_imports.is_empty());
@@ -673,14 +681,14 @@ mod tests {
         let t = Trigger::Single(SingleSource::Schedule(ScheduleTrigger {
             value: "@hourly".into(),
         }));
-        let out = render_trigger(Some(&t), None, None, &[]);
+        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
         assert_eq!(out.schedule_expr, "\"@hourly\"");
     }
 
     #[test]
     fn render_trigger_single_dataset_emits_schedule_list() {
         let t = Trigger::Single(ds("s3://x"));
-        let out = render_trigger(Some(&t), None, None, &[]);
+        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
         assert_eq!(out.schedule_expr, "[Dataset(\"s3://x\")]");
         assert_eq!(
             out.extra_imports,
@@ -693,7 +701,7 @@ mod tests {
     fn render_trigger_homogeneous_all_datasets_emits_amp_chain_alpha_sorted() {
         // Pass URIs out-of-order; D-11 alpha-sort must produce the same chain.
         let t = Trigger::All(vec![ds("s3://z"), ds("s3://a")]);
-        let out = render_trigger(Some(&t), None, None, &[]);
+        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
         assert_eq!(
             out.schedule_expr,
             "(Dataset(\"s3://a\") & Dataset(\"s3://z\"))"
@@ -707,7 +715,7 @@ mod tests {
     #[test]
     fn render_trigger_homogeneous_any_datasets_emits_pipe_chain_alpha_sorted() {
         let t = Trigger::Any(vec![ds("s3://z"), ds("s3://a")]);
-        let out = render_trigger(Some(&t), None, None, &[]);
+        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
         assert_eq!(
             out.schedule_expr,
             "(Dataset(\"s3://a\") | Dataset(\"s3://z\"))"
@@ -719,8 +727,8 @@ mod tests {
         // D-12: render-side normalization mirrors Trigger::Serialize collapse.
         let t_collapsed = Trigger::All(vec![ds("s3://x")]);
         let t_bare = Trigger::Single(ds("s3://x"));
-        let a = render_trigger(Some(&t_collapsed), None, None, &[]);
-        let b = render_trigger(Some(&t_bare), None, None, &[]);
+        let a = render_trigger(Some(&t_collapsed), None, None, &[], AirflowMajorVersion::V2);
+        let b = render_trigger(Some(&t_bare), None, None, &[], AirflowMajorVersion::V2);
         assert_eq!(a, b, "single-element all collapses to bare-single (D-12)");
     }
 
@@ -728,15 +736,15 @@ mod tests {
     fn render_trigger_single_element_any_collapses_to_bare_single() {
         let t_collapsed = Trigger::Any(vec![ds("s3://x")]);
         let t_bare = Trigger::Single(ds("s3://x"));
-        let a = render_trigger(Some(&t_collapsed), None, None, &[]);
-        let b = render_trigger(Some(&t_bare), None, None, &[]);
+        let a = render_trigger(Some(&t_collapsed), None, None, &[], AirflowMajorVersion::V2);
+        let b = render_trigger(Some(&t_bare), None, None, &[], AirflowMajorVersion::V2);
         assert_eq!(a, b, "single-element any collapses to bare-single (D-12)");
     }
 
     #[test]
     fn render_trigger_dataset_import_only_emitted_once() {
         let t = Trigger::Single(ds("s3://x"));
-        let out = render_trigger(Some(&t), None, None, &[]);
+        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
         assert_eq!(out.extra_imports.len(), 1);
     }
 
@@ -747,14 +755,14 @@ mod tests {
         // shape with None; plan 30-04 wires the auto-default centrally in
         // render_trigger. Schedule-only DAGs still preserve None (PRES-02).
         let t = Trigger::Single(ds("s3://x"));
-        let out = render_trigger(Some(&t), None, None, &[]);
+        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
         assert_eq!(out.max_active_runs, Some(1));
     }
 
     #[test]
     fn render_trigger_homogeneous_dataset_two_elements_imports_dataset_once() {
         let t = Trigger::All(vec![ds("s3://a"), ds("s3://b")]);
-        let out = render_trigger(Some(&t), None, None, &[]);
+        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
         assert_eq!(out.extra_imports.len(), 1);
         assert_eq!(out.extra_imports[0], "from airflow.datasets import Dataset");
     }
@@ -767,7 +775,7 @@ mod tests {
         // timeout=86400, deferrable=True), no aws_conn_id (Airflow's
         // aws_default applies by absence), one >> edge per root.
         let t = Trigger::Single(s3("mybucket", Some("input/")));
-        let out = render_trigger(Some(&t), None, None, &["root_task".to_string()]);
+        let out = render_trigger(Some(&t), None, None, &["root_task".to_string()], AirflowMajorVersion::V2);
         assert_eq!(out.schedule_expr, "None");
         assert_eq!(out.sensor_tasks.len(), 1);
         let st = &out.sensor_tasks[0];
@@ -805,7 +813,7 @@ mod tests {
             prefix: None,
             ..Default::default()
         }));
-        let out = render_trigger(Some(&t), None, None, &["r".to_string()]);
+        let out = render_trigger(Some(&t), None, None, &["r".to_string()], AirflowMajorVersion::V2);
         let st = &out.sensor_tasks[0];
         assert!(st.contains("bucket_key=\"path/to/file.csv\""), "got: {st}");
     }
@@ -820,7 +828,7 @@ mod tests {
             timeout: Some(3600),
             ..Default::default()
         }));
-        let out = render_trigger(Some(&t), None, None, &["r".to_string()]);
+        let out = render_trigger(Some(&t), None, None, &["r".to_string()], AirflowMajorVersion::V2);
         let st = &out.sensor_tasks[0];
         assert!(st.contains("poke_interval=120"), "got: {st}");
         assert!(st.contains("timeout=3600"), "got: {st}");
@@ -836,7 +844,7 @@ mod tests {
             deferrable: Some(false),
             ..Default::default()
         }));
-        let out = render_trigger(Some(&t), None, None, &["r".to_string()]);
+        let out = render_trigger(Some(&t), None, None, &["r".to_string()], AirflowMajorVersion::V2);
         let st = &out.sensor_tasks[0];
         assert!(st.contains("deferrable=False"), "got: {st}");
         assert!(!st.contains("deferrable=True"), "got: {st}");
@@ -856,6 +864,7 @@ mod tests {
             None,
             Some("dag_default_conn"),
             &["r".to_string()],
+            AirflowMajorVersion::V2,
         );
         let st = &out.sensor_tasks[0];
         assert!(st.contains("aws_conn_id=\"custom_conn\""), "got: {st}");
@@ -872,6 +881,7 @@ mod tests {
             None,
             Some("dag_default_conn"),
             &["r".to_string()],
+            AirflowMajorVersion::V2,
         );
         let st = &out.sensor_tasks[0];
         assert!(st.contains("aws_conn_id=\"dag_default_conn\""), "got: {st}");
@@ -882,7 +892,7 @@ mod tests {
         // S3-04: neither override nor DAG default = omit kwarg entirely.
         // Airflow's `aws_default` applies by absence.
         let t = Trigger::Single(s3("b", Some("p/")));
-        let out = render_trigger(Some(&t), None, None, &["r".to_string()]);
+        let out = render_trigger(Some(&t), None, None, &["r".to_string()], AirflowMajorVersion::V2);
         let st = &out.sensor_tasks[0];
         assert!(!st.contains("aws_conn_id="), "got: {st}");
     }
@@ -898,6 +908,7 @@ mod tests {
             None,
             None,
             &["a".to_string(), "b".to_string()],
+            AirflowMajorVersion::V2,
         );
         assert_eq!(
             out.sensor_deps,
@@ -919,7 +930,7 @@ mod tests {
         let t = Trigger::Single(sqs(
             "https://sqs.us-east-1.amazonaws.com/123456789012/myqueue",
         ));
-        let out = render_trigger(Some(&t), None, None, &["root_task".to_string()]);
+        let out = render_trigger(Some(&t), None, None, &["root_task".to_string()], AirflowMajorVersion::V2);
         assert_eq!(out.schedule_expr, "None");
         assert_eq!(out.sensor_tasks.len(), 1);
         let st = &out.sensor_tasks[0];
@@ -960,7 +971,7 @@ mod tests {
             max_messages: Some(1),
             delete_message_on_reception: Some(false),
         }));
-        let out = render_trigger(Some(&t), None, None, &["r".to_string()]);
+        let out = render_trigger(Some(&t), None, None, &["r".to_string()], AirflowMajorVersion::V2);
         let st = &out.sensor_tasks[0];
         assert!(st.contains("wait_time_seconds=10"), "got: {st}");
         assert!(st.contains("max_messages=1"), "got: {st}");
@@ -985,6 +996,7 @@ mod tests {
             None,
             Some("yard_123456789012_MyRole"),
             &["r".to_string()],
+            AirflowMajorVersion::V2,
         );
         let st = &out.sensor_tasks[0];
         assert!(
@@ -1002,6 +1014,7 @@ mod tests {
             None,
             None,
             &["a".to_string(), "b".to_string()],
+            AirflowMajorVersion::V2,
         );
         assert_eq!(
             out.sensor_deps,
@@ -1020,7 +1033,7 @@ mod tests {
         // header docstring with curl/CLI snippets and placeholders. CONC-01:
         // any trigger DAG defaults to max_active_runs=Some(1).
         let t = Trigger::Single(api(None));
-        let out = render_trigger(Some(&t), None, None, &[]);
+        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
         assert_eq!(out.schedule_expr, "None");
         assert!(out.sensor_tasks.is_empty(), "API has no sensor task");
         assert!(out.sensor_deps.is_empty(), "API has no sensor deps");
@@ -1045,7 +1058,7 @@ mod tests {
     fn render_trigger_api_with_description_includes_in_header() {
         // API-02 doc-only: description threads into the header verbatim.
         let t = Trigger::Single(api(Some("Replay failed S3 ingests")));
-        let out = render_trigger(Some(&t), None, None, &[]);
+        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
         assert!(
             out.header_docstring.contains("Replay failed S3 ingests"),
             "header missing description: {}",
@@ -1064,7 +1077,7 @@ mod tests {
             description: None,
             payload_schema: Some(schema),
         }));
-        let out = render_trigger(Some(&t), None, None, &[]);
+        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
         let h = &out.header_docstring;
         assert!(h.contains("customer_id"), "header missing customer_id: {h}");
         assert!(h.contains("event_id"), "header missing event_id: {h}");
@@ -1081,7 +1094,7 @@ mod tests {
     fn render_trigger_api_header_uses_placeholders_not_hardcoded_urls() {
         // API-01: never hardcode URLs. Use $AIRFLOW_URL placeholder.
         let t = Trigger::Single(api(None));
-        let out = render_trigger(Some(&t), None, None, &[]);
+        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
         let h = &out.header_docstring;
         assert!(
             !h.contains("https://airflow.example.com"),
@@ -1098,7 +1111,7 @@ mod tests {
     fn render_trigger_api_header_includes_no_auth_management_callout() {
         // API-03: yard does NOT manage Airflow REST auth. Header must say so.
         let t = Trigger::Single(api(None));
-        let out = render_trigger(Some(&t), None, None, &[]);
+        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
         let h = &out.header_docstring;
         let mentions_no_auth = h.contains("does NOT manage")
             || h.contains("does not manage")
@@ -1134,6 +1147,7 @@ mod tests {
             None,
             None,
             &["root_a".to_string(), "root_b".to_string()],
+            AirflowMajorVersion::V2,
         );
         assert_eq!(out.schedule_expr, "None");
         // 2 sensors + _yard_join task = 3 entries.
@@ -1204,7 +1218,7 @@ mod tests {
         // D-11: Trigger::All([Dataset, S3]) — Dataset goes to schedule= level,
         // S3 becomes a sensor. With only ONE sensor, no _yard_join (D-10).
         let t = Trigger::All(vec![ds("ds_uri"), s3_basic("b", "p/")]);
-        let out = render_trigger(Some(&t), None, None, &["root".to_string()]);
+        let out = render_trigger(Some(&t), None, None, &["root".to_string()], AirflowMajorVersion::V2);
         assert_eq!(out.schedule_expr, "[Dataset(\"ds_uri\")]");
         // 1 sensor (S3 only — Dataset is NOT a sensor in this split).
         assert_eq!(out.sensor_tasks.len(), 1, "tasks: {:?}", out.sensor_tasks);
@@ -1251,7 +1265,7 @@ mod tests {
             s3_basic("b", "p/"),
             sqs("q"),
         ]);
-        let out = render_trigger(Some(&t), None, None, &["root".to_string()]);
+        let out = render_trigger(Some(&t), None, None, &["root".to_string()], AirflowMajorVersion::V2);
         assert_eq!(out.schedule_expr, "[Dataset(\"ds_uri\")]");
         assert_eq!(out.sensor_tasks.len(), 3, "tasks: {:?}", out.sensor_tasks);
         assert!(
@@ -1275,7 +1289,7 @@ mod tests {
         // task (it contributes header docstring only) — sensor_tasks must
         // contain only S3 + SQS + _yard_join.
         let t = Trigger::All(vec![sqs("q"), s3_basic("b", "p/"), api(None)]);
-        let out = render_trigger(Some(&t), None, None, &["root".to_string()]);
+        let out = render_trigger(Some(&t), None, None, &["root".to_string()], AirflowMajorVersion::V2);
         assert_eq!(
             out.sensor_tasks.len(),
             3,
@@ -1310,7 +1324,7 @@ mod tests {
         // NOT emit _yard_join. Already covered by 30-02 fixtures, re-asserted
         // here to lock the contract.
         let t = Trigger::Single(s3_basic("b", "p/"));
-        let out = render_trigger(Some(&t), None, None, &["root".to_string()]);
+        let out = render_trigger(Some(&t), None, None, &["root".to_string()], AirflowMajorVersion::V2);
         assert_eq!(out.sensor_tasks.len(), 1, "single sensor only");
         assert!(
             !out.sensor_tasks[0].contains("_yard_join"),
@@ -1331,7 +1345,7 @@ mod tests {
         // D-10: homogeneous all-Datasets is pure schedule-level (no sensors).
         // Re-assert no _yard_join leaks in.
         let t = Trigger::All(vec![ds("a"), ds("b")]);
-        let out = render_trigger(Some(&t), None, None, &["root".to_string()]);
+        let out = render_trigger(Some(&t), None, None, &["root".to_string()], AirflowMajorVersion::V2);
         assert!(out.sensor_tasks.is_empty(), "no sensor tasks for Datasets");
         assert!(
             !out.extra_imports
@@ -1355,7 +1369,7 @@ mod tests {
             Trigger::All(vec![s3_basic("b", "p/"), sqs("q")]),
         ];
         for t in &cases {
-            let out = render_trigger(Some(t), None, None, &["r".to_string()]);
+            let out = render_trigger(Some(t), None, None, &["r".to_string()], AirflowMajorVersion::V2);
             assert_eq!(
                 out.max_active_runs,
                 Some(1),
@@ -1368,9 +1382,9 @@ mod tests {
     fn render_trigger_max_active_runs_none_for_no_trigger() {
         // PRES-02: schedule-only DAGs (trigger.is_none()) preserve Airflow's
         // implicit default of 16 — no max_active_runs= line emitted.
-        let out = render_trigger(None, Some("@daily"), None, &[]);
+        let out = render_trigger(None, Some("@daily"), None, &[], AirflowMajorVersion::V2);
         assert_eq!(out.max_active_runs, None, "schedule-only must not auto-default");
-        let out2 = render_trigger(None, None, None, &[]);
+        let out2 = render_trigger(None, None, None, &[], AirflowMajorVersion::V2);
         assert_eq!(out2.max_active_runs, None);
     }
 
@@ -1395,7 +1409,7 @@ mod tests {
         let t = Trigger::Single(SingleSource::Dataset(DatasetTrigger {
             uri: "s3://x/y".into(),
         }));
-        let out = render_trigger(Some(&t), None, None, &[]);
+        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
         let h = &out.header_docstring;
         // Per-source backfill caveat block (Dataset).
         assert!(
@@ -1427,7 +1441,7 @@ mod tests {
             prefix: Some("p".into()),
             ..Default::default()
         }));
-        let out = render_trigger(Some(&t), None, None, &[]);
+        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
         let h = &out.header_docstring;
         assert!(
             h.contains("# Airflow version contract:"),
@@ -1444,7 +1458,7 @@ mod tests {
         // D-13: SQS arm now fills header_docstring with the destructive-drain
         // backfill caveat. Banner prepended (D-11).
         let t = Trigger::Single(sqs("https://sqs/q"));
-        let out = render_trigger(Some(&t), None, None, &[]);
+        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
         let h = &out.header_docstring;
         assert!(
             h.contains("# Airflow version contract:"),
@@ -1462,13 +1476,13 @@ mod tests {
         // an EMPTY header_docstring — banner absent, no per-source block.
         // This guarantees the 20+ existing schedule-only fixtures stay
         // byte-identical to pre-Phase-32 output.
-        let out = render_trigger(None, Some("@daily"), None, &[]);
+        let out = render_trigger(None, Some("@daily"), None, &[], AirflowMajorVersion::V2);
         assert!(
             out.header_docstring.is_empty(),
             "schedule-only must not emit any header (PRES-02): {:?}",
             out.header_docstring
         );
-        let out2 = render_trigger(None, None, None, &[]);
+        let out2 = render_trigger(None, None, None, &[], AirflowMajorVersion::V2);
         assert!(
             out2.header_docstring.is_empty(),
             "schedule-only (no schedule literal) must not emit any header: {:?}",
@@ -1482,7 +1496,7 @@ mod tests {
         // prepended. Asserts both: the existing "# Trigger: API" marker AND
         // the new VERSION_BANNER prefix.
         let t = Trigger::Single(SingleSource::Api(ApiTrigger::default()));
-        let out = render_trigger(Some(&t), None, None, &[]);
+        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
         let h = &out.header_docstring;
         assert!(
             h.contains("# Trigger: API"),

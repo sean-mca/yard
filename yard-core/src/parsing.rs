@@ -2,8 +2,8 @@ use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
 use yard_structs::{
-    AirflowJobBlock, AirflowSection, AwsCredentialConfig, Import, JdbcAuth, Sink, Source,
-    Transform, Trigger,
+    AirflowJobBlock, AirflowMajorVersion, AirflowSection, AwsCredentialConfig, Import, JdbcAuth,
+    Sink, Source, Transform, Trigger,
 };
 
 /// Validate that a JSON object has no keys outside `allowed`. Used by every
@@ -61,6 +61,7 @@ const ALLOWED_AIRFLOW_SECTION: &[&str] = &[
     "aws",
     "max_active_runs",
     "region",
+    "version",
 ];
 
 /// Allowed keys on a per-job `airflow:` block (`AirflowJobBlock` —
@@ -88,6 +89,7 @@ const ALLOWED_AIRFLOW_JOB_BLOCK: &[&str] = &[
     "aws",
     "max_active_runs",
     "region",
+    "version",
 ];
 
 /// Allowed keys on a single source entry (or single-source `source:` block).
@@ -215,6 +217,16 @@ fn parse_airflow_section_inner(value: &Value) -> Result<AirflowSection> {
             .get("max_active_runs")
             .and_then(|v| v.as_u64())
             .and_then(|n| u32::try_from(n).ok()),
+        // VCFG-02: version field must go through serde_json::from_value
+        // to invoke the custom Deserialize impl that accepts both string
+        // and integer forms (D-07). Unlike `aws`, parse errors surface
+        // so users see the D-09 actionable error message.
+        version: value
+            .get("version")
+            .cloned()
+            .map(serde_json::from_value::<AirflowMajorVersion>)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
     })
 }
 
@@ -348,6 +360,8 @@ pub fn merge_airflow_sections(base: &AirflowSection, overlay: &AirflowSection) -
         // most-specific layer's explicit setting takes precedence; None
         // falls through to base.
         max_active_runs: overlay.max_active_runs.or(base.max_active_runs),
+        // AirflowMajorVersion is Copy — plain .or() suffices (D-02).
+        version: overlay.version.or(base.version),
     }
 }
 
@@ -813,6 +827,64 @@ mod tests {
             "assume_role from project must survive when dag overlay sets only aws_conn_id"
         );
         assert_eq!(aws.region.as_deref(), Some("us-east-1"));
+    }
+
+    // --- merge_airflow_sections: version cascade (D-02 / D-19) ---
+
+    #[test]
+    fn merge_airflow_version_flows_through() {
+        // D-19: project sets V3, region unset -> V3 flows through
+        let base = AirflowSection {
+            version: Some(AirflowMajorVersion::V3),
+            ..Default::default()
+        };
+        let overlay = AirflowSection {
+            version: None,
+            ..Default::default()
+        };
+        let merged = merge_airflow_sections(&base, &overlay);
+        assert_eq!(
+            merged.version,
+            Some(AirflowMajorVersion::V3),
+            "project-level V3 must propagate when region is unset"
+        );
+    }
+
+    #[test]
+    fn merge_airflow_version_override() {
+        // D-19: project sets V3, region sets V2 -> V2 wins (overlay overrides)
+        let base = AirflowSection {
+            version: Some(AirflowMajorVersion::V3),
+            ..Default::default()
+        };
+        let overlay = AirflowSection {
+            version: Some(AirflowMajorVersion::V2),
+            ..Default::default()
+        };
+        let merged = merge_airflow_sections(&base, &overlay);
+        assert_eq!(
+            merged.version,
+            Some(AirflowMajorVersion::V2),
+            "lower-level V2 must override project-level V3"
+        );
+    }
+
+    #[test]
+    fn merge_airflow_version_both_none() {
+        // D-19: both unset -> None (default resolution deferred to codegen)
+        let base = AirflowSection {
+            version: None,
+            ..Default::default()
+        };
+        let overlay = AirflowSection {
+            version: None,
+            ..Default::default()
+        };
+        let merged = merge_airflow_sections(&base, &overlay);
+        assert_eq!(
+            merged.version, None,
+            "both-None must remain None (codegen applies default)"
+        );
     }
 
     // --- validate_unknown_keys (TYPE-03) ---
