@@ -422,7 +422,7 @@ metadata — see [airflow DAG reference](airflow-dag.md).
 Single-source map. Exactly one of these five keys at the top level of `trigger:`:
 
 - `schedule:` — cron string or preset (`"@daily"`, `"@hourly"`, etc.). Equivalent to top-level `schedule:`; the typed form is `trigger: { schedule: "@daily" }`.
-- `dataset:` — Airflow Dataset URI consumer. Renders as `schedule=[Dataset(uri)]`.
+- `dataset:` (or `asset:`) — Airflow Dataset URI consumer. Renders as `schedule=[Dataset(uri)]` (AF2) or `schedule=[Asset(uri)]` (AF3). The `asset` key is a parse-time alias for `dataset`; both parse identically and serialization always emits `dataset`.
   ```yaml
   trigger:
     dataset:
