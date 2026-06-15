@@ -407,6 +407,7 @@ The file contents are parsed as an `AirflowSection`:
 | `trigger` | object (typed) | Optional event-driven trigger block. See [trigger:](#dagyaml-trigger-block). Mutually exclusive with `schedule`. |
 | `publishes` | array of strings | Dataset URIs published when the DAG completes. See [publishes:](#dagyaml-publishes). |
 | `max_active_runs` | int (>=1) | Optional concurrency limit. Default `1` for event-driven DAGs (CONC-01); Airflow default (16) for schedule-only DAGs. |
+| `version` | string | Airflow major version (`"2"` or `"3"`). Default `"2"`. Controls Dataset vs Asset codegen. See [airflow-dag reference](airflow-dag.md#airflow-version-matrix). |
 
 The same `AirflowSection` shape may also appear under an `airflow:` block
 in `yard.yaml`, `account.yaml`, `region.yaml`, and per-job files. Later

@@ -31,6 +31,7 @@
 ### Migrations
 
 - [reference/migrations/v1.6.md](reference/migrations/v1.6.md) — v1.6 migration guide: hard rename of `triggered_by:` → `trigger:` and `produces:` → `publishes:`, plus the per-field `airflow.aws:` cascade and one-time post-upgrade state-hash drift callout.
+- [reference/migrations/v1.11.md](reference/migrations/v1.11.md) — v1.11 migration guide: version-aware codegen (`airflow.version: "3"` emits Asset/providers-standard instead of Dataset/legacy), `"asset"` trigger alias, and one-time state-hash drift.
 
 ## Explanation
 
