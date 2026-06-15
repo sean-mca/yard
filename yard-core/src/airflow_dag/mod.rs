@@ -109,8 +109,8 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     use yard_structs::{
-        AirflowJobBlock, AwsCredentialConfig, Deployment, DeploymentStatus, JobName, JobType,
-        ProjectManifest, Resource, StateBackend,
+        AirflowJobBlock, AirflowMajorVersion, AwsCredentialConfig, Deployment, DeploymentStatus,
+        JobName, JobType, ProjectManifest, Resource, StateBackend,
     };
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2412,6 +2412,440 @@ mod tests {
         assert!(
             validate_python_syntax(&script).is_none(),
             "rendered schedule-only DAG has syntax error:\n{script}"
+        );
+    }
+
+    // --- Phase 56 plan 03: V3 integration tests (end-to-end codegen pipeline) ---
+    // Each test writes version: "3" into dag.yaml and asserts V3 output
+    // (Asset class, providers-standard imports, AF3 banner). Negative assertions
+    // confirm no V2 strings leak (Pitfall 1 from RESEARCH.md).
+
+    #[test]
+    fn dag_trigger_single_dataset_v3_emits_asset() {
+        // D-01/D-03: single dataset trigger with version: "3" emits Asset
+        // class and from airflow.sdk import. No V2 strings may leak.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "version: \"3\"\ntrigger:\n  dataset:\n    uri: s3://warehouse/foo\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("agg".into(), bash_job("echo agg", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("from airflow.sdk import Asset"),
+            "V3 must emit Asset import: {script}"
+        );
+        assert!(
+            script.contains("schedule=[Asset(\"s3://warehouse/foo\")]"),
+            "V3 single dataset must emit Asset class name: {script}"
+        );
+        // Negative: no V2 leak
+        assert!(
+            !script.contains("from airflow.datasets import Dataset"),
+            "V3 must NOT contain V2 Dataset import: {script}"
+        );
+        assert!(
+            !script.contains("Dataset("),
+            "V3 must NOT contain Dataset( class usage: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "V3 single dataset DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_trigger_homogeneous_all_datasets_v3_emits_asset_amp_chain() {
+        // D-03: all:[dataset, dataset] with version "3" emits Asset & chain.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "version: \"3\"\ntrigger:\n  all:\n    - dataset:\n        uri: s3://warehouse/zzz\n    - dataset:\n        uri: s3://warehouse/aaa\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("agg".into(), bash_job("echo agg", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains(
+                "schedule=(Asset(\"s3://warehouse/aaa\") & Asset(\"s3://warehouse/zzz\"))"
+            ),
+            "V3 homogeneous all must emit alpha-sorted Asset & chain: {script}"
+        );
+        assert!(
+            script.contains("from airflow.sdk import Asset"),
+            "V3 must emit Asset import: {script}"
+        );
+        assert!(
+            !script.contains("Dataset"),
+            "V3 must NOT contain Dataset: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "V3 homogeneous all DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_trigger_homogeneous_any_datasets_v3_emits_asset_pipe_chain() {
+        // D-03: any:[dataset, dataset] with version "3" emits Asset | chain.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "version: \"3\"\ntrigger:\n  any:\n    - dataset:\n        uri: s3://warehouse/zzz\n    - dataset:\n        uri: s3://warehouse/aaa\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("agg".into(), bash_job("echo agg", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains(
+                "schedule=(Asset(\"s3://warehouse/aaa\") | Asset(\"s3://warehouse/zzz\"))"
+            ),
+            "V3 homogeneous any must emit alpha-sorted Asset | chain: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "V3 homogeneous any DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_single_bash_task_v3_emits_providers_standard_import() {
+        // OPIM-01: version "3" schedule-only DAG with one bash task emits
+        // providers-standard BashOperator import. No V2 import leak.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "version: \"3\"\nschedule: \"@daily\"\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("runit".into(), bash_job("echo hi", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains(
+                "from airflow.providers.standard.operators.bash import BashOperator"
+            ),
+            "V3 must emit providers-standard BashOperator import: {script}"
+        );
+        assert!(
+            !script.contains("from airflow.operators.bash import BashOperator"),
+            "V3 must NOT contain V2 BashOperator import: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "V3 schedule-only bash DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_trigger_heterogeneous_all_v3_emits_providers_standard_empty_op() {
+        // OPIM-02: version "3" + heterogeneous all:[s3, sqs] emits
+        // providers-standard EmptyOperator import. No V2 import leak.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "version: \"3\"\ntrigger:\n  all:\n    - s3:\n        bucket: mybucket\n        prefix: input/\n    - sqs:\n        queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/myqueue\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("worker".into(), bash_job("echo work", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains(
+                "from airflow.providers.standard.operators.empty import EmptyOperator"
+            ),
+            "V3 must emit providers-standard EmptyOperator import: {script}"
+        );
+        assert!(
+            !script.contains("from airflow.operators.empty import EmptyOperator"),
+            "V3 must NOT contain V2 EmptyOperator import: {script}"
+        );
+        assert!(
+            script.contains(
+                "from airflow.providers.standard.operators.bash import BashOperator"
+            ),
+            "V3 bash task must also use providers-standard BashOperator: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "V3 heterogeneous all DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_with_publishes_v3_emits_asset_outlets() {
+        // PUB-02 + ASSET-02: version "3" + per-task publishes emits Asset
+        // class name in outlets. No Dataset leak.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "version: \"3\"\nschedule: \"@daily\"\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        let mut job = bash_job("echo done", &dag_dir);
+        job.airflow = Some(AirflowJobBlock {
+            publishes: vec!["s3://warehouse/orders".to_string()],
+            ..Default::default()
+        });
+        manifest.jobs.insert("pub_task".into(), job);
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("outlets=[Asset(\"s3://warehouse/orders\")]"),
+            "V3 per-task publishes must emit Asset outlets: {script}"
+        );
+        assert!(
+            !script.contains("Dataset("),
+            "V3 must NOT contain Dataset( class usage: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "V3 per-task publishes DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_with_dag_level_publishes_v3_emits_asset_in_yard_publish() {
+        // PUB-01 + ASSET-02: version "3" + DAG-level publishes emits Asset
+        // class in _yard_publish outlets + providers-standard EmptyOperator.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "version: \"3\"\nschedule: \"@daily\"\npublishes:\n  - s3://a\n  - s3://b\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("t1".into(), bash_job("echo t1", &dag_dir));
+        manifest
+            .jobs
+            .insert("t2".into(), bash_job("echo t2", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            script.contains("outlets=[Asset(\"s3://a\"), Asset(\"s3://b\")]"),
+            "V3 DAG-level publishes must emit Asset outlets (alpha-sorted): {script}"
+        );
+        assert!(
+            script.contains(
+                "from airflow.providers.standard.operators.empty import EmptyOperator"
+            ),
+            "V3 _yard_publish must use providers-standard EmptyOperator: {script}"
+        );
+        assert!(
+            script.contains("from airflow.sdk import Asset"),
+            "V3 publishes must import Asset: {script}"
+        );
+        assert!(
+            !script.contains("from airflow.datasets import Dataset"),
+            "V3 must NOT contain V2 Dataset import: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "V3 DAG-level publishes DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_trigger_v3_event_driven_emits_v3_banner() {
+        // BANNER-02: version "3" event-driven DAG emits the AF3 banner.
+        // No V2 banner content (no "2.9", no "aiobotocore", no "Triggerer").
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "version: \"3\"\ntrigger:\n  dataset:\n    uri: s3://x\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("agg".into(), bash_job("echo agg", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        // AF3 banner lines
+        assert!(
+            script.contains("# Airflow version contract:"),
+            "V3 banner header line must be present: {script}"
+        );
+        assert!(
+            script.contains("#   - apache-airflow >= 3.0"),
+            "V3 banner must include apache-airflow >= 3.0: {script}"
+        );
+        assert!(
+            script.contains("#   - apache-airflow-providers-amazon >= 9.0.0"),
+            "V3 banner must include providers-amazon >= 9.0.0: {script}"
+        );
+        assert!(
+            script.contains("#   - apache-airflow-providers-standard"),
+            "V3 banner must include providers-standard: {script}"
+        );
+        // Negative: no V2 banner content
+        assert!(
+            !script.contains("apache-airflow >= 2.9"),
+            "V3 must NOT contain V2 airflow >= 2.9 banner: {script}"
+        );
+        assert!(
+            !script.contains("aiobotocore"),
+            "V3 must NOT contain aiobotocore: {script}"
+        );
+        assert!(
+            !script.contains("Triggerer"),
+            "V3 must NOT contain Triggerer: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "V3 event-driven DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_v3_schedule_only_still_no_banner() {
+        // PRES-02: schedule-only DAGs never get banner regardless of version.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "version: \"3\"\nschedule: \"@daily\"\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        manifest
+            .jobs
+            .insert("runit".into(), bash_job("echo hi", &dag_dir));
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        assert!(
+            !script.contains("# Airflow version contract:"),
+            "V3 schedule-only DAG must NOT render banner (PRES-02): {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "V3 schedule-only DAG has syntax error:\n{script}"
+        );
+    }
+
+    #[test]
+    fn dag_v3_no_v2_import_strings_leak() {
+        // Kitchen-sink negative leak test: version "3" with every emission site
+        // active at once (trigger with Datasets + S3 + SQS, DAG-level publishes,
+        // per-task publishes, bash task). No V2 import strings may appear.
+        let tmp = setup_project_tree();
+        let root = tmp.path();
+        let dag_dir = root.join("pipeline");
+        write_yaml(
+            &dag_dir.join("dag.yaml"),
+            "version: \"3\"\ntrigger:\n  all:\n    - dataset:\n        uri: s3://warehouse/foo\n    - s3:\n        bucket: mybucket\n        prefix: input/\n    - sqs:\n        queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/myqueue\npublishes:\n  - s3://warehouse/output_a\n  - s3://warehouse/output_b\n",
+        );
+
+        let mut manifest = empty_manifest("test");
+        let mut job = bash_job("echo work", &dag_dir);
+        job.airflow = Some(AirflowJobBlock {
+            publishes: vec!["s3://warehouse/per_task_out".to_string()],
+            ..Default::default()
+        });
+        manifest.jobs.insert("worker".into(), job);
+
+        let dags = collect_dags(root, &manifest).unwrap();
+        let script = generate_dag(&manifest, &dags[0], &HashMap::new()).unwrap();
+
+        // Positive: V3 strings present
+        assert!(
+            script.contains("from airflow.sdk import Asset"),
+            "V3 must emit Asset import: {script}"
+        );
+        assert!(
+            script.contains(
+                "from airflow.providers.standard.operators.bash import BashOperator"
+            ),
+            "V3 must emit providers-standard BashOperator: {script}"
+        );
+        assert!(
+            script.contains(
+                "from airflow.providers.standard.operators.empty import EmptyOperator"
+            ),
+            "V3 must emit providers-standard EmptyOperator: {script}"
+        );
+        assert!(
+            script.contains("Asset("),
+            "V3 must contain Asset( class usage: {script}"
+        );
+
+        // Negative: no V2 strings anywhere
+        assert!(
+            !script.contains("from airflow.datasets import Dataset"),
+            "V3 kitchen-sink must NOT contain V2 Dataset import: {script}"
+        );
+        assert!(
+            !script.contains("from airflow.operators.bash import BashOperator"),
+            "V3 kitchen-sink must NOT contain V2 BashOperator import: {script}"
+        );
+        assert!(
+            !script.contains("from airflow.operators.empty import EmptyOperator"),
+            "V3 kitchen-sink must NOT contain V2 EmptyOperator import: {script}"
+        );
+        assert!(
+            !script.contains("Dataset("),
+            "V3 kitchen-sink must NOT contain Dataset( class usage: {script}"
+        );
+        assert!(
+            validate_python_syntax(&script).is_none(),
+            "V3 kitchen-sink DAG has syntax error:\n{script}"
         );
     }
 }
