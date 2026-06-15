@@ -3,7 +3,9 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::fmt::Write;
 use tera::{Context, Tera};
-use yard_structs::{AirflowSection, JobDefinition, JobType, ProjectManifest};
+use yard_structs::{AirflowMajorVersion, AirflowSection, JobDefinition, JobType, ProjectManifest};
+
+use super::version::VersionCodegen;
 
 use super::AIRFLOW_DAG_TEMPLATE;
 use super::ResolvedDag;
@@ -19,6 +21,9 @@ pub fn generate_dag(
 ) -> Result<String> {
     let mut tera = Tera::default();
     tera.add_raw_template("airflow_dag", AIRFLOW_DAG_TEMPLATE)?;
+
+    // D-10: resolve version once at the top; pass concrete enum to all helpers.
+    let version = dag.config.version.unwrap_or_default();
 
     // Collect the job_type used by each task so we can pick operator classes.
     let mut task_types: Vec<(String, JobType, &JobDefinition)> = Vec::with_capacity(dag.tasks.len());
@@ -59,7 +64,7 @@ pub fn generate_dag(
 
     let mut import_lines = Vec::new();
     if needs_bash {
-        import_lines.push("from airflow.operators.bash import BashOperator".to_string());
+        import_lines.push(version.bash_op_import().to_string());
     }
     if needs_glue {
         import_lines.push(
@@ -67,7 +72,7 @@ pub fn generate_dag(
         );
     }
     if has_datasets_for_publishes {
-        import_lines.push("from airflow.datasets import Dataset".to_string());
+        import_lines.push(version.class_import().to_string());
     }
 
     // default_args dict. Only include fields we actually have.
@@ -131,6 +136,7 @@ pub fn generate_dag(
         dag.config.schedule.as_deref(),
         default_aws_conn_id.as_deref(),
         &roots,
+        version,
     );
     let schedule = trender.schedule_expr.clone();
 
@@ -174,6 +180,7 @@ pub fn generate_dag(
             job,
             manifest,
             script_locations,
+            version,
         )?);
     }
     // D-05 / D-07: sensor task lines prepend user task lines so the rendered
@@ -242,7 +249,7 @@ pub fn generate_dag(
         sorted_uris.sort();
         let outlets = sorted_uris
             .iter()
-            .map(|u| format!("Dataset({})", python_string_literal(u)))
+            .map(|u| format!("{}({})", version.class_name(), python_string_literal(u)))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -279,8 +286,8 @@ pub fn generate_dag(
         // ensure `Dataset` is imported — it may be absent if no per-task
         // `airflow.publishes` (PUB-02) is set anywhere AND no Dataset trigger
         // is configured. Idempotent re-insert is safe.
-        combined_imports.insert("from airflow.operators.empty import EmptyOperator".to_string());
-        combined_imports.insert("from airflow.datasets import Dataset".to_string());
+        combined_imports.insert(version.empty_op_import().to_string());
+        combined_imports.insert(version.class_import().to_string());
     }
 
     // Final flush — `tasks_block`, `deps_block`, and `imports_block` are all
@@ -344,10 +351,11 @@ fn render_task(
     job: &JobDefinition,
     manifest: &ProjectManifest,
     script_locations: &HashMap<String, String>,
+    version: AirflowMajorVersion,
 ) -> Result<String> {
     let var = python_var_name(task_id);
     let tid = python_string_literal(task_id);
-    let outlets = render_outlets(job);
+    let outlets = render_outlets(job, version);
     match job_type {
         JobType::Bash => {
             let cmd = job
@@ -408,7 +416,7 @@ fn render_task(
 /// Returns an empty string when the job has no `airflow.publishes` entries,
 /// so callers can unconditionally interpolate the result.
 #[inline]
-fn render_outlets(job: &JobDefinition) -> String {
+fn render_outlets(job: &JobDefinition, version: AirflowMajorVersion) -> String {
     job.airflow
         .as_ref()
         .map(|a| &a.publishes)
@@ -416,7 +424,7 @@ fn render_outlets(job: &JobDefinition) -> String {
         .map(|uris| {
             let items = uris
                 .iter()
-                .map(|u| format!("Dataset({})", python_string_literal(u)))
+                .map(|u| format!("{}({})", version.class_name(), python_string_literal(u)))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("\n        outlets=[{items}],")
