@@ -620,6 +620,9 @@ mod tests {
         AirflowMajorVersion, ApiTrigger, DatasetTrigger, S3Trigger, ScheduleTrigger, SqsTrigger,
     };
 
+    // NOTE: TEST-04 (asset alias round-trip) coverage lives in
+    // yard-structs/src/config.rs (Phase 55 D-17). Not duplicated here.
+
     fn ds(uri: &str) -> SingleSource {
         SingleSource::Dataset(DatasetTrigger {
             uri: uri.to_string(),
@@ -657,6 +660,193 @@ mod tests {
         })
     }
 
+    /// Default-knob bare S3 trigger fixture for the heterogeneous-all tests.
+    fn s3_basic(bucket: &str, prefix: &str) -> SingleSource {
+        SingleSource::S3(S3Trigger {
+            bucket: bucket.to_string(),
+            prefix: Some(prefix.to_string()),
+            ..Default::default()
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 56 D-07/D-08: Shared helpers for Dataset/Asset emission site tests.
+    // Each helper accepts (version, expected_class, expected_import) and asserts
+    // the version-dependent parts of the rendered output. V2 tests (existing
+    // names, unchanged behavior) and V3 tests both call through the same helper.
+    // -----------------------------------------------------------------------
+
+    /// Shared helper 1: single Dataset/Asset trigger emits `[Class("uri")]`
+    /// schedule list and the correct import line.
+    fn assert_single_dataset_trigger(
+        version: AirflowMajorVersion,
+        expected_class: &str,
+        expected_import: &str,
+    ) {
+        let t = Trigger::Single(ds("s3://x"));
+        let out = render_trigger(Some(&t), None, None, &[], version);
+        let expected_expr = format!("[{expected_class}(\"s3://x\")]");
+        assert_eq!(out.schedule_expr, expected_expr);
+        assert_eq!(out.extra_imports, vec![expected_import.to_string()]);
+        assert!(out.sensor_tasks.is_empty());
+    }
+
+    /// Shared helper 2: homogeneous all-Datasets/Assets emits alpha-sorted `&`
+    /// chain and the correct import. ASSET-04: `&` operator present regardless
+    /// of version.
+    fn assert_homogeneous_all_datasets(
+        version: AirflowMajorVersion,
+        expected_class: &str,
+        expected_import: &str,
+    ) {
+        let t = Trigger::All(vec![ds("s3://z"), ds("s3://a")]);
+        let out = render_trigger(Some(&t), None, None, &[], version);
+        let expected_expr = format!(
+            "({expected_class}(\"s3://a\") & {expected_class}(\"s3://z\"))"
+        );
+        assert_eq!(out.schedule_expr, expected_expr);
+        assert_eq!(out.extra_imports, vec![expected_import.to_string()]);
+        // ASSET-04: composite & operator is present regardless of version.
+        assert!(
+            out.schedule_expr.contains(" & "),
+            "ASSET-04: & operator must be present for version {version:?}: {}",
+            out.schedule_expr
+        );
+    }
+
+    /// Shared helper 3: homogeneous any-Datasets/Assets emits alpha-sorted `|`
+    /// chain. ASSET-04: `|` operator present regardless of version.
+    fn assert_homogeneous_any_datasets(
+        version: AirflowMajorVersion,
+        expected_class: &str,
+        _expected_import: &str,
+    ) {
+        let t = Trigger::Any(vec![ds("s3://z"), ds("s3://a")]);
+        let out = render_trigger(Some(&t), None, None, &[], version);
+        let expected_expr = format!(
+            "({expected_class}(\"s3://a\") | {expected_class}(\"s3://z\"))"
+        );
+        assert_eq!(out.schedule_expr, expected_expr);
+        // ASSET-04: composite | operator is present regardless of version.
+        assert!(
+            out.schedule_expr.contains(" | "),
+            "ASSET-04: | operator must be present for version {version:?}: {}",
+            out.schedule_expr
+        );
+    }
+
+    /// Shared helper 4: heterogeneous-all Dataset+S3 splits correctly --
+    /// Dataset/Asset at schedule= level, S3 as sensor, no _yard_join (D-10).
+    fn assert_heterogeneous_all_dataset_plus_s3(
+        version: AirflowMajorVersion,
+        expected_class: &str,
+        expected_import: &str,
+    ) {
+        let t = Trigger::All(vec![ds("ds_uri"), s3_basic("b", "p/")]);
+        let out = render_trigger(Some(&t), None, None, &["root".to_string()], version);
+        let expected_expr = format!("[{expected_class}(\"ds_uri\")]");
+        assert_eq!(out.schedule_expr, expected_expr);
+        assert_eq!(out.sensor_tasks.len(), 1, "tasks: {:?}", out.sensor_tasks);
+        assert!(
+            out.sensor_tasks[0].contains("_yard_wait_s3 = S3KeySensor("),
+            "S3 sensor only: {}",
+            out.sensor_tasks[0]
+        );
+        assert_eq!(
+            out.sensor_deps,
+            vec!["_yard_wait_s3 >> t_root".to_string()]
+        );
+        assert!(
+            out.extra_imports
+                .iter()
+                .any(|i| i.contains(expected_import)),
+            "Dataset/Asset import: {:?}",
+            out.extra_imports
+        );
+        assert!(
+            out.extra_imports.iter().any(|i| i
+                .contains("from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor")),
+            "S3KeySensor import: {:?}",
+            out.extra_imports
+        );
+        assert!(
+            !out.extra_imports
+                .iter()
+                .any(|i| i.contains("EmptyOperator")),
+            "single-sensor mixed must NOT pull EmptyOperator: {:?}",
+            out.extra_imports
+        );
+    }
+
+    /// Shared helper 5: heterogeneous-all Dataset+S3+SQS emits _yard_join.
+    /// Also asserts EmptyOperator import uses the version-correct path.
+    fn assert_heterogeneous_all_dataset_plus_two_sensors(
+        version: AirflowMajorVersion,
+        expected_class: &str,
+        expected_import: &str,
+        expected_empty_import: &str,
+    ) {
+        let t = Trigger::All(vec![
+            ds("ds_uri"),
+            s3_basic("b", "p/"),
+            sqs("q"),
+        ]);
+        let out = render_trigger(Some(&t), None, None, &["root".to_string()], version);
+        let expected_expr = format!("[{expected_class}(\"ds_uri\")]");
+        assert_eq!(out.schedule_expr, expected_expr);
+        assert_eq!(out.sensor_tasks.len(), 3, "tasks: {:?}", out.sensor_tasks);
+        assert!(
+            out.sensor_tasks[2].contains("_yard_join = EmptyOperator("),
+            "_yard_join must appear: {}",
+            out.sensor_tasks[2]
+        );
+        assert_eq!(
+            out.sensor_deps,
+            vec![
+                "_yard_wait_s3 >> _yard_join".to_string(),
+                "_yard_wait_sqs >> _yard_join".to_string(),
+                "_yard_join >> t_root".to_string(),
+            ]
+        );
+        assert!(
+            out.extra_imports
+                .iter()
+                .any(|i| i.contains(expected_import)),
+            "Dataset/Asset import: {:?}",
+            out.extra_imports
+        );
+        assert!(
+            out.extra_imports
+                .iter()
+                .any(|i| i == expected_empty_import),
+            "EmptyOperator import must be {expected_empty_import}: {:?}",
+            out.extra_imports
+        );
+    }
+
+    /// Shared helper: Dataset/Asset import emitted exactly once for single trigger.
+    fn assert_dataset_import_only_emitted_once(version: AirflowMajorVersion) {
+        let t = Trigger::Single(ds("s3://x"));
+        let out = render_trigger(Some(&t), None, None, &[], version);
+        assert_eq!(out.extra_imports.len(), 1);
+    }
+
+    /// Shared helper: homogeneous two-element composite imports Dataset/Asset once.
+    fn assert_homogeneous_dataset_two_elements_imports_once(
+        version: AirflowMajorVersion,
+        expected_import: &str,
+    ) {
+        let t = Trigger::All(vec![ds("s3://a"), ds("s3://b")]);
+        let out = render_trigger(Some(&t), None, None, &[], version);
+        assert_eq!(out.extra_imports.len(), 1);
+        assert_eq!(out.extra_imports[0], expected_import);
+    }
+
+    // -----------------------------------------------------------------------
+    // V2 tests -- existing names preserved (TEST-01). Bodies delegate to shared
+    // helpers with V2 expected values.
+    // -----------------------------------------------------------------------
+
     #[test]
     fn render_trigger_none_with_no_schedule_emits_none() {
         let out = render_trigger(None, None, None, &[], AirflowMajorVersion::V2);
@@ -687,38 +877,28 @@ mod tests {
 
     #[test]
     fn render_trigger_single_dataset_emits_schedule_list() {
-        let t = Trigger::Single(ds("s3://x"));
-        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
-        assert_eq!(out.schedule_expr, "[Dataset(\"s3://x\")]");
-        assert_eq!(
-            out.extra_imports,
-            vec!["from airflow.datasets import Dataset".to_string()]
+        assert_single_dataset_trigger(
+            AirflowMajorVersion::V2,
+            "Dataset",
+            "from airflow.datasets import Dataset",
         );
-        assert!(out.sensor_tasks.is_empty());
     }
 
     #[test]
     fn render_trigger_homogeneous_all_datasets_emits_amp_chain_alpha_sorted() {
-        // Pass URIs out-of-order; D-11 alpha-sort must produce the same chain.
-        let t = Trigger::All(vec![ds("s3://z"), ds("s3://a")]);
-        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
-        assert_eq!(
-            out.schedule_expr,
-            "(Dataset(\"s3://a\") & Dataset(\"s3://z\"))"
-        );
-        assert_eq!(
-            out.extra_imports,
-            vec!["from airflow.datasets import Dataset".to_string()]
+        assert_homogeneous_all_datasets(
+            AirflowMajorVersion::V2,
+            "Dataset",
+            "from airflow.datasets import Dataset",
         );
     }
 
     #[test]
     fn render_trigger_homogeneous_any_datasets_emits_pipe_chain_alpha_sorted() {
-        let t = Trigger::Any(vec![ds("s3://z"), ds("s3://a")]);
-        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
-        assert_eq!(
-            out.schedule_expr,
-            "(Dataset(\"s3://a\") | Dataset(\"s3://z\"))"
+        assert_homogeneous_any_datasets(
+            AirflowMajorVersion::V2,
+            "Dataset",
+            "from airflow.datasets import Dataset",
         );
     }
 
@@ -743,9 +923,7 @@ mod tests {
 
     #[test]
     fn render_trigger_dataset_import_only_emitted_once() {
-        let t = Trigger::Single(ds("s3://x"));
-        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
-        assert_eq!(out.extra_imports.len(), 1);
+        assert_dataset_import_only_emitted_once(AirflowMajorVersion::V2);
     }
 
     #[test]
@@ -761,10 +939,10 @@ mod tests {
 
     #[test]
     fn render_trigger_homogeneous_dataset_two_elements_imports_dataset_once() {
-        let t = Trigger::All(vec![ds("s3://a"), ds("s3://b")]);
-        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
-        assert_eq!(out.extra_imports.len(), 1);
-        assert_eq!(out.extra_imports[0], "from airflow.datasets import Dataset");
+        assert_homogeneous_dataset_two_elements_imports_once(
+            AirflowMajorVersion::V2,
+            "from airflow.datasets import Dataset",
+        );
     }
 
     // --- Phase 30 plan 30-02: S3 single-source render branch (S3-01..S3-04) ---
@@ -1127,15 +1305,6 @@ mod tests {
 
     // --- Phase 30 plan 30-04 Task 2: heterogeneous-all (DS-04 + D-11 + D-10) ---
 
-    /// Default-knob bare S3 trigger fixture for the heterogeneous-all tests.
-    fn s3_basic(bucket: &str, prefix: &str) -> SingleSource {
-        SingleSource::S3(S3Trigger {
-            bucket: bucket.to_string(),
-            prefix: Some(prefix.to_string()),
-            ..Default::default()
-        })
-    }
-
     #[test]
     fn render_trigger_heterogeneous_all_s3_sqs_emits_join() {
         // DS-04: heterogeneous Trigger::All(S3, SQS) emits both sensors plus
@@ -1215,71 +1384,20 @@ mod tests {
 
     #[test]
     fn render_trigger_heterogeneous_all_dataset_plus_s3_splits_correctly() {
-        // D-11: Trigger::All([Dataset, S3]) — Dataset goes to schedule= level,
-        // S3 becomes a sensor. With only ONE sensor, no _yard_join (D-10).
-        let t = Trigger::All(vec![ds("ds_uri"), s3_basic("b", "p/")]);
-        let out = render_trigger(Some(&t), None, None, &["root".to_string()], AirflowMajorVersion::V2);
-        assert_eq!(out.schedule_expr, "[Dataset(\"ds_uri\")]");
-        // 1 sensor (S3 only — Dataset is NOT a sensor in this split).
-        assert_eq!(out.sensor_tasks.len(), 1, "tasks: {:?}", out.sensor_tasks);
-        assert!(
-            out.sensor_tasks[0].contains("_yard_wait_s3 = S3KeySensor("),
-            "S3 sensor only: {}",
-            out.sensor_tasks[0]
-        );
-        // No Dataset sensor edge — Dataset fires at schedule level.
-        assert_eq!(
-            out.sensor_deps,
-            vec!["_yard_wait_s3 >> t_root".to_string()]
-        );
-        // Imports include both Dataset (schedule level) and S3KeySensor.
-        assert!(
-            out.extra_imports
-                .iter()
-                .any(|i| i.contains("from airflow.datasets import Dataset")),
-            "Dataset import: {:?}",
-            out.extra_imports
-        );
-        assert!(
-            out.extra_imports.iter().any(|i| i
-                .contains("from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor")),
-            "S3KeySensor import: {:?}",
-            out.extra_imports
-        );
-        // No EmptyOperator import — only one sensor, no join needed.
-        assert!(
-            !out.extra_imports
-                .iter()
-                .any(|i| i.contains("EmptyOperator")),
-            "single-sensor mixed Dataset+sensor must NOT pull EmptyOperator: {:?}",
-            out.extra_imports
+        assert_heterogeneous_all_dataset_plus_s3(
+            AirflowMajorVersion::V2,
+            "Dataset",
+            "from airflow.datasets import Dataset",
         );
     }
 
     #[test]
     fn render_trigger_heterogeneous_all_dataset_plus_two_sensors_emits_join() {
-        // D-11 + DS-04: Dataset at schedule level, S3 + SQS sensors under
-        // _yard_join (multiple sensors require the join).
-        let t = Trigger::All(vec![
-            ds("ds_uri"),
-            s3_basic("b", "p/"),
-            sqs("q"),
-        ]);
-        let out = render_trigger(Some(&t), None, None, &["root".to_string()], AirflowMajorVersion::V2);
-        assert_eq!(out.schedule_expr, "[Dataset(\"ds_uri\")]");
-        assert_eq!(out.sensor_tasks.len(), 3, "tasks: {:?}", out.sensor_tasks);
-        assert!(
-            out.sensor_tasks[2].contains("_yard_join = EmptyOperator("),
-            "_yard_join must appear: {}",
-            out.sensor_tasks[2]
-        );
-        assert_eq!(
-            out.sensor_deps,
-            vec![
-                "_yard_wait_s3 >> _yard_join".to_string(),
-                "_yard_wait_sqs >> _yard_join".to_string(),
-                "_yard_join >> t_root".to_string(),
-            ]
+        assert_heterogeneous_all_dataset_plus_two_sensors(
+            AirflowMajorVersion::V2,
+            "Dataset",
+            "from airflow.datasets import Dataset",
+            "from airflow.operators.empty import EmptyOperator",
         );
     }
 
@@ -1512,6 +1630,197 @@ mod tests {
         assert!(
             i_banner < i_api,
             "VERSION_BANNER must be prepended ABOVE the API per-source header: {h}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 56 plan 56-02: V3 test variants (TEST-02).
+    //
+    // Each V3 test calls the same shared helper as its V2 counterpart,
+    // passing V3 expected values (Asset class, from airflow.sdk import Asset,
+    // providers-standard operator imports).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn render_trigger_single_asset_v3_emits_schedule_list() {
+        assert_single_dataset_trigger(
+            AirflowMajorVersion::V3,
+            "Asset",
+            "from airflow.sdk import Asset",
+        );
+    }
+
+    #[test]
+    fn render_trigger_homogeneous_all_assets_v3_emits_amp_chain_alpha_sorted() {
+        assert_homogeneous_all_datasets(
+            AirflowMajorVersion::V3,
+            "Asset",
+            "from airflow.sdk import Asset",
+        );
+    }
+
+    #[test]
+    fn render_trigger_homogeneous_any_assets_v3_emits_pipe_chain_alpha_sorted() {
+        assert_homogeneous_any_datasets(
+            AirflowMajorVersion::V3,
+            "Asset",
+            "from airflow.sdk import Asset",
+        );
+    }
+
+    #[test]
+    fn render_trigger_heterogeneous_all_asset_v3_plus_s3_splits_correctly() {
+        assert_heterogeneous_all_dataset_plus_s3(
+            AirflowMajorVersion::V3,
+            "Asset",
+            "from airflow.sdk import Asset",
+        );
+    }
+
+    #[test]
+    fn render_trigger_heterogeneous_all_asset_v3_plus_two_sensors_emits_join() {
+        assert_heterogeneous_all_dataset_plus_two_sensors(
+            AirflowMajorVersion::V3,
+            "Asset",
+            "from airflow.sdk import Asset",
+            "from airflow.providers.standard.operators.empty import EmptyOperator",
+        );
+    }
+
+    #[test]
+    fn render_trigger_dataset_import_v3_only_emitted_once() {
+        assert_dataset_import_only_emitted_once(AirflowMajorVersion::V3);
+    }
+
+    #[test]
+    fn render_trigger_homogeneous_asset_v3_two_elements_imports_asset_once() {
+        assert_homogeneous_dataset_two_elements_imports_once(
+            AirflowMajorVersion::V3,
+            "from airflow.sdk import Asset",
+        );
+    }
+
+    // --- V3-specific tests (not refactored from existing V2 tests) ---
+
+    #[test]
+    fn render_trigger_heterogeneous_all_s3_sqs_v3_emits_providers_standard_empty_op() {
+        // OPIM-02: _yard_join EmptyOperator import uses providers-standard path
+        // in V3 context. Verify no V2 EmptyOperator import string present.
+        let t = Trigger::All(vec![s3_basic("b", "p/"), sqs("q")]);
+        let out = render_trigger(
+            Some(&t),
+            None,
+            None,
+            &["root".to_string()],
+            AirflowMajorVersion::V3,
+        );
+        // _yard_join must be present (2+ sensors).
+        assert_eq!(out.sensor_tasks.len(), 3, "tasks: {:?}", out.sensor_tasks);
+        assert!(
+            out.sensor_tasks[2].contains("_yard_join = EmptyOperator("),
+            "_yard_join must appear: {}",
+            out.sensor_tasks[2]
+        );
+        // V3 EmptyOperator import must be providers-standard path.
+        assert!(
+            out.extra_imports
+                .iter()
+                .any(|i| i == "from airflow.providers.standard.operators.empty import EmptyOperator"),
+            "V3 EmptyOperator import must use providers-standard: {:?}",
+            out.extra_imports
+        );
+        // V2 EmptyOperator import must NOT be present.
+        assert!(
+            !out.extra_imports
+                .iter()
+                .any(|i| i == "from airflow.operators.empty import EmptyOperator"),
+            "V2 EmptyOperator import must NOT appear in V3 context: {:?}",
+            out.extra_imports
+        );
+    }
+
+    #[test]
+    fn render_trigger_dataset_header_v3_uses_asset_class_name() {
+        // D-09/D-13: V3 header_docstring must use "Asset" / "Assets" class names,
+        // not "Dataset" / "Datasets".
+        let t = Trigger::Single(ds("s3://x"));
+        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V3);
+        let h = &out.header_docstring;
+        // Must contain V3 class name in the per-source caveat block.
+        assert!(
+            h.contains("# Trigger: Asset"),
+            "V3 header must use 'Asset' class name: {h}"
+        );
+        assert!(
+            h.contains("Assets have no logical_date"),
+            "V3 header must use 'Assets' (plural): {h}"
+        );
+        // Must NOT contain V2 class name.
+        assert!(
+            !h.contains("# Trigger: Dataset"),
+            "V3 header must NOT use 'Dataset': {h}"
+        );
+        assert!(
+            !h.contains("Datasets have no logical_date"),
+            "V3 header must NOT use 'Datasets': {h}"
+        );
+    }
+
+    #[test]
+    fn render_trigger_v3_event_driven_emits_v3_banner() {
+        // BANNER-01/BANNER-02: V3 event-driven DAGs emit the V3 version banner.
+        // Must contain AF3 requirements, must NOT contain V2 requirements.
+        let t = Trigger::Single(ds("s3://x"));
+        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V3);
+        let h = &out.header_docstring;
+        // V3 banner requirements.
+        assert!(
+            h.contains("apache-airflow >= 3.0"),
+            "V3 banner must contain 'apache-airflow >= 3.0': {h}"
+        );
+        assert!(
+            h.contains("apache-airflow-providers-amazon >= 9.0.0"),
+            "V3 banner must contain providers-amazon >= 9.0.0: {h}"
+        );
+        assert!(
+            h.contains("apache-airflow-providers-standard"),
+            "V3 banner must contain providers-standard: {h}"
+        );
+        // Must NOT contain V2-specific banner lines.
+        assert!(
+            !h.contains("apache-airflow >= 2.9"),
+            "V3 banner must NOT contain 'apache-airflow >= 2.9': {h}"
+        );
+        assert!(
+            !h.contains("aiobotocore"),
+            "V3 banner must NOT contain 'aiobotocore': {h}"
+        );
+    }
+
+    #[test]
+    fn render_trigger_v2_event_driven_still_emits_v2_banner() {
+        // Explicit V2 banner regression test: V2 DAGs must still emit the
+        // original V2 banner. Must contain V2 requirements, must NOT contain V3.
+        let t = Trigger::Single(ds("s3://x"));
+        let out = render_trigger(Some(&t), None, None, &[], AirflowMajorVersion::V2);
+        let h = &out.header_docstring;
+        // V2 banner requirements.
+        assert!(
+            h.contains("apache-airflow >= 2.9"),
+            "V2 banner must contain 'apache-airflow >= 2.9': {h}"
+        );
+        assert!(
+            h.contains("aiobotocore >= 2.1.1"),
+            "V2 banner must contain 'aiobotocore >= 2.1.1': {h}"
+        );
+        assert!(
+            h.contains("Triggerer process required"),
+            "V2 banner must contain 'Triggerer process required': {h}"
+        );
+        // Must NOT contain V3-specific banner lines.
+        assert!(
+            !h.contains("apache-airflow >= 3.0"),
+            "V2 banner must NOT contain 'apache-airflow >= 3.0': {h}"
         );
     }
 }
