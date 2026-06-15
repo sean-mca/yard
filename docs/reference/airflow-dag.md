@@ -22,10 +22,11 @@ For the rationale behind yard's codegen design (the Tera scaffolding + Rust body
 - [Operator mapping](#operator-mapping)
 - [Task and DAG identifiers](#task-and-dag-identifiers)
 - [Cross-account connections](#cross-account-connections)
-- [Airflow Datasets](#airflow-datasets)
+- [Datasets and Assets](#datasets-and-assets)
 - [Generation, deployment, destroy](#generation-deployment-destroy)
 - [Examples (Phase 35 lift candidates)](#examples-phase-35-will-lift-these-to-how-toschedule-a-dagmd)
 - [Validation errors](#validation-errors)
+- [Airflow version matrix](#airflow-version-matrix)
 - [Limitations and planned work](#limitations-and-planned-work)
 
 ---
@@ -89,7 +90,7 @@ Resolution rules:
 | `dep` equals the declaring task's own name (either form) | Error: `depends on itself` |
 
 Cross-DAG dependencies are explicitly unsupported — if two DAGs need to be
-chained, use [Airflow Datasets](#airflow-datasets) instead.
+chained, use [Datasets and Assets](#datasets-and-assets) instead.
 
 ### Topological order
 
@@ -176,10 +177,11 @@ shape.
 | `retries` | int | any layer | `default_args["retries"]` | Passed through as an integer. |
 | `dags_bucket` | string | any layer | — (deployment) | S3 bucket the generated `.py` is uploaded to during `yard apply`. Typically the MWAA DAGs bucket. |
 | `dags_prefix` | string | any layer | — (deployment) | S3 key prefix under `dags_bucket`. Defaults to `dags/` when unset. |
-| `trigger` | object (typed) | DAG layer | per-source schedule (Dataset list, sensor task chain, or `schedule=None` for API) | Optional event-driven trigger block. See [Airflow Datasets](#airflow-datasets) and [configuration](configuration.md#dagyaml-trigger-block). |
+| `trigger` | object (typed) | DAG layer | per-source schedule (Dataset list, sensor task chain, or `schedule=None` for API) | Optional event-driven trigger block. See [Datasets and Assets](#datasets-and-assets) and [configuration](configuration.md#dagyaml-trigger-block). |
 | `publishes` | array of strings | any layer | `_yard_publish` synthetic terminal task with `outlets=[Dataset("uri"), ...]` | DAG-level Dataset URIs published when every user task succeeds. Per-task `outlets=` is configured via per-job `airflow.publishes`. |
 | `max_active_runs` | int (>=1) | DAG layer | `max_active_runs=N` on `DAG(...)` | Optional concurrency limit. Defaults to `1` for event-driven DAGs (CONC-01); Airflow's default of 16 for schedule-only DAGs. |
 | `aws` | object | any layer | — (deployment) | Optional credential override for DAG upload/destroy. When set, this `aws:` block OVERRIDES the root+account.yaml cascade. Same shape as root `aws:` (`assume_role`, `session_name`, `external_id`). See [DAG bucket credentials](#dag-bucket-credentials). |
+| `version` | string (`"2"` or `"3"`) | any layer | — (codegen) | Major Airflow version for version-aware codegen. `"2"` (default) emits Dataset/legacy imports; `"3"` emits Asset/providers-standard imports. See [migrations/v1.11.md](migrations/v1.11.md). |
 
 Unknown keys in an `airflow:` body are ignored — forward compatibility.
 
@@ -224,6 +226,16 @@ actually used are imported).
 | `glue` | `GlueJobOperator` | `from airflow.providers.amazon.aws.operators.glue import GlueJobOperator` |
 | `bash` | `BashOperator` | `from airflow.operators.bash import BashOperator` |
 | anything else | (error) | — |
+
+**Version-dependent operator imports.** The table above shows the default (V2) import paths. When `airflow.version = "3"`, yard emits different import paths for `BashOperator` and `EmptyOperator`:
+
+| Operator | V2 (`version: "2"`, default) | V3 (`version: "3"`) |
+|----------|------------------------------|---------------------|
+| `BashOperator` | `from airflow.operators.bash import BashOperator` | `from airflow.providers.standard.operators.bash import BashOperator` |
+| `EmptyOperator` | `from airflow.operators.empty import EmptyOperator` | `from airflow.providers.standard.operators.empty import EmptyOperator` |
+| `GlueJobOperator` | `from airflow.providers.amazon.aws.operators.glue import GlueJobOperator` | unchanged |
+
+`GlueJobOperator` is imported from `airflow.providers.amazon.aws.operators.glue` regardless of version. The `providers-standard` package is required for AF3 deployments (see [Airflow version matrix](#airflow-version-matrix)).
 
 Any job type that is not `bash` or `glue` causes `generate_dag` to error with
 `job type '<type>' is not supported in Airflow codegen yet`. This is a hard
