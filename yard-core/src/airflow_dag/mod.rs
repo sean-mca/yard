@@ -11,6 +11,7 @@ mod generation;
 mod helpers;
 mod resolve;
 mod triggers;
+mod version;
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
