@@ -22,10 +22,11 @@ For the rationale behind yard's codegen design (the Tera scaffolding + Rust body
 - [Operator mapping](#operator-mapping)
 - [Task and DAG identifiers](#task-and-dag-identifiers)
 - [Cross-account connections](#cross-account-connections)
-- [Airflow Datasets](#airflow-datasets)
+- [Datasets and Assets](#datasets-and-assets)
 - [Generation, deployment, destroy](#generation-deployment-destroy)
 - [Examples (Phase 35 lift candidates)](#examples-phase-35-will-lift-these-to-how-toschedule-a-dagmd)
 - [Validation errors](#validation-errors)
+- [Airflow version matrix](#airflow-version-matrix)
 - [Limitations and planned work](#limitations-and-planned-work)
 
 ---
@@ -89,7 +90,7 @@ Resolution rules:
 | `dep` equals the declaring task's own name (either form) | Error: `depends on itself` |
 
 Cross-DAG dependencies are explicitly unsupported — if two DAGs need to be
-chained, use [Airflow Datasets](#airflow-datasets) instead.
+chained, use [Datasets and Assets](#datasets-and-assets) instead.
 
 ### Topological order
 
@@ -176,10 +177,11 @@ shape.
 | `retries` | int | any layer | `default_args["retries"]` | Passed through as an integer. |
 | `dags_bucket` | string | any layer | — (deployment) | S3 bucket the generated `.py` is uploaded to during `yard apply`. Typically the MWAA DAGs bucket. |
 | `dags_prefix` | string | any layer | — (deployment) | S3 key prefix under `dags_bucket`. Defaults to `dags/` when unset. |
-| `trigger` | object (typed) | DAG layer | per-source schedule (Dataset list, sensor task chain, or `schedule=None` for API) | Optional event-driven trigger block. See [Airflow Datasets](#airflow-datasets) and [configuration](configuration.md#dagyaml-trigger-block). |
+| `trigger` | object (typed) | DAG layer | per-source schedule (Dataset list, sensor task chain, or `schedule=None` for API) | Optional event-driven trigger block. See [Datasets and Assets](#datasets-and-assets) and [configuration](configuration.md#dagyaml-trigger-block). |
 | `publishes` | array of strings | any layer | `_yard_publish` synthetic terminal task with `outlets=[Dataset("uri"), ...]` | DAG-level Dataset URIs published when every user task succeeds. Per-task `outlets=` is configured via per-job `airflow.publishes`. |
 | `max_active_runs` | int (>=1) | DAG layer | `max_active_runs=N` on `DAG(...)` | Optional concurrency limit. Defaults to `1` for event-driven DAGs (CONC-01); Airflow's default of 16 for schedule-only DAGs. |
 | `aws` | object | any layer | — (deployment) | Optional credential override for DAG upload/destroy. When set, this `aws:` block OVERRIDES the root+account.yaml cascade. Same shape as root `aws:` (`assume_role`, `session_name`, `external_id`). See [DAG bucket credentials](#dag-bucket-credentials). |
+| `version` | string (`"2"` or `"3"`) | any layer | — (codegen) | Major Airflow version for version-aware codegen. `"2"` (default) emits Dataset/legacy imports; `"3"` emits Asset/providers-standard imports. See [migrations/v1.11.md](migrations/v1.11.md). |
 
 Unknown keys in an `airflow:` body are ignored — forward compatibility.
 
@@ -224,6 +226,16 @@ actually used are imported).
 | `glue` | `GlueJobOperator` | `from airflow.providers.amazon.aws.operators.glue import GlueJobOperator` |
 | `bash` | `BashOperator` | `from airflow.operators.bash import BashOperator` |
 | anything else | (error) | — |
+
+**Version-dependent operator imports.** The table above shows the default (V2) import paths. When `airflow.version = "3"`, yard emits different import paths for `BashOperator` and `EmptyOperator`:
+
+| Operator | V2 (`version: "2"`, default) | V3 (`version: "3"`) |
+|----------|------------------------------|---------------------|
+| `BashOperator` | `from airflow.operators.bash import BashOperator` | `from airflow.providers.standard.operators.bash import BashOperator` |
+| `EmptyOperator` | `from airflow.operators.empty import EmptyOperator` | `from airflow.providers.standard.operators.empty import EmptyOperator` |
+| `GlueJobOperator` | `from airflow.providers.amazon.aws.operators.glue import GlueJobOperator` | unchanged |
+
+`GlueJobOperator` is imported from `airflow.providers.amazon.aws.operators.glue` regardless of version. The `providers-standard` package is required for AF3 deployments (see [Airflow version matrix](#airflow-version-matrix)).
 
 Any job type that is not `bash` or `glue` causes `generate_dag` to error with
 `job type '<type>' is not supported in Airflow codegen yet`. This is a hard
@@ -385,11 +397,32 @@ configured to use). yard's responsibility ends at emitting the
 
 ---
 
-## Airflow Datasets
+## Datasets and Assets
 
 yard supports [Airflow
 Datasets](https://airflow.apache.org/docs/apache-airflow/stable/authoring-and-scheduling/datasets.html)
-on both sides of a dependency:
+on both sides of a dependency.
+
+**Version-aware class names.** The class name and import path depend on the `airflow.version` config field:
+
+- **Airflow 2.x** (`version: "2"`, default): yard emits `Dataset` from `from airflow.datasets import Dataset`.
+- **Airflow 3.x** (`version: "3"`): yard emits `Asset` from `from airflow.sdk import Asset`.
+
+The composite operators (`&` for all, `|` for any) work identically with both class names -- only the class name and import path change. Existing V2 examples in this section remain the default and apply when `version` is `"2"` or omitted.
+
+**Asset trigger alias.** yard accepts both `"dataset"` and `"asset"` as trigger keys in YAML. Both parse identically; serialization always emits `"dataset"`. The `"asset"` alias provides AF3-idiomatic YAML for teams that have migrated to Airflow 3:
+
+```yaml
+# Both forms are equivalent. yard normalizes to "dataset" on output.
+trigger:
+  asset: { uri: "s3://example-bucket/sales/orders" }
+
+# Same as:
+trigger:
+  dataset: { uri: "s3://example-bucket/sales/orders" }
+```
+
+See [migrations/v1.11.md](migrations/v1.11.md) for the full upgrade guide.
 
 ### Producing datasets (`publishes` on a task)
 
@@ -434,6 +467,16 @@ schedule=(Dataset("s3://example-bucket/sales/orders") & Dataset("s3://example-bu
 A single-source variant (`trigger: { dataset: { uri: ... } }`) emits
 `schedule=[Dataset(uri)]`. See [configuration](configuration.md#dagyaml-trigger-block)
 for the full `trigger:` block reference.
+
+**AF3 equivalent.** When `airflow.version = "3"`, the same YAML emits `Asset` instead of `Dataset`:
+
+```python
+from airflow.sdk import Asset
+...
+schedule=(Asset("s3://example-bucket/sales/orders") & Asset("s3://example-bucket/sales/shipments"))
+```
+
+The YAML trigger block is unchanged -- only the generated Python class name and import path differ.
 
 ### Precedence
 
@@ -851,18 +894,38 @@ re-parsed before upload.
 
 ## Airflow version matrix
 
-yard's emitted DAGs target Airflow 2.9+ (the first version with native `&` / `|` Dataset operators and stable deferrable sensors).
+yard now supports both AF2 and AF3 tracks, controlled by the `airflow.version` config field (default `"2"`). AF2 DAGs target Airflow 2.9+ (the first version with native `&` / `|` Dataset operators and stable deferrable sensors). AF3 DAGs target Airflow 3.0+.
 
-| Track | Airflow | apache-airflow-providers-amazon | aiobotocore |
-|-------|---------|----------------------------------|-------------|
-| Modern | >= 2.11 | >= 9.x | >= 2.5.x |
-| Conservative | >= 2.9 | 8.13.x — 8.x | >= 2.1.1 |
+| Track | Airflow | apache-airflow-providers-amazon | aiobotocore | Notes |
+|-------|---------|----------------------------------|-------------|-------|
+| Modern (AF2) | >= 2.11 | >= 9.x | >= 2.5.x | |
+| Conservative (AF2) | >= 2.9 | 8.13.x -- 8.x | >= 2.1.1 | |
+| AF3 | >= 3.0 | >= 9.0.0 | -- | `apache-airflow-providers-standard` required |
 
-The `apache-airflow-providers-amazon` floor matters for the deferrable sensor implementations. The conservative track pins `apache-airflow-providers-amazon` at the 8.13.x line (last 8.x with stable Triggerer-side `S3KeySensor`); the modern track tracks 9.x for current `SqsSensor` payload-shape parity.
+The `apache-airflow-providers-amazon` floor matters for the deferrable sensor implementations. The conservative AF2 track pins `apache-airflow-providers-amazon` at the 8.13.x line (last 8.x with stable Triggerer-side `S3KeySensor`); the modern AF2 track tracks 9.x for current `SqsSensor` payload-shape parity.
 
-**Triggerer process required.** Deferrable sensors (`S3KeySensor(deferrable=True)`, `SqsSensor(deferrable=True)`) only fire when the Triggerer is running. MWAA enables this by default; self-hosted deployments may need to start it explicitly (`airflow triggerer`).
+**AF3 version banner.** Every event-driven DAG generated with `version: "3"` carries this version contract as a comment header:
 
-Every emitted event-driven DAG carries this version contract as a comment header, alongside per-source backfill caveats. Schedule-only DAGs render WITHOUT this banner — they have no version-floor requirement beyond Airflow 2.0.
+```python
+# Airflow version contract:
+#   - apache-airflow >= 3.0
+#   - apache-airflow-providers-amazon >= 9.0.0
+#   - apache-airflow-providers-standard
+```
+
+**AF2 version banner.** Event-driven DAGs generated with `version: "2"` (default) carry:
+
+```python
+# Airflow version contract:
+#   - apache-airflow >= 2.9
+#   - apache-airflow-providers-amazon >= 8.13.0
+#   - aiobotocore >= 2.1.1
+#   - Triggerer process required
+```
+
+**Triggerer process (AF2 only).** Deferrable sensors (`S3KeySensor(deferrable=True)`, `SqsSensor(deferrable=True)`) only fire when the Triggerer is running. This requirement applies to AF2 event-driven DAGs only. MWAA enables the Triggerer by default; self-hosted deployments may need to start it explicitly (`airflow triggerer`). AF3 has a different sensor architecture.
+
+Schedule-only DAGs render WITHOUT version banners -- they have no version-floor requirement beyond Airflow 2.0.
 
 ---
 
