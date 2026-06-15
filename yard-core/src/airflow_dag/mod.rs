@@ -2848,4 +2848,92 @@ mod tests {
             "V3 kitchen-sink DAG has syntax error:\n{script}"
         );
     }
+
+    // --- Phase 56 plan 03 Task 2: Wire-format regression tests (TEST-03) ---
+    // Verifies V2-default byte-identical output: omitting version field produces
+    // the same rendered Python as explicit version: "2".
+    // TEST-04 (asset round-trip) covered in yard-structs/src/config.rs -- Phase 55 D-17.
+
+    #[test]
+    fn dag_v2_default_byte_identical_to_pre_phase_56() {
+        // TEST-03: schedule-only DAG -- no version field vs explicit version: "2"
+        // must produce byte-identical rendered Python. Proves adding the version
+        // field with default V2 does not change output.
+        let tmp_none = setup_project_tree();
+        let root_none = tmp_none.path();
+        let dag_dir_none = root_none.join("pipeline");
+        write_yaml(
+            &dag_dir_none.join("dag.yaml"),
+            "schedule: \"@daily\"\n",
+        );
+        let mut manifest_none = empty_manifest("test");
+        manifest_none
+            .jobs
+            .insert("runit".into(), bash_job("echo hi", &dag_dir_none));
+        let dags_none = collect_dags(root_none, &manifest_none).unwrap();
+        let script_no_version =
+            generate_dag(&manifest_none, &dags_none[0], &HashMap::new()).unwrap();
+
+        let tmp_v2 = setup_project_tree();
+        let root_v2 = tmp_v2.path();
+        let dag_dir_v2 = root_v2.join("pipeline");
+        write_yaml(
+            &dag_dir_v2.join("dag.yaml"),
+            "version: \"2\"\nschedule: \"@daily\"\n",
+        );
+        let mut manifest_v2 = empty_manifest("test");
+        manifest_v2
+            .jobs
+            .insert("runit".into(), bash_job("echo hi", &dag_dir_v2));
+        let dags_v2 = collect_dags(root_v2, &manifest_v2).unwrap();
+        let script_explicit_v2 =
+            generate_dag(&manifest_v2, &dags_v2[0], &HashMap::new()).unwrap();
+
+        assert_eq!(
+            script_no_version, script_explicit_v2,
+            "schedule-only DAG: no-version and explicit V2 must be byte-identical"
+        );
+    }
+
+    #[test]
+    fn dag_v2_event_driven_byte_identical_to_pre_phase_56() {
+        // TEST-03 (event-driven variant): dataset-triggered DAG with no version
+        // field vs explicit version: "2" must produce byte-identical rendered
+        // Python. Proves event-driven DAGs (banner, imports, class names) are
+        // unchanged when the version field defaults to V2.
+        let tmp_none = setup_project_tree();
+        let root_none = tmp_none.path();
+        let dag_dir_none = root_none.join("pipeline");
+        write_yaml(
+            &dag_dir_none.join("dag.yaml"),
+            "trigger:\n  dataset:\n    uri: s3://warehouse/foo\n",
+        );
+        let mut manifest_none = empty_manifest("test");
+        manifest_none
+            .jobs
+            .insert("agg".into(), bash_job("echo agg", &dag_dir_none));
+        let dags_none = collect_dags(root_none, &manifest_none).unwrap();
+        let script_no_version =
+            generate_dag(&manifest_none, &dags_none[0], &HashMap::new()).unwrap();
+
+        let tmp_v2 = setup_project_tree();
+        let root_v2 = tmp_v2.path();
+        let dag_dir_v2 = root_v2.join("pipeline");
+        write_yaml(
+            &dag_dir_v2.join("dag.yaml"),
+            "version: \"2\"\ntrigger:\n  dataset:\n    uri: s3://warehouse/foo\n",
+        );
+        let mut manifest_v2 = empty_manifest("test");
+        manifest_v2
+            .jobs
+            .insert("agg".into(), bash_job("echo agg", &dag_dir_v2));
+        let dags_v2 = collect_dags(root_v2, &manifest_v2).unwrap();
+        let script_explicit_v2 =
+            generate_dag(&manifest_v2, &dags_v2[0], &HashMap::new()).unwrap();
+
+        assert_eq!(
+            script_no_version, script_explicit_v2,
+            "event-driven DAG: no-version and explicit V2 must be byte-identical"
+        );
+    }
 }
