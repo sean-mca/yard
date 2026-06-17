@@ -146,7 +146,12 @@ impl S3ScriptOps {
     /// Check whether an S3 object exists in the script bucket.
     ///
     /// Returns `true` if the `HeadObject` call succeeds, `false` if
-    /// the object is not found, or an error for other failures.
+    /// the object is not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `HeadObject` call fails for a reason
+    /// other than "not found" (e.g. permission denied, network error).
     pub async fn s3_object_exists(&self, key: &str) -> Result<bool> {
         let result = self
             .s3_client
@@ -188,9 +193,23 @@ pub fn validation_err(field: &str, message: &str) -> ValidationError {
 /// Each provider (Glue, EMR, Databricks, etc.) implements this trait.
 /// Provider config (deploy roles, buckets, etc.) is passed at construction time.
 /// Job config (execution roles, sources, etc.) is passed per-call.
+///
+/// # Design note (D-10)
+///
+/// Methods return `Pin<Box<dyn Future<...> + Send + '_>>` rather than using
+/// `async fn` in the trait definition. This is intentional: [`get_provider`]
+/// returns `Box<dyn Provider>`, which requires object safety. Native `async fn`
+/// in traits produces `impl Future` return types that are **not** object-safe,
+/// so this desugared form is the correct stdlib-only pattern for async +
+/// dynamic dispatch.
 pub trait Provider: Send + Sync {
     /// Deploy a generated artifact to the target service.
     /// Returns the resources that were created/updated (for state tracking).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the artifact upload or service-side job
+    /// creation/update fails.
     fn deploy(
         &self,
         job_name: &str,
@@ -199,6 +218,11 @@ pub trait Provider: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Resource>>> + Send + '_>>;
 
     /// Destroy previously deployed resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the service-side deletion or S3 script
+    /// cleanup fails.
     fn destroy(
         &self,
         job_name: &str,
@@ -207,6 +231,11 @@ pub trait Provider: Send + Sync {
 
     /// Verify that previously deployed resources still exist in the target service.
     /// Used by drift detection to catch out-of-band deletions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the service-side existence check fails
+    /// (as opposed to returning `exists: false` for missing resources).
     fn verify_resources(
         &self,
         job_name: &str,
@@ -215,6 +244,13 @@ pub trait Provider: Send + Sync {
 }
 
 /// Construct a provider from the job type and its provider-level config.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The job type is `Bash` (bash jobs are task-only and have no provider)
+/// - The job type is unsupported
+/// - The provider's constructor fails (e.g. missing required config fields)
 pub async fn get_provider(job_type: JobType, provider_config: &Value) -> Result<Box<dyn Provider>> {
     match job_type {
         JobType::Glue => Ok(Box::new(glue::GlueProvider::new(provider_config).await?)),

@@ -32,8 +32,8 @@ const SUPPORTED_TRANSFORM_TYPES: &[&str] = &[
     "window",
 ];
 
-// Single canonical ValidationError constructor lives in `providers::validation_err`.
-// Re-exported here as `err` so the existing call sites in this module stay terse.
+/// Single canonical [`ValidationError`] constructor, re-exported from
+/// [`crate::providers::validation_err`] so call sites in this module stay terse.
 pub use crate::providers::validation_err as err;
 
 /// Validate a job definition against yard's schema rules.

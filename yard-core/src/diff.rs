@@ -1,3 +1,13 @@
+//! Manifest-vs-state diff calculation.
+//!
+//! Compares the current [`ProjectManifest`] (what the user declares in YAML)
+//! against the persisted [`ProjectState`] (what was last deployed) and produces
+//! a list of [`JobDiff`] entries describing creates, modifies, and deletes.
+//!
+//! The diff is deterministic: both manifest jobs and state deployments are
+//! iterated via [`BTreeMap`] collects so output order is stable across
+//! processes (DIFF-01 invariant).
+
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::BTreeMap;

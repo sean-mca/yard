@@ -40,30 +40,35 @@ pub(crate) trait VersionCodegen {
     /// Class name for the event-driven scheduling primitive.
     ///
     /// V2 returns `"Dataset"`, V3 returns `"Asset"`.
+    #[must_use]
     fn class_name(self) -> &'static str;
 
     /// Full Python import line for the Dataset/Asset class.
     ///
     /// V2 returns `"from airflow.datasets import Dataset"`,
     /// V3 returns `"from airflow.sdk import Asset"`.
+    #[must_use]
     fn class_import(self) -> &'static str;
 
     /// BashOperator import line.
     ///
     /// V2 returns the core `airflow.operators.bash` path,
     /// V3 returns the `providers-standard` path.
+    #[must_use]
     fn bash_op_import(self) -> &'static str;
 
     /// EmptyOperator import line.
     ///
     /// V2 returns the core `airflow.operators.empty` path,
     /// V3 returns the `providers-standard` path.
+    #[must_use]
     fn empty_op_import(self) -> &'static str;
 
     /// Version contract banner for event-driven DAGs (D-06).
     ///
     /// V2 returns the existing [`VERSION_BANNER`](super::triggers::VERSION_BANNER),
     /// V3 returns [`VERSION_BANNER_V3`].
+    #[must_use]
     fn version_banner(self) -> &'static str;
 }
 

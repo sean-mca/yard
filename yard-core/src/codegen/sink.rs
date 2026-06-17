@@ -41,7 +41,7 @@ pub(super) const ICEBERG_TABLE_PROPERTIES: &[(&str, &str)] = &[
 pub(super) fn render_sink(sink: &Sink, default_source: &str, fill_nulls: bool, catalog_id: Option<&str>) -> Result<String> {
     let source_name = sink.source.as_deref().unwrap_or(default_source);
     let var = format!("df_{source_name}");
-    let mut lines = Vec::new();
+    let mut lines = Vec::with_capacity(4);
 
     if let Some(secret_id) = &sink.secret_id {
         lines.push(render_secret_fetch(secret_id, "sink"));

@@ -1,3 +1,17 @@
+//! Top-level orchestration for apply, plan, and destroy commands.
+//!
+//! This module composes the data-flow pipeline (resolve, diff, codegen,
+//! validation) with provider deployment and state persistence to implement
+//! the three core CLI operations:
+//!
+//! - [`apply`] — validate, diff, deploy changed jobs/DAGs, persist state
+//! - [`plan`] — read-only diff preview (same validation, no side effects)
+//! - [`destroy_job`] / [`destroy_all`] — tear down resources, delete state
+//!
+//! All state mutations are protected by per-job locking via [`LockGuard`].
+//! Locks are acquired upfront and released on exit (success or error), with
+//! a TTL backstop for crash recovery.
+
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -329,10 +343,12 @@ pub async fn apply(
 
                     // Write generated script locally
                     let gen_dir = root_dir.join(".yard/generated");
-                    std::fs::create_dir_all(&gen_dir)
+                    tokio::fs::create_dir_all(&gen_dir)
+                        .await
                         .context("failed to create .yard/generated directory")?;
                     let script_path = gen_dir.join(format!("{}.py", diff.name));
-                    std::fs::write(&script_path, &script_content)
+                    tokio::fs::write(&script_path, &script_content)
+                        .await
                         .with_context(|| format!("failed to write generated script for job \"{}\"", diff.name))?;
 
                     // Deploy via provider if configured (skip in dry-run mode).
@@ -430,7 +446,7 @@ pub async fn apply(
                         .join(".yard/generated")
                         .join(format!("{}.py", diff.name));
                     if script_path.exists() {
-                        let _ = std::fs::remove_file(script_path);
+                        let _ = tokio::fs::remove_file(script_path).await;
                     }
 
                     result.deleted.push(diff.name.clone());
@@ -470,7 +486,7 @@ pub async fn apply(
                         .join(".yard/generated/dags")
                         .join(format!("{dag_name}.py"));
                     if dag_path.exists() {
-                        let _ = std::fs::remove_file(dag_path);
+                        let _ = tokio::fs::remove_file(dag_path).await;
                     }
                     result.dag_deleted.push(dag_name);
                 }
@@ -711,7 +727,7 @@ pub async fn destroy_job(
             .join(".yard/generated")
             .join(format!("{job_name}.py"));
         if script_path.exists() {
-            let _ = std::fs::remove_file(script_path);
+            let _ = tokio::fs::remove_file(script_path).await;
         }
 
         Ok(())

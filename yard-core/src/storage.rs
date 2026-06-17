@@ -1,3 +1,20 @@
+//! State persistence backends for job and DAG deployment state.
+//!
+//! Provides two storage backend implementations:
+//!
+//! - [`LocalStorage`] — persists state as individual JSON files on the local
+//!   filesystem (e.g. `.yard/state/my_job.json`)
+//! - [`S3Storage`] — persists state as S3 objects under a common prefix
+//!
+//! Both implement the [`StorageBackend`] trait. The [`Storage`] wrapper holds
+//! a `Box<dyn StorageBackend>` and exposes thin async methods so consumers
+//! don't need to know which backend is active.
+//!
+//! Locking is implemented via per-job lock files (`.lock` suffix on local FS,
+//! conditional `PutObject` on S3). The [`LockGuard`] RAII wrapper ensures
+//! locks are released on exit, with a configurable TTL backstop for crash
+//! recovery.
+
 use anyhow::{Context, Result, anyhow};
 use aws_sdk_s3::Client;
 use std::future::Future;
@@ -691,62 +708,107 @@ impl Storage {
 
     // --- Per-job state operations (thin wrappers; delegate to self.backend) ---
 
-    /// Read a single job's state file. Returns None if the file doesn't exist.
+    /// Read a single job's state file. Returns `None` if the file doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state file exists but cannot be read or deserialized.
     pub async fn read_job(&self, job_name: &str) -> Result<Option<JobState>> {
         self.backend.read_job(job_name).await
     }
 
     /// Write a job's state file. Overwrites any existing file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state file cannot be written (permissions,
+    /// serialization, or network failure for S3).
     pub async fn write_job(&self, job_name: &str, state: &JobState) -> Result<()> {
         self.backend.write_job(job_name, state).await
     }
 
     /// Delete a job's state file. No-op if the file doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be deleted (permissions or network failure).
     pub async fn delete_job(&self, job_name: &str) -> Result<()> {
         self.backend.delete_job(job_name).await
     }
 
     /// List all job names with state files (excluding lock files and DAG files).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state directory or S3 prefix cannot be listed.
     pub async fn list_jobs(&self) -> Result<Vec<String>> {
         self.backend.list_jobs().await
     }
 
     // --- Per-DAG state operations ---
 
-    /// Read a DAG's state file. Returns None if the file doesn't exist.
+    /// Read a DAG's state file. Returns `None` if the file doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state file exists but cannot be read or deserialized.
     pub async fn read_dag(&self, dag_name: &str) -> Result<Option<DagState>> {
         self.backend.read_dag(dag_name).await
     }
 
     /// Write a DAG's state file. Overwrites any existing file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state file cannot be written.
     pub async fn write_dag(&self, dag_name: &str, state: &DagState) -> Result<()> {
         self.backend.write_dag(dag_name, state).await
     }
 
     /// Delete a DAG's state file. No-op if the file doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be deleted.
     pub async fn delete_dag(&self, dag_name: &str) -> Result<()> {
         self.backend.delete_dag(dag_name).await
     }
 
     /// List all DAG names with state files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state directory or S3 prefix cannot be listed.
     pub async fn list_dags(&self) -> Result<Vec<String>> {
         self.backend.list_dags().await
     }
 
     // --- Locking primitives ---
 
-    /// Acquire a lock for a job. Returns Ok(LockInfo) on success,
-    /// Err if already locked.
+    /// Acquire a lock for a job. Returns `Ok(LockInfo)` on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the job is already locked by another user or
+    /// if the lock file cannot be created.
     pub async fn lock(&self, job_name: &str) -> Result<LockInfo> {
         self.backend.lock(job_name).await
     }
 
     /// Remove the lock regardless of who holds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock file cannot be deleted.
     pub async fn force_unlock(&self, job_name: &str) -> Result<()> {
         self.backend.force_unlock(job_name).await
     }
 
     /// Read current lock info for a job, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock file exists but cannot be read or deserialized.
     pub async fn get_lock(&self, job_name: &str) -> Result<Option<LockInfo>> {
         self.backend.get_lock(job_name).await
     }

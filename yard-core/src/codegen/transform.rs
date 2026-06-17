@@ -13,6 +13,7 @@ use super::helpers::quoted_list;
 /// Falls back to `default_source` when the transform does not specify
 /// explicit `source` / `output` fields.
 #[inline]
+#[must_use]
 pub(super) fn resolve_df(transform: &Transform, default_source: &str) -> (String, String) {
     let input = transform.source.as_deref().unwrap_or(default_source);
     let output = transform.output.as_deref().unwrap_or(input);
@@ -47,7 +48,7 @@ pub(super) fn render_transform(
                 .as_deref()
                 .unwrap_or("SELECT * FROM source")
                 .trim();
-            let mut lines = Vec::new();
+            let mut lines = Vec::with_capacity(all_source_names.len() + 1);
             // Register all named sources as temp views
             for name in all_source_names {
                 lines.push(format!("    df_{name}.createOrReplaceTempView(\"{name}\")"));
@@ -86,7 +87,7 @@ pub(super) fn render_transform(
         }
         "rename" => {
             let (input, output) = resolve_df(transform, default_source);
-            let mut lines: Vec<String> = Vec::new();
+            let mut lines: Vec<String> = Vec::with_capacity(transform.mapping.len());
             let mut first = true;
             for (old, new) in &transform.mapping {
                 if first {

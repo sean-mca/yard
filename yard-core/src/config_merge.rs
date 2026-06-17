@@ -1,3 +1,16 @@
+//! Provider configuration deep-merge and task-only job classification.
+//!
+//! This module provides two concerns:
+//!
+//! 1. **Task-only classification** — [`is_task_only`] identifies job types
+//!    (currently only [`JobType::Bash`]) that are Airflow tasks without a Spark
+//!    artifact, short-circuiting the codegen and provider deploy paths.
+//!
+//! 2. **Provider config merge** — [`build_provider_config`] and
+//!    [`merge_provider_config`] perform recursive deep-merge of provider-level
+//!    defaults with per-job overrides. Nested objects merge key-by-key; arrays
+//!    and scalars are replaced wholesale.
+
 use serde_json::Value;
 use yard_structs::JobType;
 

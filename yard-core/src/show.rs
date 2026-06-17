@@ -1,3 +1,9 @@
+//! Show command implementation for previewing generated artifacts.
+//!
+//! Provides read-only generation of job scripts and DAG Python files without
+//! deploying or modifying state. Used by `yard show job <name>` and
+//! `yard show dag <name>` CLI commands.
+
 use anyhow::{anyhow, Context, Result};
 use yard_structs::{ProjectManifest, StateBackend};
 

@@ -1,3 +1,10 @@
+//! DAG task dependency resolution and topological sorting.
+//!
+//! Resolves `depends_on` references (full names, short names, cross-DAG
+//! detection, self-reference rejection) and topologically sorts tasks
+//! via Kahn's algorithm with stable alphabetical tie-breaking for
+//! deterministic output across runs.
+
 use anyhow::{Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -107,6 +114,11 @@ fn resolve_dep(
 
 /// Resolve and validate all depends_on references, returning a map of
 /// full_name -> resolved upstream full names.
+///
+/// # Errors
+///
+/// Returns an error if any dependency reference is a self-reference,
+/// ambiguous short name, cross-DAG reference, or unknown task.
 pub(super) fn resolve_all_depends_on(
     jobs: &[(String, &JobDefinition)],
     task_ids: &BTreeSet<String>,

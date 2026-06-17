@@ -1,3 +1,11 @@
+//! DAG collection from the filesystem.
+//!
+//! Walks a project directory tree, locates `dag.yaml` marker files, groups
+//! jobs into their nearest ancestor DAG, validates structural invariants
+//! (no nesting, no empty DAGs, no cross-DAG deps, no duplicate overrides,
+//! no cycles), and returns fully resolved [`ResolvedDag`](super::ResolvedDag)
+//! values in deterministic directory-path order.
+
 use anyhow::{Context as AnyhowContext, Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -12,13 +20,15 @@ use crate::{merge_airflow_sections, parse_airflow_section};
 /// Walk `root_dir`, find every `dag.yaml` marker, group jobs into DAGs, and
 /// return fully resolved DAGs in deterministic order (by directory path).
 ///
-/// Errors on:
-/// - Nested `dag.yaml` files (one DAG dir inside another)
-/// - Empty DAG directories (marker present, no task files)
-/// - `depends_on` references to missing or cross-DAG tasks
-/// - DAG-level override fields (schedule/retries/etc.) declared on more than
-///   one task in the same DAG
-/// - Dependency cycles
+/// # Errors
+///
+/// Returns an error if:
+/// - Nested `dag.yaml` files are found (one DAG dir inside another)
+/// - A DAG directory is empty (marker present, no task files)
+/// - `depends_on` references a missing or cross-DAG task
+/// - DAG-level override fields (schedule/retries/etc.) are declared on more
+///   than one task in the same DAG
+/// - A dependency cycle is detected
 pub fn collect_dags(root_dir: &Path, manifest: &ProjectManifest) -> Result<Vec<ResolvedDag>> {
     let mut dag_dirs = find_dag_marker_dirs(root_dir)?;
     dag_dirs.sort();

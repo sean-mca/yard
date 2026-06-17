@@ -45,6 +45,11 @@ pub struct TargetRow {
 /// Returns `Err` only when a target has an `assume_role` ARN that fails
 /// shape validation (D-10); a missing/empty `assume_role` is NOT an error
 /// (D-04) — it emits `aws_account_id: None`.
+///
+/// # Errors
+///
+/// Returns an error if DAG collection fails or if any target's
+/// `assume_role` ARN fails shape validation (not a valid ARN format).
 pub fn list_targets(
     manifest: &ProjectManifest,
     root_dir: &Path,

@@ -1,3 +1,23 @@
+//! Configuration resolution and project discovery.
+//!
+//! This module implements the YAML cascade hierarchy that merges configuration
+//! from multiple layers:
+//!
+//! ```text
+//! yard.yaml -> account.yaml -> region.yaml -> job.yaml
+//! ```
+//!
+//! The primary entry point is [`resolve_project`], which finds `yard.yaml`,
+//! discovers all jobs via recursive directory walking, cascades provider
+//! defaults and AWS credential configs through the hierarchy, and loads the
+//! current deployment state from the configured backend.
+//!
+//! Secondary entry points:
+//! - [`discover_environments`] — enumerate environments and regions without
+//!   loading state (used by `yard list targets`)
+//! - [`find_in_parent_folders`] — walk upward looking for a named file
+//! - [`yaml_to_json`] — convert `yaml_rust2::Yaml` values to `serde_json::Value`
+
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -555,6 +575,12 @@ const RESERVED_YAML_FILES: &[&str] = &[
 /// Returns `Vec<DiscoveredEnvironment>` with environment name (directory name,
 /// not account ID per D-12), optional account_id/role_arn from account.yaml,
 /// and per-region job/DAG summaries.
+///
+/// # Errors
+///
+/// Returns an error if `yard.yaml` cannot be found in `root_path` or its
+/// parents, if any directory cannot be read, or if a YAML file within a
+/// region directory is invalid.
 pub fn discover_environments(root_path: &Path) -> Result<Vec<DiscoveredEnvironment>> {
     // 1. Locate yard.yaml to establish the project root (Pitfall 3).
     let yard_yaml_path = find_in_parent_folders(root_path, "yard.yaml")

@@ -1,3 +1,10 @@
+//! Shared utility functions for hashing and variable resolution.
+//!
+//! - [`calculate_hash`] — blake3 content hashing for state drift detection
+//! - [`calculate_json_hash`] — key-order-canonical JSON hashing
+//! - [`resolve_variables`] — `${...}` variable substitution in YAML content
+//! - [`resolve_json_path`] — dotted-path lookup against the YARD context
+
 use anyhow::{Result, anyhow};
 use regex::Regex;
 use serde_json::Value;

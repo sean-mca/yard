@@ -41,9 +41,21 @@ const DEFAULT_AWS_CONN_ID: &str = "aws_default";
 const AIRFLOW_DAG_TEMPLATE: &str = include_str!("../templates/airflow_dag.py.tera");
 
 /// Airflow connection required by a DAG so a task can invoke AWS APIs under a
-/// cross-account role. The DAG-codegen layer does not manage connections —
+/// cross-account role. The DAG-codegen layer does not manage connections --
 /// this struct is emitted alongside the rendered DAG so operators can set them
 /// up in MWAA.
+///
+/// # Examples
+///
+/// ```
+/// use yard_core::airflow_dag::RequiredConnection;
+///
+/// let conn = RequiredConnection {
+///     conn_id: "yard_123456789012_MyRole".to_string(),
+///     role_arn: "arn:aws:iam::123456789012:role/MyRole".to_string(),
+/// };
+/// assert_eq!(conn.conn_id, "yard_123456789012_MyRole");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RequiredConnection {
     /// Airflow connection identifier (e.g. `"aws_conn_123456789012"`).
@@ -53,6 +65,27 @@ pub struct RequiredConnection {
 }
 
 /// A DAG resolved from filesystem discovery + validation. Ready for codegen.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::collections::BTreeMap;
+/// use std::path::PathBuf;
+/// use yard_structs::AirflowSection;
+/// use yard_core::airflow_dag::ResolvedDag;
+///
+/// let dag = ResolvedDag {
+///     name: "myproj_orders_pipeline".to_string(),
+///     dir: PathBuf::from("projects/orders"),
+///     config: AirflowSection::default(),
+///     tasks: vec!["extract".to_string(), "transform".to_string()],
+///     depends_on: BTreeMap::from([
+///         ("extract".to_string(), vec![]),
+///         ("transform".to_string(), vec!["extract".to_string()]),
+///     ]),
+/// };
+/// assert_eq!(dag.tasks.len(), 2);
+/// ```
 #[derive(Debug, Clone)]
 pub struct ResolvedDag {
     /// Sanitized, project-prefixed DAG id (e.g. `myproj_orders_pipeline`).
@@ -79,6 +112,7 @@ pub struct ResolvedDag {
 /// URIs into `generate_dag` (DAG-02); call sites pre-compute it via
 /// `dag_lifecycle::load_script_locations_from_storage` (or the public
 /// `load_script_locations` backend wrapper for CLI entry points).
+#[must_use]
 pub(crate) fn script_locations_from_state(
     states: &HashMap<String, JobState>,
 ) -> HashMap<String, String> {

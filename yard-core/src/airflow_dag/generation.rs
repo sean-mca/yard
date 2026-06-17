@@ -1,3 +1,11 @@
+//! Airflow DAG Python file generation.
+//!
+//! Takes a [`ResolvedDag`](super::ResolvedDag), the project manifest, and
+//! per-task script locations, then renders a complete Airflow Python DAG
+//! file via the `airflow_dag.py.tera` template. Handles import resolution,
+//! operator dispatch (Bash / Glue), trigger rendering, cross-account
+//! connection docstrings, and `publishes` outlet wiring.
+
 use anyhow::{Context as AnyhowContext, Result, anyhow};
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -14,6 +22,15 @@ use super::helpers::{python_string_literal, python_var_name};
 use super::triggers::{self, TriggerRender};
 
 /// Render a resolved DAG into an Airflow Python file.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - A task references a job not in the manifest
+/// - A task's job type is unsupported for Airflow codegen (e.g. EMR)
+/// - A Glue task is missing required config fields (`role`, script URI)
+/// - A task's assume-role ARN is malformed
+/// - The Tera template fails to render
 pub fn generate_dag(
     manifest: &ProjectManifest,
     dag: &ResolvedDag,

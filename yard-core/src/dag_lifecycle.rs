@@ -1,3 +1,19 @@
+//! DAG lifecycle operations: apply, diff, destroy, and state management.
+//!
+//! This module handles the complete lifecycle of Airflow DAG artifacts:
+//!
+//! - **Apply** ([`apply_dags`]) — generate Python DAG files, upload to S3,
+//!   persist DAG deployment state
+//! - **Diff** ([`calculate_dag_diffs`]) — compare resolved DAGs against
+//!   stored state to detect creates, modifies, and deletes
+//! - **Destroy** ([`destroy_dag`] / [`destroy_all_dags`]) — delete S3
+//!   artifacts, remove state, clean up generated files
+//! - **State** ([`load_dag_state`] / [`load_script_locations`]) — read
+//!   persisted DAG and job state for rendering and diffing
+//!
+//! AWS credential resolution for DAG uploads follows a precedence chain:
+//! `dag.config.aws` > `account.yaml aws:` > `manifest.aws` (root).
+
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -236,7 +252,7 @@ pub async fn apply_dags(
     }
 
     let dag_gen_dir = root_dir.join(".yard/generated/dags");
-    std::fs::create_dir_all(&dag_gen_dir)?;
+    tokio::fs::create_dir_all(&dag_gen_dir).await?;
 
     for diff in &diffs {
         match &diff.diff_type {
@@ -251,7 +267,7 @@ pub async fn apply_dags(
 
                 // Write locally
                 let dag_path = dag_gen_dir.join(format!("{}.py", diff.name));
-                std::fs::write(&dag_path, &content)?;
+                tokio::fs::write(&dag_path, &content).await?;
 
                 // Upload to S3 if dags_bucket is configured and not dry-run.
                 // Returns (s3_uri, effective_aws) — persist aws on DagState so
@@ -314,7 +330,7 @@ pub async fn apply_dags(
 
                 let dag_path = dag_gen_dir.join(format!("{}.py", diff.name));
                 if dag_path.exists() {
-                    let _ = std::fs::remove_file(dag_path);
+                    let _ = tokio::fs::remove_file(dag_path).await;
                 }
 
                 result.deleted.push(diff.name.clone());
@@ -582,7 +598,7 @@ pub async fn destroy_dag(
             .join(".yard/generated/dags")
             .join(format!("{dag_name}.py"));
         if dag_path.exists() {
-            let _ = std::fs::remove_file(dag_path);
+            let _ = tokio::fs::remove_file(dag_path).await;
         }
 
         Ok(())

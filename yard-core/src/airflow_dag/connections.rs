@@ -1,3 +1,10 @@
+//! Airflow connection resolution and cross-account credential plumbing.
+//!
+//! Derives per-task `aws_conn_id` values from the yard config hierarchy
+//! (explicit override > cross-account derive > `aws_default`), parses IAM
+//! role ARNs to extract account IDs, and collects the set of required
+//! Airflow connections for a DAG so operators can pre-provision them in MWAA.
+
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -11,12 +18,17 @@ use super::DEFAULT_AWS_CONN_ID;
 /// Derive the Airflow connection id a task should use.
 ///
 /// Precedence (highest first):
-///   1. Cascaded `_aws.aws_conn_id` — explicit override from any layer of the
-///      yard.yaml → account → region → job.yaml chain (deep-merged into the
+///   1. Cascaded `_aws.aws_conn_id` -- explicit override from any layer of the
+///      yard.yaml -> account -> region -> job.yaml chain (deep-merged into the
 ///      `_aws` blob by `cascade_provider_defaults`).
-///   2. `derive_aws_conn_id(task_role)` — when the task's assume_role
+///   2. `derive_aws_conn_id(task_role)` -- when the task's assume_role
 ///      differs from the project root (cross-account).
-///   3. `DEFAULT_AWS_CONN_ID` (`aws_default`) — same-account or no assume_role.
+///   3. `DEFAULT_AWS_CONN_ID` (`aws_default`) -- same-account or no assume_role.
+///
+/// # Errors
+///
+/// Returns an error if the task's assume-role ARN is malformed (see
+/// [`derive_aws_conn_id`]).
 pub(super) fn resolve_task_aws_conn_id(job: &JobDefinition, manifest: &ProjectManifest) -> Result<String> {
     if let Some(explicit) = job_aws_conn_id(job) {
         return Ok(explicit.to_string());
@@ -70,8 +82,15 @@ fn typed_assume_role(c: &AwsCredentialConfig) -> Option<&str> {
 /// role name) and returns just the account substring on success.
 ///
 /// Note: this surfaces the yard deploy-credential account (what yard assumes
-/// into to upload scripts/DAGs), NOT the Glue execution role — that's
+/// into to upload scripts/DAGs), NOT the Glue execution role -- that's
 /// `config.role`, threaded into rendered DAGs as `iam_role_name` in Phase 15.
+///
+/// # Errors
+///
+/// Returns an error if the ARN does not match the expected
+/// `arn:aws:iam::<12-digit-account>:role/<name>` format, including
+/// missing prefix, non-12-digit account, missing `role/` segment, or
+/// empty role name.
 pub(crate) fn parse_account_from_role_arn(role_arn: &str) -> Result<String> {
     let rest = role_arn
         .strip_prefix("arn:aws:iam::")
@@ -97,6 +116,11 @@ pub(crate) fn parse_account_from_role_arn(role_arn: &str) -> Result<String> {
 /// `yard_<account>_<role_name_sanitized>`. Returns an error on malformed or
 /// non-IAM-role ARNs so invalid config fails at plan/apply rather than at
 /// DAG runtime.
+///
+/// # Errors
+///
+/// Returns an error if `role_arn` does not conform to the IAM role ARN
+/// format (see [`parse_account_from_role_arn`]).
 pub fn derive_aws_conn_id(role_arn: &str) -> Result<String> {
     let account = parse_account_from_role_arn(role_arn)?;
     let name = role_arn
@@ -113,6 +137,10 @@ pub fn derive_aws_conn_id(role_arn: &str) -> Result<String> {
 
 /// Distinct Airflow connections the DAG's Glue tasks need, in deterministic
 /// order. Empty when every task uses `aws_default`.
+///
+/// # Errors
+///
+/// Returns an error if any Glue task's assume-role ARN is malformed.
 pub fn required_connections_for_dag(
     manifest: &ProjectManifest,
     dag: &ResolvedDag,

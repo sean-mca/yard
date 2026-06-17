@@ -1,3 +1,11 @@
+//! Helper functions for Airflow DAG Python codegen.
+//!
+//! Provides identifier sanitization ([`sanitize_identifier`],
+//! [`python_var_name`]), Python string literal escaping
+//! ([`python_string_literal`]), and orphan-airflow-block validation
+//! ([`validate_orphan_airflow_blocks`]). All functions are pure and
+//! deterministic — no I/O, no side effects.
+
 use std::collections::BTreeSet;
 use yard_structs::ProjectManifest;
 
@@ -7,6 +15,7 @@ use super::ResolvedDag;
 /// replace everything else with `_`, and prepend `_` if the first char is a
 /// digit. Used for DAG names and task variable names.
 #[inline]
+#[must_use]
 pub(super) fn sanitize_identifier(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for (i, c) in s.chars().enumerate() {
@@ -25,6 +34,7 @@ pub(super) fn sanitize_identifier(s: &str) -> String {
 /// Convert a task id to a Python variable name by prefixing `t_` and
 /// sanitizing the identifier portion.
 #[inline]
+#[must_use]
 pub(super) fn python_var_name(task_id: &str) -> String {
     format!("t_{}", sanitize_identifier(task_id))
 }
@@ -32,12 +42,17 @@ pub(super) fn python_var_name(task_id: &str) -> String {
 /// JSON strings are a subset of valid Python string literals, so we piggy-back
 /// on serde_json to produce a correctly-escaped double-quoted literal.
 #[inline]
+#[must_use]
 pub(super) fn python_string_literal(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
 /// Validate that no job has an `airflow:` block while living outside any DAG
 /// directory. Such blocks are meaningless without a DAG context.
+///
+/// Returns a `Vec` of `(job_name, error_message)` pairs for each orphan
+/// found. An empty vec means no violations.
+#[must_use]
 pub fn validate_orphan_airflow_blocks(
     manifest: &ProjectManifest,
     dags: &[ResolvedDag],

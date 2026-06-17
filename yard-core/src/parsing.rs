@@ -1,3 +1,17 @@
+//! YAML parsing utilities for converting job configuration into typed structs.
+//!
+//! This module is the entry point for transforming raw `yard.yaml` / `job.yaml`
+//! JSON-converted content into the typed representations defined in
+//! [`yard_structs`]. Every `parse_*` function accepts a [`serde_json::Value`]
+//! (produced by [`crate::resolve::yaml_to_json`]) and returns either a typed
+//! struct or `Result` when the input can be malformed.
+//!
+//! Key responsibilities:
+//! - Unknown-key validation via [`validate_unknown_keys`] (TYPE-03 D-19)
+//! - Airflow section / job-block parsing with allow-list gating
+//! - Source, sink, and transform extraction with per-entry error paths
+//! - Shallow-merge of [`AirflowSection`] layers for the config cascade
+
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -19,6 +33,11 @@ use yard_structs::{
 /// `.get(...).as_str()`-style chain (typically returning `None` and
 /// falling through to defaults). This keeps the validator focused on its
 /// one job (catching unknown KEYS) without overlapping with type checks.
+///
+/// # Errors
+///
+/// Returns an error if the value is a JSON object containing any key not
+/// present in `allowed`.
 ///
 /// **Returned error format** (D-18):
 ///   `unknown field '<key>' at <path> (allowed: <csv>)`
@@ -256,6 +275,13 @@ fn parse_trigger_field(value: &Value, key: &str) -> Result<Option<Trigger>> {
 /// caller is parsing — used in error messages from `validate_unknown_keys`
 /// when the section contains an unknown key (TYPE-03 D-19). Returns
 /// `Err` on the first unknown field; otherwise returns the parsed section.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The section contains an unknown key (validated against [`ALLOWED_AIRFLOW_SECTION`])
+/// - The legacy `triggered_by` field is present (migration pointer to `trigger:`)
+/// - The `trigger:` or `version:` value is present but malformed
 pub fn parse_airflow_section(value: &Value, path: &str) -> Result<AirflowSection> {
     // Rename-pointer migration UX (D-21): legacy v1.5 field names get
     // actionable error messages pointing users at the new shape, before
@@ -282,6 +308,13 @@ pub fn parse_airflow_section(value: &Value, path: &str) -> Result<AirflowSection
 ///
 /// `path` is the job-level structural path (e.g. `"jobs.{job_name}"`) —
 /// the function appends `.airflow` for its error messages.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The `airflow:` block contains an unknown key (validated against [`ALLOWED_AIRFLOW_JOB_BLOCK`])
+/// - The legacy `produces` or `triggered_by` field is present (migration pointer)
+/// - The inner [`AirflowSection`] parsing fails (malformed `trigger:` or `version:`)
 pub fn parse_airflow_job_block(config: &Value, path: &str) -> Result<Option<AirflowJobBlock>> {
     let Some(block) = config.get("airflow") else {
         return Ok(None);
@@ -434,8 +467,7 @@ fn str_array_field(obj: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Helper to extract a string->string map field from JSON.
-/// Helper to extract an order_by field: array of {column: string, desc: bool} objects.
+/// Helper to extract an `order_by` field: array of `{column, desc}` objects.
 fn order_by_field(obj: &Value, key: &str) -> Vec<yard_structs::OrderBySpec> {
     obj.get(key)
         .and_then(|v| v.as_array())
@@ -451,6 +483,7 @@ fn order_by_field(obj: &Value, key: &str) -> Vec<yard_structs::OrderBySpec> {
         .unwrap_or_default()
 }
 
+/// Helper to extract a string-to-string map field from JSON.
 fn str_map_field(obj: &Value, key: &str) -> HashMap<String, String> {
     obj.get(key)
         .and_then(|v| v.as_object())
@@ -510,6 +543,11 @@ fn parse_single_source(src: &Value, default_name: &str, path: &str) -> Result<Op
 ///
 /// `path` is the job-level structural path (e.g. `"jobs.{job_name}"`); the
 /// function appends `.sources[i]` or `.source` for each entry's error path.
+///
+/// # Errors
+///
+/// Returns an error if any source entry contains an unknown key or has a
+/// malformed `auth:` block.
 pub fn parse_sources(config: &Value, path: &str) -> Result<Vec<Source>> {
     // Try `sources:` (list) first
     if let Some(arr) = config.get("sources").and_then(|v| v.as_array()) {
@@ -536,6 +574,11 @@ pub fn parse_sources(config: &Value, path: &str) -> Result<Vec<Source>> {
 ///
 /// `path` is the job-level structural path; the function appends `.sink`
 /// for its error messages.
+///
+/// # Errors
+///
+/// Returns an error if the sink block contains an unknown key or has a
+/// malformed `auth:` block.
 pub fn parse_sink(config: &Value, path: &str) -> Result<Option<Sink>> {
     let Some(snk) = config.get("sink") else {
         return Ok(None);
@@ -579,6 +622,11 @@ fn parse_jdbc_auth(node: &Value, path: &str) -> Result<Option<JdbcAuth>> {
 ///
 /// `path` is the job-level structural path; per-transform error paths
 /// are built as `{path}.transforms[i]`.
+///
+/// # Errors
+///
+/// Returns an error if any transform entry contains an unknown key
+/// (validated against [`ALLOWED_TRANSFORM`]).
 pub fn parse_transforms(config: &Value, path: &str) -> Result<Vec<Transform>> {
     let Some(arr) = config.get("transforms").and_then(|v| v.as_array()) else {
         return Ok(Vec::new());

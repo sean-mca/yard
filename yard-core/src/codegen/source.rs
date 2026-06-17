@@ -47,7 +47,7 @@ pub(super) fn render_source(source: &Source, default_engine: &str) -> Result<Str
     let ctx = format!("{name}_ctx");
     let engine = effective_engine(source, default_engine);
     let auth_prefix = name.to_string();
-    let mut lines = Vec::new();
+    let mut lines = Vec::with_capacity(4);
 
     if let Some(secret_id) = &source.secret_id {
         lines.push(render_secret_fetch(secret_id, &auth_prefix));
