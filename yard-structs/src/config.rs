@@ -162,8 +162,28 @@ pub struct JobSummary {
 }
 
 /// Backend for persisting per-job and per-DAG state files.
+///
+/// # Examples
+///
+/// ```
+/// use yard_structs::StateBackend;
+///
+/// // Local filesystem backend
+/// let local: StateBackend = serde_json::from_value(serde_json::json!({
+///     "type": "local",
+///     "path": ".yard/state"
+/// })).expect("local backend should parse");
+///
+/// // S3 backend
+/// let s3: StateBackend = serde_json::from_value(serde_json::json!({
+///     "type": "s3",
+///     "bucket": "my-state-bucket",
+///     "region": "us-east-1",
+///     "key": "state/"
+/// })).expect("s3 backend should parse");
+/// ```
 #[non_exhaustive]
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum StateBackend {
     /// Local filesystem backend.
@@ -189,6 +209,18 @@ pub enum StateBackend {
 }
 
 /// Top-level project manifest parsed from `yard.yaml`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use yard_structs::ProjectManifest;
+///
+/// // ProjectManifest is typically deserialized from yard.yaml via
+/// // yard-core's parsing layer. Direct field access:
+/// # let manifest: ProjectManifest = todo!();
+/// println!("project: {}", manifest.project);
+/// println!("jobs: {}", manifest.jobs.len());
+/// ```
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectManifest {
@@ -220,7 +252,7 @@ pub struct ProjectManifest {
 }
 
 /// A Python import statement to inject into generated scripts.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Import {
     /// Module or symbol name to import.
     pub name: String,
@@ -258,7 +290,7 @@ pub struct RdsIamAuth {
 }
 
 /// A data source definition within a job (e.g. S3, JDBC, Glue Catalog).
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Source {
     /// Variable name in generated code; produces `df_<name>`.
@@ -266,16 +298,22 @@ pub struct Source {
     /// Source type discriminator: `"s3"`, `"jdbc"`, `"catalog"`, `"kafka"`, `"api"`.
     pub source_type: String,
     /// Data format: `"parquet"`, `"csv"`, `"json"`, `"orc"`.
+    #[serde(default)]
     pub format: Option<String>,
     /// S3 path for `source_type: s3`.
+    #[serde(default)]
     pub path: Option<String>,
     /// JDBC connection URL or Kafka bootstrap servers.
+    #[serde(default)]
     pub connection_url: Option<String>,
     /// Table name for `source_type: jdbc` or `source_type: catalog`.
+    #[serde(default)]
     pub table: Option<String>,
     /// Database name for `source_type: catalog`.
+    #[serde(default)]
     pub database: Option<String>,
     /// AWS Secrets Manager secret ID for credential lookup.
+    #[serde(default)]
     pub secret_id: Option<String>,
     /// "spark" (SparkSession.read) or "glue" (DynamicFrame). Defaults to the
     /// provider-level `default_engine` when unset; "spark" if that's also unset.
@@ -305,7 +343,7 @@ pub struct Source {
 }
 
 /// A data sink definition within a job (e.g. S3, JDBC, Glue Catalog).
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Sink {
     /// Which DataFrame to write (defaults to first/only source).
@@ -327,6 +365,7 @@ pub struct Sink {
     /// Write mode: `"overwrite"`, `"append"`, `"error"`.
     pub mode: Option<String>,
     /// Partition columns for the output.
+    #[serde(default)]
     pub partition_by: Vec<String>,
     /// JDBC connection type (e.g. `"mysql"`, `"postgresql"`).
     #[serde(default)]
@@ -343,7 +382,7 @@ pub struct Sink {
 }
 
 /// Column ordering specification for window transforms.
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
 pub struct OrderBySpec {
     /// Column name to order by.
     pub column: String,
@@ -352,7 +391,7 @@ pub struct OrderBySpec {
 }
 
 /// A data transformation step within a job pipeline.
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Transform {
     /// Transform type: `"filter"`, `"sql"`, `"drop_columns"`, `"rename"`,
@@ -367,8 +406,10 @@ pub struct Transform {
     /// SQL query string.
     pub query: Option<String>,
     /// Column names for `drop_columns` / `select` transforms.
+    #[serde(default)]
     pub columns: Vec<String>,
     /// Rename mapping (old name to new name).
+    #[serde(default)]
     pub mapping: HashMap<String, String>,
     /// New column name for `add_column` / `window` transforms.
     pub name: Option<String>,
@@ -383,32 +424,52 @@ pub struct Transform {
     /// Join type: `"inner"`, `"left"`, `"right"`, `"outer"`.
     pub how: Option<String>,
     /// Grouping columns for `aggregate` transforms.
+    #[serde(default)]
     pub group_by: Vec<String>,
     /// Aggregation expressions keyed by alias (e.g. `"total"` -> `"sum(amount)"`).
+    #[serde(default)]
     pub aggs: HashMap<String, String>,
     /// Partition columns for `window` transforms.
+    #[serde(default)]
     pub partition_by: Vec<String>,
     /// Ordering specification for `window` transforms.
+    #[serde(default)]
     pub order_by: Vec<OrderBySpec>,
 }
 
 /// Complete definition of a single job parsed from a job YAML file.
+///
+/// # Examples
+///
+/// ```no_run
+/// use yard_structs::JobDefinition;
+///
+/// // JobDefinition is typically deserialized from a job YAML file via
+/// // yard-core's parsing layer. Direct field access:
+/// # let job: JobDefinition = todo!();
+/// println!("type: {}", job.job_type);
+/// println!("sources: {}", job.sources.len());
+/// println!("has sink: {}", job.sink.is_some());
+/// ```
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct JobDefinition {
     /// The provider type for this job.
     pub job_type: JobType,
     /// Additional Python imports to inject into generated scripts.
+    #[serde(default)]
     pub imports: Vec<Import>,
     /// Inline Python body to embed in the generated script.
     pub body: Option<String>,
     /// Path to an external Python file that replaces YARD's generated script entirely.
     pub job_file: Option<String>,
     /// Data sources read by this job (S3 paths, catalog tables, etc.).
+    #[serde(default)]
     pub sources: Vec<Source>,
     /// Output destination (S3 path, catalog table, JDBC endpoint, etc.).
     pub sink: Option<Sink>,
     /// In-flight data transformations applied between source reads and sink write.
+    #[serde(default)]
     pub transforms: Vec<Transform>,
     /// Per-job Airflow metadata, parsed from the optional `airflow:` block.
     /// `None` means the job does not participate in any DAG.
@@ -469,7 +530,7 @@ impl Default for JobDefinition {
 }
 
 /// Hierarchical context gathered from the directory tree during config resolution.
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
 pub struct YARDContext {
     /// Account-level config from `account.yaml`.
     pub account: serde_json::Value,
@@ -556,6 +617,21 @@ impl<'de> serde::Deserialize<'de> for AirflowMajorVersion {
 /// Airflow config shared across inheritance layers (yard.yaml, region.yaml,
 /// account.yaml, dag.yaml, and the per-job `airflow:` block). Every layer has
 /// the same shape; later layers override earlier ones via shallow merge.
+///
+/// # Examples
+///
+/// ```
+/// use yard_structs::AirflowSection;
+///
+/// let section: AirflowSection = serde_json::from_value(serde_json::json!({
+///     "schedule": "@daily",
+///     "owner": "data-eng",
+///     "retries": 2
+/// })).expect("airflow section should parse");
+/// assert_eq!(section.schedule.as_deref(), Some("@daily"));
+/// assert_eq!(section.owner.as_deref(), Some("data-eng"));
+/// assert_eq!(section.retries, Some(2));
+/// ```
 ///
 /// Phase 28: `triggered_by: Vec<String>` was removed in favor of the typed
 /// `trigger: Option<Trigger>` field, and `publishes: Vec<String>` now carries

@@ -29,6 +29,10 @@ use yard_structs::{DagDiff, DiffType, JobDiff};
 ///
 /// `Modify { changes }` entries iterate in key-sorted order via the BTreeMap
 /// field type (Phase 28 / D-16).
+///
+/// # Errors
+///
+/// Returns an error if writing to the output sink fails.
 pub fn print_plan_summary(
     out: &mut impl io::Write,
     project_name: &str,
@@ -184,6 +188,7 @@ mod tests {
     }
 
     fn run(target: Option<&str>, jobs: &[JobDiff], dags: &[DagDiff]) -> String {
+        crate::utils::disable_color();
         let mut buf: Vec<u8> = Vec::new();
         print_plan_summary(&mut buf, "myproj", target, jobs, dags).unwrap();
         String::from_utf8(buf).unwrap()

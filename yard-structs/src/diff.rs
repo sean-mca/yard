@@ -3,8 +3,26 @@ use std::collections::BTreeMap;
 
 /// Classification of a change detected between the desired config and the
 /// persisted state for a job or DAG.
+///
+/// # Examples
+///
+/// ```
+/// use yard_structs::DiffType;
+/// use std::collections::BTreeMap;
+///
+/// // A new resource
+/// let create = DiffType::Create;
+///
+/// // A deleted resource
+/// let delete = DiffType::Delete;
+///
+/// // A modified resource with per-field changes
+/// let mut changes = BTreeMap::new();
+/// changes.insert("config_hash".to_string(), ("old".to_string(), "new".to_string()));
+/// let modify = DiffType::Modify { changes };
+/// ```
 #[non_exhaustive]
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum DiffType {
     /// A new resource that does not yet exist in state.
     Create,
@@ -21,7 +39,22 @@ pub enum DiffType {
 
 /// A single diff entry representing one job or DAG that changed between the
 /// desired config and the persisted state.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+///
+/// # Examples
+///
+/// ```
+/// use yard_structs::{Diff, DiffType};
+///
+/// let diff = Diff {
+///     name: "my-job".to_string(),
+///     diff_type: DiffType::Create,
+///     old_hash: None,
+///     new_hash: Some("abc123".to_string()),
+/// };
+/// assert_eq!(diff.name, "my-job");
+/// assert!(diff.old_hash.is_none());
+/// ```
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Diff {
     /// Job or DAG name this diff applies to.
     pub name: String,

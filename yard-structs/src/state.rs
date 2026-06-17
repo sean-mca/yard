@@ -8,12 +8,23 @@ use crate::config::AwsCredentialConfig;
 /// Wraps a `String` and is transparent to serde, so the JSON wire format
 /// stays `"job_name": "my-job"` (not a nested object). This preserves
 /// backward compatibility with existing state files.
+///
+/// # Examples
+///
+/// ```
+/// use yard_structs::JobName;
+///
+/// let name = JobName::new("orders-etl");
+/// assert_eq!(name.as_str(), "orders-etl");
+/// assert_eq!(format!("{name}"), "orders-etl");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct JobName(String);
 
 impl JobName {
     /// Creates a new `JobName` from any string-like value.
+    #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
     }
@@ -42,12 +53,23 @@ impl AsRef<str> for JobName {
 /// Wraps a `String` and is transparent to serde, so the JSON wire format
 /// stays `"dag_name": "my-dag"` (not a nested object). This preserves
 /// backward compatibility with existing state files.
+///
+/// # Examples
+///
+/// ```
+/// use yard_structs::DagName;
+///
+/// let name = DagName::new("analytics-dag");
+/// assert_eq!(name.as_str(), "analytics-dag");
+/// assert_eq!(format!("{name}"), "analytics-dag");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct DagName(String);
 
 impl DagName {
     /// Creates a new `DagName` from any string-like value.
+    #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
     }
@@ -129,7 +151,7 @@ pub struct Resource {
 }
 
 /// Result of verifying whether a resource still exists in AWS.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ResourceStatus {
     /// The resource being verified.
     pub resource: Resource,
@@ -204,7 +226,7 @@ pub struct DagDeployment {
 }
 
 /// Per-DAG state file, stored as `_dag_<dag_name>.json` in the state directory.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct DagState {
     /// Unique DAG name identifier.
     pub dag_name: DagName,

@@ -100,6 +100,30 @@ pub struct ApiTrigger {
 /// A trigger is either a single source, or a composite (`all` / `any`) of
 /// multiple sources. Hand-rolled `Serialize` and `Deserialize` impls enforce
 /// canonical wire forms and actionable error messages.
+///
+/// # Examples
+///
+/// ```
+/// use yard_structs::Trigger;
+///
+/// // Schedule-only trigger
+/// let schedule: Trigger = serde_json::from_value(serde_json::json!({
+///     "schedule": "@daily"
+/// })).expect("schedule trigger should parse");
+///
+/// // Dataset trigger
+/// let dataset: Trigger = serde_json::from_value(serde_json::json!({
+///     "dataset": {"uri": "s3://bucket/path"}
+/// })).expect("dataset trigger should parse");
+///
+/// // Composite trigger (all sources must fire)
+/// let composite: Trigger = serde_json::from_value(serde_json::json!({
+///     "all": [
+///         {"dataset": {"uri": "s3://a"}},
+///         {"dataset": {"uri": "s3://b"}}
+///     ]
+/// })).expect("composite trigger should parse");
+/// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Trigger {
@@ -112,6 +136,24 @@ pub enum Trigger {
 }
 
 /// A single trigger source variant.
+///
+/// # Examples
+///
+/// ```
+/// use yard_structs::SingleSource;
+///
+/// // S3 file-drop trigger
+/// let s3: SingleSource = serde_json::from_value(serde_json::json!({
+///     "s3": {"bucket": "my-bucket", "prefix": "incoming/"}
+/// })).expect("s3 source should parse");
+/// assert_eq!(s3.source_kind(), "s3");
+///
+/// // Dataset trigger
+/// let dataset: SingleSource = serde_json::from_value(serde_json::json!({
+///     "dataset": {"uri": "s3://bucket/path"}
+/// })).expect("dataset source should parse");
+/// assert_eq!(dataset.source_kind(), "dataset");
+/// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum SingleSource {
@@ -336,6 +378,7 @@ impl Trigger {
     /// Used by `yard-core/src/airflow_dag/generation.rs` to preserve the
     /// existing v1.5 dataset-trigger schedule-rendering behavior after
     /// the typed Trigger model lands.
+    #[must_use]
     pub fn dataset_uris(&self) -> Vec<&str> {
         match self {
             Trigger::Single(SingleSource::Dataset(d)) => vec![d.uri.as_str()],
@@ -356,6 +399,7 @@ impl SingleSource {
     /// the Serialize impl keys at lines 177-183 above. Used by
     /// `validate_dag_full` (TRIG-06) to render the `{kinds}` list of
     /// non-Dataset sources in heterogeneous-`any:` errors.
+    #[must_use]
     pub fn source_kind(&self) -> &'static str {
         match self {
             SingleSource::Schedule(_) => "schedule",

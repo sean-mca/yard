@@ -55,6 +55,10 @@ pub fn bold(s: &str) -> String {
 }
 
 /// Prompt the user for confirmation. Returns true if they enter "y" or "yes".
+///
+/// # Errors
+///
+/// Returns an error if flushing stdout or reading from stdin fails.
 pub fn confirm(prompt: &str) -> io::Result<bool> {
     print!("{prompt} ");
     io::stdout().flush()?;
