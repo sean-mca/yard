@@ -13,6 +13,7 @@
 //! - `transform` -- transform operations (filter, SQL, join, aggregate, window, etc.)
 
 mod helpers;
+mod pii;
 mod sink;
 mod source;
 mod transform;
@@ -24,6 +25,7 @@ use yard_structs::{JobDefinition, JobType};
 // Re-import sub-module items so they are in scope for generate_python_script
 // and for `use super::*` in the test module
 use helpers::*;
+use pii::render_pii;
 use sink::render_sink;
 use source::render_sources;
 use transform::render_transforms;
@@ -269,6 +271,9 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
     if needs_window_import(job_def) {
         extra_imports.push("from pyspark.sql.window import Window".to_string());
     }
+    if needs_pii_imports(job_def) {
+        extra_imports.push("from awsglueml.transforms import EntityDetector".to_string());
+    }
 
     let user_imports = render_imports(&job_def.imports);
     let mut all_imports = if extra_imports.is_empty() {
@@ -306,6 +311,13 @@ pub fn generate_python_script(job_name: &str, job_def: &JobDefinition) -> Result
             let sink_source = sink.source.as_deref().unwrap_or(default_source);
             if let Some(deriv) = render_partition_derivation(job_def, sink_source) {
                 parts.push(deriv);
+            }
+            if !job_def.mask_pii.is_empty() {
+                let pii_source = format!("df_{sink_source}");
+                parts.push(format!(
+                    "    # --- PII Masking ---\n{}",
+                    render_pii(&job_def.mask_pii, &pii_source)
+                ));
             }
             // Mirror job-level partition_by onto the iceberg sink so writeTo
             // emits `.partitionedBy(...)` on first table creation.
@@ -1676,6 +1688,263 @@ mod tests {
             "F import should only appear once"
         );
         assert!(script.contains("from pyspark.sql.window import Window"));
+    }
+
+    // --- PII masking ---
+
+    #[test]
+    fn pii_single_entity_generates_detect_block() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(yard_structs::Sink {
+            sink_type: "s3".to_string(),
+            format: Some("parquet".to_string()),
+            path: Some("s3://b/out".to_string()),
+            mode: Some("overwrite".to_string()),
+            ..Default::default()
+        });
+        job.mask_pii = vec!["USA_SSN".to_string()];
+        let script = generate_python_script("test_job", &job).unwrap();
+
+        // Section header (GEN-05)
+        assert!(script.contains("# --- PII Masking ---"));
+        // Import management (GEN-04)
+        assert!(script.contains("from awsglueml.transforms import EntityDetector"));
+        assert!(script.contains("from awsglue.dynamicframe import DynamicFrame"));
+        // DynamicFrame conversion sandwich (GEN-02)
+        assert!(script.contains("DynamicFrame.fromDF(df_events"));
+        assert!(script.contains(".toDF()"));
+        // EntityDetector.detect call (GEN-01)
+        assert!(script.contains("EntityDetector.detect("));
+        assert!(script.contains("\"USA_SSN\""));
+        assert!(script.contains("\"REDACT\""));
+        assert!(script.contains("\"****\""));
+        // _yard_pii_ prefix (GEN-06)
+        assert!(script.contains("_yard_pii_dyf"));
+        // Metadata column dropped (GEN-03)
+        assert!(script.contains(".drop(\"DetectedEntities\")"));
+    }
+
+    #[test]
+    fn pii_multiple_entities_all_present() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(yard_structs::Sink {
+            sink_type: "s3".to_string(),
+            format: Some("parquet".to_string()),
+            path: Some("s3://b/out".to_string()),
+            mode: Some("overwrite".to_string()),
+            ..Default::default()
+        });
+        job.mask_pii = vec![
+            "USA_SSN".to_string(),
+            "CREDIT_CARD".to_string(),
+            "EMAIL".to_string(),
+        ];
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(script.contains("\"USA_SSN\""));
+        assert!(script.contains("\"CREDIT_CARD\""));
+        assert!(script.contains("\"EMAIL\""));
+    }
+
+    #[test]
+    fn pii_block_between_transforms_and_sink() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.transforms = vec![yard_structs::Transform {
+            transform_type: "filter".to_string(),
+            condition: Some("col('active')".to_string()),
+            ..Default::default()
+        }];
+        job.sink = Some(yard_structs::Sink {
+            sink_type: "s3".to_string(),
+            format: Some("parquet".to_string()),
+            path: Some("s3://b/out".to_string()),
+            mode: Some("overwrite".to_string()),
+            ..Default::default()
+        });
+        job.mask_pii = vec!["USA_SSN".to_string()];
+        let script = generate_python_script("test_job", &job).unwrap();
+
+        let transforms_pos = script
+            .find("# --- Transforms ---")
+            .expect("Transforms section must exist");
+        let pii_pos = script
+            .find("# --- PII Masking ---")
+            .expect("PII Masking section must exist");
+        let sink_pos = script
+            .find("# --- Sink ---")
+            .expect("Sink section must exist");
+        assert!(
+            transforms_pos < pii_pos,
+            "PII block must come after transforms"
+        );
+        assert!(pii_pos < sink_pos, "PII block must come before sink");
+    }
+
+    #[test]
+    fn pii_uses_sink_source_variable() {
+        let mut job = base_job();
+        job.sources = vec![
+            s3_source("orders", "s3://b/orders"),
+            s3_source("customers", "s3://b/customers"),
+        ];
+        job.transforms = vec![yard_structs::Transform {
+            transform_type: "join".to_string(),
+            output: Some("enriched".to_string()),
+            left: Some("orders".to_string()),
+            right: Some("customers".to_string()),
+            on: Some("customer_id".to_string()),
+            how: Some("left".to_string()),
+            ..Default::default()
+        }];
+        job.sink = Some(yard_structs::Sink {
+            source: Some("enriched".to_string()),
+            sink_type: "s3".to_string(),
+            format: Some("parquet".to_string()),
+            path: Some("s3://b/out".to_string()),
+            mode: Some("overwrite".to_string()),
+            ..Default::default()
+        });
+        job.mask_pii = vec!["USA_SSN".to_string()];
+        let script = generate_python_script("test_job", &job).unwrap();
+
+        // PII block operates on the sink source variable, not the first source
+        assert!(script.contains("DynamicFrame.fromDF(df_enriched"));
+        assert!(script.contains("df_enriched = _yard_pii_dyf.toDF()"));
+    }
+
+    #[test]
+    fn pii_empty_mask_no_artifacts() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(yard_structs::Sink {
+            sink_type: "s3".to_string(),
+            format: Some("parquet".to_string()),
+            path: Some("s3://b/out".to_string()),
+            mode: Some("overwrite".to_string()),
+            ..Default::default()
+        });
+        // mask_pii is empty (default)
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(
+            !script.contains("EntityDetector"),
+            "empty mask_pii should produce no EntityDetector reference"
+        );
+        assert!(
+            !script.contains("_yard_pii_"),
+            "empty mask_pii should produce no _yard_pii_ variables"
+        );
+        assert!(
+            !script.contains("PII Masking"),
+            "empty mask_pii should produce no PII Masking section"
+        );
+        assert!(
+            !script.contains("awsglueml"),
+            "empty mask_pii should produce no awsglueml import"
+        );
+    }
+
+    #[test]
+    fn pii_body_override_skips_pii() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.body = Some("print('custom')".to_string());
+        job.mask_pii = vec!["USA_SSN".to_string()];
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(
+            !script.contains("EntityDetector"),
+            "body override must skip PII codegen"
+        );
+        assert!(
+            !script.contains("_yard_pii_"),
+            "body override must produce no PII variables"
+        );
+        assert!(
+            script.contains("print('custom')"),
+            "body content must still be present"
+        );
+    }
+
+    #[test]
+    fn pii_job_file_skips_pii() {
+        let dir = std::env::temp_dir().join(format!("yard_pii_jf_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script_path = dir.join("external.py");
+        std::fs::write(&script_path, "print('external')\n").unwrap();
+
+        let mut job = base_job();
+        job.job_file = Some(script_path.to_string_lossy().to_string());
+        job.mask_pii = vec!["USA_SSN".to_string()];
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(
+            !script.contains("EntityDetector"),
+            "job_file must skip PII codegen"
+        );
+        assert!(
+            !script.contains("_yard_pii_"),
+            "job_file must produce no PII variables"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pii_no_duplicate_dynamicframe_import() {
+        let mut job = base_job();
+        // Catalog source already triggers DynamicFrame import
+        job.sources = vec![yard_structs::Source {
+            name: "catalog_src".to_string(),
+            source_type: "catalog".to_string(),
+            database: Some("mydb".to_string()),
+            table: Some("mytable".to_string()),
+            ..Default::default()
+        }];
+        job.sink = Some(yard_structs::Sink {
+            sink_type: "s3".to_string(),
+            format: Some("parquet".to_string()),
+            path: Some("s3://b/out".to_string()),
+            mode: Some("overwrite".to_string()),
+            ..Default::default()
+        });
+        job.mask_pii = vec!["USA_SSN".to_string()];
+        let script = generate_python_script("test_job", &job).unwrap();
+
+        let count = script
+            .matches("from awsglue.dynamicframe import DynamicFrame")
+            .count();
+        assert_eq!(
+            count, 1,
+            "DynamicFrame import must appear exactly once, found {count}"
+        );
+    }
+
+    #[test]
+    fn pii_existing_non_pii_jobs_unchanged() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(yard_structs::Sink {
+            sink_type: "s3".to_string(),
+            format: Some("parquet".to_string()),
+            path: Some("s3://b/out".to_string()),
+            mode: Some("overwrite".to_string()),
+            ..Default::default()
+        });
+        // No mask_pii set (default empty vec)
+        let script = generate_python_script("test_job", &job).unwrap();
+        assert!(
+            !script.contains("_yard_pii_"),
+            "non-PII job must have no PII variables"
+        );
+        assert!(
+            !script.contains("awsglueml"),
+            "non-PII job must have no awsglueml import"
+        );
+        // Regression: sink write line still present
+        assert!(
+            script.contains("df_events.write.format(\"parquet\").mode(\"overwrite\").save(\"s3://b/out\")"),
+            "sink write line must be present for non-PII job"
+        );
     }
 
 }

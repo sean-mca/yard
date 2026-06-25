@@ -330,6 +330,10 @@ pub(super) fn needs_window_import(job_def: &JobDefinition) -> bool {
 
 /// True when the generated script needs
 /// `from awsglue.dynamicframe import DynamicFrame`.
+///
+/// Covers catalog sources/sinks, glue-engine S3/JDBC sources, and PII
+/// masking (which requires `DynamicFrame.fromDF()` / `.toDF()` for the
+/// `EntityDetector.detect()` sandwich).
 #[inline]
 #[must_use]
 pub(super) fn needs_dynamic_frame_import(job_def: &JobDefinition, default_engine: &str) -> bool {
@@ -342,6 +346,7 @@ pub(super) fn needs_dynamic_frame_import(job_def: &JobDefinition, default_engine
                 || (matches!(s.source_type.as_str(), "s3" | "jdbc")
                     && effective_engine(s, default_engine) == "glue")
         })
+        || needs_pii_imports(job_def)
 }
 
 /// True when any source is an API source, requiring `import requests`.
@@ -349,6 +354,18 @@ pub(super) fn needs_dynamic_frame_import(job_def: &JobDefinition, default_engine
 #[must_use]
 pub(super) fn needs_requests_import(job_def: &JobDefinition) -> bool {
     job_def.sources.iter().any(|s| s.source_type == "api")
+}
+
+/// True when the generated script needs the `EntityDetector` import
+/// for PII masking.
+///
+/// Returns `true` only when `mask_pii` is non-empty AND neither `body`
+/// nor `job_file` is set (D-01, D-02 -- those paths skip codegen
+/// entirely).
+#[inline]
+#[must_use]
+pub(super) fn needs_pii_imports(job_def: &JobDefinition) -> bool {
+    !job_def.mask_pii.is_empty() && job_def.body.is_none() && job_def.job_file.is_none()
 }
 
 /// Determine the default Spark engine (`"spark"` or `"glue"`) for a job
