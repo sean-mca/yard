@@ -81,6 +81,24 @@
         "type": "bash",
         "command": "echo hi"
       }
+    },
+    "pii-glue": {
+      "job_type": "glue",
+      "imports": [],
+      "body": null,
+      "job_file": null,
+      "sources": [],
+      "sink": null,
+      "transforms": [],
+      "mask_pii": ["USA_SSN", "CREDIT_CARD"],
+      "airflow": null,
+      "partition_by": [],
+      "partition_timestamp_column": null,
+      "create_timestamp": false,
+      "config": {
+        "type": "glue",
+        "role": "arn:aws:iam::555555555555:role/PiiRole"
+      }
     }
   },
   "aws": {

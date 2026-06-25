@@ -2108,4 +2108,140 @@ mod tests {
             "task_id '_yard_wait_s3' is reserved for trigger codegen — rename your task"
         );
     }
+
+    // --- Phase 60 plan 60-02: mask_pii validation (VAL-01, VAL-02, VAL-03) ---
+
+    #[test]
+    fn mask_pii_valid_glue_passes() {
+        let mut job = minimal_job();
+        job.mask_pii = vec![
+            "USA_SSN".into(),
+            "CREDIT_CARD".into(),
+            "EMAIL".into(),
+        ];
+        let errors = validate_job(&job);
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn mask_pii_emr_rejected() {
+        let mut job = minimal_job();
+        job.job_type = JobType::Emr;
+        job.config = json!({"type": "emr"});
+        job.mask_pii = vec!["USA_SSN".into()];
+        let errors = validate_job(&job);
+        assert!(
+            errors.iter().any(|e| e.field == "mask_pii"
+                && e.message.contains("only supported for glue jobs")),
+            "expected job-type rejection error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn mask_pii_bash_rejected() {
+        // Validates Pitfall 3: bash triggers is_task_only early return, but
+        // the mask_pii block is placed BEFORE that return so this still fires.
+        let job = JobDefinition {
+            job_type: JobType::Bash,
+            config: json!({"type": "bash", "command": "echo hi"}),
+            mask_pii: vec!["USA_SSN".into()],
+            ..Default::default()
+        };
+        let errors = validate_job(&job);
+        assert!(
+            errors.iter().any(|e| e.field == "mask_pii"
+                && e.message.contains("only supported for glue jobs")),
+            "expected job-type rejection error for bash, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn mask_pii_bad_format_rejected() {
+        let mut job = minimal_job();
+        job.mask_pii = vec![
+            "usa_ssn".into(),
+            "123BAD".into(),
+            "GOOD_ONE".into(),
+        ];
+        let errors = validate_job(&job);
+        assert!(
+            errors.iter().any(|e| e.field == "mask_pii[0]"
+                && e.message.contains("not valid SCREAMING_SNAKE_CASE")),
+            "expected format error at index 0, got: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.field == "mask_pii[1]"
+                && e.message.contains("not valid SCREAMING_SNAKE_CASE")),
+            "expected format error at index 1, got: {errors:?}"
+        );
+        // GOOD_ONE is valid — no error at index 2
+        assert!(
+            !errors.iter().any(|e| e.field == "mask_pii[2]"),
+            "GOOD_ONE should pass format check, but got error at index 2: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn mask_pii_empty_string_rejected() {
+        let mut job = minimal_job();
+        job.mask_pii = vec!["".into(), "USA_SSN".into()];
+        let errors = validate_job(&job);
+        assert!(
+            errors.iter().any(|e| e.field == "mask_pii[0]"
+                && e.message.contains("must not be empty")),
+            "expected empty-string error at index 0, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn mask_pii_duplicates_rejected() {
+        let mut job = minimal_job();
+        job.mask_pii = vec![
+            "USA_SSN".into(),
+            "CREDIT_CARD".into(),
+            "USA_SSN".into(),
+        ];
+        let errors = validate_job(&job);
+        assert!(
+            errors.iter().any(|e| e.field == "mask_pii"
+                && e.message.contains("duplicate entity type 'USA_SSN'")),
+            "expected duplicate error for USA_SSN, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn mask_pii_all_errors_accumulated() {
+        // D-07: all three checks run regardless of earlier failures.
+        // EMR job with bad-format duplicates should produce errors for:
+        // 1) job-type (EMR != Glue)
+        // 2) format (usa_ssn is not SCREAMING_SNAKE)
+        // 3) duplicate (usa_ssn appears twice)
+        let job = JobDefinition {
+            job_type: JobType::Emr,
+            config: json!({"type": "emr"}),
+            mask_pii: vec!["usa_ssn".into(), "usa_ssn".into()],
+            ..Default::default()
+        };
+        let errors = validate_job(&job);
+        assert!(
+            errors.len() >= 3,
+            "expected at least 3 errors (job-type + format + duplicate), got {}: {errors:?}",
+            errors.len()
+        );
+        assert!(
+            errors.iter().any(|e| e.field == "mask_pii"
+                && e.message.contains("only supported for glue jobs")),
+            "missing job-type error: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.field.starts_with("mask_pii[")
+                && e.message.contains("not valid SCREAMING_SNAKE_CASE")),
+            "missing format error: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.field == "mask_pii"
+                && e.message.contains("duplicate entity type")),
+            "missing duplicate error: {errors:?}"
+        );
+    }
 }

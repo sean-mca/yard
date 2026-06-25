@@ -471,6 +471,9 @@ pub struct JobDefinition {
     /// In-flight data transformations applied between source reads and sink write.
     #[serde(default)]
     pub transforms: Vec<Transform>,
+    /// PII entity types to detect and redact in the generated script.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mask_pii: Vec<String>,
     /// Per-job Airflow metadata, parsed from the optional `airflow:` block.
     /// `None` means the job does not participate in any DAG.
     pub airflow: Option<AirflowJobBlock>,
@@ -518,6 +521,7 @@ impl Default for JobDefinition {
             sources: Vec::new(),
             sink: None,
             transforms: Vec::new(),
+            mask_pii: Vec::new(),
             airflow: None,
             partition_by: Vec::new(),
             partition_timestamp_column: None,
@@ -1482,5 +1486,42 @@ mod tests {
         let deserialized: DiscoveredEnvironment =
             serde_json::from_value(serialized).unwrap();
         assert_eq!(deserialized, env);
+    }
+
+    // --- mask_pii serde (CFG-01, CFG-02, CFG-03) ---
+
+    #[test]
+    fn mask_pii_empty_omitted_from_json() {
+        // CFG-02/CFG-03: skip_serializing_if = "Vec::is_empty" must omit
+        // the mask_pii key when the vec is empty.
+        let job = JobDefinition::default();
+        assert!(job.mask_pii.is_empty());
+        let serialized = serde_json::to_value(&job).unwrap();
+        assert!(
+            serialized.get("mask_pii").is_none(),
+            "empty mask_pii must be omitted from JSON output, got: {serialized}"
+        );
+    }
+
+    #[test]
+    fn mask_pii_present_round_trips() {
+        // CFG-01/CFG-03: a populated mask_pii vec must serialize with the
+        // key present and round-trip back to the same elements.
+        let job = JobDefinition {
+            mask_pii: vec!["USA_SSN".into(), "CREDIT_CARD".into()],
+            ..Default::default()
+        };
+        let serialized = serde_json::to_value(&job).unwrap();
+        let mask_pii_val = serialized
+            .get("mask_pii")
+            .expect("mask_pii key must be present when non-empty");
+        assert_eq!(mask_pii_val, &json!(["USA_SSN", "CREDIT_CARD"]));
+
+        // Round-trip: deserialize back and verify
+        let deserialized: JobDefinition =
+            serde_json::from_value(serialized).unwrap();
+        assert_eq!(deserialized.mask_pii.len(), 2);
+        assert_eq!(deserialized.mask_pii[0], "USA_SSN");
+        assert_eq!(deserialized.mask_pii[1], "CREDIT_CARD");
     }
 }

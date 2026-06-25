@@ -58,8 +58,8 @@ pub use orchestrate::{
 pub use parsing::{
     merge_airflow_sections, parse_airflow_job_block, parse_airflow_section,
     parse_body, parse_create_timestamp, parse_imports, parse_job_file,
-    parse_partition_by, parse_partition_timestamp_column, parse_sink,
-    parse_sources, parse_transforms,
+    parse_mask_pii, parse_partition_by, parse_partition_timestamp_column,
+    parse_sink, parse_sources, parse_transforms,
 };
 pub use show::{show, show_dag, show_dag_with_state};
 pub use list_targets::{list_targets, TargetRow};

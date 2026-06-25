@@ -822,6 +822,7 @@ mod tests {
             sink,
             transforms,
             airflow,
+            mask_pii: Vec::new(),
             partition_by: Vec::new(),
             partition_timestamp_column: None,
             create_timestamp: false,

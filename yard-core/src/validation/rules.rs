@@ -6,7 +6,9 @@
 //! provider-specific config. Errors are collected (never short-circuit)
 //! so users see every violation in a single pass.
 
+use regex::Regex;
 use std::collections::HashSet;
+use std::sync::LazyLock;
 use yard_structs::{JdbcAuth, JobDefinition, JobType, ValidationError};
 
 /// Supported source types for Spark jobs.
@@ -32,6 +34,16 @@ const SUPPORTED_TRANSFORM_TYPES: &[&str] = &[
     "window",
 ];
 
+/// Regex for SCREAMING_SNAKE_CASE entity types (D-02).
+///
+/// Alpha-first, no leading/trailing/double underscores, no digits in first
+/// position. Examples: `USA_SSN`, `CREDIT_CARD`, `EMAIL`.
+static SCREAMING_SNAKE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // SAFETY: this is a compile-time constant pattern that always succeeds.
+    #[allow(clippy::expect_used)]
+    Regex::new(r"^[A-Z][A-Z0-9]*(_[A-Z0-9]+)*$").expect("static regex")
+});
+
 /// Single canonical [`ValidationError`] constructor, re-exported from
 /// [`crate::providers::validation_err`] so call sites in this module stay terse.
 pub use crate::providers::validation_err as err;
@@ -49,6 +61,52 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
     // "lowercase"` attribute. Unknown wire strings are rejected at parse time
     // with serde's "unknown variant" error, so the previous
     // `SUPPORTED_JOB_TYPES.contains(...)` arm is no longer reachable here.
+
+    // mask_pii validation (VAL-01/VAL-02/VAL-03).
+    //
+    // Placed BEFORE the is_task_only early return so that task-only job types
+    // (bash, ...) with mask_pii still get the job-type rejection (Pitfall 3).
+    // All three checks run independently per D-07 — no short-circuit.
+    if !job.mask_pii.is_empty() {
+        // D-08 order: job-type → format → duplicates
+
+        // VAL-01 (D-15): job-type restriction — Glue only
+        if job.job_type != JobType::Glue {
+            errors.push(err(
+                "mask_pii",
+                "pii masking is only supported for glue jobs",
+            ));
+        }
+
+        // VAL-02 (D-03/D-16/D-18/D-19): per-element format validation
+        for (i, entity) in job.mask_pii.iter().enumerate() {
+            if entity.is_empty() {
+                errors.push(err(
+                    &format!("mask_pii[{i}]"),
+                    "entity type must not be empty",
+                ));
+            } else if !SCREAMING_SNAKE_RE.is_match(entity) {
+                errors.push(err(
+                    &format!("mask_pii[{i}]"),
+                    &format!(
+                        "'{entity}' is not valid SCREAMING_SNAKE_CASE (e.g. USA_SSN, CREDIT_CARD)"
+                    ),
+                ));
+            }
+        }
+
+        // VAL-03 (D-04/D-17): duplicate detection — exact match, all elements
+        // (not just format-valid ones, per Pitfall 5/D-07)
+        let mut seen = HashSet::with_capacity(job.mask_pii.len());
+        for entity in &job.mask_pii {
+            if !seen.insert(entity.as_str()) {
+                errors.push(err(
+                    "mask_pii",
+                    &format!("duplicate entity type '{entity}'"),
+                ));
+            }
+        }
+    }
 
     // Task-only job types (bash, ...) take a separate path — they don't have
     // sources/sinks/transforms and don't deploy anywhere. Validate them here

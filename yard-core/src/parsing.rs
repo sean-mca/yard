@@ -398,6 +398,20 @@ pub fn merge_airflow_sections(base: &AirflowSection, overlay: &AirflowSection) -
     }
 }
 
+/// Extract the `mask_pii` entity type list from a job config.
+#[must_use]
+pub fn parse_mask_pii(config: &Value) -> Vec<String> {
+    config
+        .get("mask_pii")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Extract the `partition_by` column list from a job config.
 #[must_use]
 pub fn parse_partition_by(config: &Value) -> Vec<String> {

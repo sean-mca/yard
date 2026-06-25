@@ -332,6 +332,7 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
             resolved.to_string_lossy().to_string()
         });
 
+        let mask_pii = crate::parse_mask_pii(&config);
         let partition_by = crate::parse_partition_by(&config);
         let partition_timestamp_column = crate::parse_partition_timestamp_column(&config);
         let create_timestamp = crate::parse_create_timestamp(&config);
@@ -347,6 +348,7 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
                 sink,
                 transforms,
                 airflow,
+                mask_pii,
                 partition_by,
                 partition_timestamp_column,
                 create_timestamp,
