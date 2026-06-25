@@ -174,6 +174,7 @@ Defined by `JobDefinition` in `yard-structs/src/config.rs`.
 | `job_file` | string | No | Path to an external Python file that replaces codegen entirely. |
 | `airflow` | object | No | Per-job Airflow metadata (`depends_on`, `publishes`, plus overrides for `schedule`/`owner`/`retries`/etc.). |
 | `partition_by` | array | No | Iceberg partition columns. Only `year`, `month`, `day` are supported. |
+| `mask_pii` | array | No | PII entity types to detect and redact (Glue only). See [`mask_pii`](#mask_pii) below. |
 | `partition_timestamp_column` | string | No | Existing timestamp column to derive year/month/day from. Mutually exclusive with `create_timestamp`. |
 | `create_timestamp` | bool | No | If true, adds `ingestion_timestamp = current_timestamp()` and derives partitions. Mutually exclusive with `partition_timestamp_column`. |
 | `config` | object | No | Free-form provider-specific config merged with `providers.<type>` from `yard.yaml`. |
@@ -390,6 +391,70 @@ transforms:
       - column: created_at
         desc: true
 ```
+
+#### `mask_pii`
+
+`mask_pii` declares which PII entity types to detect and redact in the
+generated Glue script. Each entry names an AWS entity type; the codegen
+emits a single `EntityDetector.detect()` call that handles all listed
+types in one pass.
+
+Defined by `JobDefinition` in `yard-structs/src/config.rs`.
+
+**Worked example:**
+
+```yaml
+# orders.yaml
+type: glue
+sources:
+  - name: events
+    type: s3
+    format: parquet
+    path: s3://data-lake/raw/events/
+mask_pii:
+  - USA_SSN
+  - CREDIT_CARD
+  - EMAIL
+sink:
+  type: s3
+  format: parquet
+  path: s3://data-lake/clean/events/
+  mode: overwrite
+```
+
+**What the generated code does:**
+
+After all transforms run and before the sink write, the codegen inserts a
+PII masking block that:
+
+1. Converts the sink DataFrame to a `DynamicFrame` via
+   `DynamicFrame.fromDF()`.
+2. Calls `EntityDetector.detect()` with a fine-grained
+   `detectionParameters` dict — one key per entity type, each configured
+   with `REDACT` action and `"****"` mask text.
+3. Converts the result back to a DataFrame via `.toDF()`.
+4. Drops the `DetectedEntities` metadata column that `EntityDetector`
+   appends.
+
+All intermediate variables use the `_yard_pii_` prefix to avoid
+collisions with user-defined names.
+
+**Constraints:**
+
+- **Glue 3.0+ required.** `EntityDetector` is part of the
+  `awsglueml.transforms` module available in Glue 3.0 and later. Jobs
+  targeting earlier Glue versions will fail at runtime.
+- **`body` / `job_file` silently skips PII.** When either override is
+  set, yard replaces codegen entirely — the `mask_pii` entries have no
+  effect. No warning is emitted because the override is intentional.
+- **EMR and Bash jobs are not supported.** Setting `mask_pii` on a
+  non-Glue job type is rejected at validation.
+
+**Entity type format:** Values must be `SCREAMING_SNAKE_CASE` (e.g.
+`USA_SSN`, `CREDIT_CARD`, `EMAIL`). Duplicates are rejected at
+validation. The full list of supported entity types is defined by AWS —
+see the
+[AWS Glue PII detection documentation](https://docs.aws.amazon.com/glue/latest/dg/detect-PII.html).
 
 ### `dag.yaml` (DAG marker)
 
