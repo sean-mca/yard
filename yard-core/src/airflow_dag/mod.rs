@@ -22,7 +22,7 @@ use yard_structs::JobState;
 // Re-export sub-module items as public API
 pub use collection::collect_dags;
 pub use connections::{derive_aws_conn_id, required_connections_for_dag};
-pub(crate) use connections::parse_account_from_role_arn;
+pub use connections::parse_account_from_role_arn;
 pub use generation::generate_dag;
 pub use helpers::validate_orphan_airflow_blocks;
 

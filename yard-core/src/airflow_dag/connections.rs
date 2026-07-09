@@ -91,7 +91,7 @@ fn typed_assume_role(c: &AwsCredentialConfig) -> Option<&str> {
 /// `arn:aws:iam::<12-digit-account>:role/<name>` format, including
 /// missing prefix, non-12-digit account, missing `role/` segment, or
 /// empty role name.
-pub(crate) fn parse_account_from_role_arn(role_arn: &str) -> Result<String> {
+pub fn parse_account_from_role_arn(role_arn: &str) -> Result<String> {
     let rest = role_arn
         .strip_prefix("arn:aws:iam::")
         .ok_or_else(|| anyhow!("malformed role ARN '{role_arn}': expected 'arn:aws:iam::...'"))?;
