@@ -1,5 +1,5 @@
 name: Install yard
-description: Download the yard binary, verify its SHA256 checksum, and add it to PATH. Linux x86_64 only.
+description: Download the yard binary for the current runner platform, verify its SHA256 checksum, and add it to PATH.
 inputs:
   version:
     description: yard release tag (e.g. v1.3.4)
@@ -13,19 +13,39 @@ runs:
       run: |
         set -euo pipefail
 
-        if [ "${RUNNER_OS:-}" != "Linux" ] || [ "${RUNNER_ARCH:-}" != "X64" ]; then
-          echo "::error::yard composite action supports only Linux x86_64 runners (got os=${RUNNER_OS:-unknown} arch=${RUNNER_ARCH:-unknown})"
-          exit 1
-        fi
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64)
+            TARGET="x86_64-unknown-linux-gnu"
+            ;;
+          Linux-ARM64)
+            TARGET="aarch64-unknown-linux-gnu"
+            ;;
+          macOS-X64)
+            TARGET="x86_64-apple-darwin"
+            ;;
+          macOS-ARM64)
+            TARGET="aarch64-apple-darwin"
+            ;;
+          *)
+            echo "::error::Unsupported platform: os=${RUNNER_OS:-unknown} arch=${RUNNER_ARCH:-unknown}. Supported: Linux-X64, Linux-ARM64, macOS-X64, macOS-ARM64."
+            exit 1
+            ;;
+        esac
 
-        base="https://github.com/sean-mca/yard/releases/download/${YARD_VERSION}"
+        VERSION="${YARD_VERSION#v}"
+        TARBALL="yard-${VERSION}-${TARGET}.tar.gz"
+        BASE_URL="https://github.com/sean-mca/yard/releases/download/${YARD_VERSION}"
+
         tmp="$(mktemp -d)"
-        curl -fsSL -o "$tmp/yard-linux-x86_64" "$base/yard-linux-x86_64"
-        curl -fsSL -o "$tmp/yard-linux-x86_64.sha256" "$base/yard-linux-x86_64.sha256"
-        (cd "$tmp" && sha256sum -c yard-linux-x86_64.sha256)
+        curl -fsSL -o "$tmp/${TARBALL}" "${BASE_URL}/${TARBALL}"
+        curl -fsSL -o "$tmp/SHA256SUMS" "${BASE_URL}/SHA256SUMS"
+
+        (cd "$tmp" && grep "${TARBALL}" SHA256SUMS | shasum -a 256 -c -)
+
+        tar -xzf "$tmp/${TARBALL}" -C "$tmp"
 
         bin_dir="$HOME/.local/bin"
         mkdir -p "$bin_dir"
-        install -m 0755 "$tmp/yard-linux-x86_64" "$bin_dir/yard"
+        install -m 0755 "$tmp/yard" "$bin_dir/yard"
         echo "$bin_dir" >> "$GITHUB_PATH"
         "$bin_dir/yard" --version
