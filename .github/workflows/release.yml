@@ -1,0 +1,176 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  validate-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate tag matches Cargo.toml
+        id: version
+        env:
+          TAG_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${TAG_REF#v}"
+          CARGO_VERSION=$(grep '^version' yard-cli/Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VERSION) does not match yard-cli/Cargo.toml version ($CARGO_VERSION)"
+            exit 1
+          fi
+          echo "Version validated: $TAG_VERSION"
+          echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate-version
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          cargo build --release -p yard
+
+      - name: Package
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          TARBALL="yard-${VERSION}-${{ matrix.target }}.tar.gz"
+          tar -C target/release -czf "$TARBALL" yard
+          shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            yard-*.tar.gz
+            yard-*.tar.gz.sha256
+
+  release:
+    needs: [validate-version, build]
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ needs.validate-version.outputs.version }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          cat *.sha256 > SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            yard-*.tar.gz
+            SHA256SUMS
+
+  update-homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tap repository
+        uses: actions/checkout@v4
+        with:
+          repository: sean-mca/homebrew-yard
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Update formula
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/sean-mca/yard/releases/download/v${VERSION}"
+
+          curl -fsSL -o /tmp/SHA256SUMS "$BASE/SHA256SUMS"
+
+          SHA_MACOS_ARM=$(grep "aarch64-apple-darwin" /tmp/SHA256SUMS | awk '{print $1}')
+          SHA_MACOS_X86=$(grep "x86_64-apple-darwin" /tmp/SHA256SUMS | awk '{print $1}')
+          SHA_LINUX_ARM=$(grep "aarch64-unknown-linux-gnu" /tmp/SHA256SUMS | awk '{print $1}')
+          SHA_LINUX_X86=$(grep "x86_64-unknown-linux-gnu" /tmp/SHA256SUMS | awk '{print $1}')
+
+          mkdir -p Formula
+
+          cat > Formula/yard.rb << EOF
+          class Yard < Formula
+            desc "Data engineering CLI - hierarchical config, Glue/EMR providers, DAG generation"
+            homepage "https://github.com/sean-mca/yard"
+            version "${VERSION}"
+            license "BUSL-1.1"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/sean-mca/yard/releases/download/v#{version}/yard-#{version}-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_MACOS_ARM}"
+              else
+                url "https://github.com/sean-mca/yard/releases/download/v#{version}/yard-#{version}-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_MACOS_X86}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/sean-mca/yard/releases/download/v#{version}/yard-#{version}-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LINUX_ARM}"
+              else
+                url "https://github.com/sean-mca/yard/releases/download/v#{version}/yard-#{version}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LINUX_X86}"
+              end
+            end
+
+            def install
+              bin.install "yard"
+            end
+
+            test do
+              system "#{bin}/yard", "--version"
+            end
+          end
+          EOF
+
+      - name: Commit and push
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/yard.rb
+          git diff --cached --quiet || git commit -m "yard ${VERSION}"
+          git push
