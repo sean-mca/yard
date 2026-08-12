@@ -1,6 +1,6 @@
 [package]
 name = "yard"
-version = "0.7.3"
+version = "1.14.2"
 edition = "2024"
 
 [lints]

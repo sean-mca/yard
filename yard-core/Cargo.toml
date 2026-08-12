@@ -1,6 +1,6 @@
 [package]
 name = "yard-core"
-version = "0.7.3"
+version = "1.14.2"
 edition = "2024"
 
 [lints]

@@ -865,6 +865,31 @@ mod tests {
     }
 
     #[test]
+    fn existing_table_branch_reorders_columns_to_match_table() {
+        let script = iceberg_script();
+        let (new_table, existing) = split_branches(&script);
+        assert!(existing.contains("_existing_cols = spark.table(_tbl).columns"));
+        assert!(existing.contains("_ordered = [_c for _c in _existing_cols if _c in df_events.columns]"));
+        assert!(existing.contains("_new = [_c for _c in df_events.columns if _c not in _existing_cols]"));
+        assert!(existing.contains("df_events = df_events.select(_ordered + _new)"));
+        assert!(!new_table.contains("_existing_cols"));
+    }
+
+    #[test]
+    fn column_reorder_present_when_fill_nulls_false() {
+        let mut job = base_job();
+        job.sources = vec![s3_source("events", "s3://b/in")];
+        job.sink = Some(iceberg_sink("analytics", "events", None));
+        if let Some(s) = job.sink.as_mut() {
+            s.fill_nulls = Some(false);
+        }
+        let script = generate_python_script("test_job", &job).unwrap();
+        let (_new_table, existing) = split_branches(&script);
+        assert!(existing.contains("_existing_cols = spark.table(_tbl).columns"));
+        assert!(existing.contains("df_events = df_events.select(_ordered + _new)"));
+    }
+
+    #[test]
     fn existing_table_branch_overwrite_maps_to_overwrite_partitions() {
         let mut job = base_job();
         job.sources = vec![s3_source("events", "s3://b/in")];

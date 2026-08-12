@@ -182,13 +182,19 @@ pub(super) fn render_sink(sink: &Sink, default_source: &str, fill_nulls: bool, c
             } else {
                 String::new()
             };
+            let column_order = format!(
+                "_existing_cols = spark.table(_tbl).columns\n        \
+                 _ordered = [_c for _c in _existing_cols if _c in {var}.columns]\n        \
+                 _new = [_c for _c in {var}.columns if _c not in _existing_cols]\n        \
+                 {var} = {var}.select(_ordered + _new)\n        "
+            );
             lines.push(format!(
                 "    if not spark.catalog.tableExists(_tbl):\n        \
                      {new_table_coerce}({var}.writeTo(_tbl)\n            \
                          .using(\"iceberg\"){partition_clause}{tbl_props}\n            \
                          .create())\n    \
                  else:\n        \
-                     {existing_table_coerce}{var}.writeTo(_tbl).option(\"merge-schema\", \"true\").{write_op}()"
+                     {existing_table_coerce}{column_order}{var}.writeTo(_tbl).option(\"merge-schema\", \"true\").{write_op}()"
             ));
         }
         other => {
