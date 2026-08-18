@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Phase 12 regression tests for `yard apply --target <name>`.
 //!
 //! These call `yard_core::orchestrate::apply` directly with `dry_run = true`

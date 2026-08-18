@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Phase 13 regression tests for `yard plan --target <name>`.
 //!
 //! These call `yard_core::plan` directly with `StateBackend::Local` pointing

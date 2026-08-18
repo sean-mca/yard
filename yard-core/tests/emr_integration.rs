@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Integration tests for the EMR provider against ministack.
 //!
 //! Prerequisites:

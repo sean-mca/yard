@@ -143,8 +143,8 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     use yard_structs::{
-        AirflowJobBlock, AirflowMajorVersion, AwsCredentialConfig, Deployment, DeploymentStatus,
-        JobName, JobType, ProjectManifest, Resource, StateBackend,
+        AirflowJobBlock, AwsCredentialConfig, Deployment, DeploymentStatus, JobName, JobType,
+        ProjectManifest, Resource, StateBackend,
     };
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
