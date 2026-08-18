@@ -1415,7 +1415,7 @@ mod tests {
             let input = json!(input_str);
             let parsed: AirflowMajorVersion = serde_json::from_value(input).unwrap();
             assert_eq!(parsed, expected);
-            let reser = serde_json::to_value(&parsed).unwrap();
+            let reser = serde_json::to_value(parsed).unwrap();
             assert_eq!(reser, json!(input_str), "must serialize back to string form");
         }
     }
@@ -1428,7 +1428,7 @@ mod tests {
             let parsed: AirflowMajorVersion = serde_json::from_value(input).unwrap();
             assert_eq!(parsed, expected);
             // D-08: serialization always emits string form
-            let reser = serde_json::to_value(&parsed).unwrap();
+            let reser = serde_json::to_value(parsed).unwrap();
             assert_eq!(reser, json!(input_int.to_string()), "integer input must serialize as string");
         }
     }
