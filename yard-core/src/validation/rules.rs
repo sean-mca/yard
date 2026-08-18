@@ -152,43 +152,43 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
         match source.source_type.as_str() {
             "s3" => {
                 if source.path.is_none() {
-                    errors.push(err(&prefix.to_string(), "type \"s3\" requires \"path\""));
+                    errors.push(err(&prefix, "type \"s3\" requires \"path\""));
                 }
             }
             "jdbc" => {
                 if source.connection_url.is_none() && source.auth.is_none() {
                     errors.push(err(
-                        &prefix.to_string(),
+                        &prefix,
                         "type \"jdbc\" requires \"connection_url\" or \"auth\" (to derive the URL)",
                     ));
                 }
                 if source.connection_url.is_none() && source.auth.is_some() {
                     if source.connection_type.is_none() {
                         errors.push(err(
-                            &prefix.to_string(),
+                            &prefix,
                             "type \"jdbc\" requires \"connection_type\" when \"connection_url\" is not set",
                         ));
                     }
                     if source.database.is_none() {
                         errors.push(err(
-                            &prefix.to_string(),
+                            &prefix,
                             "type \"jdbc\" requires \"database\" when \"connection_url\" is not set",
                         ));
                     }
                 }
                 if source.table.is_none() {
-                    errors.push(err(&prefix.to_string(), "type \"jdbc\" requires \"table\""));
+                    errors.push(err(&prefix, "type \"jdbc\" requires \"table\""));
                 }
                 if source.engine.as_deref() == Some("glue")
                     && source.connection_type.is_none()
                 {
                     errors.push(err(
-                        &prefix.to_string(),
+                        &prefix,
                         "type \"jdbc\" with engine \"glue\" requires \"connection_type\" (mysql, postgresql, sqlserver, oracle, redshift)",
                     ));
                 }
                 errors.extend(validate_jdbc_auth(
-                    &prefix.to_string(),
+                    &prefix,
                     source.secret_id.as_deref(),
                     source.auth.as_ref(),
                 ));
@@ -196,29 +196,29 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
             "kafka" => {
                 if source.connection_url.is_none() {
                     errors.push(err(
-                        &prefix.to_string(),
+                        &prefix,
                         "type \"kafka\" requires \"connection_url\" (bootstrap servers)",
                     ));
                 }
                 if source.topic.is_none() {
-                    errors.push(err(&prefix.to_string(), "type \"kafka\" requires \"topic\""));
+                    errors.push(err(&prefix, "type \"kafka\" requires \"topic\""));
                 }
             }
             "api" => {
                 if source.url.is_none() {
-                    errors.push(err(&prefix.to_string(), "type \"api\" requires \"url\""));
+                    errors.push(err(&prefix, "type \"api\" requires \"url\""));
                 }
             }
             "catalog" => {
                 if source.database.is_none() {
                     errors.push(err(
-                        &prefix.to_string(),
+                        &prefix,
                         "type \"catalog\" requires \"database\"",
                     ));
                 }
                 if source.table.is_none() {
                     errors.push(err(
-                        &prefix.to_string(),
+                        &prefix,
                         "type \"catalog\" requires \"table\"",
                     ));
                 }
@@ -274,14 +274,14 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
             "filter" => {
                 if transform.condition.is_none() {
                     errors.push(err(
-                        &prefix.to_string(),
+                        &prefix,
                         "type \"filter\" requires \"condition\"",
                     ));
                 }
             }
             "sql" => {
                 if transform.query.is_none() {
-                    errors.push(err(&prefix.to_string(), "type \"sql\" requires \"query\""));
+                    errors.push(err(&prefix, "type \"sql\" requires \"query\""));
                 }
             }
             "join" => {
@@ -296,7 +296,7 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
                         ));
                     }
                 } else {
-                    errors.push(err(&prefix.to_string(), "type \"join\" requires \"left\""));
+                    errors.push(err(&prefix, "type \"join\" requires \"left\""));
                 }
                 if let Some(right) = &transform.right {
                     if !known_names.contains(right) {
@@ -309,16 +309,16 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
                         ));
                     }
                 } else {
-                    errors.push(err(&prefix.to_string(), "type \"join\" requires \"right\""));
+                    errors.push(err(&prefix, "type \"join\" requires \"right\""));
                 }
                 if transform.on.is_none() {
-                    errors.push(err(&prefix.to_string(), "type \"join\" requires \"on\""));
+                    errors.push(err(&prefix, "type \"join\" requires \"on\""));
                 }
             }
             "drop_columns" | "select" => {
                 if transform.columns.is_empty() {
                     errors.push(err(
-                        &prefix.to_string(),
+                        &prefix,
                         &format!(
                             "type \"{}\" requires non-empty \"columns\"",
                             transform.transform_type
@@ -329,7 +329,7 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
             "rename" => {
                 if transform.mapping.is_empty() {
                     errors.push(err(
-                        &prefix.to_string(),
+                        &prefix,
                         "type \"rename\" requires non-empty \"mapping\"",
                     ));
                 }
@@ -337,13 +337,13 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
             "add_column" => {
                 if transform.name.is_none() {
                     errors.push(err(
-                        &prefix.to_string(),
+                        &prefix,
                         "type \"add_column\" requires \"name\"",
                     ));
                 }
                 if transform.expression.is_none() {
                     errors.push(err(
-                        &prefix.to_string(),
+                        &prefix,
                         "type \"add_column\" requires \"expression\"",
                     ));
                 }
@@ -351,13 +351,13 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
             "aggregate" => {
                 if transform.group_by.is_empty() {
                     errors.push(err(
-                        &prefix.to_string(),
+                        &prefix,
                         "type \"aggregate\" requires non-empty \"group_by\"",
                     ));
                 }
                 if transform.aggs.is_empty() {
                     errors.push(err(
-                        &prefix.to_string(),
+                        &prefix,
                         "type \"aggregate\" requires non-empty \"aggs\"",
                     ));
                 }
@@ -365,19 +365,19 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
             "window" => {
                 if transform.name.is_none() {
                     errors.push(err(
-                        &prefix.to_string(),
+                        &prefix,
                         "type \"window\" requires \"name\" (new column name)",
                     ));
                 }
                 if transform.expression.is_none() {
                     errors.push(err(
-                        &prefix.to_string(),
+                        &prefix,
                         "type \"window\" requires \"expression\"",
                     ));
                 }
                 if transform.partition_by.is_empty() && transform.order_by.is_empty() {
                     errors.push(err(
-                        &prefix.to_string(),
+                        &prefix,
                         "type \"window\" requires at least one of \"partition_by\" or \"order_by\"",
                     ));
                 }
