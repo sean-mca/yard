@@ -5,6 +5,7 @@
 //! yard-core/src/airflow_dag/mod.rs:82-106 precedent).
 
 #![allow(dead_code)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 // `dead_code` is allow-listed at the module level because individual tests use
 // different subsets of the fixture helpers. Without this, `cargo test` warns for
 // every helper that the current test binary doesn't touch, and those warnings

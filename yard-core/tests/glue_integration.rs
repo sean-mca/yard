@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Integration tests for the Glue provider against ministack.
 //!
 //! Prerequisites:

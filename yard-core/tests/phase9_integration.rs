@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Phase 9 integration tests against ministack.
 //!
 //! These exercise the state backend and DAG credential paths end-to-end
