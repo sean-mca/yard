@@ -3,18 +3,18 @@ gsd_state_version: 1.0
 milestone: v1.16
 milestone_name: Rules Compliance Audit
 current_phase: 65
-current_phase_name: yard-core Audit & Fix
-status: executing
+current_phase_name: yard-core-audit-fix
+status: verifying
 stopped_at: Phase 65 context gathered
-last_updated: "2026-08-18T01:07:25.559Z"
+last_updated: "2026-08-18T01:37:08.853Z"
 last_activity: 2026-08-18
-last_activity_desc: Phase 64 complete, transitioned to Phase 65
+last_activity_desc: Phase 65 execution started
 progress:
   total_phases: 2
-  completed_phases: 1
-  total_plans: 2
-  completed_plans: 2
-  percent: 50
+  completed_phases: 2
+  total_plans: 5
+  completed_plans: 5
+  percent: 100
 ---
 
 # Project State
@@ -24,14 +24,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-17)
 
 **Core value:** The CLI must remain correct and easy to reason about -- every refactor must preserve existing behavior and pass the full test suite.
-**Current focus:** Phase 64 — yard-structs-yard-cli-audit-fix
+**Current focus:** Phase 65 — yard-core-audit-fix
 
 ## Current Position
 
-Phase: 65 — yard-core Audit & Fix
-Plan: Not started
-Status: Ready to execute
-Last activity: 2026-08-18 — Phase 64 complete, transitioned to Phase 65
+Phase: 65 (yard-core-audit-fix) — EXECUTING
+Plan: 3 of 3
+Status: Phase complete — ready for verification
+Last activity: 2026-08-18 — Phase 65 execution started
 
 Progress: [██████████] 100%
 
@@ -49,6 +49,11 @@ Recent decisions affecting current work:
 - [Phase ?]: A-08 flagged: ProjectState.deployments HashMap<String, Deployment> TYPE-01 finding, deferred for backward compat
 - [Phase 64 P02]: A-02: colorize() Cow NOT warranted -- CLI display helper, not hot path, O(single-digit) calls
 - [Phase 64 P02]: A-03: wildcard arms in display.rs confirmed intentional for #[non_exhaustive] DiffType
+- [Phase ?]: Phase 65 P01: No violations found in codegen/ -- zero code changes needed; format! in sink.rs confirmed as template construction (N-08)
+- [Phase ?]: Phase 65 P02: ~29 own-borrow-over-clone violations fixed in validation/rules.rs
+- [Phase ?]: Phase 65 P02: D-06 honored -- # Examples deferred to future doc phase
+- [Phase 65 P03]: V-06/V-07 lint suppression added for consistency on test files with 0 unwrap calls
+- [Phase 65 P03]: D-05 (HashMap<String, Deployment>) and D-06 (# Examples) deferred findings honored
 
 ### Roadmap Evolution
 
@@ -81,7 +86,7 @@ Items carried forward from previous milestones:
 
 ## Session Continuity
 
-Last session: 2026-08-18T00:40:00.152Z
+Last session: 2026-08-18T01:36:54.808Z
 Stopped at: Phase 65 context gathered
 Resume file: .planning/phases/65-yard-core-audit-fix/65-CONTEXT.md
 
@@ -95,3 +100,6 @@ Resume file: .planning/phases/65-yard-core-audit-fix/65-CONTEXT.md
 |-------|------|----------|-------|
 | Phase 64 P01 | 172 | 2 tasks | 1 files |
 | Phase 64 P02 | 207 | 2 tasks | 0 files |
+| Phase 65 P01 | 177 | 2 tasks | 0 files |
+| Phase 65 P02 | 320 | 2 tasks | 1 files |
+| Phase 65 P03 | 4min | 2 tasks | 8 files |

@@ -253,7 +253,7 @@ Full codebase audit of yard-cli, yard-core, and yard-structs against the 179 Rus
 Cross-cutting requirements: `cargo clippy -D warnings` clean, `cargo test --workspace` green, zero `Cargo.toml` edits without explicit approval, no new `unsafe`, no new `.unwrap()`/`.expect()` in production code.
 
 - [x] **Phase 64: yard-structs + yard-cli Audit & Fix** - Full rules compliance audit of the two smaller crates (~4k LOC) against all 14 rule categories (completed 2026-08-18)
-- [ ] **Phase 65: yard-core Audit & Fix** - Full rules compliance audit of the larger crate (~18k LOC) against all 14 rule categories
+- [x] **Phase 65: yard-core Audit & Fix** - Full rules compliance audit of the larger crate (~18k LOC) against all 14 rule categories (completed 2026-08-18)
 
 ### Phase 64: yard-structs + yard-cli Audit & Fix
 
@@ -288,13 +288,13 @@ Plans:
   4. `cargo clippy --all-targets --workspace -- -D warnings` produces zero warnings after fixes
   5. `cargo test --workspace` passes with no regressions from the fixes
 
-**Plans:** 3 plans
+**Plans:** 3/3 plans complete
 
 Plans:
 
-- [ ] 65-01-PLAN.md -- codegen/ audit (6 files): deep audit PII codegen + Iceberg reorder, verify source/transform
-- [ ] 65-02-PLAN.md -- validation/ + parsing.rs audit (4 files): deep audit PII validation rules + parse_mask_pii
-- [ ] 65-03-PLAN.md -- remaining files audit (21 src + 6 test files): fix V-01..V-07, verify airflow_dag/providers/storage/orchestrate/resolve
+- [x] 65-01-PLAN.md -- codegen/ audit (6 files): deep audit PII codegen + Iceberg reorder, verify source/transform
+- [x] 65-02-PLAN.md -- validation/ + parsing.rs audit (4 files): deep audit PII validation rules + parse_mask_pii
+- [x] 65-03-PLAN.md -- remaining files audit (21 src + 6 test files): fix V-01..V-07, verify airflow_dag/providers/storage/orchestrate/resolve
 
 **Cross-cutting constraints:**
 
@@ -326,7 +326,7 @@ Plans:
 | 62. Documentation | v1.14 | 1/1 | Complete | 2026-06-25 |
 | 63. Cross-Platform Releases + Homebrew | v1.15 | 3/3 | Complete | 2026-07-19 |
 | 64. yard-structs + yard-cli Audit & Fix | v1.16 | 2/2 | Complete    | 2026-08-18 |
-| 65. yard-core Audit & Fix | v1.16 | 0/3 | Not started | - |
+| 65. yard-core Audit & Fix | v1.16 | 3/3 | Complete   | 2026-08-18 |
 
 **Out-of-band patches (NOT tracked under v1.9 or v1.10):**
 
