@@ -137,8 +137,8 @@ def _yard_kind(dt):
 
 def _yard_kind_mismatch(src_dt, tgt_dt):
     # True when the source-inferred kind diverges from the target kind in a way
-    # df.to() cannot reconcile (struct vs list/map, or scalar vs container).
-    # Scalar-vs-scalar is left to df.to()'s safe up-cast.
+    # that cannot be reconciled by casting (struct vs list/map, or scalar vs
+    # container). Scalar-vs-scalar mismatches are handled by explicit cast.
     ks, kt = _yard_kind(src_dt), _yard_kind(tgt_dt)
     if ks == kt:
         return False
@@ -179,7 +179,16 @@ def _yard_read_iceberg_schema(spark, tbl):
 
 
 def _yard_conform(df, target_schema):
-    return df.to(target_schema)
+    src_types = {f.name: f.dataType for f in df.schema.fields}
+    cols = []
+    for f in target_schema.fields:
+        if f.name in src_types and src_types[f.name] != f.dataType:
+            cols.append(df[f.name].cast(f.dataType).alias(f.name))
+        elif f.name in src_types:
+            cols.append(df[f.name])
+        else:
+            cols.append(F.lit(None).cast(f.dataType).alias(f.name))
+    return df.select(cols)
 "#;
 
 /// Generate a complete PySpark script for the given job definition.
@@ -774,8 +783,9 @@ mod tests {
         assert!(script.contains("def _yard_kind_mismatch(src_dt, tgt_dt):"));
         assert!(script.contains("def _yard_conform(df, target_schema):"));
         assert!(script.contains("def _yard_read_iceberg_schema(spark, tbl):"));
-        // The single-pass conform delegates to Spark 3.5 DataFrame.to().
-        assert!(script.contains("return df.to(target_schema)"));
+        // The conform function casts mismatched column types explicitly.
+        assert!(script.contains("src_types[f.name] != f.dataType"));
+        assert!(script.contains("df[f.name].cast(f.dataType)"));
     }
 
     #[test]
@@ -837,8 +847,8 @@ mod tests {
         assert!(new_table.contains("_target = _yard_void_free_schema(df_events.schema)"));
         assert!(new_table.contains("df_events = _yard_conform(df_events, _target)"));
         assert!(new_table.contains(".create())"));
-        // df.to() is the single conform pass.
-        assert!(script.contains("return df.to(target_schema)"));
+        // conform function casts mismatched types explicitly.
+        assert!(script.contains("df[f.name].cast(f.dataType)"));
     }
 
     #[test]
