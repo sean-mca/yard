@@ -42,26 +42,34 @@ pub async fn run() -> Result<()> {
 
     match cli.command {
         parser::Commands::Init { directory } => commands::init::execute(directory).await?,
-        parser::Commands::Plan { directory, target } => {
-            commands::plan::execute(directory, target).await?
-        }
+        parser::Commands::Plan {
+            directory,
+            target,
+            dir,
+        } => commands::plan::execute(directory, target, dir).await?,
         parser::Commands::Apply {
             directory,
             dry_run,
             auto_approve,
             target,
-        } => commands::apply::execute(directory, dry_run, auto_approve, target).await?,
+            dir,
+        } => commands::apply::execute(directory, dry_run, auto_approve, target, dir).await?,
         parser::Commands::Show {
             job_name,
             directory,
         } => commands::show::execute(job_name, directory).await?,
-        parser::Commands::Validate { directory } => commands::validate::execute(directory).await?,
+        parser::Commands::Validate {
+            directory,
+            target,
+            dir,
+        } => commands::validate::execute(directory, target, dir).await?,
         parser::Commands::Destroy {
             job_name,
             directory,
             dry_run,
             auto_approve,
-        } => commands::destroy::execute(job_name, directory, dry_run, auto_approve).await?,
+            dir,
+        } => commands::destroy::execute(job_name, directory, dry_run, auto_approve, dir).await?,
         parser::Commands::ForceUnlock {
             job_name,
             directory,
