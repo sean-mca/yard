@@ -187,6 +187,76 @@ pub fn build_target_matrix_project() -> TargetMatrixProject {
     }
 }
 
+/// Returned by `build_dir_scoped_project` — bundles the tmpdir, manifest, and
+/// job names for `--dir` integration tests.
+pub struct DirScopedProject {
+    pub tmp: TempDir,
+    pub manifest: ProjectManifest,
+    pub sub_a_job: String,
+    pub sub_b_job: String,
+    pub root_job: String,
+}
+
+/// Build a project with jobs in separate subdirectories for `--dir` tests.
+///
+/// ```text
+/// tmpdir/
+///   yard.yaml
+///   account.yaml
+///   region.yaml
+///   sub_a/job_alpha/config.yaml
+///   sub_b/job_beta/config.yaml
+///   root_level/job_gamma/config.yaml
+/// ```
+pub fn build_dir_scoped_project() -> DirScopedProject {
+    let tmp = TempDir::new();
+    let root = tmp.path().to_path_buf();
+
+    write_yaml(&root.join("yard.yaml"), "project: test\n");
+    write_yaml(&root.join("account.yaml"), "account:\n  id: \"123\"\n");
+    write_yaml(&root.join("region.yaml"), "region:\n  id: us-east-1\n");
+
+    let alpha_dir = root.join("sub_a").join("job_alpha");
+    write_yaml(
+        &alpha_dir.join("config.yaml"),
+        "type: bash\ncommand: \"echo alpha\"\n",
+    );
+
+    let beta_dir = root.join("sub_b").join("job_beta");
+    write_yaml(
+        &beta_dir.join("config.yaml"),
+        "type: bash\ncommand: \"echo beta\"\n",
+    );
+
+    let gamma_dir = root.join("root_level").join("job_gamma");
+    write_yaml(
+        &gamma_dir.join("config.yaml"),
+        "type: bash\ncommand: \"echo gamma\"\n",
+    );
+
+    let state_dir = root.join(".yard/state");
+    let mut jobs = HashMap::new();
+    jobs.insert("job_alpha".to_string(), bash_job("echo alpha", &alpha_dir));
+    jobs.insert("job_beta".to_string(), bash_job("echo beta", &beta_dir));
+    jobs.insert("job_gamma".to_string(), bash_job("echo gamma", &gamma_dir));
+
+    let manifest = ProjectManifest {
+        project: "test".to_string(),
+        state: StateBackend::Local { path: state_dir },
+        providers: HashMap::new(),
+        jobs,
+        aws: None,
+    };
+
+    DirScopedProject {
+        tmp,
+        manifest,
+        sub_a_job: "job_alpha".to_string(),
+        sub_b_job: "job_beta".to_string(),
+        root_job: "job_gamma".to_string(),
+    }
+}
+
 /// Prevent the compiler from warning about the unused `Deployment` import — it's
 /// pulled in for Phase 13 reuse (state-preload helpers that will be added there).
 #[allow(dead_code)]

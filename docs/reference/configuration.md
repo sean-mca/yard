@@ -752,3 +752,59 @@ following per-environment patterns are discoverable from the repo:
   compiled with `YARD_API_BASE=""` (so the UI derives its host from
   `window().location()`), while local dev uses the default
   `http://127.0.0.1:3001`.
+
+---
+
+## Directory scoping with --dir
+
+The `--dir <path>` flag scopes `plan`, `apply`, `destroy`, and `validate`
+to all jobs discovered under a directory subtree. This is the directory-level
+equivalent of `--target` (which selects a single job by name).
+
+### How it works
+
+`--dir` takes a path relative to the project root (where `yard.yaml` lives)
+or an absolute path. yard canonicalizes both the provided path and the
+project root, then retains only jobs whose resolved directory starts with
+the `--dir` path prefix.
+
+```bash
+# Plan only jobs under staging/us-east-1/
+yard plan --dir staging/us-east-1
+
+# Apply with dry-run, scoped to a region
+yard apply --dir production/eu-west-1 --dry-run
+
+# Destroy all jobs under a subtree
+yard destroy --dir staging/us-east-1 --auto-approve
+
+# Validate only jobs in a specific directory
+yard validate --dir staging/
+```
+
+Output includes a `(scoped to: <path>/)` line so it is clear which subtree
+is active:
+
+```
+--- Plan for my-project ---
+(scoped to: staging/us-east-1/)
+
+  + Create job [etl-orders]
+  + Create job [etl-users]
+```
+
+### Mutual exclusivity
+
+`--dir` and `--target` are mutually exclusive on `plan`, `apply`, and
+`validate`. For `destroy`, `--dir` is mutually exclusive with the
+positional `JOB_NAME` argument. Passing both produces a clap conflict
+error before any code runs.
+
+### Error behavior
+
+| Condition | Error message |
+|-----------|---------------|
+| Path does not exist | `directory not found: <resolved path>` |
+| Path is a file, not a directory | `expected a directory, got a file -- use --target for single jobs` |
+| Path is outside the project root | `directory <path> is outside the project root <root>` |
+| No jobs found under the path | `no jobs found under <path> -- the directory exists but contains no YAML job files` |

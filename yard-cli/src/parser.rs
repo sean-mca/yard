@@ -47,8 +47,12 @@ pub enum Commands {
         directory: Option<String>,
 
         /// Only plan a specific job
-        #[arg(long)]
+        #[arg(long, conflicts_with = "dir")]
         target: Option<String>,
+
+        /// Scope to all jobs under a directory subtree
+        #[arg(long, conflicts_with = "target")]
+        dir: Option<String>,
     },
 
     /// Apply infrastructure changes (codegen + deploy)
@@ -66,8 +70,12 @@ pub enum Commands {
         auto_approve: bool,
 
         /// Only apply a specific job
-        #[arg(long)]
+        #[arg(long, conflicts_with = "dir")]
         target: Option<String>,
+
+        /// Scope to all jobs under a directory subtree
+        #[arg(long, conflicts_with = "target")]
+        dir: Option<String>,
     },
 
     /// Show the generated script for a job
@@ -86,12 +94,20 @@ pub enum Commands {
         /// Project directory (defaults to current working directory).
         #[arg(index = 1)]
         directory: Option<String>,
+
+        /// Only validate a specific job
+        #[arg(long, conflicts_with = "dir")]
+        target: Option<String>,
+
+        /// Scope to all jobs under a directory subtree
+        #[arg(long, conflicts_with = "target")]
+        dir: Option<String>,
     },
 
     /// Destroy deployed jobs and remove state
     Destroy {
         /// Specific job to destroy (omit to destroy all)
-        #[arg(index = 1)]
+        #[arg(index = 1, conflicts_with = "dir")]
         job_name: Option<String>,
 
         /// Project directory (defaults to current working directory).
@@ -105,6 +121,10 @@ pub enum Commands {
         /// Skip confirmation prompt
         #[arg(long)]
         auto_approve: bool,
+
+        /// Scope destroy to all jobs under a directory subtree
+        #[arg(long, conflicts_with = "job_name")]
+        dir: Option<String>,
     },
 
     /// Force-unlock a locked job

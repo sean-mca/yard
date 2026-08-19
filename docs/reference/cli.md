@@ -49,7 +49,8 @@ Apply pending changes to AWS. For each target in the project, codegen renders th
 |------|----------|---------|-------------|
 | `--dry-run` | No | unset | Skip provider deployment (codegen and state only). |
 | `--auto-approve` | No | unset | Skip confirmation prompt. |
-| `--target <TARGET>` | No | unset | Only apply a specific job. |
+| `--target <TARGET>` | No | unset | Only apply a specific job. Mutually exclusive with `--dir`. |
+| `--dir <DIR>` | No | unset | Scope to all jobs under a directory subtree. Mutually exclusive with `--target`. |
 | Global flags | — | — | Inherits `--no-color`, `--colorblind`, `--help`. See [Global flags](#global-flags). |
 
 Examples:
@@ -57,6 +58,7 @@ Examples:
 ```bash
 yard apply
 yard apply --target etl-daily --dry-run
+yard apply --dir staging/us-east-1 --dry-run
 ```
 
 See [airflow-dag.md](airflow-dag.md) for what `yard apply` does to DAG resources.
@@ -77,6 +79,7 @@ Destroy deployed jobs and remove state. The optional positional `JOB_NAME` narro
 |------|----------|---------|-------------|
 | `--dry-run` | No | unset | Skip provider teardown (state and local files only). |
 | `--auto-approve` | No | unset | Skip confirmation prompt. |
+| `--dir <DIR>` | No | unset | Scope destroy to all jobs under a directory subtree. Mutually exclusive with `JOB_NAME`. |
 | Global flags | — | — | Inherits `--no-color`, `--colorblind`, `--help`. See [Global flags](#global-flags). |
 
 Examples:
@@ -84,6 +87,7 @@ Examples:
 ```bash
 yard destroy etl-daily --auto-approve
 yard destroy --dry-run
+yard destroy --dir staging/us-east-1 --auto-approve
 ```
 
 See [airflow-dag.md](airflow-dag.md) for DAG destroy semantics.
@@ -184,7 +188,8 @@ Compute the diff between current AWS state and the desired state derived from th
 
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
-| `--target <TARGET>` | No | unset | Only plan a specific job. |
+| `--target <TARGET>` | No | unset | Only plan a specific job. Mutually exclusive with `--dir`. |
+| `--dir <DIR>` | No | unset | Scope to all jobs under a directory subtree. Mutually exclusive with `--target`. |
 | Global flags | — | — | Inherits `--no-color`, `--colorblind`, `--help`. See [Global flags](#global-flags). |
 
 Examples:
@@ -192,6 +197,7 @@ Examples:
 ```bash
 yard plan
 yard plan --target etl-daily
+yard plan --dir staging/us-east-1
 ```
 
 See [airflow-dag.md](airflow-dag.md) for DAG plan semantics.
@@ -230,16 +236,20 @@ Synopsis:
 yard validate [OPTIONS] [DIRECTORY]
 ```
 
-Validate every job in the project: schema-check the YAMLs and verify provider knob acceptance per `validate_job_full`. Iterates `manifest.jobs` only — does not run DAG validation, orphan checks, or cross-DAG link checks (see [airflow-dag.md](airflow-dag.md) for DAG-side validation scope). Reads (does not write) state — requires AWS credentials.
+Validate every job in the project: schema-check the YAMLs and verify provider knob acceptance per `validate_job_full`. Iterates `manifest.jobs` only — does not run DAG validation, orphan checks, or cross-DAG link checks (see [airflow-dag.md](airflow-dag.md) for DAG-side validation scope). Reads (does not write) state — requires AWS credentials. Use `--target` to validate a single job or `--dir` to validate jobs under a directory subtree.
 
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
+| `--target <TARGET>` | No | unset | Only validate a specific job. Mutually exclusive with `--dir`. |
+| `--dir <DIR>` | No | unset | Scope to all jobs under a directory subtree. Mutually exclusive with `--target`. |
 | Global flags | — | — | Inherits `--no-color`, `--colorblind`, `--help`. See [Global flags](#global-flags). |
 
-Example:
+Examples:
 
 ```bash
 yard validate
+yard validate --target etl-daily
+yard validate --dir staging/
 ```
 
 ---
