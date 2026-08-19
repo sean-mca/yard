@@ -37,6 +37,7 @@ pub fn print_plan_summary(
     out: &mut impl io::Write,
     project_name: &str,
     target: Option<&str>,
+    dir_scope: Option<&str>,
     job_diffs: &[JobDiff],
     dag_diffs: &[DagDiff],
 ) -> io::Result<()> {
@@ -47,6 +48,8 @@ pub fn print_plan_summary(
     )?;
     if let Some(name) = target {
         writeln!(out, "(targeting: {})\n", name)?;
+    } else if let Some(scope) = dir_scope {
+        writeln!(out, "(scoped to: {})\n", scope)?;
     } else {
         writeln!(out)?;
     }
@@ -187,16 +190,21 @@ mod tests {
         }
     }
 
-    fn run(target: Option<&str>, jobs: &[JobDiff], dags: &[DagDiff]) -> String {
+    fn run(
+        target: Option<&str>,
+        dir_scope: Option<&str>,
+        jobs: &[JobDiff],
+        dags: &[DagDiff],
+    ) -> String {
         crate::utils::disable_color();
         let mut buf: Vec<u8> = Vec::new();
-        print_plan_summary(&mut buf, "myproj", target, jobs, dags).unwrap();
+        print_plan_summary(&mut buf, "myproj", target, dir_scope, jobs, dags).unwrap();
         String::from_utf8(buf).unwrap()
     }
 
     #[test]
     fn create_job_only() {
-        let s = run(None, &[job_create("loader")], &[]);
+        let s = run(None, None, &[job_create("loader")], &[]);
         assert_eq!(
             s,
             "--- Plan for myproj ---\n\n  + Create job [loader]\n"
@@ -212,6 +220,7 @@ mod tests {
         // sorted at the type level.
         let s = run(
             None,
+            None,
             &[job_modify(
                 "loader",
                 vec![("script", "a.py", "b.py"), ("memory", "1g", "2g")],
@@ -226,7 +235,7 @@ mod tests {
 
     #[test]
     fn delete_job() {
-        let s = run(None, &[job_delete("stale")], &[]);
+        let s = run(None, None, &[job_delete("stale")], &[]);
         assert_eq!(
             s,
             "--- Plan for myproj ---\n\n  - Delete job [stale]\n"
@@ -235,7 +244,7 @@ mod tests {
 
     #[test]
     fn create_dag() {
-        let s = run(None, &[], &[dag_create("pipeline")]);
+        let s = run(None, None, &[], &[dag_create("pipeline")]);
         assert_eq!(
             s,
             "--- Plan for myproj ---\n\n  + Create DAG [pipeline]\n"
@@ -245,6 +254,7 @@ mod tests {
     #[test]
     fn modify_dag() {
         let s = run(
+            None,
             None,
             &[],
             &[dag_modify("pipeline", vec![("schedule", "@hourly", "@daily")])],
@@ -257,7 +267,7 @@ mod tests {
 
     #[test]
     fn delete_dag() {
-        let s = run(None, &[], &[dag_delete("old_pipeline")]);
+        let s = run(None, None, &[], &[dag_delete("old_pipeline")]);
         assert_eq!(
             s,
             "--- Plan for myproj ---\n\n  - Delete DAG [old_pipeline]\n"
@@ -267,6 +277,7 @@ mod tests {
     #[test]
     fn job_and_dag_mix_no_target() {
         let s = run(
+            None,
             None,
             &[job_create("loader")],
             &[dag_create("pipeline")],
@@ -279,7 +290,7 @@ mod tests {
 
     #[test]
     fn job_only_with_target_filter() {
-        let s = run(Some("loader"), &[job_create("loader")], &[]);
+        let s = run(Some("loader"), None, &[job_create("loader")], &[]);
         // `writeln!(out, "(targeting: {})\n", name)` emits "(targeting: loader)\n"
         // from the format string's trailing \n, plus another "\n" from writeln
         // itself → byte sequence "(targeting: loader)\n\n". Mirrors the
@@ -292,10 +303,28 @@ mod tests {
 
     #[test]
     fn dag_only_with_target_filter() {
-        let s = run(Some("pipeline"), &[], &[dag_create("pipeline")]);
+        let s = run(Some("pipeline"), None, &[], &[dag_create("pipeline")]);
         assert_eq!(
             s,
             "--- Plan for myproj ---\n(targeting: pipeline)\n\n  + Create DAG [pipeline]\n"
+        );
+    }
+
+    #[test]
+    fn dir_scope_shows_scoped_to() {
+        let s = run(None, Some("staging/us-east-1/"), &[job_create("loader")], &[]);
+        assert_eq!(
+            s,
+            "--- Plan for myproj ---\n(scoped to: staging/us-east-1/)\n\n  + Create job [loader]\n"
+        );
+    }
+
+    #[test]
+    fn dir_scope_none_unchanged() {
+        let s = run(None, None, &[job_create("loader")], &[]);
+        assert_eq!(
+            s,
+            "--- Plan for myproj ---\n\n  + Create job [loader]\n"
         );
     }
 }

@@ -35,6 +35,7 @@ pub async fn execute(directory: Option<String>, target: Option<String>) -> Resul
         &mut io::stdout().lock(),
         &project.manifest.project,
         target.as_deref(),
+        None,
         &result.job_diffs,
         &result.dag_diffs,
     )?;

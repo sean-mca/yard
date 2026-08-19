@@ -41,6 +41,7 @@ pub async fn execute(
         &mut io::stdout().lock(),
         &project.manifest.project,
         target.as_deref(),
+        None,
         &result.job_diffs,
         &result.dag_diffs,
     )?;
