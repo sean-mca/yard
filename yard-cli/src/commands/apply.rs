@@ -5,12 +5,15 @@ use crate::commands::display::print_plan_summary;
 use crate::utils::{color_create, color_delete, color_modify, confirm};
 use anyhow::Result;
 use std::io;
+use std::path::Path;
 
 /// Execute `yard apply`: plan changes, prompt for confirmation, then deploy.
 ///
 /// When `dry_run` is `true`, changes are planned and displayed but not
 /// applied. When `auto_approve` is `true`, the confirmation prompt is
-/// skipped. An optional `target` restricts the operation to a single job.
+/// skipped. An optional `target` restricts the operation to a single job;
+/// an optional `dir` scopes the operation to all jobs under a directory
+/// subtree.
 ///
 /// # Errors
 ///
@@ -21,11 +24,20 @@ pub async fn execute(
     dry_run: bool,
     auto_approve: bool,
     target: Option<String>,
+    dir: Option<String>,
 ) -> Result<()> {
     let project = resolve_project(directory).await?;
 
+    let (manifest, dir_scope) = if let Some(ref dir_path) = dir {
+        let filtered =
+            yard_core::resolve::filter_manifest_by_dir(&project.manifest, Path::new(dir_path), &project.root_dir)?;
+        (filtered.manifest, Some(filtered.display_path))
+    } else {
+        (project.manifest.clone(), None)
+    };
+
     let result = yard_core::plan(
-        &project.manifest,
+        &manifest,
         &project.current_state,
         &project.root_dir,
         target.clone(),
@@ -39,9 +51,9 @@ pub async fn execute(
 
     print_plan_summary(
         &mut io::stdout().lock(),
-        &project.manifest.project,
+        &manifest.project,
         target.as_deref(),
-        None,
+        dir_scope.as_deref(),
         &result.job_diffs,
         &result.dag_diffs,
     )?;
@@ -62,7 +74,7 @@ pub async fn execute(
     println!("\nApplying...");
 
     let result = yard_core::apply(
-        &project.manifest,
+        &manifest,
         &project.current_state,
         &project.root_dir,
         dry_run,
