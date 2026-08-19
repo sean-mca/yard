@@ -740,6 +740,115 @@ pub fn discover_environments(root_path: &Path) -> Result<Vec<DiscoveredEnvironme
     Ok(environments)
 }
 
+/// The result of filtering a [`ProjectManifest`] by directory path.
+///
+/// Contains the filtered manifest (only jobs whose directory matches the
+/// requested path prefix) and a human-readable display path relative to
+/// the project root.
+#[derive(Debug, Clone)]
+pub struct DirFilterResult {
+    /// The manifest with only the matching jobs retained.
+    pub manifest: ProjectManifest,
+    /// The directory path relative to the project root, always with a
+    /// trailing slash (e.g. `"staging/us-east-1/"`). Used in CLI output
+    /// for the `(scoped to: ...)` display line.
+    pub display_path: String,
+}
+
+/// Filter a project manifest to retain only jobs whose directory is at or
+/// below `dir_path`.
+///
+/// `dir_path` may be relative (joined to `root_dir`) or absolute (used
+/// directly). Both the resolved directory and `root_dir` are canonicalized
+/// so that symlinks and `..` segments are resolved before comparison.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - `dir_path` does not exist ("`directory not found: <path>`")
+/// - `dir_path` is a file, not a directory ("`expected a directory, got a
+///   file -- use --target for single jobs`")
+/// - The canonicalized directory is outside `root_dir` ("`directory <path>
+///   is outside the project root <root>`")
+/// - No jobs match the directory prefix after filtering ("`no jobs found
+///   under <path>`")
+pub fn filter_manifest_by_dir(
+    manifest: &ProjectManifest,
+    dir_path: &Path,
+    root_dir: &Path,
+) -> Result<DirFilterResult> {
+    // Resolve relative paths against the project root.
+    let resolved = if dir_path.is_relative() {
+        root_dir.join(dir_path)
+    } else {
+        dir_path.to_path_buf()
+    };
+
+    // Existence check.
+    if !resolved.exists() {
+        anyhow::bail!("directory not found: {}", resolved.display());
+    }
+
+    // Must be a directory, not a file.
+    if !resolved.is_dir() {
+        anyhow::bail!(
+            "expected a directory, got a file -- use --target for single jobs"
+        );
+    }
+
+    // Canonicalize both paths so symlinks and `..` are resolved.
+    let canonical_dir = std::fs::canonicalize(&resolved)
+        .with_context(|| format!("failed to canonicalize directory: {}", resolved.display()))?;
+    let canonical_root = std::fs::canonicalize(root_dir)
+        .with_context(|| format!("failed to canonicalize project root: {}", root_dir.display()))?;
+
+    // Reject paths outside the project root.
+    if !canonical_dir.starts_with(&canonical_root) {
+        anyhow::bail!(
+            "directory {} is outside the project root {}",
+            canonical_dir.display(),
+            canonical_root.display()
+        );
+    }
+
+    // Filter jobs by directory prefix.
+    let mut filtered = manifest.clone();
+    filtered.jobs.retain(|_name, job_def| {
+        std::fs::canonicalize(&job_def.dir)
+            .map(|c| c.starts_with(&canonical_dir))
+            .unwrap_or(false)
+    });
+
+    // Compute display path relative to the project root.
+    let display_path = canonical_dir
+        .strip_prefix(&canonical_root)
+        .map(|rel| {
+            let s = rel.to_string_lossy().to_string();
+            if s.is_empty() {
+                "./".to_string()
+            } else if s.ends_with('/') {
+                s
+            } else {
+                format!("{s}/")
+            }
+        })
+        .unwrap_or_else(|_| "./".to_string());
+
+    // Zero-match check.
+    if filtered.jobs.is_empty() {
+        anyhow::bail!(
+            "no jobs found under {} -- the directory exists but contains no YAML job files. \
+             Check that the path is correct and contains job definitions.",
+            display_path
+        );
+    }
+
+    Ok(DirFilterResult {
+        manifest: filtered,
+        display_path,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1323,5 +1432,125 @@ mod tests {
             msg.contains("yard.yaml"),
             "error should mention yard.yaml, got: {msg}"
         );
+    }
+
+    // --- filter_manifest_by_dir tests ---
+
+    fn manifest_with_jobs(dirs: &[(&str, &Path)]) -> ProjectManifest {
+        let mut jobs = HashMap::new();
+        for (name, dir) in dirs {
+            jobs.insert(
+                (*name).to_string(),
+                JobDefinition {
+                    dir: dir.to_path_buf(),
+                    ..Default::default()
+                },
+            );
+        }
+        ProjectManifest {
+            project: "test".into(),
+            state: StateBackend::Local {
+                path: ".yard/state".into(),
+            },
+            providers: HashMap::new(),
+            jobs,
+            aws: None,
+        }
+    }
+
+    #[test]
+    fn filter_manifest_by_dir_happy_path() {
+        let tmp = TempDir::new();
+        make_yard_project(&tmp.0);
+        let sub_a = tmp.0.join("sub_a");
+        let sub_b = tmp.0.join("sub_b");
+        fs::create_dir_all(&sub_a).unwrap();
+        fs::create_dir_all(&sub_b).unwrap();
+
+        let manifest = manifest_with_jobs(&[("job_a", &sub_a), ("job_b", &sub_b)]);
+        let result = filter_manifest_by_dir(&manifest, Path::new("sub_a"), &tmp.0).unwrap();
+        assert_eq!(result.manifest.jobs.len(), 1);
+        assert!(result.manifest.jobs.contains_key("job_a"));
+        assert!(result.display_path.ends_with("sub_a/"));
+    }
+
+    #[test]
+    fn filter_manifest_by_dir_absolute_path() {
+        let tmp = TempDir::new();
+        make_yard_project(&tmp.0);
+        let sub_a = tmp.0.join("sub_a");
+        let sub_b = tmp.0.join("sub_b");
+        fs::create_dir_all(&sub_a).unwrap();
+        fs::create_dir_all(&sub_b).unwrap();
+
+        let manifest = manifest_with_jobs(&[("job_a", &sub_a), ("job_b", &sub_b)]);
+        let abs_path = std::fs::canonicalize(&sub_a).unwrap();
+        let result = filter_manifest_by_dir(&manifest, &abs_path, &tmp.0).unwrap();
+        assert_eq!(result.manifest.jobs.len(), 1);
+        assert!(result.manifest.jobs.contains_key("job_a"));
+    }
+
+    #[test]
+    fn filter_manifest_by_dir_nonexistent_path_errors() {
+        let tmp = TempDir::new();
+        make_yard_project(&tmp.0);
+        let manifest = manifest_with_jobs(&[]);
+        let result = filter_manifest_by_dir(&manifest, Path::new("nope"), &tmp.0);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("directory not found"), "got: {msg}");
+    }
+
+    #[test]
+    fn filter_manifest_by_dir_file_path_errors() {
+        let tmp = TempDir::new();
+        make_yard_project(&tmp.0);
+        let file = tmp.0.join("some_file.txt");
+        fs::write(&file, "hello").unwrap();
+        let manifest = manifest_with_jobs(&[]);
+        let result = filter_manifest_by_dir(&manifest, &file, &tmp.0);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("expected a directory"), "got: {msg}");
+    }
+
+    #[test]
+    fn filter_manifest_by_dir_outside_root_errors() {
+        let tmp = TempDir::new();
+        make_yard_project(&tmp.0);
+        let outside = std::env::temp_dir();
+        let manifest = manifest_with_jobs(&[]);
+        let result = filter_manifest_by_dir(&manifest, &outside, &tmp.0);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("outside the project root"), "got: {msg}");
+    }
+
+    #[test]
+    fn filter_manifest_by_dir_zero_matches_errors() {
+        let tmp = TempDir::new();
+        make_yard_project(&tmp.0);
+        let empty_dir = tmp.0.join("empty_dir");
+        fs::create_dir_all(&empty_dir).unwrap();
+        let other_dir = tmp.0.join("other");
+        fs::create_dir_all(&other_dir).unwrap();
+
+        let manifest = manifest_with_jobs(&[("job_x", &other_dir)]);
+        let result = filter_manifest_by_dir(&manifest, &empty_dir, &tmp.0);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("no jobs found under"), "got: {msg}");
+    }
+
+    #[test]
+    fn filter_manifest_by_dir_display_path_relative() {
+        let tmp = TempDir::new();
+        make_yard_project(&tmp.0);
+        let sub_a = tmp.0.join("sub_a");
+        fs::create_dir_all(&sub_a).unwrap();
+
+        let manifest = manifest_with_jobs(&[("job_a", &sub_a)]);
+        let result = filter_manifest_by_dir(&manifest, Path::new("sub_a"), &tmp.0).unwrap();
+        assert_eq!(result.display_path, "sub_a/");
     }
 }
