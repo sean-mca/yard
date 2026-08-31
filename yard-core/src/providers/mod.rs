@@ -18,7 +18,7 @@ use aws_sdk_s3::Client as S3Client;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
-use yard_structs::{JobType, Resource, ResourceStatus, ValidationError};
+use yard_structs::{JobType, Resource, ResourceStatus, SchemaField, ValidationError};
 
 /// Build a standard AWS SDK config with region, retry policy, and optional
 /// STS `AssumeRole` wrapped around the default credential provider chain.
@@ -241,6 +241,41 @@ pub trait Provider: Send + Sync {
         job_name: &str,
         resources: &[Resource],
     ) -> Pin<Box<dyn Future<Output = Result<Vec<ResourceStatus>>> + Send + '_>>;
+
+    /// Run provider-specific validation on the job config.
+    ///
+    /// Returns additional validation errors to append to yard-core's
+    /// structural validation. Default returns no errors, which is
+    /// correct for compiled-in providers that rely on
+    /// [`validate_provider_config`] instead.
+    fn validate(
+        &self,
+        _job_name: &str,
+        _job_config: &Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ValidationError>>> + Send + '_>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Generate the deployment script for a job.
+    ///
+    /// Returns `Some(script_content)` if the provider handles codegen,
+    /// or `None` to fall back to yard-core's built-in codegen. Default
+    /// returns `None`.
+    fn codegen(
+        &self,
+        _job_name: &str,
+        _job_config: &Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<String>>> + Send + '_>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Return the config field descriptors this provider accepts.
+    ///
+    /// Used by config cascade validation (Phase 68). Default returns
+    /// an empty schema.
+    fn schema(&self) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaField>>> + Send + '_>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 /// Construct a provider from the job type and its provider-level config.
