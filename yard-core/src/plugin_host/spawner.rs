@@ -62,6 +62,8 @@ pub struct PluginSpawner {
     plugin_name: String,
     /// Runtime configuration.
     config: PluginHostConfig,
+    /// Extra environment variables to pass to the child process.
+    env_vars: HashMap<String, String>,
 }
 
 impl PluginSpawner {
@@ -71,7 +73,16 @@ impl PluginSpawner {
             binary_path,
             plugin_name,
             config,
+            env_vars: HashMap::new(),
         }
+    }
+
+    /// Set extra environment variables to pass to the child process.
+    ///
+    /// These are merged with the inherited environment on each spawn.
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env_vars.insert(key.into(), value.into());
+        self
     }
 
     /// Core operation dispatcher -- spawns the plugin, validates the
@@ -148,17 +159,19 @@ impl PluginSpawner {
         progress_callback: impl Fn(ProgressMessage) + Send,
     ) -> Result<Value> {
         // Spawn the plugin binary (HOST-01)
-        let mut child = Command::new(&self.binary_path)
-            .stdin(std::process::Stdio::piped())
+        let mut cmd = Command::new(&self.binary_path);
+        cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to spawn plugin binary '{}'",
-                    self.binary_path.display()
-                )
-            })?;
+            .stderr(std::process::Stdio::inherit());
+        for (k, v) in &self.env_vars {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.kill_on_drop(true).spawn().with_context(|| {
+            format!(
+                "failed to spawn plugin binary '{}'",
+                self.binary_path.display()
+            )
+        })?;
 
         let stdout = child
             .stdout

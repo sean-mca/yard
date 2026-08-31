@@ -18,13 +18,10 @@ fn main() {
 
     match mode.as_str() {
         "no_handshake" => {
-            // Skip handshake -- read stdin immediately (will fail protocol)
-            let stdin = io::stdin();
-            let mut line = String::new();
-            let _ = stdin.lock().read_line(&mut line);
-            // Write a response without handshake
-            let resp = serde_json::json!({"type": "response", "errors": []});
-            println!("{}", resp);
+            // Skip handshake -- close stdout immediately so the host
+            // sees EOF instead of a handshake line.
+            drop(io::stdout());
+            std::process::exit(0);
         }
         "bad_version" => {
             // Handshake with wrong protocol version
