@@ -21,4 +21,5 @@
 pub mod provider;
 pub mod spawner;
 
+pub use provider::PluginProvider;
 pub use spawner::{cleanup_plugin_cache, PluginHostConfig, PluginSpawner};

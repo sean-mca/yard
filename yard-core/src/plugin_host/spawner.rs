@@ -97,17 +97,17 @@ impl PluginSpawner {
         progress_callback: impl Fn(ProgressMessage) + Send,
     ) -> Result<Value> {
         // Optionally verify binary checksum (D-17: skip if no lock file)
-        if let Some(ref lock_path) = self.config.lock_file_path {
-            if lock_path.exists() {
-                verify_checksum(&self.binary_path, lock_path, &self.plugin_name)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "checksum verification failed for plugin '{}'",
-                            self.plugin_name
-                        )
-                    })?;
-            }
+        if let Some(ref lock_path) = self.config.lock_file_path
+            && lock_path.exists()
+        {
+            verify_checksum(&self.binary_path, lock_path, &self.plugin_name)
+                .await
+                .with_context(|| {
+                    format!(
+                        "checksum verification failed for plugin '{}'",
+                        self.plugin_name
+                    )
+                })?;
         }
 
         let timeout_duration =
