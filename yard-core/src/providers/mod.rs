@@ -322,22 +322,29 @@ pub async fn get_provider_for_job(
     plugin_source: Option<&str>,
     plugin_host_config: &PluginHostConfig,
 ) -> Result<Box<dyn Provider>> {
-    if let (Some(version), Some(source)) = (plugin_version, plugin_source) {
-        let plugin_name = format!("yard-plugin-{job_type}");
-        let binary_path =
-            download::ensure_plugin_cached(&plugin_name, version, source, plugin_host_config)
-                .await
-                .with_context(|| {
-                    format!("failed to ensure plugin binary for {plugin_name} v{version}")
-                })?;
+    match (plugin_version, plugin_source) {
+        (Some(version), Some(source)) => {
+            let plugin_name = format!("yard-plugin-{job_type}");
+            let binary_path =
+                download::ensure_plugin_cached(&plugin_name, version, source, plugin_host_config)
+                    .await
+                    .with_context(|| {
+                        format!("failed to ensure plugin binary for {plugin_name} v{version}")
+                    })?;
 
-        Ok(Box::new(PluginProvider::from_binary(
-            binary_path,
-            plugin_name,
-            plugin_host_config.clone(),
-        )))
-    } else {
-        get_provider(job_type, provider_config).await
+            Ok(Box::new(PluginProvider::from_binary(
+                binary_path,
+                plugin_name,
+                plugin_host_config.clone(),
+            )))
+        }
+        (Some(_), None) => {
+            bail!("job has plugin_version but no plugin_source -- both are required")
+        }
+        (None, Some(_)) => {
+            bail!("job has plugin_source but no plugin_version -- both are required")
+        }
+        (None, None) => get_provider(job_type, provider_config).await,
     }
 }
 
