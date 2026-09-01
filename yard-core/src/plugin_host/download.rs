@@ -67,6 +67,10 @@ fn expand_url_template(template: &str, name: &str, version: &str) -> String {
 ///
 /// Creates parent directories as needed.
 async fn download_binary(url: &str, dest: &Path) -> Result<()> {
+    if !url.starts_with("https://") {
+        bail!("plugin binary URL must use HTTPS (got: {url})");
+    }
+
     let response = reqwest::get(url)
         .await
         .with_context(|| format!("failed to fetch plugin binary from {url}"))?;
