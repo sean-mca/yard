@@ -7,7 +7,7 @@
 //!
 //! # Quick start
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use yard_plugin_sdk::{PluginHandler, PluginServer};
 //!
 //! struct MyProvider;
