@@ -732,6 +732,8 @@ mod tests {
             config,
             dir: std::path::PathBuf::new(),
             base_name: String::new(),
+            plugin_version: None,
+            plugin_source: None,
         }
     }
 

@@ -358,6 +358,8 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
                 config,
                 dir: job_dir.clone(),
                 base_name,
+                plugin_version: None,
+                plugin_source: None,
             },
         );
     }

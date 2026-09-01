@@ -18,6 +18,7 @@
 //!
 //! [`Provider`]: crate::providers::Provider
 
+pub mod download;
 pub mod provider;
 pub mod spawner;
 
