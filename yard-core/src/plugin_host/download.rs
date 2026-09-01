@@ -210,9 +210,13 @@ pub async fn update_lock_file(
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
 
-    tokio::fs::write(path, json.as_bytes())
+    let tmp_path = path.with_extension("lock.tmp");
+    tokio::fs::write(&tmp_path, json.as_bytes())
         .await
-        .with_context(|| format!("failed to write lock file at {}", path.display()))?;
+        .with_context(|| format!("failed to write lock file at {}", tmp_path.display()))?;
+    tokio::fs::rename(&tmp_path, path)
+        .await
+        .with_context(|| format!("failed to finalize lock file at {}", path.display()))?;
 
     Ok(())
 }
