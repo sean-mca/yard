@@ -16,6 +16,10 @@ use serde_json::json;
 use yard_core::plugin_host::{PluginHostConfig, PluginProvider, PluginSpawner};
 use yard_core::providers::Provider;
 
+// Imports for download/cache integration tests
+use yard_core::plugin_host::download::{ensure_plugin_cached, update_lock_file};
+use yard_core::plugin_host::spawner::{LockFile, platform_key};
+
 static TEST_PLUGIN_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 /// Build the test plugin binary once per test run and return its path.
@@ -276,4 +280,258 @@ async fn test_plugin_provider_implements_provider_trait() {
     assert_eq!(resources.len(), 1);
     assert_eq!(resources[0].r#type, "TestResource");
     assert_eq!(resources[0].id, "test-123");
+}
+
+// ---- Download / cache / lock-file integration tests ----
+
+/// Return the path to the compiled test plugin binary for use as a
+/// stand-in plugin binary in download/cache tests.
+fn test_plugin_binary_path() -> PathBuf {
+    build_test_plugin()
+}
+
+/// Helper: spin up a minimal HTTP server on an OS-assigned port that
+/// serves `body` bytes on every GET request. Returns
+/// `(addr, JoinHandle)`. The server runs until the handle is aborted.
+fn spawn_http_server(body: Vec<u8>) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let tokio_listener = tokio::net::TcpListener::from_std(listener).unwrap();
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = tokio_listener.accept().await else {
+                break;
+            };
+            // Read the request (consume until \r\n\r\n)
+            let mut buf = vec![0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    (addr, handle)
+}
+
+#[tokio::test]
+async fn test_ensure_plugin_cached_returns_path_when_binary_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugins_dir = dir.path().join("plugins");
+    std::fs::create_dir_all(&plugins_dir).unwrap();
+
+    let platform = platform_key();
+    let binary_name = format!("test-plugin-1.0.0-{platform}");
+    let cached_path = plugins_dir.join(&binary_name);
+
+    // Manually place the test plugin binary into the cache location
+    let source_binary = test_plugin_binary_path();
+    std::fs::copy(&source_binary, &cached_path).unwrap();
+
+    let config = PluginHostConfig {
+        plugins_dir: plugins_dir.clone(),
+        timeout_secs: 5,
+        lock_file_path: Some(dir.path().join("yard.lock")),
+    };
+
+    // URL is bogus -- the binary is already cached so no HTTP request fires
+    let result = ensure_plugin_cached(
+        "test-plugin",
+        "1.0.0",
+        "http://bogus-should-not-be-called/${name}",
+        &config,
+    )
+    .await;
+
+    let path = result.unwrap();
+    assert_eq!(path, cached_path, "should return the cached binary path");
+    assert!(path.exists(), "cached binary should exist on disk");
+}
+
+#[tokio::test]
+async fn test_ensure_plugin_cached_cache_miss_downloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugins_dir = dir.path().join("plugins");
+    std::fs::create_dir_all(&plugins_dir).unwrap();
+    let lock_path = dir.path().join("yard.lock");
+
+    // Read the test plugin binary content to serve over HTTP
+    let source_binary = test_plugin_binary_path();
+    let binary_bytes = std::fs::read(&source_binary).unwrap();
+
+    let (addr, server_handle) = spawn_http_server(binary_bytes.clone());
+
+    let config = PluginHostConfig {
+        plugins_dir: plugins_dir.clone(),
+        timeout_secs: 10,
+        lock_file_path: Some(lock_path.clone()),
+    };
+
+    let url_template = format!("http://{addr}/${{name}}-${{version}}");
+    let result = ensure_plugin_cached("test-plugin", "1.0.0", &url_template, &config).await;
+
+    server_handle.abort();
+
+    let path = result.unwrap();
+    let platform = platform_key();
+    let expected_name = format!("test-plugin-1.0.0-{platform}");
+    assert_eq!(
+        path.file_name().unwrap().to_str().unwrap(),
+        expected_name,
+        "downloaded binary should have the expected filename"
+    );
+    assert!(path.exists(), "downloaded binary should exist on disk");
+
+    // Verify the binary content matches what the server served
+    let downloaded = std::fs::read(&path).unwrap();
+    assert_eq!(
+        downloaded.len(),
+        binary_bytes.len(),
+        "downloaded binary size should match source"
+    );
+
+    // Verify the lock file was created with the correct entry
+    assert!(lock_path.exists(), "lock file should exist after download");
+    let lock_contents = std::fs::read_to_string(&lock_path).unwrap();
+    let lock: LockFile = serde_json::from_str(&lock_contents).unwrap();
+    assert_eq!(lock.plugins.len(), 1);
+    assert_eq!(lock.plugins[0].name, "test-plugin");
+    assert_eq!(lock.plugins[0].version, "1.0.0");
+    assert!(
+        lock.plugins[0].checksums.contains_key(&platform),
+        "lock file should contain a checksum for the current platform"
+    );
+}
+
+#[tokio::test]
+async fn test_version_mismatch_triggers_redownload() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugins_dir = dir.path().join("plugins");
+    std::fs::create_dir_all(&plugins_dir).unwrap();
+    let lock_path = dir.path().join("yard.lock");
+
+    let platform = platform_key();
+    let source_binary = test_plugin_binary_path();
+
+    // Seed: place an old version binary in the cache
+    let old_binary_name = format!("test-plugin-0.3.1-{platform}");
+    let old_cached = plugins_dir.join(&old_binary_name);
+    std::fs::copy(&source_binary, &old_cached).unwrap();
+
+    // Seed a lock file with the old version
+    update_lock_file(
+        Some(&lock_path),
+        "test-plugin",
+        "0.3.1",
+        &platform,
+        "old_checksum_abc",
+    )
+    .await
+    .unwrap();
+
+    // Serve the binary for the new version download
+    let binary_bytes = std::fs::read(&source_binary).unwrap();
+    let (addr, server_handle) = spawn_http_server(binary_bytes);
+
+    let config = PluginHostConfig {
+        plugins_dir: plugins_dir.clone(),
+        timeout_secs: 10,
+        lock_file_path: Some(lock_path.clone()),
+    };
+
+    let url_template = format!("http://{addr}/${{name}}-${{version}}");
+    let result = ensure_plugin_cached("test-plugin", "0.4.0", &url_template, &config).await;
+
+    server_handle.abort();
+
+    let path = result.unwrap();
+    let new_binary_name = format!("test-plugin-0.4.0-{platform}");
+    assert_eq!(
+        path.file_name().unwrap().to_str().unwrap(),
+        new_binary_name,
+        "should download with the new version filename"
+    );
+    assert!(path.exists(), "new version binary should exist");
+    assert!(
+        old_cached.exists(),
+        "old version binary should still exist (cleanup is future yard plugin clean)"
+    );
+
+    // Verify the lock file was updated with the new version
+    let lock_contents = std::fs::read_to_string(&lock_path).unwrap();
+    let lock: LockFile = serde_json::from_str(&lock_contents).unwrap();
+    let entry = lock
+        .plugins
+        .iter()
+        .find(|e| e.name == "test-plugin")
+        .expect("lock file should have test-plugin entry");
+    assert_eq!(entry.version, "0.4.0", "lock entry should have new version");
+    assert!(
+        entry.checksums.contains_key(&platform),
+        "lock entry should have a checksum for the current platform"
+    );
+    // Old checksums are cleared on version bump (D-19)
+    assert_eq!(
+        entry.checksums.len(),
+        1,
+        "stale checksums should be cleared after version bump"
+    );
+}
+
+#[tokio::test]
+async fn test_update_lock_file_accumulates_platforms() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock_path = dir.path().join("yard.lock");
+
+    // Seed with one platform
+    update_lock_file(
+        Some(&lock_path),
+        "test-plugin",
+        "1.0.0",
+        "x86_64-linux",
+        "abc123",
+    )
+    .await
+    .unwrap();
+
+    // Add a second platform, same plugin and version
+    update_lock_file(
+        Some(&lock_path),
+        "test-plugin",
+        "1.0.0",
+        "aarch64-macos",
+        "def456",
+    )
+    .await
+    .unwrap();
+
+    let lock_contents = std::fs::read_to_string(&lock_path).unwrap();
+    let lock: LockFile = serde_json::from_str(&lock_contents).unwrap();
+
+    assert_eq!(lock.plugins.len(), 1, "should still be one plugin entry");
+    let entry = &lock.plugins[0];
+    assert_eq!(entry.name, "test-plugin");
+    assert_eq!(entry.version, "1.0.0");
+    assert_eq!(
+        entry.checksums.len(),
+        2,
+        "should have two platform checksums"
+    );
+    assert_eq!(
+        entry.checksums.get("x86_64-linux"),
+        Some(&"abc123".to_string())
+    );
+    assert_eq!(
+        entry.checksums.get("aarch64-macos"),
+        Some(&"def456".to_string())
+    );
 }
