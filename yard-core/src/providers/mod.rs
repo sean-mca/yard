@@ -450,46 +450,44 @@ pub fn validate_provider_config_with_schema(
     schema: Option<&SchemaResponse>,
     errors: &mut Vec<ValidationError>,
 ) {
-    let Some(schema) = schema else {
-        // D-07: plugin not installed or unknown type, skip provider-specific validation
-        return;
-    };
-
     let job_type_key = job_type.to_string();
-    let inner = job_config.get(&job_type_key);
 
-    // Validate fields against schema if inner block is present and is an object
-    if let Some(inner) = inner {
-        if let Some(obj) = inner.as_object() {
-            let allowed_fields: Vec<&str> =
-                schema.fields.iter().map(|f| f.name.as_str()).collect();
+    // Schema-driven field validation (D-03, D-05): only when schema is available.
+    // When schema is None (D-07: plugin not installed), skip field-level checks
+    // but still run compiled-in value-level validation below.
+    if let Some(schema) = schema
+        && let Some(inner) = job_config.get(&job_type_key)
+        && let Some(obj) = inner.as_object()
+    {
+        let allowed_fields: Vec<&str> =
+            schema.fields.iter().map(|f| f.name.as_str()).collect();
 
-            for key in obj.keys() {
-                if !allowed_fields.contains(&key.as_str()) {
-                    errors.push(validation_err(
-                        &format!("{job_type_key}.{key}"),
-                        &format!(
-                            "unknown provider config field '{}' (allowed: {})",
-                            key,
-                            allowed_fields.join(", ")
-                        ),
-                    ));
-                }
+        for key in obj.keys() {
+            if !allowed_fields.contains(&key.as_str()) {
+                errors.push(validation_err(
+                    &format!("{job_type_key}.{key}"),
+                    &format!(
+                        "unknown provider config field '{}' (allowed: {})",
+                        key,
+                        allowed_fields.join(", ")
+                    ),
+                ));
             }
+        }
 
-            // Check required fields
-            for field in &schema.fields {
-                if field.required && inner.get(&field.name).is_none() {
-                    errors.push(validation_err(
-                        &format!("{job_type_key}.{}", field.name),
-                        &format!("required field '{}' is missing", field.name),
-                    ));
-                }
+        for field in &schema.fields {
+            if field.required && inner.get(&field.name).is_none() {
+                errors.push(validation_err(
+                    &format!("{job_type_key}.{}", field.name),
+                    &format!("required field '{}' is missing", field.name),
+                ));
             }
         }
     }
 
     // Compiled-in value-level validation for known types.
+    // Runs regardless of schema availability so existing tests and
+    // schema-less callers still get value-level checks.
     // Phase 70 removes this dispatch when providers are extracted to plugin repos.
     match job_type {
         JobType::Glue => glue::validate_config(job_config, errors),

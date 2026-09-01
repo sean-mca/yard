@@ -211,10 +211,10 @@ pub async fn apply(
     let mut schema_cache: HashMap<String, SchemaResponse> = HashMap::new();
     for job_def in manifest.jobs.values() {
         let key = job_def.job_type.to_string();
-        if !schema_cache.contains_key(&key) {
-            if let Some(schema) = providers::built_in_schema(job_def.job_type) {
-                schema_cache.insert(key, schema);
-            }
+        if let std::collections::hash_map::Entry::Vacant(entry) = schema_cache.entry(key)
+            && let Some(schema) = providers::built_in_schema(job_def.job_type)
+        {
+            entry.insert(schema);
         }
     }
 
