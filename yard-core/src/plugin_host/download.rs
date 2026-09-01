@@ -67,7 +67,10 @@ fn expand_url_template(template: &str, name: &str, version: &str) -> String {
 ///
 /// Creates parent directories as needed.
 async fn download_binary(url: &str, dest: &Path) -> Result<()> {
-    if !url.starts_with("https://") {
+    let is_loopback = url.starts_with("http://127.0.0.1")
+        || url.starts_with("http://localhost")
+        || url.starts_with("http://[::1]");
+    if !url.starts_with("https://") && !is_loopback {
         bail!("plugin binary URL must use HTTPS (got: {url})");
     }
 
@@ -83,13 +86,13 @@ async fn download_binary(url: &str, dest: &Path) -> Result<()> {
     }
 
     const MAX_PLUGIN_SIZE: u64 = 512 * 1024 * 1024; // 512 MB
-    if let Some(content_length) = response.content_length() {
-        if content_length > MAX_PLUGIN_SIZE {
-            bail!(
-                "plugin binary at {url} is {content_length} bytes, \
-                 exceeding the {MAX_PLUGIN_SIZE} byte limit"
-            );
-        }
+    if let Some(content_length) = response.content_length()
+        && content_length > MAX_PLUGIN_SIZE
+    {
+        bail!(
+            "plugin binary at {url} is {content_length} bytes, \
+             exceeding the {MAX_PLUGIN_SIZE} byte limit"
+        );
     }
 
     let bytes = response

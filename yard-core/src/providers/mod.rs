@@ -12,7 +12,7 @@
 pub mod emr;
 pub mod glue;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client as S3Client;
 use serde_json::Value;
