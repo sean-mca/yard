@@ -21,6 +21,8 @@ pub mod config;
 pub mod diff;
 /// `ValidationError` for config validation results.
 pub mod error;
+/// JSON-over-stdio plugin protocol types shared between host and plugins.
+pub mod plugin;
 /// Per-job and per-DAG deployment state types.
 pub mod state;
 /// Typed Airflow trigger model (`Trigger`, `SingleSource`) supporting S3,
@@ -30,5 +32,6 @@ pub mod trigger;
 pub use config::*;
 pub use diff::*;
 pub use error::*;
+pub use plugin::*;
 pub use state::*;
 pub use trigger::*;
