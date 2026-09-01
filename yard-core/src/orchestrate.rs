@@ -218,6 +218,13 @@ pub async fn apply(
         }
     }
 
+    // Construct plugin host config for plugin-aware provider dispatch.
+    let plugin_host_config = crate::plugin_host::PluginHostConfig {
+        plugins_dir: root_dir.join(".yard/plugins"),
+        lock_file_path: Some(root_dir.join("yard.lock")),
+        ..Default::default()
+    };
+
     // Validate all jobs up front (schema + syntax) — abort before making any changes
     let mut all_errors: Vec<(String, Vec<yard_structs::ValidationError>)> = Vec::with_capacity(manifest.jobs.len());
     for (name, job_def) in &manifest.jobs {
@@ -379,8 +386,14 @@ pub async fn apply(
                                 &job_def.config,
                                 &provider_key,
                             );
-                            let provider =
-                                providers::get_provider(job_def.job_type, &merged_config).await?;
+                            let provider = providers::get_provider_for_job(
+                                job_def.job_type,
+                                &merged_config,
+                                job_def.plugin_version.as_deref(),
+                                job_def.plugin_source.as_deref(),
+                                &plugin_host_config,
+                            )
+                            .await?;
                             provider
                                 .deploy(&diff.name, &script_content, &job_def.config)
                                 .await?

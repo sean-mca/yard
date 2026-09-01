@@ -20,6 +20,10 @@ use std::future::Future;
 use std::pin::Pin;
 use yard_structs::{JobType, Resource, ResourceStatus, SchemaField, SchemaResponse, ValidationError};
 
+use crate::plugin_host::download;
+use crate::plugin_host::PluginHostConfig;
+use crate::plugin_host::PluginProvider;
+
 /// Build a standard AWS SDK config with region, retry policy, and optional
 /// STS `AssumeRole` wrapped around the default credential provider chain.
 ///
@@ -294,6 +298,46 @@ pub async fn get_provider(job_type: JobType, provider_config: &Value) -> Result<
             "No provider for job type: {job_type} (bash is task-only — should not reach get_provider)"
         )),
         _ => Err(anyhow!("unsupported job type: {job_type}")),
+    }
+}
+
+/// Plugin-aware provider dispatch for the apply create/modify path.
+///
+/// When `plugin_version` and `plugin_source` are both present, downloads the
+/// plugin binary (if not already cached) and constructs a [`PluginProvider`].
+/// Otherwise falls through to the compiled-in [`get_provider`].
+///
+/// Target-aware download (D-16) is achieved by design: only jobs that reach
+/// the create/modify path call this function, so only the providers needed by
+/// targeted jobs are downloaded.
+///
+/// # Errors
+///
+/// Returns an error if the plugin download fails, or if the compiled-in
+/// provider construction fails when no plugin fields are present.
+pub async fn get_provider_for_job(
+    job_type: JobType,
+    provider_config: &Value,
+    plugin_version: Option<&str>,
+    plugin_source: Option<&str>,
+    plugin_host_config: &PluginHostConfig,
+) -> Result<Box<dyn Provider>> {
+    if let (Some(version), Some(source)) = (plugin_version, plugin_source) {
+        let plugin_name = format!("yard-plugin-{job_type}");
+        let binary_path =
+            download::ensure_plugin_cached(&plugin_name, version, source, plugin_host_config)
+                .await
+                .with_context(|| {
+                    format!("failed to ensure plugin binary for {plugin_name} v{version}")
+                })?;
+
+        Ok(Box::new(PluginProvider::from_binary(
+            binary_path,
+            plugin_name,
+            plugin_host_config.clone(),
+        )))
+    } else {
+        get_provider(job_type, provider_config).await
     }
 }
 
