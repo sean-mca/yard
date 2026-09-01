@@ -9,7 +9,7 @@
 use regex::Regex;
 use std::collections::HashSet;
 use std::sync::LazyLock;
-use yard_structs::{JdbcAuth, JobDefinition, JobType, ValidationError};
+use yard_structs::{JdbcAuth, JobDefinition, JobType, SchemaResponse, ValidationError};
 
 /// Supported source types for Spark jobs.
 const SUPPORTED_SOURCE_TYPES: &[&str] = &["s3", "jdbc", "catalog", "kafka", "api"];
@@ -50,10 +50,27 @@ pub use crate::providers::validation_err as err;
 
 /// Validate a job definition against yard's schema rules.
 ///
-/// Returns a (possibly empty) list of validation errors. Errors are
-/// collected without short-circuiting so every violation is reported.
+/// Delegates to [`validate_job_with_schema`] with `None` schema, preserving
+/// backward compatibility for call sites that don't have a schema cache.
 #[must_use]
 pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
+    validate_job_with_schema(job, None)
+}
+
+/// Validate a job definition against yard's schema rules with optional
+/// provider schema for field checking and source/sink type union (D-03).
+///
+/// Returns a (possibly empty) list of validation errors. Errors are
+/// collected without short-circuiting so every violation is reported.
+///
+/// When `schema` is `Some`, source/sink type checks union the built-in
+/// types with the schema's declared types, and provider config validation
+/// uses schema-driven field checking.
+#[must_use]
+pub fn validate_job_with_schema(
+    job: &JobDefinition,
+    schema: Option<&SchemaResponse>,
+) -> Vec<ValidationError> {
     let mut errors = Vec::with_capacity(4);
 
     // Note: job-type validity (one of `glue`, `emr`, `bash`) is now enforced
@@ -124,6 +141,10 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
         ));
     }
 
+    // Build effective source type list — union built-in types with plugin-declared types (D-03)
+    let effective_source_types = effective_type_list(SUPPORTED_SOURCE_TYPES, schema.and_then(|s| s.supported_source_types.as_deref()));
+    let effective_sink_types = effective_type_list(SUPPORTED_SINK_TYPES, schema.and_then(|s| s.supported_sink_types.as_deref()));
+
     // Track known df names for reference checking
     let mut known_names: HashSet<String> = HashSet::new();
 
@@ -131,13 +152,13 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
     for (i, source) in job.sources.iter().enumerate() {
         let prefix = format!("sources[{}]", i);
 
-        if !SUPPORTED_SOURCE_TYPES.contains(&source.source_type.as_str()) {
+        if !effective_source_types.iter().any(|t| t == &source.source_type) {
             errors.push(err(
                 &format!("{prefix}.type"),
                 &format!(
                     "\"{}\" is not a supported source type (expected: {})",
                     source.source_type,
-                    SUPPORTED_SOURCE_TYPES.join(", ")
+                    effective_source_types.join(", ")
                 ),
             ));
         }
@@ -396,13 +417,13 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
 
     // Sink
     if let Some(ref sink) = job.sink {
-        if !SUPPORTED_SINK_TYPES.contains(&sink.sink_type.as_str()) {
+        if !effective_sink_types.iter().any(|t| t == &sink.sink_type) {
             errors.push(err(
                 "sink.type",
                 &format!(
                     "\"{}\" is not a supported sink type (expected: {})",
                     sink.sink_type,
-                    SUPPORTED_SINK_TYPES.join(", ")
+                    effective_sink_types.join(", ")
                 ),
             ));
         }
@@ -529,10 +550,24 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
         ));
     }
 
-    // Provider-specific config validation — dispatched to the provider registry.
-    crate::providers::validate_provider_config(job.job_type, &job.config, &mut errors);
+    // Provider-specific config validation — dispatched via schema-driven validation.
+    crate::providers::validate_provider_config_with_schema(job.job_type, &job.config, schema, &mut errors);
 
     errors
+}
+
+/// Build an effective type list by unioning built-in types with optional
+/// plugin-declared types (D-03). Used for source and sink type validation.
+fn effective_type_list(builtin: &[&str], plugin_types: Option<&[String]>) -> Vec<String> {
+    let mut types: Vec<String> = builtin.iter().map(|s| (*s).to_string()).collect();
+    if let Some(extras) = plugin_types {
+        for t in extras {
+            if !types.iter().any(|existing| existing == t) {
+                types.push(t.clone());
+            }
+        }
+    }
+    types
 }
 
 /// Validate a task-only job (bash, ... future: python, sensor, dbt).
