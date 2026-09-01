@@ -15,10 +15,11 @@
 mod rules;
 mod syntax;
 
-use yard_structs::{JobDefinition, ValidationError};
+use yard_structs::{JobDefinition, SchemaResponse, ValidationError};
 
 // Re-export public API (preserves crate::validation::X paths)
 pub use rules::validate_job;
+pub use rules::validate_job_with_schema;
 pub use syntax::validate_python_syntax;
 
 // Import for local use in validate_job_full
@@ -35,7 +36,22 @@ use yard_structs::{AirflowSection, SingleSource, Trigger};
 /// skipped since the generated script would be invalid anyway.
 #[must_use]
 pub fn validate_job_full(job_name: &str, job_def: &JobDefinition) -> Vec<ValidationError> {
-    let mut errors = validate_job(job_def);
+    validate_job_full_with_schema(job_name, job_def, None)
+}
+
+/// Validate a job definition and its generated script with optional
+/// provider schema for schema-driven field validation (D-03, D-05).
+///
+/// Same as [`validate_job_full`] but passes the schema through to
+/// [`validate_job_with_schema`] for source/sink type union and
+/// schema-driven provider config field checking.
+#[must_use]
+pub fn validate_job_full_with_schema(
+    job_name: &str,
+    job_def: &JobDefinition,
+    schema: Option<&SchemaResponse>,
+) -> Vec<ValidationError> {
+    let mut errors = validate_job_with_schema(job_def, schema);
 
     // Only check syntax if schema validation passed — no point generating
     // a script from an invalid config
@@ -2242,6 +2258,140 @@ mod tests {
             errors.iter().any(|e| e.field == "mask_pii"
                 && e.message.contains("duplicate entity type")),
             "missing duplicate error: {errors:?}"
+        );
+    }
+
+    // --- Phase 68 plan 68-02: schema-driven provider config validation ---
+
+    #[test]
+    fn schema_driven_unknown_field_detected() {
+        // Create a Glue job with an unknown field in the glue: block.
+        // validate_job_with_schema with the Glue built_in_schema should
+        // detect the unknown field.
+        let mut job = minimal_job();
+        job.config = json!({
+            "type": "glue",
+            "role": "arn:aws:iam::123456789:role/GlueRole",
+            "glue": {
+                "script_bucket": "my-bucket",
+                "bogus_field": 42
+            }
+        });
+        let schema = crate::providers::built_in_schema(JobType::Glue);
+        let errors = validate_job_with_schema(&job, schema.as_ref());
+        assert!(
+            errors.iter().any(|e| e.message.contains("bogus_field")),
+            "expected error mentioning 'bogus_field', got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn schema_driven_required_field_missing() {
+        // Glue schema declares script_bucket as required. If the glue: block
+        // exists but omits script_bucket, schema validation should catch it.
+        let mut job = minimal_job();
+        job.config = json!({
+            "type": "glue",
+            "role": "arn:aws:iam::123456789:role/GlueRole",
+            "glue": {
+                "worker_type": "G.1X"
+            }
+        });
+        let schema = crate::providers::built_in_schema(JobType::Glue);
+        let errors = validate_job_with_schema(&job, schema.as_ref());
+        assert!(
+            errors.iter().any(|e| e.message.contains("required field 'script_bucket'")),
+            "expected required-field error for script_bucket, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn schema_driven_valid_fields_pass() {
+        // All valid Glue fields — no unknown field errors from schema validation.
+        let job = valid_glue_job();
+        let schema = crate::providers::built_in_schema(JobType::Glue);
+        let errors = validate_job_with_schema(&job, schema.as_ref());
+        assert!(
+            !errors.iter().any(|e| e.message.contains("unknown provider config field")),
+            "unexpected unknown-field error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn schema_none_skips_provider_validation() {
+        // When schema is None, validate_provider_config_with_schema returns
+        // immediately — no provider-specific errors should appear.
+        let mut job = minimal_job();
+        job.config = json!({
+            "type": "glue",
+            "glue": { "totally_fake_field": true }
+        });
+        let errors = validate_job_with_schema(&job, None);
+        // With None schema, the old validate_provider_config is NOT called
+        // (validate_provider_config_with_schema returns immediately), so no
+        // provider-specific errors. The only error would be from the role check
+        // if we had wired it. Since validate_provider_config_with_schema skips
+        // everything on None, there should be no provider config field errors.
+        assert!(
+            !errors.iter().any(|e| e.message.contains("unknown provider config field")),
+            "schema=None should skip field validation: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn source_type_union_with_plugin_types() {
+        // When schema declares supported_source_types, they are unioned with
+        // the built-in SUPPORTED_SOURCE_TYPES during validation.
+        let mut job = minimal_job();
+        job.sources = vec![Source {
+            name: "custom".to_string(),
+            source_type: "databricks_table".to_string(),
+            ..Default::default()
+        }];
+        // Without schema, "databricks_table" is unknown
+        let errors_no_schema = validate_job_with_schema(&job, None);
+        assert!(
+            errors_no_schema.iter().any(|e| e.field == "sources[0].type"),
+            "expected source type error without schema, got: {errors_no_schema:?}"
+        );
+
+        // With schema declaring databricks_table, it should pass
+        let schema = yard_structs::SchemaResponse {
+            fields: vec![],
+            supported_source_types: Some(vec!["databricks_table".to_string()]),
+            supported_sink_types: None,
+        };
+        let errors_with_schema = validate_job_with_schema(&job, Some(&schema));
+        assert!(
+            !errors_with_schema.iter().any(|e| e.field == "sources[0].type"),
+            "expected no source type error with schema, got: {errors_with_schema:?}"
+        );
+    }
+
+    #[test]
+    fn sink_type_union_with_plugin_types() {
+        let mut job = minimal_job();
+        job.sink = Some(Sink {
+            sink_type: "databricks_table".to_string(),
+            ..Default::default()
+        });
+        // Without schema, "databricks_table" is unknown
+        let errors_no_schema = validate_job_with_schema(&job, None);
+        assert!(
+            errors_no_schema.iter().any(|e| e.field == "sink.type"),
+            "expected sink type error without schema, got: {errors_no_schema:?}"
+        );
+
+        // With schema declaring databricks_table, it should pass
+        let schema = yard_structs::SchemaResponse {
+            fields: vec![],
+            supported_source_types: None,
+            supported_sink_types: Some(vec!["databricks_table".to_string()]),
+        };
+        let errors_with_schema = validate_job_with_schema(&job, Some(&schema));
+        assert!(
+            !errors_with_schema.iter().any(|e| e.field == "sink.type"),
+            "expected no sink type error with schema, got: {errors_with_schema:?}"
         );
     }
 }

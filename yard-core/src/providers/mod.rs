@@ -18,7 +18,7 @@ use aws_sdk_s3::Client as S3Client;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
-use yard_structs::{JobType, Resource, ResourceStatus, ValidationError};
+use yard_structs::{JobType, Resource, ResourceStatus, SchemaField, SchemaResponse, ValidationError};
 
 /// Build a standard AWS SDK config with region, retry policy, and optional
 /// STS `AssumeRole` wrapped around the default credential provider chain.
@@ -276,6 +276,221 @@ pub fn validate_provider_config(
     job_config: &Value,
     errors: &mut Vec<ValidationError>,
 ) {
+    match job_type {
+        JobType::Glue => glue::validate_config(job_config, errors),
+        JobType::Emr => {
+            if let Some(config) = job_config.get("emr") {
+                emr::validate_config(config, errors);
+            }
+        }
+        JobType::Bash => {}
+        _ => {}
+    }
+}
+
+/// Return the built-in schema for a compiled-in provider type (D-05, D-06).
+///
+/// Returns `Some(SchemaResponse)` for providers that ship inside yard-core
+/// (Glue, EMR, Bash). Returns `None` for unknown/plugin types — the caller
+/// must fetch the schema from the plugin binary in that case.
+///
+/// When Phase 70 extracts Glue/EMR to separate plugin repos, each plugin's
+/// `schema` handler will return the same data. This function becomes a
+/// fallback for the built-in-only path.
+#[must_use]
+pub fn built_in_schema(job_type: JobType) -> Option<SchemaResponse> {
+    match job_type {
+        JobType::Glue => Some(SchemaResponse {
+            fields: vec![
+                SchemaField {
+                    name: "script_bucket".to_string(),
+                    field_type: "string".to_string(),
+                    required: true,
+                    description: "S3 bucket for uploaded PySpark scripts".to_string(),
+                },
+                SchemaField {
+                    name: "script_prefix".to_string(),
+                    field_type: "string".to_string(),
+                    required: false,
+                    description: "S3 key prefix within the script bucket".to_string(),
+                },
+                SchemaField {
+                    name: "worker_type".to_string(),
+                    field_type: "string".to_string(),
+                    required: false,
+                    description: "Glue worker type (G.025X, G.1X, G.2X, G.4X, G.8X, Z.2X)".to_string(),
+                },
+                SchemaField {
+                    name: "number_of_workers".to_string(),
+                    field_type: "integer".to_string(),
+                    required: false,
+                    description: "Number of Glue workers (minimum 1)".to_string(),
+                },
+                SchemaField {
+                    name: "glue_version".to_string(),
+                    field_type: "string".to_string(),
+                    required: false,
+                    description: "Glue ETL version (3.0, 4.0, 5.0)".to_string(),
+                },
+                SchemaField {
+                    name: "timeout".to_string(),
+                    field_type: "integer".to_string(),
+                    required: false,
+                    description: "Job timeout in minutes".to_string(),
+                },
+                SchemaField {
+                    name: "max_retries".to_string(),
+                    field_type: "integer".to_string(),
+                    required: false,
+                    description: "Maximum retry count on failure".to_string(),
+                },
+                SchemaField {
+                    name: "max_concurrent_runs".to_string(),
+                    field_type: "integer".to_string(),
+                    required: false,
+                    description: "Maximum concurrent job runs".to_string(),
+                },
+                SchemaField {
+                    name: "bookmark".to_string(),
+                    field_type: "string".to_string(),
+                    required: false,
+                    description: "Job bookmark setting (enabled, disabled)".to_string(),
+                },
+                SchemaField {
+                    name: "connections".to_string(),
+                    field_type: "array".to_string(),
+                    required: false,
+                    description: "List of Glue connection names".to_string(),
+                },
+                SchemaField {
+                    name: "default_arguments".to_string(),
+                    field_type: "object".to_string(),
+                    required: false,
+                    description: "Default arguments map for the Glue job".to_string(),
+                },
+                SchemaField {
+                    name: "region".to_string(),
+                    field_type: "string".to_string(),
+                    required: false,
+                    description: "AWS region for the Glue service".to_string(),
+                },
+            ],
+            supported_source_types: None,
+            supported_sink_types: None,
+        }),
+        JobType::Emr => Some(SchemaResponse {
+            fields: vec![
+                SchemaField {
+                    name: "action_on_failure".to_string(),
+                    field_type: "string".to_string(),
+                    required: false,
+                    description: "Action on step failure (CONTINUE, CANCEL_AND_WAIT, TERMINATE_CLUSTER)".to_string(),
+                },
+                SchemaField {
+                    name: "deploy_mode".to_string(),
+                    field_type: "string".to_string(),
+                    required: false,
+                    description: "Spark deploy mode (cluster, client)".to_string(),
+                },
+                SchemaField {
+                    name: "script_bucket".to_string(),
+                    field_type: "string".to_string(),
+                    required: true,
+                    description: "S3 bucket for uploaded PySpark scripts".to_string(),
+                },
+                SchemaField {
+                    name: "cluster_id".to_string(),
+                    field_type: "string".to_string(),
+                    required: true,
+                    description: "EMR cluster ID to submit steps to".to_string(),
+                },
+                SchemaField {
+                    name: "script_prefix".to_string(),
+                    field_type: "string".to_string(),
+                    required: false,
+                    description: "S3 key prefix within the script bucket".to_string(),
+                },
+                SchemaField {
+                    name: "region".to_string(),
+                    field_type: "string".to_string(),
+                    required: false,
+                    description: "AWS region for the EMR service".to_string(),
+                },
+            ],
+            supported_source_types: None,
+            supported_sink_types: None,
+        }),
+        JobType::Bash => Some(SchemaResponse {
+            fields: vec![],
+            ..Default::default()
+        }),
+        // Unknown/plugin types: no built-in schema. The caller should fetch
+        // the schema from the plugin binary (Phase 70 JobType::Plugin(String)).
+        _ => None,
+    }
+}
+
+/// Schema-driven provider config field validation (D-05).
+///
+/// Validates provider config fields against the schema's declared field list
+/// and checks required fields. After schema-level checks, runs compiled-in
+/// value-level validation for known provider types.
+///
+/// When `schema` is `None`, returns immediately — this is the structural prep
+/// for Phase 70 when `JobType::Plugin(String)` makes the missing-plugin path
+/// reachable (D-07).
+///
+/// # Note
+///
+/// The compiled-in `glue::validate_config` / `emr::validate_config` calls
+/// are retained until Phase 70 extracts providers to separate repos.
+pub fn validate_provider_config_with_schema(
+    job_type: JobType,
+    job_config: &Value,
+    schema: Option<&SchemaResponse>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let Some(schema) = schema else {
+        // D-07: plugin not installed or unknown type, skip provider-specific validation
+        return;
+    };
+
+    let job_type_key = job_type.to_string();
+    let inner = job_config.get(&job_type_key);
+
+    // Validate fields against schema if inner block is present and is an object
+    if let Some(inner) = inner {
+        if let Some(obj) = inner.as_object() {
+            let allowed_fields: Vec<&str> =
+                schema.fields.iter().map(|f| f.name.as_str()).collect();
+
+            for key in obj.keys() {
+                if !allowed_fields.contains(&key.as_str()) {
+                    errors.push(validation_err(
+                        &format!("{job_type_key}.{key}"),
+                        &format!(
+                            "unknown provider config field '{}' (allowed: {})",
+                            key,
+                            allowed_fields.join(", ")
+                        ),
+                    ));
+                }
+            }
+
+            // Check required fields
+            for field in &schema.fields {
+                if field.required && inner.get(&field.name).is_none() {
+                    errors.push(validation_err(
+                        &format!("{job_type_key}.{}", field.name),
+                        &format!("required field '{}' is missing", field.name),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Compiled-in value-level validation for known types.
+    // Phase 70 removes this dispatch when providers are extracted to plugin repos.
     match job_type {
         JobType::Glue => glue::validate_config(job_config, errors),
         JobType::Emr => {

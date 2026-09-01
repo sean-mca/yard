@@ -19,7 +19,7 @@ use std::fmt::Write;
 use std::path::Path;
 use yard_structs::{
     DagDiff, Deployment, DeploymentStatus, DiffType, JobDiff, JobName, JobState, JobType,
-    ProjectManifest, ProjectState, ResourceStatus,
+    ProjectManifest, ProjectState, ResourceStatus, SchemaResponse,
 };
 
 use crate::airflow_dag;
@@ -206,10 +206,23 @@ pub async fn apply(
     dry_run: bool,
     target: Option<String>,
 ) -> Result<ApplyResult> {
+    // Build schema cache from built-in providers (D-06). Populated once per
+    // provider type, then passed through the validation pipeline.
+    let mut schema_cache: HashMap<String, SchemaResponse> = HashMap::new();
+    for job_def in manifest.jobs.values() {
+        let key = job_def.job_type.to_string();
+        if !schema_cache.contains_key(&key) {
+            if let Some(schema) = providers::built_in_schema(job_def.job_type) {
+                schema_cache.insert(key, schema);
+            }
+        }
+    }
+
     // Validate all jobs up front (schema + syntax) — abort before making any changes
     let mut all_errors: Vec<(String, Vec<yard_structs::ValidationError>)> = Vec::with_capacity(manifest.jobs.len());
     for (name, job_def) in &manifest.jobs {
-        let errors = validation::validate_job_full(name, job_def);
+        let schema = schema_cache.get(&job_def.job_type.to_string());
+        let errors = validation::validate_job_full_with_schema(name, job_def, schema);
         if !errors.is_empty() {
             all_errors.push((name.clone(), errors));
         }
