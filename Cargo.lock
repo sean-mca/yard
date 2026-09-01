@@ -6057,6 +6057,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "yard-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "yard-structs",
+]
+
+[[package]]
 name = "yard-server"
 version = "0.2.2"
 dependencies = [
