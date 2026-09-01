@@ -502,6 +502,15 @@ pub struct JobDefinition {
     /// `depends_on`.
     #[serde(skip, default)]
     pub base_name: String,
+    /// Plugin binary version pinned for this job (e.g. `"0.3.1"`). When set
+    /// alongside `plugin_source`, yard downloads and uses the plugin binary
+    /// instead of a compiled-in provider.
+    #[serde(default)]
+    pub plugin_version: Option<String>,
+    /// URL template for downloading the plugin binary. Placeholders:
+    /// `${name}`, `${version}`, `${os}`, `${arch}`.
+    #[serde(default)]
+    pub plugin_source: Option<String>,
 }
 
 /// Hand-written `Default` because `JobType` deliberately has no `Default` impl
@@ -529,6 +538,8 @@ impl Default for JobDefinition {
             config: serde_json::Value::Null,
             dir: PathBuf::new(),
             base_name: String::new(),
+            plugin_version: None,
+            plugin_source: None,
         }
     }
 }
@@ -1523,5 +1534,39 @@ mod tests {
         assert_eq!(deserialized.mask_pii.len(), 2);
         assert_eq!(deserialized.mask_pii[0], "USA_SSN");
         assert_eq!(deserialized.mask_pii[1], "CREDIT_CARD");
+    }
+
+    #[test]
+    fn job_definition_plugin_fields_deserialize() {
+        let input = json!({
+            "job_type": "glue",
+            "config": {},
+            "plugin_version": "0.3.1",
+            "plugin_source": "https://example.com/${name}-${version}"
+        });
+        let job: JobDefinition = serde_json::from_value(input).unwrap();
+        assert_eq!(job.plugin_version.as_deref(), Some("0.3.1"));
+        assert_eq!(
+            job.plugin_source.as_deref(),
+            Some("https://example.com/${name}-${version}")
+        );
+    }
+
+    #[test]
+    fn job_definition_without_plugin_fields_backward_compat() {
+        let input = json!({
+            "job_type": "glue",
+            "config": {}
+        });
+        let job: JobDefinition = serde_json::from_value(input).unwrap();
+        assert!(job.plugin_version.is_none());
+        assert!(job.plugin_source.is_none());
+    }
+
+    #[test]
+    fn job_definition_default_has_no_plugin_fields() {
+        let job = JobDefinition::default();
+        assert!(job.plugin_version.is_none());
+        assert!(job.plugin_source.is_none());
     }
 }
