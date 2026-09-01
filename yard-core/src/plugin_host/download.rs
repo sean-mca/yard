@@ -93,9 +93,13 @@ async fn download_binary(url: &str, dest: &Path) -> Result<()> {
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
 
-    tokio::fs::write(dest, &bytes)
+    let tmp_dest = dest.with_extension("downloading");
+    tokio::fs::write(&tmp_dest, &bytes)
         .await
-        .with_context(|| format!("failed to write plugin binary to {}", dest.display()))?;
+        .with_context(|| format!("failed to write plugin binary to {}", tmp_dest.display()))?;
+    tokio::fs::rename(&tmp_dest, dest)
+        .await
+        .with_context(|| format!("failed to finalize plugin binary at {}", dest.display()))?;
 
     Ok(())
 }
