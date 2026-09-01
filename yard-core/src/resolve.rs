@@ -58,6 +58,8 @@ const STATIC_JOB_DOC_ALLOWED: &[&str] = &[
     "partition_timestamp_column",
     "create_timestamp",
     "_aws",
+    "plugin_version",
+    "plugin_source",
 ];
 
 /// Build the full allowed-keys list for a job doc by combining the static
@@ -340,6 +342,15 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
         let partition_timestamp_column = crate::parse_partition_timestamp_column(&config);
         let create_timestamp = crate::parse_create_timestamp(&config);
 
+        let plugin_version = config
+            .get("plugin_version")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let plugin_source = config
+            .get("plugin_source")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
         all_jobs.insert(
             job_name,
             JobDefinition {
@@ -358,8 +369,8 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
                 config,
                 dir: job_dir.clone(),
                 base_name,
-                plugin_version: None,
-                plugin_source: None,
+                plugin_version,
+                plugin_source,
             },
         );
     }
