@@ -6048,10 +6048,24 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "tera",
  "tokio",
  "walkdir",
  "yaml-rust2",
+ "yard-structs",
+]
+
+[[package]]
+name = "yard-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
  "yard-structs",
 ]
 

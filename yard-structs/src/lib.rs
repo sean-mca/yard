@@ -11,6 +11,9 @@
 //!   newtypes and `DeploymentStatus`/`DagDeploymentStatus` enums.
 //! - [`diff`] -- Diff types (`DiffType`, `Diff`) for plan/apply change detection.
 //! - [`error`] -- `ValidationError` for config validation results.
+//! - [`plugin`] -- JSON-over-stdio plugin protocol types
+//!   (`PluginOperation`, `HandshakeMessage`, `PluginRequest`, response
+//!   structs) shared between the host and external plugin binaries.
 //! - [`trigger`] -- Typed Airflow trigger model (`Trigger`, `SingleSource`)
 //!   supporting S3, Dataset, SQS, API, and composite triggers.
 

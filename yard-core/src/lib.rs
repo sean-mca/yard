@@ -33,6 +33,9 @@ pub mod list_targets;
 pub mod orchestrate;
 /// YAML-to-typed-struct parsers for jobs, sources, sinks, and airflow blocks.
 pub mod parsing;
+/// Plugin host -- process spawning and Provider adapter for out-of-process
+/// plugin binaries.
+pub mod plugin_host;
 pub mod providers;
 /// Project discovery, YAML config cascade, and variable resolution.
 pub mod resolve;

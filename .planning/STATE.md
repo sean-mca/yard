@@ -1,39 +1,39 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.16
-milestone_name: Rules Compliance Audit
-current_phase: 65
-current_phase_name: yard-core-audit-fix
-status: verifying
-stopped_at: Phase 65 context gathered
-last_updated: "2026-08-18T01:37:08.853Z"
-last_activity: 2026-08-18
-last_activity_desc: Phase 65 execution started
+milestone: v2.0
+milestone_name: Plugin Architecture
+current_phase: 68
+current_phase_name: provider-scoped-config-cascade
+status: executing
+stopped_at: Phase 68 context gathered
+last_updated: "2026-09-01T12:19:35.592Z"
+last_activity: 2026-09-01
+last_activity_desc: Phase 68 execution started
 progress:
-  total_phases: 2
+  total_phases: 5
   completed_phases: 2
-  total_plans: 5
+  total_plans: 7
   completed_plans: 5
-  percent: 100
+  percent: 40
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-08-17)
+See: .planning/PROJECT.md (updated 2026-08-31)
 
 **Core value:** The CLI must remain correct and easy to reason about -- every refactor must preserve existing behavior and pass the full test suite.
-**Current focus:** Phase 65 — yard-core-audit-fix
+**Current focus:** Phase 68 — provider-scoped-config-cascade
 
 ## Current Position
 
-Phase: 65 (yard-core-audit-fix) — EXECUTING
-Plan: 3 of 3
-Status: Phase complete — ready for verification
-Last activity: 2026-08-18 — Phase 65 execution started
+Phase: 68 (provider-scoped-config-cascade) — EXECUTING
+Plan: 1 of 2
+Status: Executing Phase 68
+Last activity: 2026-09-01 — Phase 68 execution started
 
-Progress: [██████████] 100%
+Progress: [░░░░░░░░░░] 0%
 
 ## Accumulated Context
 
@@ -42,29 +42,23 @@ Progress: [██████████] 100%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
-- (v1.16 roadmap): 2-phase structure mirroring v1.12 precedent -- crate-based grouping (read each file once, check all rules)
-- (v1.16 roadmap): All 14 requirements map to both phases -- each phase covers its crate subset against all 14 rule categories
-- (v1.16 roadmap): yard-server excluded per v1.12 precedent
-- [Phase ?]: A-01 confirmed: AwsCredentialConfig::merge clone pattern is necessary (callers borrow)
-- [Phase ?]: A-08 flagged: ProjectState.deployments HashMap<String, Deployment> TYPE-01 finding, deferred for backward compat
-- [Phase 64 P02]: A-02: colorize() Cow NOT warranted -- CLI display helper, not hot path, O(single-digit) calls
-- [Phase 64 P02]: A-03: wildcard arms in display.rs confirmed intentional for #[non_exhaustive] DiffType
-- [Phase ?]: Phase 65 P01: No violations found in codegen/ -- zero code changes needed; format! in sink.rs confirmed as template construction (N-08)
-- [Phase ?]: Phase 65 P02: ~29 own-borrow-over-clone violations fixed in validation/rules.rs
-- [Phase ?]: Phase 65 P02: D-06 honored -- # Examples deferred to future doc phase
-- [Phase 65 P03]: V-06/V-07 lint suppression added for consistency on test files with 0 unwrap calls
-- [Phase 65 P03]: D-05 (HashMap<String, Deployment>) and D-06 (# Examples) deferred findings honored
+- (v2.0 roadmap): 5-phase structure -- Protocol+Host -> SDK -> Config Cascade -> Distribution -> Core Slimming+Docs
+- (v2.0 roadmap): Providers (Glue/EMR) live in separate repos; v2.0 removes them from core but does NOT create plugin binaries in this repo
+- (v2.0 roadmap): yard-plugin-sdk is a workspace crate IN this repo
+- (v2.0 research): Critical pitfall -- stdio deadlock; use unidirectional flow (write request, close stdin, read response)
+- (v2.0 research): Critical pitfall -- stdout contamination; SDK must own stdout, plugin authors use stderr for logging
+- [Phase ?]: PluginHandler: 8 required methods, no defaults
+- [Phase ?]: ProtocolWriter is pub(crate) -- stdout capture is internal SDK detail
 
 ### Roadmap Evolution
 
-- 2026-08-17: v1.16 roadmap created -- 2 phases (64-65), 14 requirements mapped to both phases
-- 2026-07-19: v1.15 Distribution milestone shipped -- Phase 63 complete
-- 2026-06-25: v1.14 PII Detection & Masking shipped -- 3 phases (60-62)
-- 2026-06-17: v1.12 Code Audit shipped -- 2 phases (58-59), the prior audit baseline
+- 2026-08-31: v2.0 roadmap created -- 5 phases (66-70), 23 requirements mapped
+- 2026-08-18: v1.16 Rules Compliance Audit shipped -- 2 phases (64-65)
+- 2026-07-19: v1.15 Distribution shipped -- Phase 63
 
 ### Pending Todos
 
-- Iceberg follow-up (from 50.1): make the kind-mismatch guard recursive + add self-contained coercion; currently top-level only.
+- Iceberg follow-up (from 50.1): make the kind-mismatch guard recursive + add self-contained coercion
 
 ### Blockers/Concerns
 
@@ -86,20 +80,14 @@ Items carried forward from previous milestones:
 
 ## Session Continuity
 
-Last session: 2026-08-18T01:36:54.808Z
-Stopped at: Phase 65 context gathered
-Resume file: .planning/phases/65-yard-core-audit-fix/65-CONTEXT.md
-
-## Operator Next Steps
-
-- Plan Phase 64 with `/gsd-plan-phase 64`
+Last session: 2026-09-01T00:51:08.121Z
+Stopped at: Phase 68 context gathered
+Resume file: .planning/phases/68-provider-scoped-config-cascade/68-CONTEXT.md
 
 ## Performance Metrics
 
 | Phase | Plan | Duration | Notes |
 |-------|------|----------|-------|
-| Phase 64 P01 | 172 | 2 tasks | 1 files |
-| Phase 64 P02 | 207 | 2 tasks | 0 files |
-| Phase 65 P01 | 177 | 2 tasks | 0 files |
-| Phase 65 P02 | 320 | 2 tasks | 1 files |
-| Phase 65 P03 | 4min | 2 tasks | 8 files |
+| -- | -- | -- | v2.0 not yet started |
+| Phase 67 P01 | 4min | - tasks | - files |
+| Phase 67 P02 | 4min | 2 tasks | 3 files |
