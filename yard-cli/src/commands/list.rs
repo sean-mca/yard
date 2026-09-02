@@ -65,6 +65,7 @@ pub async fn execute(directory: Option<String>, _json: bool) -> Result<()> {
     }
 
     filtered.sort_by(|a, b| a.target.cmp(&b.target));
+    filtered.dedup_by(|a, b| a.target == b.target);
 
     let out = serde_json::to_string_pretty(&filtered)?;
     println!("{out}");
