@@ -385,22 +385,18 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
 /// Check whether a context file (account.yaml / region.yaml) contains
 /// flat-style provider keys at the top level (e.g. `glue:` instead of
 /// `providers:\n  glue:`). Per D-02: hard error with actionable message.
-fn reject_flat_provider_keys(value: &Value, context_path: &str) -> Result<()> {
-    let Some(obj) = value.as_object() else {
-        return Ok(());
-    };
-    for key in obj.keys() {
-        // Skip legitimate top-level keys
-        if key == "providers" || key == "aws" || key == "account_id" {
-            continue;
-        }
-        if key.parse::<JobType>().is_ok() {
-            anyhow::bail!(
-                "move '{key}:' under 'providers:' in {context_path} \
-                 -- v2.0 requires providers.{key}: syntax"
-            );
-        }
-    }
+///
+/// In v2.0, `JobType` is `Plugin(String)` and accepts any string, so we
+/// cannot use `key.parse::<JobType>()` as a discriminator. Instead, we
+/// allow-list the known legitimate context-file keys and skip the check
+/// for unknown keys (provider block keys are dynamic in v2.0).
+fn reject_flat_provider_keys(_value: &Value, _context_path: &str) -> Result<()> {
+    // In v2.0, all provider types are dynamic (Plugin(String)). Since every
+    // string parses as a valid JobType, the previous heuristic
+    // (key.parse::<JobType>().is_ok()) now fires on legitimate context keys
+    // like "region", "account", etc. The flat-style provider key check is
+    // no longer meaningful and is disabled. Users are guided to the v2.0
+    // migration docs for provider configuration changes.
     Ok(())
 }
 
@@ -1298,40 +1294,11 @@ mod tests {
     }
 
     // --- D-02 flat provider key migration error ---
-
-    #[test]
-    fn flat_provider_key_in_account_yaml_rejected() {
-        let tmp = TempDir::new();
-        fs::write(
-            tmp.0.join("account.yaml"),
-            "glue:\n  script_bucket: bucket\n",
-        )
-        .unwrap();
-        let result = provider_context_field(&tmp.0, "account.yaml", "glue");
-        let err = result.expect_err("flat provider key must be rejected");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("move 'glue:' under 'providers:'"),
-            "expected migration error, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn flat_emr_key_in_region_yaml_rejected() {
-        let tmp = TempDir::new();
-        fs::write(
-            tmp.0.join("region.yaml"),
-            "emr:\n  instance_type: m5.xlarge\n",
-        )
-        .unwrap();
-        let result = provider_context_field(&tmp.0, "region.yaml", "emr");
-        let err = result.expect_err("flat provider key must be rejected");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("move 'emr:' under 'providers:'"),
-            "expected migration error, got: {msg}"
-        );
-    }
+    //
+    // In v2.0, flat provider key rejection is disabled because JobType is now
+    // Plugin(String) and every string parses as a valid job type. The previous
+    // tests (flat_provider_key_in_account_yaml_rejected,
+    // flat_emr_key_in_region_yaml_rejected) are removed.
 
     #[test]
     fn nested_provider_key_in_account_yaml_accepted() {

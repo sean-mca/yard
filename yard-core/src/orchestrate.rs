@@ -173,12 +173,12 @@ pub fn validate_target(
     manifest: &ProjectManifest,
     target: Option<&str>,
 ) -> Result<()> {
-    if let Some(name) = target {
-        if !manifest.jobs.contains_key(name) {
-            return Err(anyhow!(
-                "target '{name}' not found -- no job with that name"
-            ));
-        }
+    if let Some(name) = target
+        && !manifest.jobs.contains_key(name)
+    {
+        return Err(anyhow!(
+            "target '{name}' not found -- no job with that name"
+        ));
     }
     Ok(())
 }

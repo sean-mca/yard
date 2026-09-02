@@ -73,13 +73,21 @@ pub async fn run_drift_check(state: &ApiState) -> Result<DriftData, String> {
     let project = yard_core::resolve::resolve_project(workdir.path())
         .await
         .map_err(|e| format!("Failed to resolve project: {e}"))?;
-    let diffs = yard_core::calculate_diff(&project.manifest, &project.current_state)
+    let plugin_host_config = yard_core::plugin_host::PluginHostConfig {
+        plugins_dir: workdir.path().join(".yard/plugins"),
+        lock_file_path: Some(workdir.path().join("yard.lock")),
+        ..Default::default()
+    };
+
+    let diffs = yard_core::calculate_diff(&project.manifest, &project.current_state, &plugin_host_config)
+        .await
         .map_err(|e| format!("Failed to calculate diff: {e}"))?;
 
     // Verify that deployed resources still exist in AWS
     let resource_statuses = yard_core::verify_deployed_resources(
         &project.manifest,
         &project.current_state,
+        &plugin_host_config,
     )
     .await
     .map_err(|e| format!("Failed to verify resources: {e}"))?;

@@ -2,9 +2,7 @@
 
 use super::resolve_project;
 use anyhow::{Result, bail};
-use std::collections::HashMap;
 use std::path::Path;
-use yard_structs::plugin::SchemaResponse;
 
 /// Execute `yard validate`: check job configurations for errors.
 ///
@@ -59,24 +57,16 @@ pub async fn execute(
     };
     job_names.sort();
 
-    // Build schema cache from compiled-in providers (D-06, mirrors orchestrate.rs).
-    let mut schema_cache: HashMap<String, SchemaResponse> = HashMap::new();
-    for job_def in manifest.jobs.values() {
-        let key = job_def.job_type.to_string();
-        if let std::collections::hash_map::Entry::Vacant(entry) = schema_cache.entry(key)
-            && let Some(schema) = yard_core::providers::built_in_schema(job_def.job_type)
-        {
-            entry.insert(schema);
-        }
-    }
+    // In v2.0, provider schemas come from plugin binaries (Provider::schema).
+    // Structural validation runs without a schema cache -- provider-specific
+    // validation is the plugin's responsibility via Provider::validate.
 
     for name in job_names {
         let job_def = match manifest.jobs.get(name) {
             Some(j) => j,
             None => continue,
         };
-        let schema = schema_cache.get(&job_def.job_type.to_string());
-        let errors = yard_core::validation::validate_job_full_with_schema(name, job_def, schema);
+        let errors = yard_core::validation::validate_job_full_with_schema(name, job_def, None);
 
         if errors.is_empty() {
             println!("[PASS] {}.yaml", name);

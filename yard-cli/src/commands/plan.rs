@@ -40,7 +40,7 @@ pub async fn execute(
     )
     .await?;
 
-    if result.job_diffs.is_empty() && result.dag_diffs.is_empty() {
+    if result.job_diffs.is_empty() {
         println!("No changes. Infrastructure is up to date.");
         return Ok(());
     }
@@ -51,7 +51,6 @@ pub async fn execute(
         target.as_deref(),
         dir_scope.as_deref(),
         &result.job_diffs,
-        &result.dag_diffs,
     )?;
 
     Ok(())
