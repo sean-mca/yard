@@ -251,7 +251,8 @@ pub async fn apply(
 
     // All work happens inside this block so we always unlock on exit
     let apply_result = async {
-        // Re-read fresh state under lock -- the passed-in current_state may be stale
+        // Re-read fresh state under lock -- the passed-in current_state may be stale.
+        // Only read state for the locked jobs (the preliminary-diff set).
         let mut fresh_deployments = HashMap::new();
         for name in &job_names {
             if let Some(job_state) = storage.read_job(name).await? {
@@ -264,8 +265,13 @@ pub async fn apply(
             deployments: fresh_deployments,
         };
 
+        // Scope manifest to locked jobs only so calculate_diff does not
+        // classify unlocked jobs (missing from fresh_state) as Creates.
+        let mut scoped_manifest = manifest.clone();
+        scoped_manifest.jobs.retain(|name, _| job_names.contains(name));
+
         // Authoritative diff against fresh state
-        let mut diffs = calculate_diff(manifest, &fresh_state, &plugin_host_config).await?;
+        let mut diffs = calculate_diff(&scoped_manifest, &fresh_state, &plugin_host_config).await?;
         if let Some(ref name) = target {
             diffs.retain(|d| &d.name == name);
         }
