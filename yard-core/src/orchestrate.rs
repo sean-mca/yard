@@ -539,7 +539,7 @@ pub async fn init_state_backend(
                 .with_context(|| format!("Failed to reach S3 bucket {bucket} in {region}"))?;
             println!("Verified S3 state bucket {bucket} ({region})");
         }
-        _ => anyhow::bail!("unsupported state backend variant"),
+        other => anyhow::bail!("unsupported state backend variant: {other:?}"),
     }
     Ok(())
 }
