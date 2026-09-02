@@ -1,15 +1,13 @@
-//! Job and DAG validation orchestration.
+//! Job validation orchestration.
 //!
 //! This module is the public entry point for all validation in yard-core.
-//! It re-exports the core validators and adds higher-level checks:
+//! It re-exports the core validators:
 //!
-//! - [`validate_job_full`] -- schema validation + generated-script syntax check
-//! - [`validate_dag_full`] -- trigger rules (TRIG-04..06), reserved task IDs,
-//!   concurrency bounds, and S3 poke-interval floor
-//! - [`validate_project`] -- cross-DAG broken-link warnings for Dataset triggers
+//! - [`validate_job_full`] -- schema validation (codegen-based syntax
+//!   checking is now delegated to the plugin via `Provider::validate`)
 //!
 //! Sub-modules:
-//! - `rules` -- per-job schema validation (sources, transforms, sinks, providers)
+//! - `rules` -- per-job schema validation (sources, transforms, sinks)
 //! - `syntax` -- Python syntax validation via `python3 ast.parse`
 
 mod rules;
@@ -22,294 +20,48 @@ pub use rules::validate_job;
 pub use rules::validate_job_with_schema;
 pub use syntax::validate_python_syntax;
 
-// Import for local use in validate_job_full
-use rules::err;
-
-use crate::airflow_dag::ResolvedDag;
-use std::collections::BTreeSet;
-use yard_structs::{AirflowSection, SingleSource, Trigger};
-
-/// Validate a job definition and its generated script.
+/// Validate a job definition against yard's structural schema.
 ///
-/// Runs schema validation first, then generates the script and checks
-/// Python syntax. If schema validation fails, syntax checking is
-/// skipped since the generated script would be invalid anyway.
+/// Runs schema validation. Script syntax checking is now delegated to the
+/// plugin via `Provider::validate` and is not performed in core.
 #[must_use]
 pub fn validate_job_full(job_name: &str, job_def: &JobDefinition) -> Vec<ValidationError> {
     validate_job_full_with_schema(job_name, job_def, None)
 }
 
-/// Validate a job definition and its generated script with optional
-/// provider schema for schema-driven field validation (D-03, D-05).
+/// Validate a job definition with optional provider schema for
+/// schema-driven field validation (D-03, D-05).
 ///
 /// Same as [`validate_job_full`] but passes the schema through to
 /// [`validate_job_with_schema`] for source/sink type union and
 /// schema-driven provider config field checking.
+///
+/// Script generation and syntax checking are no longer performed in core --
+/// they are delegated to the plugin via `Provider::codegen` and
+/// `Provider::validate`.
 #[must_use]
 pub fn validate_job_full_with_schema(
-    job_name: &str,
+    _job_name: &str,
     job_def: &JobDefinition,
     schema: Option<&SchemaResponse>,
 ) -> Vec<ValidationError> {
-    let mut errors = validate_job_with_schema(job_def, schema);
-
-    // Only check syntax if schema validation passed — no point generating
-    // a script from an invalid config
-    if errors.is_empty() {
-        match crate::codegen::generate_python_script(job_name, job_def) {
-            Ok(script) => {
-                if let Some(syntax_err) = validate_python_syntax(&script) {
-                    errors.push(err(
-                        "script",
-                        &format!("generated script has a syntax error: {syntax_err}"),
-                    ));
-                }
-            }
-            Err(e) => {
-                errors.push(err("script", &format!("failed to generate script: {e}")));
-            }
-        }
-    }
-
-    errors
-}
-
-/// Validate a resolved DAG's trigger configuration against TRIG-04..TRIG-06.
-///
-/// Caller (`orchestrate::plan` / `orchestrate::apply`) iterates `pre_dags`
-/// and rolls up errors per DAG. Empty `Vec` means the DAG passed all checks.
-#[must_use]
-pub fn validate_dag_full(dag: &ResolvedDag) -> Vec<ValidationError> {
-    let cfg = &dag.config;
-    let mut errors: Vec<ValidationError> = Vec::with_capacity(4);
-
-    // Rule order locked per CONTEXT D-08 — deterministic output for tests + rollup.
-    if let Some(e) = check_mutual_exclusion(cfg.schedule.as_deref(), cfg.trigger.as_ref()) {
-        errors.push(e);
-    }
-    errors.extend(check_empty_composites(cfg.trigger.as_ref()));
-    if let Some(e) = check_heterogeneous_any(cfg.trigger.as_ref()) {
-        errors.push(e);
-    }
-
-    // Phase 30 plan 30-01 NEW rules (D-06 TRIG-08, D-14 CONC-02). Appended
-    // after the Phase 29 rules so existing test orderings stay byte-identical.
-    errors.extend(check_reserved_task_ids(dag));
-    if let Some(e) = check_max_active_runs(cfg) {
-        errors.push(e);
-    }
-
-    // Phase 30 plan 30-02 NEW rule (S3-02 knob validation).
-    errors.extend(check_s3_poke_interval(cfg.trigger.as_ref()));
-
-    errors
-}
-
-/// TRIG-04: top-level schedule and trigger are mutually exclusive.
-#[inline]
-fn check_mutual_exclusion(
-    schedule: Option<&str>,
-    trigger: Option<&Trigger>,
-) -> Option<ValidationError> {
-    if schedule.is_some() && trigger.is_some() {
-        Some(err(
-            "airflow.trigger",
-            "cannot declare both top-level 'schedule:' and 'trigger:' — these are mutually exclusive. To schedule via the trigger block, use 'trigger: { schedule: \"<expr>\" }' and remove the top-level 'schedule:' field.",
-        ))
-    } else {
-        None
-    }
-}
-
-/// TRIG-05a / TRIG-05b: composite lists must be non-empty.
-fn check_empty_composites(trigger: Option<&Trigger>) -> Vec<ValidationError> {
-    let mut out: Vec<ValidationError> = Vec::with_capacity(1);
-    match trigger {
-        Some(Trigger::All(v)) if v.is_empty() => {
-            out.push(err(
-                "airflow.trigger.all",
-                "empty 'all: []' composite — must contain at least one trigger source.",
-            ));
-        }
-        Some(Trigger::Any(v)) if v.is_empty() => {
-            out.push(err(
-                "airflow.trigger.any",
-                "empty 'any: []' composite — must contain at least one trigger source.",
-            ));
-        }
-        _ => {}
-    }
-    out
-}
-
-/// TRIG-06: any: must contain only Dataset sources.
-/// Excludes Dataset from the rendered {kinds} list; sorts and dedupes via BTreeSet.
-fn check_heterogeneous_any(trigger: Option<&Trigger>) -> Option<ValidationError> {
-    let sources = match trigger {
-        Some(Trigger::Any(v)) if !v.is_empty() => v,
-        _ => return None,
-    };
-    let kinds: BTreeSet<&'static str> = sources
-        .iter()
-        .filter(|s| !matches!(s, SingleSource::Dataset(_)))
-        .map(|s| s.source_kind())
-        .collect();
-    if kinds.is_empty() {
-        return None;
-    }
-    let joined = kinds.into_iter().collect::<Vec<_>>().join(", ");
-    Some(err(
-        "airflow.trigger.any",
-        &format!(
-            "'any:' supports only homogeneous Dataset sources (found: {joined}). Heterogeneous 'any:' has no clean Airflow primitive in v1.6 — split into separate DAGs per source, or use homogeneous Dataset triggers."
-        ),
-    ))
-}
-
-/// TRIG-08 (Phase 30, plan 30-01; extended Phase 32 plan 32-02): reserved
-/// trigger codegen task IDs cannot collide with user-declared task IDs. Caught
-/// at `validate_dag_full` pre-codegen so users get a clear actionable error
-/// before codegen produces an invalid DAG with two same-id tasks.
-///
-/// Reserved IDs split by codegen surface (D-03):
-/// - `_yard_wait_s3`, `_yard_wait_sqs`, `_yard_wait_dataset`, `_yard_wait_api`,
-///   `_yard_join` are reserved when `trigger.is_some()` (Phase 30 contract —
-///   schedule-only DAGs may freely name a task `_yard_wait_s3`).
-/// - `_yard_publish` is reserved when `!publishes.is_empty()` regardless of
-///   `trigger.is_some()` (Phase 32 — codegen synthesizes the publish task
-///   whenever publishes is non-empty, including schedule-only DAGs with
-///   `publishes:`).
-fn check_reserved_task_ids(dag: &ResolvedDag) -> Vec<ValidationError> {
-    // Early-return only when neither codegen surface produces reserved IDs.
-    if dag.config.trigger.is_none() && dag.config.publishes.is_empty() {
-        return Vec::new();
-    }
-    let mut reserved: BTreeSet<&'static str> = BTreeSet::new();
-    if dag.config.trigger.is_some() {
-        reserved.insert("_yard_wait_s3");
-        reserved.insert("_yard_wait_sqs");
-        reserved.insert("_yard_wait_dataset");
-        reserved.insert("_yard_wait_api");
-        reserved.insert("_yard_join");
-    }
-    if !dag.config.publishes.is_empty() {
-        reserved.insert("_yard_publish");
-    }
-    let mut out = Vec::new();
-    for task_id in &dag.tasks {
-        if reserved.contains(task_id.as_str()) {
-            out.push(err(
-                "airflow.tasks",
-                &format!(
-                    "task_id '{task_id}' is reserved for trigger codegen — rename your task"
-                ),
-            ));
-        }
-    }
-    out
-}
-
-/// CONC-02 (Phase 30, plan 30-01): `airflow.max_active_runs` must be >= 1
-/// when explicitly set. Reject 0 at parse with verbatim error
-/// `must be >= 1`. No upper bound. None (unset) is always valid --
-/// CONC-01's "event-driven default of 1" applies at codegen time.
-#[inline]
-fn check_max_active_runs(cfg: &AirflowSection) -> Option<ValidationError> {
-    match cfg.max_active_runs {
-        Some(0) => Some(err("airflow.max_active_runs", "must be >= 1")),
-        _ => None,
-    }
-}
-
-/// S3-02 (Phase 30, plan 30-02): `S3Trigger.poke_interval < 10` triggers
-/// Airflow's triggerer hot-loop (deferrable sensors poll the loop too
-/// aggressively below 10s). Reject at validate_dag_full so codegen never
-/// emits a footgun config. None (unset) falls back to the render-time
-/// default of 60 and is always valid.
-///
-/// Walks both bare-single and composite (`all:` / `any:`) trigger lists so
-/// an S3 leaf nested in a heterogeneous-all composite still trips the rule.
-fn check_s3_poke_interval(trigger: Option<&Trigger>) -> Vec<ValidationError> {
-    let mut out = Vec::new();
-    let sources: Vec<&SingleSource> = match trigger {
-        Some(Trigger::Single(s)) => vec![s],
-        Some(Trigger::All(v)) | Some(Trigger::Any(v)) => v.iter().collect(),
-        None | Some(_) => return out,
-    };
-    for s in sources {
-        if let SingleSource::S3(s3) = s
-            && let Some(pi) = s3.poke_interval
-            && pi < 10
-        {
-            out.push(err(
-                "airflow.trigger.s3.poke_interval",
-                "must be >= 10 (lower values trigger the Airflow triggerer hot-loop)",
-            ));
-        }
-    }
-    out
-}
-
-/// Cross-DAG broken-link soft warning.
-///
-/// Walks every DAG's `AirflowSection.publishes` to build the publish-set,
-/// then yields a soft warning per `(DAG, missing-URI)` for every Dataset
-/// trigger consumer with no in-project publisher. Sorted by `(dag_id, uri)`
-/// per D-08. Never returns `Err` -- soft warnings only.
-///
-/// Wired symmetrically into `orchestrate::plan` and `orchestrate::apply`
-/// after the `validate_dag_full` rollup. Detection scope is Dataset URIs
-/// only (D-09); S3 / SQS / API consumers do not flow through this check.
-#[must_use]
-pub fn validate_project(dags: &[ResolvedDag]) -> Vec<String> {
-    let mut published: BTreeSet<&str> = BTreeSet::new();
-    for dag in dags {
-        for uri in &dag.config.publishes {
-            published.insert(uri.as_str());
-        }
-    }
-    let mut warnings: Vec<(String, String)> = Vec::new();
-    for dag in dags {
-        let consumed = dag
-            .config
-            .trigger
-            .as_ref()
-            .map(|t| t.dataset_uris())
-            .unwrap_or_default();
-        for uri in consumed {
-            if !published.contains(uri) {
-                warnings.push((dag.name.clone(), uri.to_string()));
-            }
-        }
-    }
-    warnings.sort();
-    warnings
-        .into_iter()
-        .map(|(dag_id, uri)| {
-            format!(
-                "WARN: dag '{dag_id}': trigger.dataset \"{uri}\" has no publisher in this project (broken link, non-fatal)"
-            )
-        })
-        .collect()
+    validate_job_with_schema(job_def, schema)
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::airflow_dag::ResolvedDag;
     use serde_json::json;
-    use std::collections::BTreeMap;
     use std::collections::HashMap;
-    use std::path::PathBuf;
     use yard_structs::{
-        AirflowSection, DatasetTrigger, JdbcAuth, JobType, RdsIamAuth, S3Trigger, ScheduleTrigger,
-        Sink, SingleSource, Source, SqsTrigger, Transform, Trigger,
+        JdbcAuth, JobType, RdsIamAuth,
+        Sink, Source, Transform,
     };
 
     fn valid_glue_job() -> JobDefinition {
         JobDefinition {
-            job_type: JobType::Glue,
+            job_type: JobType::Plugin("glue".to_string()),
             imports: vec![],
             body: None,
             job_file: None,
@@ -365,7 +117,7 @@ mod tests {
 
     fn minimal_job() -> JobDefinition {
         JobDefinition {
-            job_type: JobType::Glue,
+            job_type: JobType::Plugin("glue".to_string()),
             config: json!({"type": "glue", "role": "arn:aws:iam::123456789:role/GlueRole"}),
             ..Default::default()
         }
@@ -378,15 +130,6 @@ mod tests {
         let errors = validate_job(&valid_glue_job());
         assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
     }
-
-    // --- Job type ---
-    //
-    // The `invalid_job_type` test was deleted in Phase 21 plan 21-01: unknown
-    // wire strings are now rejected at deserialize time by serde via
-    // JobType's `unknown variant` error (covered by
-    // `yard_structs::config::tests::job_type_deserialize_unknown_rejects`).
-    // Constructing a JobDefinition with an invalid job_type is no longer
-    // expressible — JobType is a closed three-variant enum.
 
     // --- Source types ---
 
@@ -1055,12 +798,6 @@ mod tests {
 
     #[test]
     fn collects_all_errors() {
-        // Note: prior to Phase 21 plan 21-01 this test mutated job.job_type to
-        // "unknown" to also assert a job-type validation error. That arm now
-        // lives at deserialize time (serde unknown-variant rejection on
-        // JobType) and cannot be exercised by mutating a typed JobDefinition.
-        // The test still validates that source/transform/sink errors collect
-        // independently and don't short-circuit.
         let mut job = minimal_job();
         job.sources = vec![Source {
             name: "src".to_string(),
@@ -1108,131 +845,24 @@ mod tests {
             auth: None,
         });
         let errors = validate_job(&job);
-        // Down from `>= 3` after Phase 21 21-01 deleted the job-type
-        // validation arm (now enforced upstream by serde at deserialize).
         assert!(errors.len() >= 2);
         assert!(errors.iter().any(|e| e.field == "sources[0].type"));
         assert!(errors.iter().any(|e| e.field == "sink.type"));
     }
 
-    // --- Glue config validation ---
+    // --- body and job_file mutual exclusion ---
 
     #[test]
-    fn valid_glue_config_passes() {
+    fn body_and_job_file_mutually_exclusive() {
         let mut job = minimal_job();
-        job.config = json!({
-            "type": "glue",
-            "role": "arn:aws:iam::123456789:role/GlueRole",
-            "glue": {
-                "worker_type": "G.2X",
-                "number_of_workers": 10,
-                "glue_version": "4.0",
-                "timeout": 120,
-                "max_retries": 1,
-                "bookmark": "enabled",
-                "connections": ["my-conn"],
-                "default_arguments": {"--key": "value"}
-            }
-        });
-        let errors = validate_job(&job);
-        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
-    }
-
-    #[test]
-    fn invalid_worker_type() {
-        let mut job = minimal_job();
-        job.config = json!({
-            "type": "glue",
-            "glue": { "worker_type": "G.99X" }
-        });
-        let errors = validate_job(&job);
-        assert!(errors.iter().any(|e| e.field == "glue.worker_type"));
-    }
-
-    #[test]
-    fn invalid_number_of_workers() {
-        let mut job = minimal_job();
-        job.config = json!({
-            "type": "glue",
-            "glue": { "number_of_workers": 0 }
-        });
-        let errors = validate_job(&job);
-        assert!(errors.iter().any(|e| e.field == "glue.number_of_workers"));
-    }
-
-    #[test]
-    fn invalid_glue_version() {
-        let mut job = minimal_job();
-        job.config = json!({
-            "type": "glue",
-            "glue": { "glue_version": "2.0" }
-        });
-        let errors = validate_job(&job);
-        assert!(errors.iter().any(|e| e.field == "glue.glue_version"));
-    }
-
-    #[test]
-    fn invalid_bookmark_value() {
-        let mut job = minimal_job();
-        job.config = json!({
-            "type": "glue",
-            "glue": { "bookmark": "maybe" }
-        });
-        let errors = validate_job(&job);
-        assert!(errors.iter().any(|e| e.field == "glue.bookmark"));
-    }
-
-    #[test]
-    fn negative_timeout_rejected() {
-        let mut job = minimal_job();
-        job.config = json!({
-            "type": "glue",
-            "glue": { "timeout": 0 }
-        });
-        let errors = validate_job(&job);
-        assert!(errors.iter().any(|e| e.field == "glue.timeout"));
-    }
-
-    #[test]
-    fn no_glue_block_is_fine() {
-        let job = minimal_job();
-        let errors = validate_job(&job);
-        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
-    }
-
-    // --- Glue role validation ---
-
-    #[test]
-    fn glue_job_missing_role() {
-        let mut job = minimal_job();
-        job.config = json!({"type": "glue"});
+        job.body = Some("print('hi')".to_string());
+        job.job_file = Some("./custom.py".to_string());
         let errors = validate_job(&job);
         assert!(
-            errors.iter().any(|e| e.field == "role"),
-            "Expected role error, got: {:?}",
             errors
-        );
-    }
-
-    #[test]
-    fn glue_job_empty_role() {
-        let mut job = minimal_job();
-        job.config = json!({"type": "glue", "role": ""});
-        let errors = validate_job(&job);
-        assert!(
-            errors.iter().any(|e| e.field == "role"),
-            "Expected role error, got: {:?}",
-            errors
-        );
-    }
-
-    #[test]
-    fn glue_job_with_role_passes() {
-        let job = minimal_job();
-        let errors = validate_job(&job);
-        assert!(
-            !errors.iter().any(|e| e.field == "role"),
-            "Unexpected role error: {:?}",
+                .iter()
+                .any(|e| e.field == "job_file" && e.message.contains("cannot specify both")),
+            "Expected mutual exclusion error, got: {:?}",
             errors
         );
     }
@@ -1255,175 +885,6 @@ mod tests {
             "Expected SyntaxError, got: {:?}",
             result
         );
-    }
-
-    #[test]
-    fn validate_job_full_catches_bad_body() {
-        let mut job = minimal_job();
-        job.body = Some("def broken(\n".to_string());
-        let errors = validate_job_full("bad_body", &job);
-        assert!(
-            errors.iter().any(|e| e.field == "script"),
-            "Expected script error, got: {:?}",
-            errors
-        );
-    }
-
-    #[test]
-    fn validate_job_full_passes_valid_job() {
-        let job = valid_glue_job();
-        let errors = validate_job_full("good_job", &job);
-        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
-    }
-
-    #[test]
-    fn body_and_job_file_mutually_exclusive() {
-        let mut job = minimal_job();
-        job.body = Some("print('hi')".to_string());
-        job.job_file = Some("./custom.py".to_string());
-        let errors = validate_job(&job);
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.field == "job_file" && e.message.contains("cannot specify both")),
-            "Expected mutual exclusion error, got: {:?}",
-            errors
-        );
-    }
-
-    #[test]
-    fn validate_job_full_catches_bad_job_file() {
-        let dir = std::env::temp_dir().join(format!("yard_vjf_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let bad_script = dir.join("bad.py");
-        std::fs::write(&bad_script, "def broken(\n").unwrap();
-
-        let mut job = minimal_job();
-        job.job_file = Some(bad_script.to_string_lossy().to_string());
-
-        let errors = validate_job_full("bad_file_job", &job);
-        assert!(
-            errors.iter().any(|e| e.field == "script"),
-            "Expected script syntax error, got: {:?}",
-            errors
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn validate_job_full_passes_good_job_file() {
-        let dir = std::env::temp_dir().join(format!("yard_vjfg_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let good_script = dir.join("good.py");
-        std::fs::write(&good_script, "print('hello')\n").unwrap();
-
-        let mut job = minimal_job();
-        job.job_file = Some(good_script.to_string_lossy().to_string());
-
-        let errors = validate_job_full("good_file_job", &job);
-        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // --- bash task type ---
-
-    fn bash_job(command: Option<&str>) -> JobDefinition {
-        let mut cfg = json!({"type": "bash"});
-        if let Some(c) = command {
-            cfg.as_object_mut()
-                .expect("object")
-                .insert("command".to_string(), json!(c));
-        }
-        JobDefinition {
-            job_type: JobType::Bash,
-            config: cfg,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn bash_valid_with_command() {
-        let job = bash_job(Some("echo hello"));
-        let errors = validate_job(&job);
-        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
-    }
-
-    #[test]
-    fn bash_missing_command_errors() {
-        let job = bash_job(None);
-        let errors = validate_job(&job);
-        assert!(
-            errors.iter().any(|e| e.field == "command"),
-            "expected command error, got: {errors:?}"
-        );
-    }
-
-    #[test]
-    fn bash_empty_command_errors() {
-        let job = bash_job(Some("   "));
-        let errors = validate_job(&job);
-        assert!(errors.iter().any(|e| e.field == "command"));
-    }
-
-    #[test]
-    fn bash_rejects_sources() {
-        let mut job = bash_job(Some("echo hi"));
-        job.sources = vec![Source {
-            name: "s".to_string(),
-            source_type: "s3".to_string(),
-            format: None,
-            path: Some("s3://b/x".to_string()),
-            connection_url: None,
-            table: None,
-            database: None,
-            secret_id: None,
-            ..Default::default()
-        }];
-        let errors = validate_job(&job);
-        assert!(errors.iter().any(|e| e.field == "sources"));
-    }
-
-    #[test]
-    fn bash_rejects_sink() {
-        let mut job = bash_job(Some("echo hi"));
-        job.sink = Some(Sink {
-            source: None,
-            sink_type: "s3".to_string(),
-            format: None,
-            path: Some("s3://b/out".to_string()),
-            connection_url: None,
-            table: None,
-            database: None,
-            secret_id: None,
-            mode: None,
-            partition_by: vec![],
-            fill_nulls: None,
-            connection_type: None,
-            auth: None,
-        });
-        let errors = validate_job(&job);
-        assert!(errors.iter().any(|e| e.field == "sink"));
-    }
-
-    #[test]
-    fn bash_passes_validate_job_full() {
-        // validate_job_full runs generate_python_script + validate_python_syntax.
-        // Bash jobs return an empty script, which must parse as valid Python.
-        let job = bash_job(Some("echo hello"));
-        let errors = validate_job_full("bash_task", &job);
-        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
-    }
-
-    #[test]
-    fn bash_rejects_transforms_body_job_file() {
-        let mut job = bash_job(Some("echo hi"));
-        job.body = Some("pass".to_string());
-        let errors = validate_job(&job);
-        assert!(errors.iter().any(|e| e.field == "body"));
     }
 
     // --- aggregate ---
@@ -1510,666 +971,7 @@ mod tests {
         );
     }
 
-    // --- validate_dag_full (Phase 29 — TRIG-04..TRIG-06 trigger validation, D-23) ---
-
-    fn dag_with(section: AirflowSection) -> ResolvedDag {
-        // Construct a minimal ResolvedDag for validator unit tests.
-        // ResolvedDag derives ONLY #[derive(Debug, Clone)] — NOT Default — so every
-        // field is enumerated explicitly. validate_dag_full reads only `dag.name`
-        // and `dag.config`; the other fields are populated with empty values.
-        // AirflowSection DOES derive Default, so the caller may use
-        // `..Default::default()` when constructing the `section` argument.
-        ResolvedDag {
-            name: "test_dag".to_string(),
-            dir: PathBuf::new(),
-            config: section,
-            tasks: Vec::new(),
-            depends_on: BTreeMap::new(),
-        }
-    }
-
-    fn s3_src() -> SingleSource {
-        SingleSource::S3(S3Trigger {
-            bucket: "b".into(),
-            ..Default::default()
-        })
-    }
-    fn sqs_src() -> SingleSource {
-        SingleSource::Sqs(SqsTrigger {
-            queue_url: "q".into(),
-            wait_time_seconds: None,
-            max_messages: None,
-            delete_message_on_reception: None,
-        })
-    }
-    fn ds_src(uri: &str) -> SingleSource {
-        SingleSource::Dataset(DatasetTrigger { uri: uri.into() })
-    }
-
-    #[test]
-    fn validate_dag_full_passes_schedule_only() {
-        let dag = dag_with(AirflowSection {
-            schedule: Some("@daily".into()),
-            trigger: None,
-            ..Default::default()
-        });
-        assert!(validate_dag_full(&dag).is_empty());
-    }
-
-    #[test]
-    fn validate_dag_full_passes_trigger_only() {
-        let dag = dag_with(AirflowSection {
-            schedule: None,
-            trigger: Some(Trigger::Single(SingleSource::Schedule(ScheduleTrigger {
-                value: "@daily".into(),
-            }))),
-            ..Default::default()
-        });
-        assert!(validate_dag_full(&dag).is_empty());
-    }
-
-    #[test]
-    fn validate_dag_full_passes_homogeneous_dataset_any() {
-        let dag = dag_with(AirflowSection {
-            schedule: None,
-            trigger: Some(Trigger::Any(vec![ds_src("a"), ds_src("b")])),
-            ..Default::default()
-        });
-        assert!(validate_dag_full(&dag).is_empty());
-    }
-
-    #[test]
-    fn validate_dag_full_passes_heterogeneous_all() {
-        let dag = dag_with(AirflowSection {
-            schedule: None,
-            trigger: Some(Trigger::All(vec![s3_src(), sqs_src()])),
-            ..Default::default()
-        });
-        assert!(
-            validate_dag_full(&dag).is_empty(),
-            "heterogeneous all: must be allowed (DS-04)"
-        );
-    }
-
-    #[test]
-    fn validate_dag_full_rejects_schedule_and_trigger() {
-        let dag = dag_with(AirflowSection {
-            schedule: Some("@daily".into()),
-            trigger: Some(Trigger::Single(ds_src("u"))),
-            ..Default::default()
-        });
-        let errs = validate_dag_full(&dag);
-        assert_eq!(errs.len(), 1);
-        assert_eq!(errs[0].field, "airflow.trigger");
-        assert_eq!(
-            errs[0].message,
-            "cannot declare both top-level 'schedule:' and 'trigger:' — these are mutually exclusive. To schedule via the trigger block, use 'trigger: { schedule: \"<expr>\" }' and remove the top-level 'schedule:' field."
-        );
-    }
-
-    #[test]
-    fn validate_dag_full_rejects_empty_all() {
-        let dag = dag_with(AirflowSection {
-            schedule: None,
-            trigger: Some(Trigger::All(vec![])),
-            ..Default::default()
-        });
-        let errs = validate_dag_full(&dag);
-        assert_eq!(errs.len(), 1);
-        assert_eq!(errs[0].field, "airflow.trigger.all");
-        assert_eq!(
-            errs[0].message,
-            "empty 'all: []' composite — must contain at least one trigger source."
-        );
-    }
-
-    #[test]
-    fn validate_dag_full_rejects_empty_any() {
-        let dag = dag_with(AirflowSection {
-            schedule: None,
-            trigger: Some(Trigger::Any(vec![])),
-            ..Default::default()
-        });
-        let errs = validate_dag_full(&dag);
-        assert_eq!(errs.len(), 1);
-        assert_eq!(errs[0].field, "airflow.trigger.any");
-        assert_eq!(
-            errs[0].message,
-            "empty 'any: []' composite — must contain at least one trigger source."
-        );
-    }
-
-    #[test]
-    fn validate_dag_full_rejects_heterogeneous_any_single_source() {
-        let dag = dag_with(AirflowSection {
-            schedule: None,
-            trigger: Some(Trigger::Any(vec![s3_src()])),
-            ..Default::default()
-        });
-        let errs = validate_dag_full(&dag);
-        assert_eq!(errs.len(), 1);
-        assert_eq!(errs[0].field, "airflow.trigger.any");
-        assert_eq!(
-            errs[0].message,
-            "'any:' supports only homogeneous Dataset sources (found: s3). Heterogeneous 'any:' has no clean Airflow primitive in v1.6 — split into separate DAGs per source, or use homogeneous Dataset triggers."
-        );
-    }
-
-    #[test]
-    fn validate_dag_full_rejects_heterogeneous_any_multi_kind() {
-        let dag = dag_with(AirflowSection {
-            schedule: None,
-            trigger: Some(Trigger::Any(vec![s3_src(), sqs_src()])),
-            ..Default::default()
-        });
-        let errs = validate_dag_full(&dag);
-        assert_eq!(errs.len(), 1);
-        assert_eq!(errs[0].field, "airflow.trigger.any");
-        assert_eq!(
-            errs[0].message,
-            "'any:' supports only homogeneous Dataset sources (found: s3, sqs). Heterogeneous 'any:' has no clean Airflow primitive in v1.6 — split into separate DAGs per source, or use homogeneous Dataset triggers."
-        );
-    }
-
-    #[test]
-    fn validate_dag_full_rejects_heterogeneous_any_with_dataset() {
-        // Per D-18 example: Dataset is the allowed source — excluded from {kinds}.
-        let dag = dag_with(AirflowSection {
-            schedule: None,
-            trigger: Some(Trigger::Any(vec![s3_src(), ds_src("u")])),
-            ..Default::default()
-        });
-        let errs = validate_dag_full(&dag);
-        assert_eq!(errs.len(), 1);
-        assert_eq!(errs[0].field, "airflow.trigger.any");
-        assert_eq!(
-            errs[0].message,
-            "'any:' supports only homogeneous Dataset sources (found: s3). Heterogeneous 'any:' has no clean Airflow primitive in v1.6 — split into separate DAGs per source, or use homogeneous Dataset triggers."
-        );
-    }
-
-    #[test]
-    fn validate_dag_full_accumulates_multiple_errors() {
-        // Per D-09 + D-23: schedule + trigger { any: [] } -> exactly two errors.
-        let dag = dag_with(AirflowSection {
-            schedule: Some("@daily".into()),
-            trigger: Some(Trigger::Any(vec![])),
-            ..Default::default()
-        });
-        let errs = validate_dag_full(&dag);
-        assert_eq!(errs.len(), 2, "expected TRIG-04 + TRIG-05b, got: {errs:?}");
-        assert_eq!(errs[0].field, "airflow.trigger"); // TRIG-04 first per D-08
-        assert_eq!(errs[1].field, "airflow.trigger.any"); // TRIG-05b second
-    }
-
-    // --- Phase 30 plan 30-01: TRIG-08 + CONC-02 ---
-
-    #[test]
-    fn validate_dag_full_rejects_max_active_runs_zero() {
-        let dag = dag_with(AirflowSection {
-            max_active_runs: Some(0),
-            ..Default::default()
-        });
-        let errs = validate_dag_full(&dag);
-        assert_eq!(errs.len(), 1, "expected exactly one CONC-02 error: {errs:?}");
-        assert_eq!(errs[0].field, "airflow.max_active_runs");
-        assert_eq!(errs[0].message, "must be >= 1");
-    }
-
-    #[test]
-    fn validate_dag_full_passes_max_active_runs_one() {
-        let dag = dag_with(AirflowSection {
-            max_active_runs: Some(1),
-            ..Default::default()
-        });
-        assert!(validate_dag_full(&dag).is_empty());
-    }
-
-    #[test]
-    fn validate_dag_full_passes_max_active_runs_none() {
-        let dag = dag_with(AirflowSection {
-            max_active_runs: None,
-            ..Default::default()
-        });
-        assert!(validate_dag_full(&dag).is_empty());
-    }
-
-    #[test]
-    fn validate_dag_full_rejects_reserved_task_id_yard_wait_dataset() {
-        let mut dag = dag_with(AirflowSection {
-            trigger: Some(Trigger::Single(ds_src("s3://x"))),
-            ..Default::default()
-        });
-        dag.tasks = vec!["_yard_wait_dataset".to_string()];
-        let errs = validate_dag_full(&dag);
-        assert_eq!(errs.len(), 1, "expected exactly one TRIG-08 error: {errs:?}");
-        assert_eq!(errs[0].field, "airflow.tasks");
-        assert_eq!(
-            errs[0].message,
-            "task_id '_yard_wait_dataset' is reserved for trigger codegen — rename your task"
-        );
-    }
-
-    #[test]
-    fn validate_dag_full_rejects_reserved_task_id_yard_join_for_heterogeneous_all() {
-        let mut dag = dag_with(AirflowSection {
-            trigger: Some(Trigger::All(vec![s3_src(), sqs_src()])),
-            ..Default::default()
-        });
-        dag.tasks = vec!["_yard_join".to_string()];
-        let errs = validate_dag_full(&dag);
-        assert_eq!(errs.len(), 1, "expected exactly one TRIG-08 error: {errs:?}");
-        assert_eq!(errs[0].field, "airflow.tasks");
-        assert_eq!(
-            errs[0].message,
-            "task_id '_yard_join' is reserved for trigger codegen — rename your task"
-        );
-    }
-
-    #[test]
-    fn validate_dag_full_passes_when_no_trigger_present_with_reserved_id_named_task() {
-        // TRIG-08 only fires when a trigger is present. Schedule-only DAGs
-        // can name a task `_yard_wait_s3` without conflict (we don't emit
-        // any reserved IDs in that codegen path).
-        let mut dag = dag_with(AirflowSection {
-            schedule: Some("@daily".into()),
-            trigger: None,
-            ..Default::default()
-        });
-        dag.tasks = vec!["_yard_wait_s3".to_string()];
-        assert!(validate_dag_full(&dag).is_empty());
-    }
-
-    #[test]
-    fn validate_dag_full_accumulates_phase29_and_phase30_errors() {
-        // Sanity-check rule independence: TRIG-04 (mutual exclusion) AND
-        // CONC-02 (max_active_runs >= 1) both fire — no short-circuit.
-        let dag = dag_with(AirflowSection {
-            schedule: Some("@daily".into()),
-            trigger: Some(Trigger::Single(s3_src())),
-            max_active_runs: Some(0),
-            ..Default::default()
-        });
-        let errs = validate_dag_full(&dag);
-        assert_eq!(
-            errs.len(),
-            2,
-            "expected TRIG-04 + CONC-02, got: {errs:?}"
-        );
-        assert_eq!(errs[0].field, "airflow.trigger"); // TRIG-04 first per locked order
-        assert_eq!(errs[1].field, "airflow.max_active_runs"); // CONC-02 last (Phase 30 appended rules)
-        assert_eq!(errs[1].message, "must be >= 1");
-    }
-
-    // --- Phase 30 plan 30-02: S3-02 knob validation (poke_interval >= 10) ---
-
-    #[test]
-    fn validate_dag_full_rejects_s3_poke_interval_below_10() {
-        // S3-02: deferrable sensors hot-loop the triggerer below 10s. Reject
-        // at validate_dag_full so codegen never emits a footgun config.
-        let dag = dag_with(AirflowSection {
-            trigger: Some(Trigger::Single(SingleSource::S3(S3Trigger {
-                bucket: "b".into(),
-                prefix: Some("p".into()),
-                poke_interval: Some(5),
-                ..Default::default()
-            }))),
-            ..Default::default()
-        });
-        let errs = validate_dag_full(&dag);
-        assert_eq!(errs.len(), 1, "expected exactly one S3-02 error: {errs:?}");
-        assert_eq!(errs[0].field, "airflow.trigger.s3.poke_interval");
-        assert_eq!(
-            errs[0].message,
-            "must be >= 10 (lower values trigger the Airflow triggerer hot-loop)"
-        );
-    }
-
-    #[test]
-    fn validate_dag_full_passes_s3_poke_interval_exactly_10() {
-        // 10 is the floor, not below — must pass.
-        let dag = dag_with(AirflowSection {
-            trigger: Some(Trigger::Single(SingleSource::S3(S3Trigger {
-                bucket: "b".into(),
-                prefix: Some("p".into()),
-                poke_interval: Some(10),
-                ..Default::default()
-            }))),
-            ..Default::default()
-        });
-        assert!(validate_dag_full(&dag).is_empty());
-    }
-
-    #[test]
-    fn validate_dag_full_passes_s3_poke_interval_default_none() {
-        // Unset poke_interval falls back to render-time default of 60.
-        let dag = dag_with(AirflowSection {
-            trigger: Some(Trigger::Single(SingleSource::S3(S3Trigger {
-                bucket: "b".into(),
-                prefix: Some("p".into()),
-                poke_interval: None,
-                ..Default::default()
-            }))),
-            ..Default::default()
-        });
-        assert!(validate_dag_full(&dag).is_empty());
-    }
-
-    #[test]
-    fn validate_dag_full_rejects_s3_poke_interval_in_composite_all() {
-        // Knob validation must walk composite trigger lists too — an S3 leaf
-        // inside a heterogeneous all: list should still trip the rule.
-        let dag = dag_with(AirflowSection {
-            trigger: Some(Trigger::All(vec![
-                SingleSource::S3(S3Trigger {
-                    bucket: "b".into(),
-                    prefix: Some("p".into()),
-                    poke_interval: Some(3),
-                    ..Default::default()
-                }),
-                sqs_src(),
-            ])),
-            ..Default::default()
-        });
-        let errs = validate_dag_full(&dag);
-        // Filter to just the S3-02 error to avoid coupling to other rule output.
-        let s3_errs: Vec<_> = errs
-            .iter()
-            .filter(|e| e.field == "airflow.trigger.s3.poke_interval")
-            .collect();
-        assert_eq!(
-            s3_errs.len(),
-            1,
-            "expected one S3-02 error from composite all walk: got {errs:?}"
-        );
-        assert_eq!(
-            s3_errs[0].message,
-            "must be >= 10 (lower values trigger the Airflow triggerer hot-loop)"
-        );
-    }
-
-    // --- Phase 32 plan 32-02: PUB-03 cross-DAG broken-link warnings + extended TRIG-08 ---
-
-    /// Build a minimal ResolvedDag with a custom name + AirflowSection. The
-    /// existing `dag_with` helper uses a fixed `"test_dag"` name, but PUB-03
-    /// tests need multiple DAGs with distinct names, so this variant exposes
-    /// the name parameter.
-    fn dag_named(name: &str, section: AirflowSection) -> ResolvedDag {
-        ResolvedDag {
-            name: name.to_string(),
-            dir: PathBuf::new(),
-            config: section,
-            tasks: Vec::new(),
-            depends_on: BTreeMap::new(),
-        }
-    }
-
-    #[test]
-    fn validate_project_warns_on_broken_dataset_link() {
-        // DAG-A consumes a Dataset URI no DAG in the project publishes.
-        let dag_a = dag_named(
-            "dag-a",
-            AirflowSection {
-                trigger: Some(Trigger::Single(SingleSource::Dataset(DatasetTrigger {
-                    uri: "s3://orders/raw".into(),
-                }))),
-                ..Default::default()
-            },
-        );
-        let dag_b = dag_named(
-            "dag-b",
-            AirflowSection {
-                publishes: vec!["s3://orders/processed".into()],
-                ..Default::default()
-            },
-        );
-        let warnings = validate_project(&[dag_a, dag_b]);
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(
-            warnings[0],
-            "WARN: dag 'dag-a': trigger.dataset \"s3://orders/raw\" has no publisher in this project (broken link, non-fatal)"
-        );
-    }
-
-    #[test]
-    fn validate_project_passes_when_publisher_present() {
-        // DAG-A consumes s3://orders/raw, DAG-B publishes s3://orders/raw.
-        let dag_a = dag_named(
-            "dag-a",
-            AirflowSection {
-                trigger: Some(Trigger::Single(SingleSource::Dataset(DatasetTrigger {
-                    uri: "s3://orders/raw".into(),
-                }))),
-                ..Default::default()
-            },
-        );
-        let dag_b = dag_named(
-            "dag-b",
-            AirflowSection {
-                publishes: vec!["s3://orders/raw".into()],
-                ..Default::default()
-            },
-        );
-        let warnings = validate_project(&[dag_a, dag_b]);
-        assert!(warnings.is_empty(), "expected no warnings, got: {warnings:?}");
-    }
-
-    #[test]
-    fn validate_project_walks_all_composite_datasets() {
-        // DAG-A consumes two Dataset URIs via `all:`; nothing publishes either.
-        let dag_a = dag_named(
-            "dag-a",
-            AirflowSection {
-                trigger: Some(Trigger::All(vec![
-                    SingleSource::Dataset(DatasetTrigger { uri: "s3://a".into() }),
-                    SingleSource::Dataset(DatasetTrigger { uri: "s3://b".into() }),
-                ])),
-                ..Default::default()
-            },
-        );
-        let warnings = validate_project(&[dag_a]);
-        assert_eq!(warnings.len(), 2);
-        assert_eq!(
-            warnings[0],
-            "WARN: dag 'dag-a': trigger.dataset \"s3://a\" has no publisher in this project (broken link, non-fatal)"
-        );
-        assert_eq!(
-            warnings[1],
-            "WARN: dag 'dag-a': trigger.dataset \"s3://b\" has no publisher in this project (broken link, non-fatal)"
-        );
-    }
-
-    #[test]
-    fn validate_project_walks_heterogeneous_all_datasets() {
-        // Heterogeneous `all:` mixes Dataset, S3, and Sqs sources. Only the
-        // Dataset URI flows through dataset_uris() — S3/SQS elements MUST NOT
-        // produce broken-link warnings (D-09 scope: Dataset URIs only).
-        let dag_a = dag_named(
-            "dag-a",
-            AirflowSection {
-                trigger: Some(Trigger::All(vec![
-                    SingleSource::Dataset(DatasetTrigger {
-                        uri: "s3://only-dataset".into(),
-                    }),
-                    SingleSource::S3(S3Trigger {
-                        bucket: "b".into(),
-                        ..Default::default()
-                    }),
-                    SingleSource::Sqs(SqsTrigger {
-                        queue_url: "q".into(),
-                        wait_time_seconds: None,
-                        max_messages: None,
-                        delete_message_on_reception: None,
-                    }),
-                ])),
-                ..Default::default()
-            },
-        );
-        let warnings = validate_project(&[dag_a]);
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(
-            warnings[0],
-            "WARN: dag 'dag-a': trigger.dataset \"s3://only-dataset\" has no publisher in this project (broken link, non-fatal)"
-        );
-    }
-
-    #[test]
-    fn validate_project_warnings_sorted_by_dag_then_uri() {
-        // Two DAGs ("dag-zebra", "dag-alpha"), each consuming two missing URIs
-        // ("s3://z", "s3://a"). Output must be sorted by (dag_id, uri) lex.
-        let dag_zebra = dag_named(
-            "dag-zebra",
-            AirflowSection {
-                trigger: Some(Trigger::All(vec![
-                    SingleSource::Dataset(DatasetTrigger { uri: "s3://z".into() }),
-                    SingleSource::Dataset(DatasetTrigger { uri: "s3://a".into() }),
-                ])),
-                ..Default::default()
-            },
-        );
-        let dag_alpha = dag_named(
-            "dag-alpha",
-            AirflowSection {
-                trigger: Some(Trigger::All(vec![
-                    SingleSource::Dataset(DatasetTrigger { uri: "s3://z".into() }),
-                    SingleSource::Dataset(DatasetTrigger { uri: "s3://a".into() }),
-                ])),
-                ..Default::default()
-            },
-        );
-        // Pass in deliberately reversed order to confirm sort is on the output, not the input.
-        let warnings = validate_project(&[dag_zebra, dag_alpha]);
-        assert_eq!(warnings.len(), 4);
-        assert_eq!(
-            warnings[0],
-            "WARN: dag 'dag-alpha': trigger.dataset \"s3://a\" has no publisher in this project (broken link, non-fatal)"
-        );
-        assert_eq!(
-            warnings[1],
-            "WARN: dag 'dag-alpha': trigger.dataset \"s3://z\" has no publisher in this project (broken link, non-fatal)"
-        );
-        assert_eq!(
-            warnings[2],
-            "WARN: dag 'dag-zebra': trigger.dataset \"s3://a\" has no publisher in this project (broken link, non-fatal)"
-        );
-        assert_eq!(
-            warnings[3],
-            "WARN: dag 'dag-zebra': trigger.dataset \"s3://z\" has no publisher in this project (broken link, non-fatal)"
-        );
-    }
-
-    #[test]
-    fn check_reserved_task_ids_rejects_yard_publish_when_publishes_non_empty_no_trigger() {
-        // Schedule-only DAG (`trigger: None`) with `publishes:` non-empty must
-        // still reserve `_yard_publish` — codegen synthesizes the publish task
-        // whenever publishes is non-empty regardless of trigger presence.
-        // This is the gating bug Phase 32 fixes (RESEARCH Code Example 2).
-        let mut dag = dag_with(AirflowSection {
-            schedule: Some("@daily".into()),
-            trigger: None,
-            publishes: vec!["s3://x".into()],
-            ..Default::default()
-        });
-        dag.tasks = vec!["_yard_publish".to_string()];
-        let errs = validate_dag_full(&dag);
-        let publish_errs: Vec<_> = errs
-            .iter()
-            .filter(|e| e.field == "airflow.tasks")
-            .collect();
-        assert_eq!(publish_errs.len(), 1, "expected one TRIG-08 error: {errs:?}");
-        assert_eq!(
-            publish_errs[0].message,
-            "task_id '_yard_publish' is reserved for trigger codegen — rename your task"
-        );
-    }
-
-    #[test]
-    fn check_reserved_task_ids_returns_empty_for_schedule_only_no_publishes() {
-        // Schedule-only DAG, NO publishes, with a `_yard_wait_s3` task name.
-        // The original early-return must still apply: no codegen reserves IDs
-        // for schedule-only-no-publishes DAGs, so naming a task `_yard_wait_s3`
-        // is allowed (no regression on the existing TRIG-08 contract).
-        let mut dag = dag_with(AirflowSection {
-            schedule: Some("@daily".into()),
-            trigger: None,
-            publishes: vec![],
-            ..Default::default()
-        });
-        dag.tasks = vec!["_yard_wait_s3".to_string()];
-        let errs = check_reserved_task_ids(&dag);
-        assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
-    }
-
-    #[test]
-    fn check_reserved_task_ids_still_rejects_yard_wait_when_trigger_present() {
-        // DAG with a `trigger:` block (no publishes) and a user task named
-        // `_yard_wait_s3` — existing TRIG-08 path unchanged. This guards
-        // against accidentally narrowing the existing reservation set.
-        let mut dag = dag_with(AirflowSection {
-            trigger: Some(Trigger::Single(SingleSource::S3(S3Trigger {
-                bucket: "b".into(),
-                ..Default::default()
-            }))),
-            ..Default::default()
-        });
-        dag.tasks = vec!["_yard_wait_s3".to_string()];
-        let errs = validate_dag_full(&dag);
-        let task_errs: Vec<_> = errs
-            .iter()
-            .filter(|e| e.field == "airflow.tasks")
-            .collect();
-        assert_eq!(task_errs.len(), 1, "expected one TRIG-08 error: {errs:?}");
-        assert_eq!(
-            task_errs[0].message,
-            "task_id '_yard_wait_s3' is reserved for trigger codegen — rename your task"
-        );
-    }
-
-    // --- Phase 60 plan 60-02: mask_pii validation (VAL-01, VAL-02, VAL-03) ---
-
-    #[test]
-    fn mask_pii_valid_glue_passes() {
-        let mut job = minimal_job();
-        job.mask_pii = vec![
-            "USA_SSN".into(),
-            "CREDIT_CARD".into(),
-            "EMAIL".into(),
-        ];
-        let errors = validate_job(&job);
-        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
-    }
-
-    #[test]
-    fn mask_pii_emr_rejected() {
-        let mut job = minimal_job();
-        job.job_type = JobType::Emr;
-        job.config = json!({"type": "emr"});
-        job.mask_pii = vec!["USA_SSN".into()];
-        let errors = validate_job(&job);
-        assert!(
-            errors.iter().any(|e| e.field == "mask_pii"
-                && e.message.contains("only supported for glue jobs")),
-            "expected job-type rejection error, got: {errors:?}"
-        );
-    }
-
-    #[test]
-    fn mask_pii_bash_rejected() {
-        // Validates Pitfall 3: bash triggers is_task_only early return, but
-        // the mask_pii block is placed BEFORE that return so this still fires.
-        let job = JobDefinition {
-            job_type: JobType::Bash,
-            config: json!({"type": "bash", "command": "echo hi"}),
-            mask_pii: vec!["USA_SSN".into()],
-            ..Default::default()
-        };
-        let errors = validate_job(&job);
-        assert!(
-            errors.iter().any(|e| e.field == "mask_pii"
-                && e.message.contains("only supported for glue jobs")),
-            "expected job-type rejection error for bash, got: {errors:?}"
-        );
-    }
+    // --- mask_pii validation ---
 
     #[test]
     fn mask_pii_bad_format_rejected() {
@@ -2190,7 +992,6 @@ mod tests {
                 && e.message.contains("not valid SCREAMING_SNAKE_CASE")),
             "expected format error at index 1, got: {errors:?}"
         );
-        // GOOD_ONE is valid — no error at index 2
         assert!(
             !errors.iter().any(|e| e.field == "mask_pii[2]"),
             "GOOD_ONE should pass format check, but got error at index 2: {errors:?}"
@@ -2225,137 +1026,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mask_pii_all_errors_accumulated() {
-        // D-07: all three checks run regardless of earlier failures.
-        // EMR job with bad-format duplicates should produce errors for:
-        // 1) job-type (EMR != Glue)
-        // 2) format (usa_ssn is not SCREAMING_SNAKE)
-        // 3) duplicate (usa_ssn appears twice)
-        let job = JobDefinition {
-            job_type: JobType::Emr,
-            config: json!({"type": "emr"}),
-            mask_pii: vec!["usa_ssn".into(), "usa_ssn".into()],
-            ..Default::default()
-        };
-        let errors = validate_job(&job);
-        assert!(
-            errors.len() >= 3,
-            "expected at least 3 errors (job-type + format + duplicate), got {}: {errors:?}",
-            errors.len()
-        );
-        assert!(
-            errors.iter().any(|e| e.field == "mask_pii"
-                && e.message.contains("only supported for glue jobs")),
-            "missing job-type error: {errors:?}"
-        );
-        assert!(
-            errors.iter().any(|e| e.field.starts_with("mask_pii[")
-                && e.message.contains("not valid SCREAMING_SNAKE_CASE")),
-            "missing format error: {errors:?}"
-        );
-        assert!(
-            errors.iter().any(|e| e.field == "mask_pii"
-                && e.message.contains("duplicate entity type")),
-            "missing duplicate error: {errors:?}"
-        );
-    }
-
-    // --- Phase 68 plan 68-02: schema-driven provider config validation ---
-
-    #[test]
-    fn schema_driven_unknown_field_detected() {
-        // Create a Glue job with an unknown field in the glue: block.
-        // validate_job_with_schema with the Glue built_in_schema should
-        // detect the unknown field.
-        let mut job = minimal_job();
-        job.config = json!({
-            "type": "glue",
-            "role": "arn:aws:iam::123456789:role/GlueRole",
-            "glue": {
-                "script_bucket": "my-bucket",
-                "bogus_field": 42
-            }
-        });
-        let schema = crate::providers::built_in_schema(JobType::Glue);
-        let errors = validate_job_with_schema(&job, schema.as_ref());
-        assert!(
-            errors.iter().any(|e| e.message.contains("bogus_field")),
-            "expected error mentioning 'bogus_field', got: {errors:?}"
-        );
-    }
-
-    #[test]
-    fn schema_driven_required_field_missing() {
-        // Glue schema declares script_bucket as required. If the glue: block
-        // exists but omits script_bucket, schema validation should catch it.
-        let mut job = minimal_job();
-        job.config = json!({
-            "type": "glue",
-            "role": "arn:aws:iam::123456789:role/GlueRole",
-            "glue": {
-                "worker_type": "G.1X"
-            }
-        });
-        let schema = crate::providers::built_in_schema(JobType::Glue);
-        let errors = validate_job_with_schema(&job, schema.as_ref());
-        assert!(
-            errors.iter().any(|e| e.message.contains("required field 'script_bucket'")),
-            "expected required-field error for script_bucket, got: {errors:?}"
-        );
-    }
-
-    #[test]
-    fn schema_driven_valid_fields_pass() {
-        // All valid Glue fields — no unknown field errors from schema validation.
-        let job = valid_glue_job();
-        let schema = crate::providers::built_in_schema(JobType::Glue);
-        let errors = validate_job_with_schema(&job, schema.as_ref());
-        assert!(
-            !errors.iter().any(|e| e.message.contains("unknown provider config field")),
-            "unexpected unknown-field error: {errors:?}"
-        );
-    }
-
-    #[test]
-    fn schema_none_skips_provider_validation() {
-        // When schema is None, validate_provider_config_with_schema returns
-        // immediately — no provider-specific errors should appear.
-        let mut job = minimal_job();
-        job.config = json!({
-            "type": "glue",
-            "glue": { "totally_fake_field": true }
-        });
-        let errors = validate_job_with_schema(&job, None);
-        // With None schema, the old validate_provider_config is NOT called
-        // (validate_provider_config_with_schema returns immediately), so no
-        // provider-specific errors. The only error would be from the role check
-        // if we had wired it. Since validate_provider_config_with_schema skips
-        // everything on None, there should be no provider config field errors.
-        assert!(
-            !errors.iter().any(|e| e.message.contains("unknown provider config field")),
-            "schema=None should skip field validation: {errors:?}"
-        );
-    }
+    // --- schema-driven provider config validation ---
 
     #[test]
     fn source_type_union_with_plugin_types() {
-        // When schema declares supported_source_types, they are unioned with
-        // the built-in SUPPORTED_SOURCE_TYPES during validation.
         let mut job = minimal_job();
         job.sources = vec![Source {
             name: "custom".to_string(),
             source_type: "databricks_table".to_string(),
             ..Default::default()
         }];
-        // Without schema, "databricks_table" is unknown
         let errors_no_schema = validate_job_with_schema(&job, None);
         assert!(
             errors_no_schema.iter().any(|e| e.field == "sources[0].type"),
             "expected source type error without schema, got: {errors_no_schema:?}"
         );
 
-        // With schema declaring databricks_table, it should pass
         let schema = yard_structs::SchemaResponse {
             fields: vec![],
             supported_source_types: Some(vec!["databricks_table".to_string()]),
@@ -2375,14 +1061,12 @@ mod tests {
             sink_type: "databricks_table".to_string(),
             ..Default::default()
         });
-        // Without schema, "databricks_table" is unknown
         let errors_no_schema = validate_job_with_schema(&job, None);
         assert!(
             errors_no_schema.iter().any(|e| e.field == "sink.type"),
             "expected sink type error without schema, got: {errors_no_schema:?}"
         );
 
-        // With schema declaring databricks_table, it should pass
         let schema = yard_structs::SchemaResponse {
             fields: vec![],
             supported_source_types: None,

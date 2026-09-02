@@ -18,7 +18,7 @@
 //! - [`plugin_host`] -- process spawning and Provider adapter for out-of-process plugin binaries
 //! - [`utils`] -- hashing, variable resolution
 
-/// Provider config deep-merge and task-only classification.
+/// Provider config deep-merge.
 pub mod config_merge;
 /// Manifest-vs-state diff computation.
 pub mod diff;
@@ -55,4 +55,4 @@ pub use parsing::{
     parse_sink, parse_sources, parse_transforms,
 };
 pub use show::show;
-pub use list_targets::{list_targets, TargetRow};
+pub use list_targets::{list_targets, parse_account_from_role_arn, TargetRow};

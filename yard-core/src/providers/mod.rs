@@ -188,7 +188,7 @@ pub async fn get_provider_for_job(
     plugin_source: Option<&str>,
     plugin_host_config: &PluginHostConfig,
 ) -> Result<Box<dyn Provider>> {
-    let JobType::Plugin(type_name) = job_type;
+    let type_name = job_type.to_string();
     match (plugin_version, plugin_source) {
         (Some(version), Some(source)) => {
             let plugin_name = format!("yard-plugin-{type_name}");

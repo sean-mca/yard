@@ -63,21 +63,23 @@ const STATIC_JOB_DOC_ALLOWED: &[&str] = &[
 ];
 
 /// Build the full allowed-keys list for a job doc by combining the static
-/// fields with the wire-form of every `JobType` variant (so `glue: {...}`,
-/// `emr: {...}`, `bash: {...}` provider-block siblings are accepted but
-/// `sprk: {...}` is rejected). D-21: list is derived from the live
-/// `JobType` enum, not hard-coded — adding a fourth variant in TYPE-01
-/// flows through here without an edit.
+/// fields with the job's own type name as a provider-block key.
 ///
-/// NOTE: Phase 70 will add `JobType::Plugin(String)` — this function will
-/// need updating at that point to accept dynamic plugin provider-block keys.
-fn job_doc_allowed_keys() -> Vec<String> {
+/// In v2.0 `JobType` is `Plugin(String)` -- the provider-block key is
+/// the job's `type` value (e.g. `glue`, `emr`, `databricks`). The key is
+/// passed in dynamically since we can't enumerate all plugin types at
+/// compile time.
+fn job_doc_allowed_keys(job_type_key: Option<&str>) -> Vec<String> {
     let mut all: Vec<String> = STATIC_JOB_DOC_ALLOWED
         .iter()
         .map(|s| (*s).to_string())
         .collect();
-    for variant in [JobType::Glue, JobType::Emr, JobType::Bash] {
-        all.push(variant.to_string());
+    if let Some(key) = job_type_key {
+        all.push(key.to_string());
+    }
+    // Also include "mask_pii" which is a valid job-doc key
+    if !all.iter().any(|k| k == "mask_pii") {
+        all.push("mask_pii".to_string());
     }
     all
 }
@@ -319,7 +321,9 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
         // provider-block keys. Catches user typos like `sceudule:`,
         // `transformsss:`, or `glu: { ... }` at parse time with a
         // structured error.
-        let allowed_owned = job_doc_allowed_keys();
+        // Extract job type string to allow its provider-block key
+        let job_type_key = config.get("type").and_then(|v| v.as_str());
+        let allowed_owned = job_doc_allowed_keys(job_type_key);
         let allowed_borrowed: Vec<&str> = allowed_owned.iter().map(String::as_str).collect();
         let job_path = format!("jobs.{job_name}");
         crate::parsing::validate_unknown_keys(&config, &allowed_borrowed, &job_path)?;
@@ -942,7 +946,7 @@ mod tests {
             cfg.as_object_mut().unwrap().insert("aws".into(), aws);
         }
         JobDefinition {
-            job_type: JobType::Glue,
+            job_type: JobType::Plugin("glue".to_string()),
             config: cfg,
             dir: dir.to_path_buf(),
             ..Default::default()
