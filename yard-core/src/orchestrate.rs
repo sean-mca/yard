@@ -370,6 +370,8 @@ pub async fn apply(
                         applied_at: chrono::Utc::now().to_rfc3339(),
                         resources,
                         env: None,
+                        plugin_version: job_def.plugin_version.clone(),
+                        plugin_source: job_def.plugin_source.clone(),
                     };
 
                     storage
@@ -417,8 +419,8 @@ pub async fn apply(
                             let provider = providers::get_provider_for_job(
                                 &job_type,
                                 &merged_config,
-                                None,
-                                None,
+                                existing.plugin_version.as_deref(),
+                                existing.plugin_source.as_deref(),
                                 &plugin_host_config,
                             )
                             .await?;
@@ -613,8 +615,8 @@ pub async fn destroy_job(
                 let provider = providers::get_provider_for_job(
                     &job_type,
                     &merged_config,
-                    None,
-                    None,
+                    job_state.deployment.plugin_version.as_deref(),
+                    job_state.deployment.plugin_source.as_deref(),
                     &plugin_host_config,
                 )
                 .await?;
@@ -725,6 +727,8 @@ mod tests {
             status: DeploymentStatus::Generated,
             applied_at: "2025-01-01T00:00:00Z".to_string(),
             resources: Vec::new(),
+            plugin_version: None,
+            plugin_source: None,
         }
     }
 
