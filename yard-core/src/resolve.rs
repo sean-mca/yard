@@ -390,13 +390,33 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
 /// cannot use `key.parse::<JobType>()` as a discriminator. Instead, we
 /// allow-list the known legitimate context-file keys and skip the check
 /// for unknown keys (provider block keys are dynamic in v2.0).
-fn reject_flat_provider_keys(_value: &Value, _context_path: &str) -> Result<()> {
-    // In v2.0, all provider types are dynamic (Plugin(String)). Since every
-    // string parses as a valid JobType, the previous heuristic
-    // (key.parse::<JobType>().is_ok()) now fires on legitimate context keys
-    // like "region", "account", etc. The flat-style provider key check is
-    // no longer meaningful and is disabled. Users are guided to the v2.0
-    // migration docs for provider configuration changes.
+fn reject_flat_provider_keys(value: &Value, context_path: &str) -> Result<()> {
+    // In v2.0, `JobType` is `Plugin(String)` -- every string parses as valid,
+    // so the previous heuristic (`key.parse::<JobType>().is_ok()`) is useless.
+    // Instead, allow-list the known legitimate context-file keys and warn on
+    // anything else, which likely indicates a misplaced provider block (e.g.
+    // `glue:` at the top level instead of under `providers:`).
+    const KNOWN_CONTEXT_KEYS: &[&str] = &[
+        "aws",
+        "account_id",
+        "providers",
+        "region",
+        "account",
+        "state",
+        "project",
+        "tags",
+    ];
+    if let Some(obj) = value.as_object() {
+        for key in obj.keys() {
+            if !KNOWN_CONTEXT_KEYS.contains(&key.as_str()) {
+                eprintln!(
+                    "Warning: unknown top-level key \"{key}\" in {context_path} -- \
+                     if this is a provider config, move it under `providers:`. \
+                     See docs/reference/migrations/v2.0.md"
+                );
+            }
+        }
+    }
     Ok(())
 }
 
