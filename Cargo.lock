@@ -5726,7 +5726,7 @@ dependencies = [
 
 [[package]]
 name = "yard"
-version = "1.15.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5742,7 +5742,7 @@ dependencies = [
 
 [[package]]
 name = "yard-core"
-version = "1.15.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -5763,7 +5763,7 @@ dependencies = [
 
 [[package]]
 name = "yard-plugin-sdk"
-version = "0.1.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -5776,7 +5776,7 @@ dependencies = [
 
 [[package]]
 name = "yard-server"
-version = "0.2.2"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5817,7 +5817,7 @@ dependencies = [
 
 [[package]]
 name = "yard-structs"
-version = "1.15.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "serde",
