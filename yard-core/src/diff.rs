@@ -58,7 +58,12 @@ pub async fn calculate_diff(
                 .await
                 .unwrap_or(None)
                 .unwrap_or_default(),
-            Err(_) => String::new(),
+            Err(e) => {
+                eprintln!(
+                    "Warning: plugin codegen failed for job \"{name}\", using empty script for hash: {e}"
+                );
+                String::new()
+            }
         };
 
         // Hash script + config + trigger so changes to any of them produce a

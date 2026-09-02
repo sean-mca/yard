@@ -305,7 +305,13 @@ pub async fn apply(
                             .await
                             .unwrap_or(None)
                             .unwrap_or_default(),
-                        Err(_) => String::new(),
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: plugin codegen failed for job \"{}\", deploying empty script: {e}",
+                                diff.name
+                            );
+                            String::new()
+                        }
                     };
 
                     let config_str = serde_json::to_string(&job_def.config).with_context(|| {
