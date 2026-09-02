@@ -6,36 +6,32 @@
 [![CI](https://github.com/sean-mca/yard/actions/workflows/ci.yml/badge.svg)](https://github.com/sean-mca/yard/actions/workflows/ci.yml)
 [![License: BSL 1.1](https://img.shields.io/badge/License-BSL_1.1-blue.svg)](LICENSE)
 
-Declarative infrastructure for data pipelines. Define ETL jobs in YAML, and YARD generates the PySpark scripts, manages state, and deploys to AWS. Think Terragrunt, but for data engineering.
+Declarative infrastructure for data pipelines. Define ETL jobs in YAML, and YARD deploys to AWS via provider plugins. Think Terragrunt, but for data engineering.
 
 ## Status
 
-Active development. Latest release: v1.3.4 (Linux-x86_64 binary). Current milestone (v1.7): docs restructure. Glue and EMR providers ship plan/apply/destroy/show/validate; event-driven Airflow DAGs via `trigger:` (v1.6); per-target deployment via `yard list targets` (v1.3.4). Databricks provider planned. No stability guarantees yet.
+Active development. Latest release: v2.0.0. Plugin-based provider architecture — providers (Glue, EMR) are external plugin binaries. Per-target deployment via `yard list targets`. No stability guarantees yet.
 
 ## Why YARD?
 
-Most data teams manage Glue jobs, EMR steps, and Airflow DAGs through a mix of Terraform, custom scripts, and ClickOps. When someone leaves, the knowledge of how things are wired together leaves with them.
+Most data teams manage Glue jobs and EMR steps through a mix of Terraform, custom scripts, and ClickOps. When someone leaves, the knowledge of how things are wired together leaves with them.
 
 YARD replaces all of that with a single YAML-driven workflow:
 
 - **One file per job.** No Terraform modules, no CloudFormation, no copy-pasted boilerplate.
-- **PySpark codegen.** Write transforms in YAML, get production-ready scripts. Or bring your own.
+- **Plugin providers.** Provider logic runs as external binaries over a JSON protocol. Install `yard-plugin-glue` or `yard-plugin-emr`, or build your own with `yard-plugin-sdk`.
 - **Plan/apply lifecycle.** See what will change before it changes. State is per-job, so teams deploy concurrently without locks.
-- **Airflow DAG generation.** Drop a `dag.yaml` marker in a directory, and YARD generates the DAG Python file with dependency wiring and uploads it to your MWAA bucket.
+- **Auto-download.** Plugins are downloaded from GitHub Releases on first use with TOFU checksum verification (`yard.lock`).
 
 ## Installation
 
-Download the latest Linux-x86_64 binary:
+Install via Homebrew:
 
 ```bash
-curl -LO https://github.com/sean-mca/yard/releases/download/v1.3.4/yard-linux-x86_64
-curl -LO https://github.com/sean-mca/yard/releases/download/v1.3.4/yard-linux-x86_64.sha256
-sha256sum -c yard-linux-x86_64.sha256
-chmod +x yard-linux-x86_64
-sudo mv yard-linux-x86_64 /usr/local/bin/yard
+brew install sean-mca/yard/yard
 ```
 
-Linux-x86_64 only — macOS and Windows users build from source.
+Or download a binary from [GitHub Releases](https://github.com/sean-mca/yard/releases) (macOS ARM/Intel, Linux ARM/x86_64).
 
 Or build from source:
 
@@ -53,6 +49,8 @@ See [docs/quickstart.md](docs/quickstart.md) for prerequisites and first-run set
 ```yaml
 # orders.yaml
 type: glue
+plugin_version: "0.1.0"
+plugin_source: "https://github.com/your-org/yard-plugin-glue/releases/download/v${version}/yard-plugin-glue-${version}-${os}-${arch}"
 role: arn:aws:iam::123456789:role/GlueJobExecutionRole
 
 source:
@@ -84,17 +82,18 @@ Applying...
 State updated successfully.
 ```
 
-That's it. YARD generated the PySpark script, uploaded it to S3, and created the Glue job.
+That's it. YARD downloaded the Glue plugin, generated the PySpark script, uploaded it to S3, and created the Glue job.
 
-## Providers
+## Plugins
 
-| Provider | Status | What it does |
-|----------|--------|--------------|
-| AWS Glue | Stable | Generates PySpark scripts, uploads to S3, creates/updates Glue jobs |
-| AWS EMR (classic) | Stable | Generates PySpark scripts, uploads to S3, submits steps to existing clusters |
-| Airflow DAGs | Stable | Generates Airflow DAG Python files from YAML, uploads to a DAGs bucket |
-| Databricks | Planned | Job creation/update/destroy against the Databricks Jobs API |
-| AWS EMR Serverless | Planned | Submit job runs to serverless Spark applications |
+Providers are external plugin binaries that communicate with yard over a JSON-over-stdio protocol.
+
+| Plugin | Status | What it does |
+|--------|--------|--------------|
+| [yard-plugin-glue](https://github.com/your-org/yard-plugin-glue) | In progress | PySpark codegen, S3 upload, Glue job create/update/destroy |
+| [yard-plugin-emr](https://github.com/your-org/yard-plugin-emr) | In progress | PySpark codegen, S3 upload, EMR step submission |
+
+See [docs/how-to/build-a-plugin.md](docs/how-to/build-a-plugin.md) to build your own provider plugin.
 
 ## Project structure
 
@@ -146,16 +145,17 @@ See [docs/how-to/deploy.md](docs/how-to/deploy.md) for setup instructions.
 
 ## Architecture
 
-Rust workspace with four crates:
+Rust workspace with five crates:
 
 | Crate | Purpose |
 |-------|---------|
 | `yard-cli` | Thin CLI wrapper -- parses args, calls core, formats output |
-| `yard-core` | Business logic -- codegen, state, storage, validation, providers |
-| `yard-structs` | Shared types -- job definitions, state, config |
+| `yard-core` | Orchestrator -- plugin host, state, storage, validation, config cascade |
+| `yard-structs` | Shared types -- job definitions, state, config, plugin protocol |
+| `yard-plugin-sdk` | SDK for building provider plugins (implements PluginHandler trait) |
 | `yard-server` | Web dashboard -- Dioxus fullstack, axum API, DynamoDB |
 
-Provider system is trait-based. Adding a new provider means implementing the `Provider` trait -- no changes to existing code.
+Provider plugins are external binaries. Build one by implementing the `PluginHandler` trait from `yard-plugin-sdk`.
 
 See [docs/explanation/architecture.md](docs/explanation/architecture.md) for a deeper walk-through.
 

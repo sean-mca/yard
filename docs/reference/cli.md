@@ -43,7 +43,7 @@ Synopsis:
 yard apply [OPTIONS] [DIRECTORY]
 ```
 
-Apply pending changes to AWS. For each target in the project, codegen renders the script, the provider deploys it (Glue `UpdateJob`/`CreateJob`, EMR `AddJobFlowSteps`, S3 script upload), and yard updates state. Use `--target <NAME>` to limit scope to a single job; use `--dry-run` to skip provider deployment and exercise codegen + state only.
+Apply pending changes to AWS. For each target in the project, the provider plugin renders the script and deploys it, and yard updates state. Use `--target <NAME>` to limit scope to a single job; use `--dry-run` to skip provider deployment.
 
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
@@ -60,8 +60,6 @@ yard apply
 yard apply --target etl-daily --dry-run
 yard apply --dir staging/us-east-1 --dry-run
 ```
-
-See [airflow-dag.md](airflow-dag.md) for what `yard apply` does to DAG resources.
 
 ---
 
@@ -89,8 +87,6 @@ yard destroy etl-daily --auto-approve
 yard destroy --dry-run
 yard destroy --dir staging/us-east-1 --auto-approve
 ```
-
-See [airflow-dag.md](airflow-dag.md) for DAG destroy semantics.
 
 ---
 
@@ -160,7 +156,7 @@ Synopsis:
 yard list targets [OPTIONS] [DIRECTORY]
 ```
 
-Emit all deployment targets (jobs + DAGs) as a JSON array to stdout, sorted alphabetically by `target`. Each row is `{target, kind, aws_account_id}` where `aws_account_id` is a 12-digit string or `null` (the key is always present). This command shipped in v1.3.4 and is intended for CI matrix builders that fan out `yard apply --target` per row.
+Emit all deployment targets as a JSON array to stdout, sorted alphabetically by `target`. Each row is `{target, kind, aws_account_id}` where `aws_account_id` is a 12-digit string or `null` (the key is always present). Intended for CI matrix builders that fan out `yard apply --target` per row.
 
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
@@ -200,8 +196,6 @@ yard plan --target etl-daily
 yard plan --dir staging/us-east-1
 ```
 
-See [airflow-dag.md](airflow-dag.md) for DAG plan semantics.
-
 ---
 
 ## yard show
@@ -212,7 +206,7 @@ Synopsis:
 yard show [OPTIONS] <JOB_NAME> [DIRECTORY]
 ```
 
-Print the generated PySpark script for a single job to stdout. `<JOB_NAME>` is required. Useful for diffing codegen output without running `apply`.
+Print the generated script for a single job to stdout. `<JOB_NAME>` is required. Runs the provider plugin's codegen operation. Useful for diffing output without running `apply`.
 
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
@@ -224,8 +218,6 @@ Example:
 yard show etl-daily > /tmp/etl-daily.py
 ```
 
-See [airflow-dag.md](airflow-dag.md) for DAG show semantics.
-
 ---
 
 ## yard validate
@@ -236,7 +228,7 @@ Synopsis:
 yard validate [OPTIONS] [DIRECTORY]
 ```
 
-Validate every job in the project: schema-check the YAMLs and verify provider knob acceptance per `validate_job_full`. Iterates `manifest.jobs` only — does not run DAG validation, orphan checks, or cross-DAG link checks (see [airflow-dag.md](airflow-dag.md) for DAG-side validation scope). Reads (does not write) state — requires AWS credentials. Use `--target` to validate a single job or `--dir` to validate jobs under a directory subtree.
+Validate every job in the project: schema-check the YAMLs and run the provider plugin's `validate` and `schema` operations. Reads (does not write) state — requires AWS credentials. Use `--target` to validate a single job or `--dir` to validate jobs under a directory subtree.
 
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
@@ -257,8 +249,6 @@ yard validate --dir staging/
 ## See also
 
 - [configuration.md](configuration.md) — YAML schema and environment variables
-- [providers/glue.md](providers/glue.md) — Glue provider knobs and AWS resources
-- [providers/emr.md](providers/emr.md) — EMR provider knobs and AWS resources
-- [airflow-dag.md](airflow-dag.md) — Airflow DAG schema, trigger semantics, and DAG-side behavior of plan/apply/show/destroy
-- [codegen.md](codegen.md) — Source/sink/transform rendering rules
-- [why codegen](../explanation/why-codegen.md) — Rationale behind the codegen design
+- [providers/glue.md](providers/glue.md) — Glue provider plugin
+- [providers/emr.md](providers/emr.md) — EMR provider plugin
+- [migrations/v2.0.md](migrations/v2.0.md) — v2.0 migration guide
