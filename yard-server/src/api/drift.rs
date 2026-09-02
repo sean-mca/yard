@@ -349,26 +349,42 @@ fn walk_for_jobs(dir: &Path, workdir: &Path, jobs: &mut HashMap<String, JobFileI
     }
 }
 
+/// Extract environment and region for a job file by searching for context
+/// marker files (`account.yaml` for environment, `region.yaml` for region)
+/// in ancestor directories, consistent with how `resolve.rs` discovers
+/// the config cascade hierarchy.
+///
+/// Falls back to `"unknown"` when no marker file is found (e.g. flat
+/// project structure without context files).
 fn extract_env_region(job_path: &Path, workdir: &Path) -> (String, String) {
-    let relative = job_path.strip_prefix(workdir).unwrap_or(job_path);
+    let job_dir = job_path.parent().unwrap_or(job_path);
+    let mut environment = String::from("unknown");
+    let mut region = String::from("unknown");
 
-    let segments: Vec<&str> = relative.iter().filter_map(|s| s.to_str()).collect();
-
-    // Path convention: <provider>/<env>/<region>/job.yaml
-    let offset = if segments.first() == Some(&"jobs") {
-        1
-    } else {
-        0
-    };
-
-    let environment = segments
-        .get(1 + offset)
-        .unwrap_or(&"unknown")
-        .to_string();
-    let region = segments
-        .get(2 + offset)
-        .unwrap_or(&"unknown")
-        .to_string();
+    // Walk up from the job's directory looking for context marker files.
+    let mut dir = job_dir;
+    loop {
+        if dir.join("region.yaml").exists()
+            && let Some(name) = dir.file_name().and_then(|n| n.to_str())
+        {
+            region = name.to_string();
+        }
+        if dir.join("account.yaml").exists() {
+            if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+                environment = name.to_string();
+            }
+            // account.yaml is higher in the hierarchy; stop here
+            break;
+        }
+        // Stop if we've reached the workdir root
+        if dir == workdir || dir.parent().is_none() {
+            break;
+        }
+        dir = match dir.parent() {
+            Some(p) => p,
+            None => break,
+        };
+    }
 
     (environment, region)
 }
