@@ -328,7 +328,7 @@ fn walk_for_jobs(dir: &Path, workdir: &Path, jobs: &mut HashMap<String, JobFileI
         {
             if matches!(
                 file_name,
-                "yard.yaml" | "account.yaml" | "region.yaml" | "transforms.yaml"
+                "yard.yaml" | "account.yaml" | "region.yaml" | "transforms.yaml" | "dag.yaml"
             ) {
                 continue;
             }
