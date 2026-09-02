@@ -9,8 +9,6 @@ workspace = true
 [dependencies]
 anyhow = "1.0.102"
 aws-config = { version = "1.8.15", features = ["behavior-version-latest"] }
-aws-sdk-emr = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-glue = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = { version = "1.127.0", features = ["behavior-version-latest"] }
 blake3 = { version = "1.8.3", features = ["serde"] }
 chrono = "0.4.44"
@@ -19,7 +17,6 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10"
-tera = "1.20.1"
 tokio = { version = "1.50.0", features = ["full"] }
 walkdir = "2.5.0"
 yaml-rust2 = "0.11.0"
