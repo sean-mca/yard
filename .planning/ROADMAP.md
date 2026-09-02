@@ -264,7 +264,7 @@ Cross-cutting requirements: `cargo clippy -D warnings` clean, `cargo test --work
 - [x] **Phase 66: Plugin Protocol + Host** - JSON-over-stdio protocol types, process spawner, PluginProvider adapter (completed 2026-08-31)
 - [x] **Phase 67: Plugin SDK** - `yard-plugin-sdk` workspace crate with PluginServer::run() and PluginHandler trait (completed 2026-09-01)
 - [ ] **Phase 68: Provider-Scoped Config Cascade** - Provider-scoped config sections at all hierarchy levels, schema-driven validation
-- [ ] **Phase 69: Plugin Distribution** - `yard init` downloads, checksum-verifies, and caches plugin binaries
+- [x] **Phase 69: Plugin Distribution** - `yard init` downloads, checksum-verifies, and caches plugin binaries (completed 2026-09-01)
 - [ ] **Phase 70: Core Slimming + Documentation** - Remove compiled-in providers, migration guide, plugin author guide
 
 ## Phase Details
@@ -350,7 +350,10 @@ Plans:
   3. Plugin binaries are cached at `~/.yard/plugins/<name>-<version>-<os>-<arch>` and reused across projects without re-downloading
   4. A version mismatch between the version pinned in yard.yaml and the cached binary produces a clear error at startup
 
-**Plans**: TBD
+**Plans**: 2/2 plans complete
+
+- [x] 69-01-PLAN.md
+- [x] 69-02-PLAN.md
 
 ### Phase 70: Core Slimming + Documentation
 
@@ -364,7 +367,16 @@ Plans:
   3. A v1.x user can follow the migration guide to upgrade to v2.0 -- covering new config format, `yard init` requirement, and plugin binary setup
   4. A plugin author can follow the author guide to build a provider plugin from scratch using yard-plugin-sdk, test it locally, and release it
 
-**Plans**: TBD
+**Plans:** 3 plans
+Plans:
+**Wave 1** *(parallel)*
+
+- [ ] 70-01-PLAN.md — JobType rewrite to Plugin(String), module deletion (~11k lines), dependency removal, provider dispatch rewrite
+- [ ] 70-03-PLAN.md — v2.0 migration guide, plugin author guide, doc cleanup
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 70-02-PLAN.md — Rewire remaining yard-core modules and CLI commands for plugin-only architecture
 
 ## Progress
 
@@ -382,8 +394,8 @@ Plans:
 | 66. Plugin Protocol + Host | v2.0 | 3/3 | Complete    | 2026-08-31 |
 | 67. Plugin SDK | v2.0 | 2/2 | Complete   | 2026-09-01 |
 | 68. Provider-Scoped Config Cascade | v2.0 | 0/2 | Planned    |  |
-| 69. Plugin Distribution | v2.0 | 0/? | Not started | - |
-| 70. Core Slimming + Documentation | v2.0 | 0/? | Not started | - |
+| 69. Plugin Distribution | v2.0 | 2/2 | Complete    | 2026-09-01 |
+| 70. Core Slimming + Documentation | v2.0 | 0/3 | Planned | - |
 
 **Out-of-band patches (NOT tracked under v1.9 or v1.10):**
 
