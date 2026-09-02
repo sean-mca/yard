@@ -9,7 +9,7 @@
 use regex::Regex;
 use std::collections::HashSet;
 use std::sync::LazyLock;
-use yard_structs::{JdbcAuth, JobDefinition, JobType, ValidationError};
+use yard_structs::{JdbcAuth, JobDefinition, SchemaResponse, ValidationError};
 
 /// Supported source types for Spark jobs.
 const SUPPORTED_SOURCE_TYPES: &[&str] = &["s3", "jdbc", "catalog", "kafka", "api"];
@@ -50,10 +50,27 @@ pub use crate::providers::validation_err as err;
 
 /// Validate a job definition against yard's schema rules.
 ///
-/// Returns a (possibly empty) list of validation errors. Errors are
-/// collected without short-circuiting so every violation is reported.
+/// Delegates to [`validate_job_with_schema`] with `None` schema, preserving
+/// backward compatibility for call sites that don't have a schema cache.
 #[must_use]
 pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
+    validate_job_with_schema(job, None)
+}
+
+/// Validate a job definition against yard's schema rules with optional
+/// provider schema for field checking and source/sink type union (D-03).
+///
+/// Returns a (possibly empty) list of validation errors. Errors are
+/// collected without short-circuiting so every violation is reported.
+///
+/// When `schema` is `Some`, source/sink type checks union the built-in
+/// types with the schema's declared types, and provider config validation
+/// uses schema-driven field checking.
+#[must_use]
+pub fn validate_job_with_schema(
+    job: &JobDefinition,
+    schema: Option<&SchemaResponse>,
+) -> Vec<ValidationError> {
     let mut errors = Vec::with_capacity(4);
 
     // Note: job-type validity (one of `glue`, `emr`, `bash`) is now enforced
@@ -64,20 +81,11 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
 
     // mask_pii validation (VAL-01/VAL-02/VAL-03).
     //
-    // Placed BEFORE the is_task_only early return so that task-only job types
-    // (bash, ...) with mask_pii still get the job-type rejection (Pitfall 3).
     // All three checks run independently per D-07 — no short-circuit.
+    // In v2.0, mask_pii is validated at the structural level here. The
+    // provider-specific job-type restriction (e.g. "glue only") is now the
+    // plugin's responsibility via Provider::validate.
     if !job.mask_pii.is_empty() {
-        // D-08 order: job-type → format → duplicates
-
-        // VAL-01 (D-15): job-type restriction — Glue only
-        if job.job_type != JobType::Glue {
-            errors.push(err(
-                "mask_pii",
-                "pii masking is only supported for glue jobs",
-            ));
-        }
-
         // VAL-02 (D-03/D-16/D-18/D-19): per-element format validation
         for (i, entity) in job.mask_pii.iter().enumerate() {
             if entity.is_empty() {
@@ -108,14 +116,6 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
         }
     }
 
-    // Task-only job types (bash, ...) take a separate path — they don't have
-    // sources/sinks/transforms and don't deploy anywhere. Validate them here
-    // and skip the Spark-job checks below.
-    if crate::is_task_only(job.job_type) {
-        validate_task_only_job(job, &mut errors);
-        return errors;
-    }
-
     // body and job_file are mutually exclusive (only relevant for Spark jobs)
     if job.body.is_some() && job.job_file.is_some() {
         errors.push(err(
@@ -124,6 +124,10 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
         ));
     }
 
+    // Build effective source type list — union built-in types with plugin-declared types (D-03)
+    let effective_source_types = effective_type_list(SUPPORTED_SOURCE_TYPES, schema.and_then(|s| s.supported_source_types.as_deref()));
+    let effective_sink_types = effective_type_list(SUPPORTED_SINK_TYPES, schema.and_then(|s| s.supported_sink_types.as_deref()));
+
     // Track known df names for reference checking
     let mut known_names: HashSet<String> = HashSet::new();
 
@@ -131,13 +135,13 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
     for (i, source) in job.sources.iter().enumerate() {
         let prefix = format!("sources[{}]", i);
 
-        if !SUPPORTED_SOURCE_TYPES.contains(&source.source_type.as_str()) {
+        if !effective_source_types.iter().any(|t| t == &source.source_type) {
             errors.push(err(
                 &format!("{prefix}.type"),
                 &format!(
                     "\"{}\" is not a supported source type (expected: {})",
                     source.source_type,
-                    SUPPORTED_SOURCE_TYPES.join(", ")
+                    effective_source_types.join(", ")
                 ),
             ));
         }
@@ -396,13 +400,13 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
 
     // Sink
     if let Some(ref sink) = job.sink {
-        if !SUPPORTED_SINK_TYPES.contains(&sink.sink_type.as_str()) {
+        if !effective_sink_types.iter().any(|t| t == &sink.sink_type) {
             errors.push(err(
                 "sink.type",
                 &format!(
                     "\"{}\" is not a supported sink type (expected: {})",
                     sink.sink_type,
-                    SUPPORTED_SINK_TYPES.join(", ")
+                    effective_sink_types.join(", ")
                 ),
             ));
         }
@@ -529,69 +533,24 @@ pub fn validate_job(job: &JobDefinition) -> Vec<ValidationError> {
         ));
     }
 
-    // Provider-specific config validation — dispatched to the provider registry.
-    crate::providers::validate_provider_config(job.job_type, &job.config, &mut errors);
+    // Provider-specific config validation is now the plugin's responsibility
+    // via Provider::validate. Core validation covers only structural schema.
 
     errors
 }
 
-/// Validate a task-only job (bash, ... future: python, sensor, dbt).
-///
-/// These jobs must not carry Spark-job fields
-/// (sources/sink/transforms/body/job_file) and must carry their
-/// task-type-specific required fields.
-fn validate_task_only_job(job: &JobDefinition, errors: &mut Vec<ValidationError>) {
-    // Reject Spark-shaped fields on task-only jobs — they're meaningless here.
-    if !job.sources.is_empty() {
-        errors.push(err(
-            "sources",
-            &format!(
-                "task-only job type \"{}\" cannot declare sources",
-                job.job_type
-            ),
-        ));
-    }
-    if job.sink.is_some() {
-        errors.push(err(
-            "sink",
-            &format!(
-                "task-only job type \"{}\" cannot declare a sink",
-                job.job_type
-            ),
-        ));
-    }
-    if !job.transforms.is_empty() {
-        errors.push(err(
-            "transforms",
-            &format!(
-                "task-only job type \"{}\" cannot declare transforms",
-                job.job_type
-            ),
-        ));
-    }
-    if job.body.is_some() || job.job_file.is_some() {
-        errors.push(err(
-            "body",
-            &format!(
-                "task-only job type \"{}\" cannot declare body or job_file",
-                job.job_type
-            ),
-        ));
-    }
-
-    if job.job_type == JobType::Bash {
-        let has_command = job
-            .config
-            .get("command")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.trim().is_empty());
-        if !has_command {
-            errors.push(err(
-                "command",
-                "bash jobs require a non-empty \"command\" field",
-            ));
+/// Build an effective type list by unioning built-in types with optional
+/// plugin-declared types (D-03). Used for source and sink type validation.
+fn effective_type_list(builtin: &[&str], plugin_types: Option<&[String]>) -> Vec<String> {
+    let mut types: Vec<String> = builtin.iter().map(|s| (*s).to_string()).collect();
+    if let Some(extras) = plugin_types {
+        for t in extras {
+            if !types.iter().any(|existing| existing == t) {
+                types.push(t.clone());
+            }
         }
     }
+    types
 }
 
 /// Validate the interplay between `secret_id` and `auth` on a jdbc source/sink.

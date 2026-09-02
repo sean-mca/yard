@@ -7,30 +7,38 @@ fn default_path_buf() -> PathBuf {
     PathBuf::new()
 }
 
-/// Discriminator for `JobDefinition.job_type` (TYPE-01). Wire format is the
-/// lowercase variant name — `"glue"`, `"emr"`, `"bash"`. Adding a fourth job
-/// type requires (1) a new variant here, (2) a `FromStr` arm below, (3) a new
-/// provider impl in `yard-core/src/providers/`, and (4) a new validation arm
-/// in `yard-core/src/validation/rules.rs`.
+/// Discriminator for `JobDefinition.job_type` (TYPE-01, D-03). Provider types
+/// are now dynamic strings resolved at runtime through the plugin system.
+/// Wire format is a plain string — `"glue"`, `"emr"`, `"databricks"` — for
+/// backward compatibility with existing state files.
 #[non_exhaustive]
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum JobType {
-    /// AWS Glue ETL job.
-    Glue,
-    /// AWS EMR step.
-    Emr,
-    /// Shell/bash script execution.
-    Bash,
+    /// Dynamic plugin-resolved provider type.
+    Plugin(String),
+}
+
+/// Custom `Serialize`: emit plain string for backward-compatible state files.
+/// Serializing `Plugin("glue")` produces `"glue"`, not `{"Plugin":"glue"}`.
+impl Serialize for JobType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let JobType::Plugin(s) = self;
+        serializer.serialize_str(s)
+    }
+}
+
+/// Custom `Deserialize`: accept plain string from YAML/JSON.
+/// Deserializing `"glue"` produces `Plugin("glue")`.
+impl<'de> Deserialize<'de> for JobType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(JobType::Plugin(s))
+    }
 }
 
 impl std::fmt::Display for JobType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            JobType::Glue => "glue",
-            JobType::Emr => "emr",
-            JobType::Bash => "bash",
-        };
+        let JobType::Plugin(s) = self;
         f.write_str(s)
     }
 }
@@ -38,14 +46,10 @@ impl std::fmt::Display for JobType {
 impl std::str::FromStr for JobType {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> anyhow::Result<Self> {
-        match s {
-            "glue" => Ok(JobType::Glue),
-            "emr" => Ok(JobType::Emr),
-            "bash" => Ok(JobType::Bash),
-            other => Err(anyhow::anyhow!(
-                "invalid job type '{other}' (expected: glue, emr, bash)"
-            )),
+        if s.is_empty() {
+            anyhow::bail!("job type cannot be empty");
         }
+        Ok(JobType::Plugin(s.to_string()))
     }
 }
 
@@ -502,19 +506,25 @@ pub struct JobDefinition {
     /// `depends_on`.
     #[serde(skip, default)]
     pub base_name: String,
+    /// Plugin binary version pinned for this job (e.g. `"0.3.1"`). When set
+    /// alongside `plugin_source`, yard downloads and uses the plugin binary
+    /// instead of a compiled-in provider.
+    #[serde(default)]
+    pub plugin_version: Option<String>,
+    /// URL template for downloading the plugin binary. Placeholders:
+    /// `${name}`, `${version}`, `${os}`, `${arch}`.
+    #[serde(default)]
+    pub plugin_source: Option<String>,
 }
 
-/// Hand-written `Default` because `JobType` deliberately has no `Default` impl
-/// (D-08): the only sensible default for a JobDefinition's `job_type` is
-/// `JobType::Glue` (most-tested type, least-surprising default for the
-/// non-deployable empty default), but a default at the JobType level would
-/// invite accidental `JobType::default()` calls in code that should always
-/// pick deliberately. The default JobDefinition itself stays non-deployable —
-/// empty body, no sources, no sink — same as before this refactor.
+/// Hand-written `Default` because `JobType` deliberately has no `Default` impl:
+/// a default at the `JobType` level would invite accidental `JobType::default()`
+/// calls in code that should always pick deliberately. The default uses `"glue"`
+/// as the placeholder type for non-deployable empty defaults (test fixtures).
 impl Default for JobDefinition {
     fn default() -> Self {
         Self {
-            job_type: JobType::Glue,
+            job_type: JobType::Plugin("glue".to_string()),
             imports: Vec::new(),
             body: None,
             job_file: None,
@@ -529,6 +539,8 @@ impl Default for JobDefinition {
             config: serde_json::Value::Null,
             dir: PathBuf::new(),
             base_name: String::new(),
+            plugin_version: None,
+            plugin_source: None,
         }
     }
 }
@@ -1006,53 +1018,76 @@ mod tests {
         assert_eq!(merged, AwsCredentialConfig::default());
     }
 
-    // --- JobType (TYPE-01) ---
+    // --- JobType (TYPE-01, D-03) ---
 
     #[test]
-    fn job_type_serialize_lowercase() {
-        assert_eq!(serde_json::to_value(JobType::Glue).unwrap(), json!("glue"));
-        assert_eq!(serde_json::to_value(JobType::Emr).unwrap(), json!("emr"));
-        assert_eq!(serde_json::to_value(JobType::Bash).unwrap(), json!("bash"));
+    fn job_type_serialize_plain_string() {
+        // Wire format: Plugin("glue") serializes as "glue", not {"Plugin":"glue"}
+        assert_eq!(
+            serde_json::to_value(JobType::Plugin("glue".to_string())).unwrap(),
+            json!("glue")
+        );
+        assert_eq!(
+            serde_json::to_value(JobType::Plugin("emr".to_string())).unwrap(),
+            json!("emr")
+        );
+        assert_eq!(
+            serde_json::to_value(JobType::Plugin("databricks".to_string())).unwrap(),
+            json!("databricks")
+        );
     }
 
     #[test]
-    fn job_type_deserialize_lowercase() {
+    fn job_type_deserialize_plain_string() {
         let g: JobType = serde_json::from_value(json!("glue")).unwrap();
-        assert_eq!(g, JobType::Glue);
+        assert_eq!(g, JobType::Plugin("glue".to_string()));
         let e: JobType = serde_json::from_value(json!("emr")).unwrap();
-        assert_eq!(e, JobType::Emr);
-        let b: JobType = serde_json::from_value(json!("bash")).unwrap();
-        assert_eq!(b, JobType::Bash);
+        assert_eq!(e, JobType::Plugin("emr".to_string()));
+        let custom: JobType = serde_json::from_value(json!("databricks")).unwrap();
+        assert_eq!(custom, JobType::Plugin("databricks".to_string()));
     }
 
     #[test]
-    fn job_type_deserialize_unknown_rejects() {
-        let err = serde_json::from_value::<JobType>(json!("sprk")).unwrap_err();
-        assert!(format!("{err}").contains("unknown variant"), "got: {err}");
+    fn job_type_serde_round_trip() {
+        for name in ["glue", "emr", "bash", "databricks", "custom-provider"] {
+            let jt = JobType::Plugin(name.to_string());
+            let serialized = serde_json::to_value(&jt).unwrap();
+            assert_eq!(serialized, json!(name));
+            let deserialized: JobType = serde_json::from_value(serialized).unwrap();
+            assert_eq!(deserialized, jt);
+        }
     }
 
     #[test]
     fn job_type_from_str_round_trip() {
         use std::str::FromStr;
-        for variant in [JobType::Glue, JobType::Emr, JobType::Bash] {
-            let s = variant.to_string();
+        for name in ["glue", "emr", "bash", "databricks"] {
+            let jt = JobType::Plugin(name.to_string());
+            let s = jt.to_string();
+            assert_eq!(s, name);
             let back = JobType::from_str(&s).unwrap();
-            assert_eq!(back, variant);
+            assert_eq!(back, jt);
         }
     }
 
     #[test]
-    fn job_type_from_str_invalid() {
+    fn job_type_from_str_empty_rejected() {
         use std::str::FromStr;
-        let err = JobType::from_str("sprk").unwrap_err();
-        assert!(format!("{err}").contains("invalid job type"), "got: {err}");
+        let err = JobType::from_str("").unwrap_err();
+        assert!(
+            format!("{err}").contains("job type cannot be empty"),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn job_type_display_matches_wire_format() {
-        assert_eq!(format!("{}", JobType::Glue), "glue");
-        assert_eq!(format!("{}", JobType::Emr), "emr");
-        assert_eq!(format!("{}", JobType::Bash), "bash");
+        assert_eq!(format!("{}", JobType::Plugin("glue".to_string())), "glue");
+        assert_eq!(format!("{}", JobType::Plugin("emr".to_string())), "emr");
+        assert_eq!(
+            format!("{}", JobType::Plugin("databricks".to_string())),
+            "databricks"
+        );
     }
 
     // --- deny_unknown_fields (TYPE-03) ---
@@ -1376,12 +1411,12 @@ mod tests {
                 jobs: vec![
                     JobSummary {
                         name: "orders".to_string(),
-                        job_type: JobType::Glue,
+                        job_type: JobType::Plugin("glue".to_string()),
                         config_yaml: None,
                     },
                     JobSummary {
                         name: "deploy".to_string(),
-                        job_type: JobType::Bash,
+                        job_type: JobType::Plugin("bash".to_string()),
                         config_yaml: None,
                     },
                 ],
@@ -1523,5 +1558,39 @@ mod tests {
         assert_eq!(deserialized.mask_pii.len(), 2);
         assert_eq!(deserialized.mask_pii[0], "USA_SSN");
         assert_eq!(deserialized.mask_pii[1], "CREDIT_CARD");
+    }
+
+    #[test]
+    fn job_definition_plugin_fields_deserialize() {
+        let input = json!({
+            "job_type": "glue",
+            "config": {},
+            "plugin_version": "0.3.1",
+            "plugin_source": "https://example.com/${name}-${version}"
+        });
+        let job: JobDefinition = serde_json::from_value(input).unwrap();
+        assert_eq!(job.plugin_version.as_deref(), Some("0.3.1"));
+        assert_eq!(
+            job.plugin_source.as_deref(),
+            Some("https://example.com/${name}-${version}")
+        );
+    }
+
+    #[test]
+    fn job_definition_without_plugin_fields_backward_compat() {
+        let input = json!({
+            "job_type": "glue",
+            "config": {}
+        });
+        let job: JobDefinition = serde_json::from_value(input).unwrap();
+        assert!(job.plugin_version.is_none());
+        assert!(job.plugin_source.is_none());
+    }
+
+    #[test]
+    fn job_definition_default_has_no_plugin_fields() {
+        let job = JobDefinition::default();
+        assert!(job.plugin_version.is_none());
+        assert!(job.plugin_source.is_none());
     }
 }

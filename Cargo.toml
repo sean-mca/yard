@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["yard-cli", "yard-core", "yard-structs", "yard-server"]
+members = ["yard-cli", "yard-core", "yard-structs", "yard-server", "yard-plugin-sdk"]
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -1,27 +1,10 @@
-//! Provider configuration deep-merge and task-only job classification.
+//! Provider configuration deep-merge.
 //!
-//! This module provides two concerns:
-//!
-//! 1. **Task-only classification** — [`is_task_only`] identifies job types
-//!    (currently only [`JobType::Bash`]) that are Airflow tasks without a Spark
-//!    artifact, short-circuiting the codegen and provider deploy paths.
-//!
-//! 2. **Provider config merge** — [`build_provider_config`] and
-//!    [`merge_provider_config`] perform recursive deep-merge of provider-level
-//!    defaults with per-job overrides. Nested objects merge key-by-key; arrays
-//!    and scalars are replaced wholesale.
+//! [`build_provider_config`] and [`merge_provider_config`] perform recursive
+//! deep-merge of provider-level defaults with per-job overrides. Nested
+//! objects merge key-by-key; arrays and scalars are replaced wholesale.
 
 use serde_json::Value;
-use yard_structs::JobType;
-
-/// Job types that are Airflow tasks only -- they don't have a Spark artifact to
-/// generate and no provider to deploy through. Used in validation, codegen,
-/// and apply to short-circuit the Spark path. **Single source of truth** --
-/// callers must use this helper instead of hard-coding the list.
-#[must_use]
-pub fn is_task_only(job_type: JobType) -> bool {
-    matches!(job_type, JobType::Bash)
-}
 
 /// Build the `Value` passed to `get_provider`: provider defaults shallow-
 /// merged with the job's `<job_type>:` block, plus the per-job `_aws` block
@@ -163,20 +146,4 @@ mod tests {
         assert_eq!(merged["a"]["b"]["d"], 2);
     }
 
-    // --- is_task_only ---
-
-    #[test]
-    fn is_task_only_recognizes_bash() {
-        assert!(is_task_only(JobType::Bash));
-    }
-
-    #[test]
-    fn is_task_only_rejects_spark_types() {
-        // The "unknown" assertion present before Phase 21 plan 21-01 is gone:
-        // JobType is a closed three-variant enum, so an "unknown" value is not
-        // expressible — that surface is now serde-deserialize-time and is
-        // covered by `yard_structs::config::tests::job_type_deserialize_unknown_rejects`.
-        assert!(!is_task_only(JobType::Glue));
-        assert!(!is_task_only(JobType::Emr));
-    }
 }

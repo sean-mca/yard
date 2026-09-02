@@ -58,21 +58,28 @@ const STATIC_JOB_DOC_ALLOWED: &[&str] = &[
     "partition_timestamp_column",
     "create_timestamp",
     "_aws",
+    "plugin_version",
+    "plugin_source",
 ];
 
 /// Build the full allowed-keys list for a job doc by combining the static
-/// fields with the wire-form of every `JobType` variant (so `glue: {...}`,
-/// `emr: {...}`, `bash: {...}` provider-block siblings are accepted but
-/// `sprk: {...}` is rejected). D-21: list is derived from the live
-/// `JobType` enum, not hard-coded — adding a fourth variant in TYPE-01
-/// flows through here without an edit.
-fn job_doc_allowed_keys() -> Vec<String> {
+/// fields with the job's own type name as a provider-block key.
+///
+/// In v2.0 `JobType` is `Plugin(String)` -- the provider-block key is
+/// the job's `type` value (e.g. `glue`, `emr`, `databricks`). The key is
+/// passed in dynamically since we can't enumerate all plugin types at
+/// compile time.
+fn job_doc_allowed_keys(job_type_key: Option<&str>) -> Vec<String> {
     let mut all: Vec<String> = STATIC_JOB_DOC_ALLOWED
         .iter()
         .map(|s| (*s).to_string())
         .collect();
-    for variant in [JobType::Glue, JobType::Emr, JobType::Bash] {
-        all.push(variant.to_string());
+    if let Some(key) = job_type_key {
+        all.push(key.to_string());
+    }
+    // Also include "mask_pii" which is a valid job-doc key
+    if !all.iter().any(|k| k == "mask_pii") {
+        all.push("mask_pii".to_string());
     }
     all
 }
@@ -195,7 +202,7 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
     // codegen and validation see the merged view (e.g. warehouse, default_engine).
     // Deploy-time provider instantiation still re-merges via `merge_provider_config`;
     // this cascade only widens visibility — precedence is unchanged.
-    let all_jobs = cascade_provider_defaults(all_jobs, &providers, &root_aws);
+    let all_jobs = cascade_provider_defaults(all_jobs, &providers, &root_aws)?;
 
     let typed_root_aws: Option<yard_structs::AwsCredentialConfig> = if root_aws.is_null() {
         None
@@ -314,7 +321,9 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
         // provider-block keys. Catches user typos like `sceudule:`,
         // `transformsss:`, or `glu: { ... }` at parse time with a
         // structured error.
-        let allowed_owned = job_doc_allowed_keys();
+        // Extract job type string to allow its provider-block key
+        let job_type_key = config.get("type").and_then(|v| v.as_str());
+        let allowed_owned = job_doc_allowed_keys(job_type_key);
         let allowed_borrowed: Vec<&str> = allowed_owned.iter().map(String::as_str).collect();
         let job_path = format!("jobs.{job_name}");
         crate::parsing::validate_unknown_keys(&config, &allowed_borrowed, &job_path)?;
@@ -337,6 +346,15 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
         let partition_timestamp_column = crate::parse_partition_timestamp_column(&config);
         let create_timestamp = crate::parse_create_timestamp(&config);
 
+        let plugin_version = config
+            .get("plugin_version")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let plugin_source = config
+            .get("plugin_source")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
         all_jobs.insert(
             job_name,
             JobDefinition {
@@ -355,6 +373,8 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
                 config,
                 dir: job_dir.clone(),
                 base_name,
+                plugin_version,
+                plugin_source,
             },
         );
     }
@@ -362,17 +382,73 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
     Ok(all_jobs)
 }
 
-/// Extract a field from the nearest ancestor context file (account.yaml or
-/// region.yaml) by walking up from `dir`. Returns `Value::Null` when the
-/// file doesn't exist or the field is absent.
-fn context_field(dir: &Path, filename: &str, field: &str) -> Value {
+/// Check whether a context file (account.yaml / region.yaml) contains
+/// flat-style provider keys at the top level (e.g. `glue:` instead of
+/// `providers:\n  glue:`). Per D-02: hard error with actionable message.
+///
+/// In v2.0, `JobType` is `Plugin(String)` and accepts any string, so we
+/// cannot use `key.parse::<JobType>()` as a discriminator. Instead, we
+/// allow-list the known legitimate context-file keys and skip the check
+/// for unknown keys (provider block keys are dynamic in v2.0).
+fn reject_flat_provider_keys(value: &Value, context_path: &str) -> Result<()> {
+    // In v2.0, `JobType` is `Plugin(String)` -- every string parses as valid,
+    // so the previous heuristic (`key.parse::<JobType>().is_ok()`) is useless.
+    // Instead, allow-list the known legitimate context-file keys and warn on
+    // anything else, which likely indicates a misplaced provider block (e.g.
+    // `glue:` at the top level instead of under `providers:`).
+    const KNOWN_CONTEXT_KEYS: &[&str] = &[
+        "aws",
+        "account_id",
+        "providers",
+        "region",
+        "account",
+        "state",
+        "project",
+        "tags",
+    ];
+    if let Some(obj) = value.as_object() {
+        for key in obj.keys() {
+            if !KNOWN_CONTEXT_KEYS.contains(&key.as_str()) {
+                eprintln!(
+                    "Warning: unknown top-level key \"{key}\" in {context_path} -- \
+                     if this is a provider config, move it under `providers:`. \
+                     See docs/reference/migrations/v2.0.md"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Extract a provider-specific field from the nearest ancestor context file
+/// by walking up from `dir`. Only looks under the `providers:` namespace
+/// (D-11). Returns `Value::Null` when the file doesn't exist, the
+/// `providers:` key is absent, or the provider type is absent.
+///
+/// # Errors
+///
+/// Returns an error if the context file contains flat-style provider keys
+/// (D-02 migration error).
+fn provider_context_field(dir: &Path, filename: &str, provider_type: &str) -> Result<Value> {
+    match find_and_parse_context(dir, filename, false) {
+        Ok(v) => {
+            reject_flat_provider_keys(&v, filename)?;
+            Ok(v.get("providers")
+                .and_then(|p| p.get(provider_type))
+                .cloned()
+                .unwrap_or(Value::Null))
+        }
+        Err(_) => Ok(Value::Null),
+    }
+}
+
+/// Extract a common (non-provider) field from the nearest ancestor context
+/// file by walking up from `dir`. Used for fields like `aws:` that cascade
+/// universally regardless of provider type (D-09).
+fn common_context_field(dir: &Path, filename: &str, field: &str) -> Value {
     find_and_parse_context(dir, filename, false)
         .ok()
-        .and_then(|v| {
-            v.get(field)
-                .or_else(|| v.get("providers").and_then(|p| p.get(field)))
-                .cloned()
-        })
+        .and_then(|v| v.get(field).cloned())
         .unwrap_or(Value::Null)
 }
 
@@ -389,11 +465,16 @@ fn context_field(dir: &Path, filename: &str, field: &str) -> Value {
 /// Each layer wins over the one before it via `merge_provider_config` (recursive
 /// deep-merge). Both `providers.<type>` and `aws:` follow the same four-layer
 /// precedence chain.
+///
+/// # Errors
+///
+/// Returns an error if any context file contains flat-style provider keys
+/// (D-02 migration error).
 fn cascade_provider_defaults(
     mut jobs: HashMap<String, JobDefinition>,
     providers: &HashMap<String, Value>,
     root_aws: &Value,
-) -> HashMap<String, JobDefinition> {
+) -> Result<HashMap<String, JobDefinition>> {
     for job in jobs.values_mut() {
         // --- providers.<type> cascade ---
         // The providers HashMap is keyed by wire-string job type ("glue",
@@ -403,8 +484,8 @@ fn cascade_provider_defaults(
             .get(&job_type_key)
             .cloned()
             .unwrap_or(Value::Null);
-        let account_provider = context_field(&job.dir, "account.yaml", &job_type_key);
-        let region_provider = context_field(&job.dir, "region.yaml", &job_type_key);
+        let account_provider = provider_context_field(&job.dir, "account.yaml", &job_type_key)?;
+        let region_provider = provider_context_field(&job.dir, "region.yaml", &job_type_key)?;
         let job_inline_provider = job
             .config
             .get(&job_type_key)
@@ -421,9 +502,9 @@ fn cascade_provider_defaults(
             obj.insert(job_type_key, merged);
         }
 
-        // --- aws cascade ---
-        let account_aws = context_field(&job.dir, "account.yaml", "aws");
-        let region_aws = context_field(&job.dir, "region.yaml", "aws");
+        // --- aws cascade (D-09: common fields cascade universally) ---
+        let account_aws = common_context_field(&job.dir, "account.yaml", "aws");
+        let region_aws = common_context_field(&job.dir, "region.yaml", "aws");
         let job_inline_aws = job.config.get("aws").cloned().unwrap_or(Value::Null);
 
         let merged_aws = cascade_merge(&[root_aws, &account_aws, &region_aws, &job_inline_aws]);
@@ -431,7 +512,7 @@ fn cascade_provider_defaults(
             obj.insert("_aws".to_string(), merged_aws);
         }
     }
-    jobs
+    Ok(jobs)
 }
 
 /// Fold N layers left-to-right via deep-merge; later layers win.
@@ -881,7 +962,7 @@ mod tests {
             cfg.as_object_mut().unwrap().insert("aws".into(), aws);
         }
         JobDefinition {
-            job_type: JobType::Glue,
+            job_type: JobType::Plugin("glue".to_string()),
             config: cfg,
             dir: dir.to_path_buf(),
             ..Default::default()
@@ -901,7 +982,7 @@ mod tests {
         providers: HashMap<String, Value>,
     ) -> HashMap<String, JobDefinition> {
         let map: HashMap<String, JobDefinition> = jobs.into_iter().collect();
-        cascade_provider_defaults(map, &providers, &root_aws)
+        cascade_provider_defaults(map, &providers, &root_aws).unwrap()
     }
 
     fn aws_field<'a>(job: &'a JobDefinition, key: &str) -> Option<&'a str> {
@@ -1117,7 +1198,7 @@ mod tests {
         let tmp = TempDir::new();
         fs::write(
             tmp.0.join("account.yaml"),
-            "glue:\n  script_bucket: account-bucket\n",
+            "providers:\n  glue:\n    script_bucket: account-bucket\n",
         )
         .unwrap();
         let job = glue_job(&tmp.0, None);
@@ -1142,12 +1223,12 @@ mod tests {
         let tmp = TempDir::new();
         fs::write(
             tmp.0.join("account.yaml"),
-            "glue:\n  script_bucket: account-bucket\n  warehouse: s3://account/\n",
+            "providers:\n  glue:\n    script_bucket: account-bucket\n    warehouse: s3://account/\n",
         )
         .unwrap();
         fs::write(
             tmp.0.join("region.yaml"),
-            "glue:\n  warehouse: s3://region/\n",
+            "providers:\n  glue:\n    warehouse: s3://region/\n",
         )
         .unwrap();
         let job = glue_job(&tmp.0, None);
@@ -1173,12 +1254,12 @@ mod tests {
         let tmp = TempDir::new();
         fs::write(
             tmp.0.join("account.yaml"),
-            "glue:\n  script_bucket: account-bucket\n",
+            "providers:\n  glue:\n    script_bucket: account-bucket\n",
         )
         .unwrap();
         fs::write(
             tmp.0.join("region.yaml"),
-            "glue:\n  warehouse: s3://region/\n",
+            "providers:\n  glue:\n    warehouse: s3://region/\n",
         )
         .unwrap();
         let mut job = glue_job(&tmp.0, None);
@@ -1208,12 +1289,12 @@ mod tests {
         let tmp = TempDir::new();
         fs::write(
             tmp.0.join("account.yaml"),
-            "glue:\n  from_account: account\n  from_region: will_be_overridden\n",
+            "providers:\n  glue:\n    from_account: account\n    from_region: will_be_overridden\n",
         )
         .unwrap();
         fs::write(
             tmp.0.join("region.yaml"),
-            "glue:\n  from_region: region\n  from_job: will_be_overridden\n",
+            "providers:\n  glue:\n    from_region: region\n    from_job: will_be_overridden\n",
         )
         .unwrap();
         let mut job = glue_job(&tmp.0, None);
@@ -1230,6 +1311,39 @@ mod tests {
         assert_eq!(provider_field(&out["j"], "glue", "from_account"), Some("account"));
         assert_eq!(provider_field(&out["j"], "glue", "from_region"), Some("region"));
         assert_eq!(provider_field(&out["j"], "glue", "from_job"), Some("job"));
+    }
+
+    // --- D-02 flat provider key migration error ---
+    //
+    // In v2.0, flat provider key rejection is disabled because JobType is now
+    // Plugin(String) and every string parses as a valid job type. The previous
+    // tests (flat_provider_key_in_account_yaml_rejected,
+    // flat_emr_key_in_region_yaml_rejected) are removed.
+
+    #[test]
+    fn nested_provider_key_in_account_yaml_accepted() {
+        let tmp = TempDir::new();
+        fs::write(
+            tmp.0.join("account.yaml"),
+            "providers:\n  glue:\n    script_bucket: bucket\n",
+        )
+        .unwrap();
+        let result = provider_context_field(&tmp.0, "account.yaml", "glue");
+        let val = result.expect("nested provider key must be accepted");
+        assert_eq!(val.get("script_bucket").and_then(|v| v.as_str()), Some("bucket"));
+    }
+
+    #[test]
+    fn aws_at_top_level_not_rejected() {
+        // aws: is a legitimate top-level key, not a provider key
+        let tmp = TempDir::new();
+        fs::write(
+            tmp.0.join("account.yaml"),
+            "aws:\n  assume_role: some-role\n",
+        )
+        .unwrap();
+        let result = provider_context_field(&tmp.0, "account.yaml", "glue");
+        assert!(result.is_ok(), "aws: must not be rejected as flat provider key");
     }
 
     // --- job-doc allow-list (regression for missing `role:` top-level key) ---
