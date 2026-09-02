@@ -111,14 +111,24 @@ pub async fn calculate_diff(
 }
 
 /// Compare two JSON objects and return a map of changed keys to `(old, new)` value strings.
+///
+/// Detects added, modified, AND deleted keys. A key present in `old` but
+/// absent in `new` is reported as `(old_value, "null")`.
 #[must_use]
 fn compare_json(old: &Value, new: &Value) -> BTreeMap<String, (String, String)> {
     let mut changes = BTreeMap::new();
     if let (Value::Object(old_obj), Value::Object(new_obj)) = (old, new) {
+        // Added or modified keys
         for (k, v) in new_obj {
             let old_val = old_obj.get(k).unwrap_or(&Value::Null);
             if old_val != v {
                 changes.insert(k.clone(), (old_val.to_string(), v.to_string()));
+            }
+        }
+        // Deleted keys (present in old, absent in new)
+        for (k, v) in old_obj {
+            if !new_obj.contains_key(k) {
+                changes.insert(k.clone(), (v.to_string(), "null".to_string()));
             }
         }
     }
