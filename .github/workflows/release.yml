@@ -129,7 +129,7 @@ jobs:
 
           cat > Formula/yard.rb << EOF
           class Yard < Formula
-            desc "Data engineering CLI - hierarchical config, Glue/EMR providers, DAG generation"
+            desc "Data engineering CLI - plugin-based provider architecture for cloud data pipelines"
             homepage "https://github.com/sean-mca/yard"
             version "${VERSION}"
             license "BUSL-1.1"

@@ -2,7 +2,7 @@
 
 ## Overview
 
-yard is a Rust workspace (4 crates, ~21k lines) providing a terragrunt-inspired CLI for data-engineering deploys plus a nascent Atlantis-like server. v1.0 hardened the CLI core (S3 pagination + four-module decomposition). v1.1 hardened yard-server (testable trait layer, structured errors, WebSocket updates, Slack drift alerts, cross-account credentials). v1.2 delivered a workspace tech-debt audit and drove clippy to zero across the workspace. v1.3 delivered the `--target` correctness sweep — `yard apply --target` and `yard plan --target` both behave correctly across the full job/DAG matrix with regression coverage. v1.3.1 fixed the `_yard_fill_nulls` over-matching bug and extended the recursive codegen coercion to cover the wider class of Parquet-unwritable types. v1.4 shipped the DAG codegen Glue kwargs, the Iceberg-aware codegen insert (Phase 18.1), and `yard list targets --json`; the Linux release workflow + composite Action work (Phases 16-18) was deferred to backlog. v1.5 Hardening + Extensibility (typed configs, storage/provider DRY, yard-server security) shipped 2026-04-28 — paying down structural tech debt across all four crates and closing the security gaps that blocked yard-server from leaving localhost. v1.6 Event-Driven DAGs shipped 2026-04-30 — adds a top-level `trigger:` block to `dag.yaml` covering S3 file drops, Airflow Datasets, SQS messages, and external API triggers, with first-class payload plumbing into task `op_kwargs`, DAG-level `publishes:` rendering via synthetic terminal task, cross-DAG broken-link soft-warning, per-DAG version-banner header, and the four-doc v1.6 user-facing surface (CONFIGURATION/AIRFLOW updates + new MIGRATION-v1.6.md). v1.7 Documentation Overhaul shipped 2026-05-02 — restructured `docs/` into a Diataxis-lite tree, refreshed reference layer, added copy-paste job templates, refreshed root README, CI doc-validation guard. v1.8 Code Quality + Bug Fixes shipped 2026-05-11 — workspace-wide audit and critical/high bug fixes across all 4 crates. v1.9 yard-server Redesign shipped 2026-05-18 — ground-up rebuild of yard-server as an Atlantis-like server with chatOps, environment-aware dashboard, drift detection, Slack alerting, and trait-based auth. v1.10 yard-server Production Readiness (in progress) — E2E integration tests, health endpoints, graceful shutdown, and Docker container image to take the v1.9 rebuild from dev to deployable. v1.11 Airflow 3.0 Asset Support — version-aware codegen so yard emits `Asset` (AF3) or `Dataset` (AF2) depending on a new `airflow.version` config field, with per-environment control via the config cascade. v1.12 Code Audit — rules compliance audit of yard-cli, yard-core, and yard-structs against the 179 Rust coding standards in `rules/`, catching drift since the Phase 48 baseline (especially v1.11 additions: version.rs, config cascade, trigger alias). v1.14 PII Detection & Masking — declarative `mask_pii` support in `job.yaml` that generates `EntityDetector.detect()` code blocks in Glue codegen with REDACT action and `"****"` mask text. v1.15 Distribution — cross-platform release workflow + Homebrew tap formula. v1.16 Rules Compliance Audit — full codebase audit of yard-cli, yard-core, and yard-structs against the 179 Rust coding standards, catching drift since the v1.12 audit (June 2026).
+yard is a Rust workspace (4 crates, ~21k lines) providing a terragrunt-inspired CLI for data-engineering deploys plus a nascent Atlantis-like server. v1.0 hardened the CLI core (S3 pagination + four-module decomposition). v1.1 hardened yard-server (testable trait layer, structured errors, WebSocket updates, Slack drift alerts, cross-account credentials). v1.2 delivered a workspace tech-debt audit and drove clippy to zero across the workspace. v1.3 delivered the `--target` correctness sweep — `yard apply --target` and `yard plan --target` both behave correctly across the full job/DAG matrix with regression coverage. v1.3.1 fixed the `_yard_fill_nulls` over-matching bug and extended the recursive codegen coercion to cover the wider class of Parquet-unwritable types. v1.4 shipped the DAG codegen Glue kwargs, the Iceberg-aware codegen insert (Phase 18.1), and `yard list targets --json`; the Linux release workflow + composite Action work (Phases 16-18) was deferred to backlog. v1.5 Hardening + Extensibility (typed configs, storage/provider DRY, yard-server security) shipped 2026-04-28 — paying down structural tech debt across all four crates and closing the security gaps that blocked yard-server from leaving localhost. v1.6 Event-Driven DAGs shipped 2026-04-30 — adds a top-level `trigger:` block to `dag.yaml` covering S3 file drops, Airflow Datasets, SQS messages, and external API triggers, with first-class payload plumbing into task `op_kwargs`, DAG-level `publishes:` rendering via synthetic terminal task, cross-DAG broken-link soft-warning, per-DAG version-banner header, and the four-doc v1.6 user-facing surface (CONFIGURATION/AIRFLOW updates + new MIGRATION-v1.6.md). v1.7 Documentation Overhaul shipped 2026-05-02 — restructured `docs/` into a Diataxis-lite tree, refreshed reference layer, added copy-paste job templates, refreshed root README, CI doc-validation guard. v1.8 Code Quality + Bug Fixes shipped 2026-05-11 — workspace-wide audit and critical/high bug fixes across all 4 crates. v1.9 yard-server Redesign shipped 2026-05-18 — ground-up rebuild of yard-server as an Atlantis-like server with chatOps, environment-aware dashboard, drift detection, Slack alerting, and trait-based auth. v1.10 yard-server Production Readiness (in progress) — E2E integration tests, health endpoints, graceful shutdown, and Docker container image to take the v1.9 rebuild from dev to deployable. v1.11 Airflow 3.0 Asset Support — version-aware codegen so yard emits `Asset` (AF3) or `Dataset` (AF2) depending on a new `airflow.version` config field, with per-environment control via the config cascade. v1.12 Code Audit — rules compliance audit of yard-cli, yard-core, and yard-structs against the 179 Rust coding standards in `rules/`, catching drift since the Phase 48 baseline (especially v1.11 additions: version.rs, config cascade, trigger alias). v1.14 PII Detection & Masking — declarative `mask_pii` support in `job.yaml` that generates `EntityDetector.detect()` code blocks in Glue codegen with REDACT action and `"****"` mask text. v1.15 Distribution — cross-platform release workflow + Homebrew tap formula. v1.16 Rules Compliance Audit shipped 2026-08-18 — full codebase audit of yard-cli, yard-core, and yard-structs against the 179 Rust coding standards, catching drift since the v1.12 audit (June 2026). v2.0 Plugin Architecture transforms yard from a monolithic binary with compiled-in providers into an orchestrator that delegates provider-specific work to out-of-process plugin binaries over JSON-over-stdio, enabling community-authored providers and slimming the core binary.
 
 ## Milestones
 
@@ -23,7 +23,8 @@ yard is a Rust workspace (4 crates, ~21k lines) providing a terragrunt-inspired 
 - 🚧 **v1.13 State Scoping + Distributed State** — Phases 52-53 (in progress)
 - ✅ **v1.14 PII Detection & Masking** — Phases 60-62 (shipped 2026-06-25)
 - ✅ **v1.15 Distribution** — Phase 63 (shipped 2026-07-19)
-- 🚧 **v1.16 Rules Compliance Audit** — Phases 64-65
+- ✅ **v1.16 Rules Compliance Audit** — Phases 64-65 (shipped 2026-08-18)
+- 🚧 **v2.0 Plugin Architecture** — Phases 66-70
 
 ## Phases
 
@@ -244,64 +245,138 @@ Plans:
 
 </details>
 
+<details>
+<summary>v1.16 Rules Compliance Audit (Phases 64-65) -- SHIPPED 2026-08-18</summary>
+
+Full codebase audit of yard-cli, yard-core, and yard-structs against the 179 Rust coding standards in `rules/`, catching drift since the v1.12 audit (June 2026). yard-server excluded per precedent (v1.12). Each phase audits its crate subset against ALL 14 rule categories.
+
+- [x] **Phase 64: yard-structs + yard-cli Audit & Fix** (2/2 plans, completed 2026-08-18)
+- [x] **Phase 65: yard-core Audit & Fix** (3/3 plans, completed 2026-08-18)
+
+</details>
+
+### v2.0 Plugin Architecture (Phases 66-70)
+
+Transform yard from a monolithic binary with compiled-in providers into an orchestrator that delegates provider-specific work (validate, codegen, deploy, destroy, verify, schema) to out-of-process plugin binaries communicating over JSON-over-stdio. Providers (Glue, EMR) move to separate repos; this milestone builds the plugin infrastructure and slims the core.
+
+Cross-cutting requirements: `cargo clippy -D warnings` clean, `cargo test --workspace` green, zero `Cargo.toml` edits without explicit approval, no new `unsafe`, no new `.unwrap()`/`.expect()` in production code. All code must adhere to the 179 rules defined in `rules/`.
+
+- [x] **Phase 66: Plugin Protocol + Host** - JSON-over-stdio protocol types, process spawner, PluginProvider adapter (completed 2026-08-31)
+- [x] **Phase 67: Plugin SDK** - `yard-plugin-sdk` workspace crate with PluginServer::run() and PluginHandler trait (completed 2026-09-01)
+- [ ] **Phase 68: Provider-Scoped Config Cascade** - Provider-scoped config sections at all hierarchy levels, schema-driven validation
+- [x] **Phase 69: Plugin Distribution** - `yard init` downloads, checksum-verifies, and caches plugin binaries (completed 2026-09-01)
+- [ ] **Phase 70: Core Slimming + Documentation** - Remove compiled-in providers, migration guide, plugin author guide
+
 ## Phase Details
 
-### v1.16 Rules Compliance Audit (Phases 64-65)
+### Phase 66: Plugin Protocol + Host
 
-Full codebase audit of yard-cli, yard-core, and yard-structs against the 179 Rust coding standards in `rules/`, catching drift since the v1.12 audit (June 2026) and verifying all existing code still holds. yard-server excluded per precedent (v1.12). Each phase audits its crate subset against ALL 14 rule categories -- the auditor reads each file once and checks all applicable rules.
-
-Cross-cutting requirements: `cargo clippy -D warnings` clean, `cargo test --workspace` green, zero `Cargo.toml` edits without explicit approval, no new `unsafe`, no new `.unwrap()`/`.expect()` in production code.
-
-- [x] **Phase 64: yard-structs + yard-cli Audit & Fix** - Full rules compliance audit of the two smaller crates (~4k LOC) against all 14 rule categories (completed 2026-08-18)
-- [x] **Phase 65: yard-core Audit & Fix** - Full rules compliance audit of the larger crate (~18k LOC) against all 14 rule categories (completed 2026-08-18)
-
-### Phase 64: yard-structs + yard-cli Audit & Fix
-
-**Goal**: All production code in yard-structs (~3.5k LOC) and yard-cli (~520 LOC) passes the 179 Rust coding standards with zero violations
-**Depends on**: Nothing (first phase of v1.16; no feature work dependency)
-**Requirements**: OWN-01, ERR-01, MEM-01, API-01, ASYNC-01, OPT-01, NAME-01, TYPE-01, TEST-01, DOC-01, PERF-01, PROJ-01, LINT-01, ANTI-01
+**Goal**: yard-core can spawn plugin binaries as child processes and exchange typed JSON-over-stdio messages for all provider operations
+**Depends on**: Nothing (first v2.0 phase)
+**Requirements**: PROTO-01, PROTO-02, PROTO-03, PROTO-04, HOST-01, HOST-02, HOST-03, HOST-04
 **Success Criteria** (what must be TRUE):
 
-  1. Every source file in yard-structs and yard-cli has been audited against all 14 rule categories with per-file findings documented
-  2. All violations found are fixed in committed code -- no known non-deferred violations remain
-  3. `cargo clippy --all-targets --workspace -- -D warnings` produces zero warnings after fixes
-  4. `cargo test --workspace` passes with no regressions from the fixes
-  5. Code added since v1.12 (yard-structs `mask_pii` field, any yard-cli changes) receives explicit audit attention
-
-**Plans:** 2/2 plans complete
-
-Plans:
-
-- [x] 64-01-PLAN.md -- yard-structs audit (6 files): fix V-01/V-02 clippy warnings, full 14-category audit
-- [x] 64-02-PLAN.md -- yard-cli audit (15 files): focused audit on list.rs rewrite, colorize Cow, display wildcard arms
-
-### Phase 65: yard-core Audit & Fix
-
-**Goal**: All production code in yard-core (~18k LOC, 30+ files across airflow_dag/, codegen/, providers/, validation/, and root src/) passes the 179 Rust coding standards with zero violations
-**Depends on**: Phase 64
-**Requirements**: OWN-01, ERR-01, MEM-01, API-01, ASYNC-01, OPT-01, NAME-01, TYPE-01, TEST-01, DOC-01, PERF-01, PROJ-01, LINT-01, ANTI-01
-**Success Criteria** (what must be TRUE):
-
-  1. Every module in yard-core has been audited against all 14 rule categories with per-file findings documented
-  2. All violations found are fixed in committed code -- no known non-deferred violations remain
-  3. New code since v1.12 (~800 LOC: validation module additions, PII codegen in codegen/pii.rs, list targets filter, Iceberg column reorder) receives focused audit attention and any violations are fixed
-  4. `cargo clippy --all-targets --workspace -- -D warnings` produces zero warnings after fixes
-  5. `cargo test --workspace` passes with no regressions from the fixes
+  1. A test plugin binary spawned by yard-core correctly handles all 6 operations (validate, codegen, deploy, destroy, verify, schema) over line-delimited JSON
+  2. The plugin sends a version/capabilities handshake on startup; yard-core rejects incompatible versions and the plugin terminates when stdin closes (EOF)
+  3. Progress lines emitted by a plugin during long-running operations are received by yard-core without blocking the response flow
+  4. A plugin that exceeds the configured timeout is killed and the user sees an actionable error message
+  5. PluginProvider implements the existing Provider trait so orchestrate.rs dispatches to plugins with zero changes to the orchestration flow
 
 **Plans:** 3/3 plans complete
-
 Plans:
+**Wave 1**
 
-- [x] 65-01-PLAN.md -- codegen/ audit (6 files): deep audit PII codegen + Iceberg reorder, verify source/transform
-- [x] 65-02-PLAN.md -- validation/ + parsing.rs audit (4 files): deep audit PII validation rules + parse_mask_pii
-- [x] 65-03-PLAN.md -- remaining files audit (21 src + 6 test files): fix V-01..V-07, verify airflow_dag/providers/storage/orchestrate/resolve
+- [x] 66-01-PLAN.md — Protocol types in yard-structs + Provider trait expansion (3->6 methods)
 
-**Cross-cutting constraints:**
+**Wave 2** *(blocked on Wave 1 completion)*
 
-- All violations found are fixed in committed code
-- cargo clippy -p yard-core --lib -- -D warnings produces zero warnings
-- D-06 honored: doc-examples-section (adding # Examples to public items) explicitly deferred to a future documentation phase
-- cargo test -p yard-core passes with no regressions
+- [x] 66-02-PLAN.md — Plugin host module (spawner + PluginProvider adapter)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [x] 66-03-PLAN.md — Test plugin binary + integration tests
+
+### Phase 67: Plugin SDK
+
+**Goal**: Plugin authors can build provider plugins using a Rust SDK that handles all protocol mechanics
+**Depends on**: Phase 66
+**Requirements**: SDK-01, SDK-02, SDK-03
+**Success Criteria** (what must be TRUE):
+
+  1. A minimal plugin binary using `PluginServer::run()` and implementing `PluginHandler` compiles and responds correctly to host requests for all 6 operations
+  2. Plugin author code cannot accidentally write to stdout -- the SDK captures stdout for protocol framing and provides a separate logging channel via stderr
+  3. SDK re-exports Resource and ResourceStatus types from yard-structs so plugin authors do not need a direct yard-structs dependency
+
+**Plans:** 2/2 plans complete
+Plans:
+**Wave 1**
+
+- [x] 67-01-PLAN.md — SDK crate foundation (handler trait, stdout capture, server run loop, re-exports)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [x] 67-02-PLAN.md — SDK integration verification (SDK-based test plugin + host interop tests)
+
+### Phase 68: Provider-Scoped Config Cascade
+
+**Goal**: Config cascade resolves provider-specific sections per job type and validates config fields dynamically via the plugin's schema operation
+**Depends on**: Phase 67
+**Requirements**: CASC-01, CASC-02, CASC-03
+**Success Criteria** (what must be TRUE):
+
+  1. A `providers.<type>:` section at any hierarchy level (yard.yaml, account.yaml, region.yaml, job.yaml) merges into jobs of that type with correct four-level precedence
+  2. Common fields (`aws:`, `state:`) cascade to all job types regardless of whether a provider-scoped section exists
+  3. A plugin's `schema` response determines which config fields are valid for that provider, replacing the hardcoded ALLOWED_* lists in validation
+
+**Plans:** 0/2 plans executed
+Plans:
+**Wave 1**
+
+- [ ] 68-01-PLAN.md — Config cascade syntax enforcement + SchemaResponse extension (CASC-01, CASC-02)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 68-02-PLAN.md — Schema-driven validation pipeline (CASC-03)
+
+### Phase 69: Plugin Distribution
+
+**Goal**: Users can declare provider plugins in yard.yaml and `yard init` downloads, verifies, and caches the correct platform-specific binaries
+**Depends on**: Phase 66
+**Requirements**: DIST-01, DIST-02, DIST-03, DIST-04
+**Success Criteria** (what must be TRUE):
+
+  1. Running `yard init` reads provider declarations from yard.yaml and downloads the correct platform-specific binary from the configured GitHub release URL
+  2. Downloaded binaries are verified via SHA-256 checksum before being placed in the cache; a checksum mismatch produces an error and does not cache the binary
+  3. Plugin binaries are cached at `~/.yard/plugins/<name>-<version>-<os>-<arch>` and reused across projects without re-downloading
+  4. A version mismatch between the version pinned in yard.yaml and the cached binary produces a clear error at startup
+
+**Plans**: 2/2 plans complete
+
+- [x] 69-01-PLAN.md
+- [x] 69-02-PLAN.md
+
+### Phase 70: Core Slimming + Documentation
+
+**Goal**: yard-core contains no compiled-in provider code, AWS SDK provider dependencies are removed, and v2.0 migration and plugin authoring documentation is published
+**Depends on**: Phase 68, Phase 69
+**Requirements**: SLIM-01, SLIM-02, SLIM-03, DOC-01, DOC-02
+**Success Criteria** (what must be TRUE):
+
+  1. `JobType::Plugin(String)` variant enables dynamic provider resolution so adding a new provider requires no changes to the yard-core enum
+  2. aws-sdk-glue and aws-sdk-emr are not in yard-core's dependency tree (`cargo tree -p yard-core` shows neither)
+  3. A v1.x user can follow the migration guide to upgrade to v2.0 -- covering new config format, `yard init` requirement, and plugin binary setup
+  4. A plugin author can follow the author guide to build a provider plugin from scratch using yard-plugin-sdk, test it locally, and release it
+
+**Plans:** 3 plans
+Plans:
+**Wave 1** *(parallel)*
+
+- [ ] 70-01-PLAN.md — JobType rewrite to Plugin(String), module deletion (~11k lines), dependency removal, provider dispatch rewrite
+- [ ] 70-03-PLAN.md — v2.0 migration guide, plugin author guide, doc cleanup
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 70-02-PLAN.md — Rewire remaining yard-core modules and CLI commands for plugin-only architecture
 
 ## Progress
 
@@ -316,17 +391,11 @@ Plans:
 | 52. State Scoping + Offline Validation | v1.13 | 3/3 | Complete | 2026-07-20 |
 | 53. Account-Distributed State | v1.13 | 0/? | Not started | - |
 | 54. Codegen + Validation Performance | v1.10 | 0/? | Not started | - |
-| 55. Type Foundation + Config Cascade | v1.11 | 4/4 | Complete | 2026-06-13 |
-| 56. Version-Aware Codegen + Tests | v1.11 | 2/2 | Complete | 2026-06-15 |
-| 57. Documentation | v1.11 | 1/1 | Complete | 2026-06-15 |
-| 58. yard-structs + yard-cli Audit | v1.12 | 2/2 | Complete | 2026-06-16 |
-| 59. yard-core Audit | v1.12 | 6/6 | Complete | 2026-06-17 |
-| 60. Config & Validation Foundation | v1.14 | 2/2 | Complete | 2026-06-24 |
-| 61. Codegen & Tests | v1.14 | 2/2 | Complete | 2026-06-24 |
-| 62. Documentation | v1.14 | 1/1 | Complete | 2026-06-25 |
-| 63. Cross-Platform Releases + Homebrew | v1.15 | 3/3 | Complete | 2026-07-19 |
-| 64. yard-structs + yard-cli Audit & Fix | v1.16 | 2/2 | Complete    | 2026-08-18 |
-| 65. yard-core Audit & Fix | v1.16 | 3/3 | Complete   | 2026-08-18 |
+| 66. Plugin Protocol + Host | v2.0 | 3/3 | Complete    | 2026-08-31 |
+| 67. Plugin SDK | v2.0 | 2/2 | Complete   | 2026-09-01 |
+| 68. Provider-Scoped Config Cascade | v2.0 | 0/2 | Planned    |  |
+| 69. Plugin Distribution | v2.0 | 2/2 | Complete    | 2026-09-01 |
+| 70. Core Slimming + Documentation | v2.0 | 0/3 | Planned | - |
 
 **Out-of-band patches (NOT tracked under v1.9 or v1.10):**
 

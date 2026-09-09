@@ -8,9 +8,9 @@ use std::path::Path;
 /// Execute `yard destroy`: tear down deployed resources and remove state.
 ///
 /// Three mutually exclusive modes: `dir` scopes to all jobs under a
-/// directory subtree, `job_name` destroys a single job or DAG (tries job
-/// first, then DAG), `None` destroys all deployed resources. `dry_run`
-/// skips provider teardown; `auto_approve` skips the confirmation prompt.
+/// directory subtree, `job_name` destroys a single job, `None` destroys
+/// all deployed resources. `dry_run` skips provider teardown;
+/// `auto_approve` skips the confirmation prompt.
 ///
 /// # Errors
 ///
@@ -103,7 +103,6 @@ pub async fn execute(
 
             println!("\nDestroying...");
 
-            // Try as a job first, then as a DAG
             let destroyed_job = yard_core::destroy_job(
                 &project.manifest.state,
                 &project.manifest.providers,
@@ -116,29 +115,14 @@ pub async fn execute(
             if destroyed_job {
                 println!("{}", color_delete(&format!("  - Destroyed: {}", name)));
             } else {
-                let destroyed_dag = yard_core::destroy_dag(
-                    &project.manifest.state,
-                    &project.manifest.providers,
-                    project.manifest.aws.as_ref(),
-                    &name,
-                    &project.root_dir,
-                    dry_run,
-                )
-                .await?;
-
-                if destroyed_dag {
-                    println!("{}", color_delete(&format!("  - Destroyed DAG: {}", name)));
-                } else {
-                    println!("No state found for \"{}\".", name);
-                }
+                println!("No state found for \"{}\".", name);
             }
         }
         None => {
             let storage = yard_core::storage::get_storage(&project.manifest.state).await?;
             let job_names = storage.list_jobs().await?;
-            let dag_names = storage.list_dags().await?;
 
-            if job_names.is_empty() && dag_names.is_empty() {
+            if job_names.is_empty() {
                 println!("No resources to destroy.");
                 return Ok(());
             }
@@ -153,9 +137,6 @@ pub async fn execute(
             println!();
             for name in &job_names {
                 println!("{}", color_delete(&format!("  - Destroy job [{}]", name)));
-            }
-            for name in &dag_names {
-                println!("{}", color_delete(&format!("  - Destroy DAG [{}]", name)));
             }
 
             if dry_run {
@@ -184,9 +165,6 @@ pub async fn execute(
 
             for name in &result.destroyed {
                 println!("{}", color_delete(&format!("  - Destroyed: {}", name)));
-            }
-            for name in &result.dags_destroyed {
-                println!("{}", color_delete(&format!("  - Destroyed DAG: {}", name)));
             }
 
             println!("\nAll resources destroyed.");

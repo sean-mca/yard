@@ -30,7 +30,7 @@ Use GitHub Issues at `https://github.com/sean-mca/yard/issues` for bug reports, 
 
 ## Setting Up a Development Environment
 
-See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for prerequisites, build commands, and local workflow. See [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md) for first-run setup.
+See [docs/contributing/development.md](docs/contributing/development.md) for prerequisites, build commands, and local workflow. See [docs/quickstart.md](docs/quickstart.md) for first-run setup.
 
 ## Contribution Workflow
 
@@ -56,7 +56,7 @@ See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for prerequisites, build commands
 
 ## Coding Standards
 
-The full rules live in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) and [CLAUDE.md](CLAUDE.md). The non-negotiables for every PR:
+The full rules live in [docs/contributing/development.md](docs/contributing/development.md) and [CLAUDE.md](CLAUDE.md). The non-negotiables for every PR:
 
 - **`cargo clippy --all-targets -- -D warnings` must pass with zero issues.** CI enforces this.
 - **`cargo fmt --all -- --check` must pass.** CI enforces this.
@@ -84,13 +84,13 @@ PR guidelines:
 
 - Keep PRs focused — one logical change per PR. Split large changes into a series if you can.
 - Write a PR description that explains **what** changed and **why**. Reference the issue it closes (`Closes #123`) when applicable.
-- Include tests for new behavior and bug fixes. See [docs/TESTING.md](docs/TESTING.md) for the testing strategy and how to run the suite.
+- Include tests for new behavior and bug fixes. See [docs/contributing/testing.md](docs/contributing/testing.md) for the testing strategy and how to run the suite.
 - Make sure CI is green before asking for review. The CI job runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`; the result is posted as a comment on the PR.
 - Rebase on `main` (rather than merging `main` into your branch) to keep history clean when possible.
 
 ## Testing Expectations
 
-See [docs/TESTING.md](docs/TESTING.md) for the full testing strategy. In short:
+See [docs/contributing/testing.md](docs/contributing/testing.md) for the full testing strategy. In short:
 
 - New features need tests covering the happy path and at least the obvious error cases.
 - Bug fixes should include a regression test that fails without the fix.
@@ -99,7 +99,7 @@ See [docs/TESTING.md](docs/TESTING.md) for the full testing strategy. In short:
 
 ## Code Review Expectations
 
-- Reviews focus on correctness, clarity, adherence to the rules above, and fit with the existing architecture (see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)).
+- Reviews focus on correctness, clarity, adherence to the rules above, and fit with the existing architecture (see [docs/explanation/architecture.md](docs/explanation/architecture.md)).
 - Expect comments — most PRs go through at least one round of revisions.
 - Reviewers may ask you to split a PR, extract a refactor into its own change, or discuss an approach in an issue before continuing.
 - The project is early-stage and actively developed, so response times vary. If a PR has been idle for a while, a polite nudge on the PR thread is welcome.
@@ -108,7 +108,7 @@ See [docs/TESTING.md](docs/TESTING.md) for the full testing strategy. In short:
 
 This document covers contribution mechanics. For deeper context:
 
-- Architecture and crate layout: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- Configuration schema and environment variables: [docs/CONFIGURATION.md](docs/CONFIGURATION.md)
-- Development workflow and build commands: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)
-- Testing strategy: [docs/TESTING.md](docs/TESTING.md)
+- Architecture and crate layout: [docs/explanation/architecture.md](docs/explanation/architecture.md)
+- Configuration schema and environment variables: [docs/reference/configuration.md](docs/reference/configuration.md)
+- Development workflow and build commands: [docs/contributing/development.md](docs/contributing/development.md)
+- Testing strategy: [docs/contributing/testing.md](docs/contributing/testing.md)

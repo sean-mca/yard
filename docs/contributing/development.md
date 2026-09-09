@@ -32,8 +32,9 @@ members = ["yard-cli", "yard-core", "yard-structs", "yard-server"]
 | Crate | Role |
 |-------|------|
 | `yard-cli` (package name `yard`, produces the `yard` binary) | Thin CLI wrapper — parses `clap` args, delegates to `yard-core`, formats output. No business logic. The `list` subcommand (v1.3.4) follows this rule by calling `yard_core::list_targets::list_targets(&manifest, &root_dir)` and formatting the rows. |
-| `yard-core` | Library. All logic: codegen, providers, storage, validation, diff, DAG generation, orchestration. v1.5 added the `StorageBackend` trait (P23 EXT-01) at `yard-core/src/storage.rs` — backends now implement a single `Box<dyn StorageBackend>` interface (Local + S3 today; DynamoDB / GCS / etc. plug in by adding an impl). v1.5 also introduced typed-config helpers `GlueRawConfig` / `EmrRawConfig` (P24 EXT-02) — private `serde::Deserialize` structs in `yard-core/src/providers/{glue,emr}.rs` that own provider-knob extraction with field-level defaults. v1.6 added the `Trigger` enum (5 source variants — `schedule`, `s3`, `dataset`, `sqs`, `api`) at `yard-structs/src/trigger.rs` plus the `airflow_dag/{helpers,triggers}.rs` modules for event-driven DAG codegen. |
+| `yard-core` | Library. All host-side logic: config resolution, plugin host, storage, validation, diff, orchestration. The `StorageBackend` trait at `yard-core/src/storage.rs` gives backends a single `Box<dyn StorageBackend>` interface (Local + S3 today; DynamoDB / GCS / etc. plug in by adding an impl). v2.0 deleted the compiled-in providers, the codegen module and the Airflow DAG modules, and added `plugin_host/` (download, spawner, provider). |
 | `yard-structs` | Shared `serde` types (`ProjectManifest`, `JobDefinition`, `JobState`, `JobDiff`, `StateBackend`, `Resource`, `Trigger`, …). Minimal deps — `serde`, `anyhow`, `serde_json`. |
+| `yard-plugin-sdk` | Library. Published SDK for provider-plugin authors — the `PluginHandler` trait, `PluginServer` run loop, fd-level stdout protection, and re-exports of the protocol types from `yard-structs`. |
 | `yard-server` | Dioxus fullstack binary — GitHub webhooks, drift polling, Axum API, Dioxus/Tailwind dashboard, DynamoDB persistence. v1.5 split the server into focused submodules: `auth/` (P25 SRV-01 — `require_bearer` middleware + hand-rolled constant-time `ct_eq` compare), `secrets/` (P25 SRV-02 — `SecretStore` trait with `AwsSecretStore` impl over `secretsmanager:GetSecretValue`), and `polling/` (P26 SRV-03 — `supervised_iteration` per-iteration timeouts + `compute_backoff_sleep` exponential backoff). The cookie-session login surface (`auth/session`, `auth/logout`) lives in `api/auth_session.rs`. |
 
 The dependency graph is strict: `yard-cli` and `yard-server` depend on
@@ -282,127 +283,30 @@ LLM-assisted contributions alike.
 
 ## Adding a new provider
 
-Providers are AWS services (or any remote deploy target) that yard
-uploads generated scripts to. Glue and EMR are implemented today;
-Databricks and EMR Serverless are planned.
+As of v2.0, providers are **not** added to this repo. A provider is a
+standalone plugin binary that yard downloads and talks to over JSON-over-stdio,
+so adding one means creating a separate crate and release — no changes to
+`yard-core` at all.
 
-### 1. Define the struct and trait impl
+The full walkthrough lives in
+[docs/how-to/build-a-plugin.md](../how-to/build-a-plugin.md): the Rust SDK
+tutorial (`yard-plugin-sdk` + the `PluginHandler` trait), local testing against
+the plugin cache, the release/naming convention, and the raw JSON protocol spec
+for plugins written in other languages.
 
-Add a new file under `yard-core/src/providers/`, e.g.
-`yard-core/src/providers/databricks.rs`. The `Provider` trait lives in
-`yard-core/src/providers/mod.rs`:
+What *does* live in this repo:
 
-```rust
-pub trait Provider: Send + Sync {
-    fn deploy(
-        &self,
-        job_name: &str,
-        artifact: &str,
-        job_config: &Value,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Resource>>> + Send + '_>>;
+- `yard-plugin-sdk/` — the SDK plugin authors depend on. Changes here are a
+  published API change; bump deliberately.
+- `yard-structs/src/plugin.rs` — the protocol types shared by host and SDK. A
+  change to these is a protocol change and must bump `protocol_version`.
+- `yard-core/src/plugin_host/` — the host side: download/caching, process
+  lifecycle, checksum verification, and the `Provider` impl.
 
-    fn destroy(
-        &self,
-        job_name: &str,
-        resources: &[Resource],
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
-
-    fn verify_resources(
-        &self,
-        job_name: &str,
-        resources: &[Resource],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<ResourceStatus>>> + Send + '_>>;
-}
-```
-
-Implement all three methods. `deploy` returns the `Resource`s it
-created/updated so `yard-core` can track them in state. `verify_resources`
-is called by drift detection to confirm those resources still exist in
-the target service.
-
-Look at `yard-core/src/providers/glue.rs` for a reference implementation
-that covers all three methods and uses the shared `S3ScriptOps` helper for
-script uploads.
-
-#### Typed-config helper pattern (v1.5 P24 EXT-02)
-
-New providers should define a private `XxxRawConfig` `serde::Deserialize`
-struct that owns the provider's knob extraction, mirroring the
-`GlueRawConfig` (`yard-core/src/providers/glue.rs::GlueRawConfig`) and
-`EmrRawConfig` (`yard-core/src/providers/emr.rs::EmrRawConfig`) examples.
-The pattern:
-
-- Private struct with `#[derive(Deserialize)]` and one field per
-  provider knob.
-- Per-field `#[serde(default = "...")]` for sensible defaults so
-  `serde_json::from_value` materialises a fully-typed config from a
-  partial `serde_json::Value`.
-- Provider `new()` extracts hard-required fields (e.g. `script_bucket`)
-  with the legacy error string preserved byte-for-byte before calling
-  `serde_json::from_value` for the typed knobs (so existing tests and
-  user-facing error messages don't drift).
-- The struct stays `pub(crate)` or private — it's an implementation
-  detail of the provider, not a public API.
-
-`GlueRawConfig` is the canonical example; copy its shape verbatim for
-new providers and replace the field set.
-
-### 2. Register the file
-
-In `yard-core/src/providers/mod.rs`, add:
-
-```rust
-pub mod databricks;
-```
-
-### 3. Register in the `get_provider` dispatch
-
-Still in `yard-core/src/providers/mod.rs`, extend the `match` in
-`get_provider`:
-
-```rust
-pub async fn get_provider(job_type: &str, provider_config: &Value) -> Result<Box<dyn Provider>> {
-    match job_type {
-        "glue" => Ok(Box::new(glue::GlueProvider::new(provider_config).await?)),
-        "emr"  => Ok(Box::new(emr::EmrProvider::new(provider_config).await?)),
-        "databricks" => Ok(Box::new(databricks::DatabricksProvider::new(provider_config).await?)),
-        other => Err(anyhow!("No provider for job type: {other}")),
-    }
-}
-```
-
-This is the only dispatch point — orchestration, diff, storage, and
-codegen already work polymorphically against `Box<dyn Provider>`.
-
-### 4. Handle codegen
-
-If the new provider needs a generated PySpark script, add a new Tera
-template under `yard-core/src/templates/` (mirror `glue.py.tera` or
-`emr.py.tera`) and extend `generate_python_script` in
-`yard-core/src/codegen/mod.rs` to dispatch on the new `job_type`.
-
-If the provider doesn't need codegen (task-only types like Airflow's
-`bash` operator), have `generate_python_script` return an empty string
-for the new type — the provider's `deploy` method won't receive an
-artifact to upload.
-
-See [codegen reference](../reference/codegen.md) for the full codegen reference —
-template context variables, how source/transform/sink dispatch works,
-and where to wire a new source/sink/transform type.
-
-### 5. Document and test
-
-- Add provider-defaults docs to `docs/reference/providers/<type>.md`
-  (mirror the existing `docs/reference/providers/glue.md` and
-  `docs/reference/providers/emr.md`), and add a one-line cross-link
-  from the relevant `providers.<type>` section in
-  `docs/reference/configuration.md`.
-- Add unit tests in the new `providers/<name>.rs` file (the existing
-  providers use `#[cfg(test)]` modules with mocked `serde_json::Value`
-  configs).
-- Update the provider status table in `README.md`.
-
-No changes to existing providers are needed.
+If you are extending the *protocol* (a new operation, a new response field),
+touch all three, keep the handshake's `protocol_version` in sync, and add
+coverage to `yard-core/tests/plugin_integration.rs` and
+`yard-core/tests/sdk_plugin_integration.rs`.
 
 ---
 

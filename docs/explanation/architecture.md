@@ -3,9 +3,15 @@
 
 ## System overview
 
-YARD is a Rust CLI and companion server for data-engineering infrastructure. It consumes a Terragrunt-style hierarchical YAML tree rooted at `yard.yaml`, generates PySpark scripts from declarative job definitions, tracks per-job deployment state, and pushes the resulting artifacts to target services (AWS Glue, EMR classic, Airflow/MWAA). The companion `yard-server` adds a GitHub-webhook-driven PR workflow, periodic drift detection against live AWS resources, and a Dioxus fullstack dashboard backed by DynamoDB.
+YARD is a Rust CLI and companion server for data-engineering infrastructure. It consumes a Terragrunt-style hierarchical YAML tree rooted at `yard.yaml`, resolves each job's configuration, tracks per-job deployment state, and delegates all provider-specific work — validation, script generation, deploy, destroy, verify — to **provider plugins**: standalone binaries that yard spawns and talks to over a JSON-over-stdio protocol. The companion `yard-server` adds a GitHub-webhook-driven PR workflow, periodic drift detection, and a Dioxus fullstack dashboard backed by DynamoDB.
 
-The workspace is split into four Cargo crates with a strict layering rule: the CLI is a thin wrapper, all business logic lives in `yard-core`, and `yard-structs` holds the serialisable data types shared between the CLI, the core, and the server.
+As of v2.0 the yard binary contains no provider implementations. It knows how to
+resolve config, diff state, and drive the plugin protocol; everything that
+touches a cloud service lives in a plugin. See
+[how-to/build-a-plugin.md](../how-to/build-a-plugin.md) for the plugin side of
+the contract.
+
+The workspace is split into five Cargo crates with a strict layering rule: the CLI is a thin wrapper, all business logic lives in `yard-core`, and `yard-structs` holds the serialisable data types shared between the CLI, the core, the server, and the plugin SDK.
 
 ## Workspace layout
 
@@ -14,14 +20,15 @@ The workspace is declared in `Cargo.toml` at the repository root:
 ```toml
 [workspace]
 resolver = "3"
-members = ["yard-cli", "yard-core", "yard-structs", "yard-server"]
+members = ["yard-cli", "yard-core", "yard-structs", "yard-server", "yard-plugin-sdk"]
 ```
 
 | Crate | Binary/library | Purpose |
 |-------|----------------|---------|
 | `yard-cli` (package name `yard`) | `yard` binary | Parses `clap` args, delegates to `yard-core`, prints results. No business logic. v1.3.4 added the `list` subcommand (`yard list targets [--json]`) for CI matrix builders. |
-| `yard-core` | library | Codegen, providers, storage, validation, diff, DAG generation, orchestration. v1.5 added the `StorageBackend` trait, `GlueRawConfig` / `EmrRawConfig` typed-config helpers, and `list_targets.rs`. v1.6 added `airflow_dag/helpers.rs` and `airflow_dag/triggers.rs`. |
-| `yard-structs` | library | Shared `serde` types: `ProjectManifest`, `JobDefinition`, `JobState`, `JobDiff`, `StateBackend`, `LockInfo`, `Resource`. v1.6 added `trigger.rs` (the typed `Trigger` enum) and `error.rs`. Minimal deps (`serde`, `anyhow`, `serde_json`). |
+| `yard-core` | library | Plugin host, storage, validation, diff, orchestration, config cascade. v2.0 removed the compiled-in providers, the codegen module and the Airflow DAG module, and added `plugin_host/` (spawner, download, provider). |
+| `yard-structs` | library | Shared `serde` types: `ProjectManifest`, `JobDefinition`, `JobState`, `JobDiff`, `StateBackend`, `LockInfo`, `Resource`. v2.0 added `plugin.rs` (the JSON-over-stdio protocol types). Minimal deps (`serde`, `anyhow`, `serde_json`). |
+| `yard-plugin-sdk` | library | Published SDK for plugin authors. Wraps the protocol (handshake, request parsing, stdout protection, tracing) behind the `PluginHandler` trait so authors write business logic only. |
 | `yard-server` | Dioxus fullstack binary | GitHub webhooks, drift polling, Slack alerting, Axum API, Dioxus/Tailwind dashboard, DynamoDB persistence. v1.5 split into focused submodules — `auth/` (bearer + cookie middleware), `secrets/` (`SecretStore` over Secrets Manager), `polling/` (per-iteration timeouts + exp backoff). |
 
 ## Crate dependency graph
@@ -29,18 +36,22 @@ members = ["yard-cli", "yard-core", "yard-structs", "yard-server"]
 ```mermaid
 graph TD
     CLI[yard-cli<br/>clap + tokio]
-    CORE[yard-core<br/>aws-sdk, tera, blake3]
+    CORE[yard-core<br/>reqwest, blake3]
     STRUCTS[yard-structs<br/>serde, anyhow]
     SERVER[yard-server<br/>dioxus, axum, dynamodb]
+    SDK[yard-plugin-sdk<br/>serde_json, tracing]
 
     CLI --> CORE
     CLI --> STRUCTS
     CORE --> STRUCTS
     SERVER --> CORE
     SERVER --> STRUCTS
+    SDK --> STRUCTS
 ```
 
-Only `yard-cli` and `yard-server` are top-level consumers. `yard-core` never depends on `yard-cli` or `yard-server`, and `yard-structs` depends on nothing inside the workspace — this keeps the shared types small and cheap to depend on.
+Only `yard-cli` and `yard-server` are top-level consumers. `yard-core` never depends on `yard-cli` or `yard-server`, and `yard-structs` depends on nothing inside the workspace — this keeps the shared types small and cheap to depend on. `yard-plugin-sdk` depends only on `yard-structs`, so plugin authors pull in the protocol types without pulling in the whole core.
+
+Note the AWS SDK and templating crates are gone from `yard-core` in v2.0 — those dependencies now live in each provider plugin instead.
 
 ## Component diagram — end-to-end plan/apply
 
@@ -52,14 +63,13 @@ graph TD
     CONFIG[yard-core::config_merge<br/>build_provider_config]
     LIST[yard-core::list_targets<br/>list_targets]
     VAL[yard-core::validation<br/>rules + syntax]
-    CODEGEN[yard-core::codegen<br/>generate_python_script]
     DIFF[yard-core::diff<br/>calculate_diff]
-    TRIG[yard-structs::trigger<br/>Trigger enum<br/>5 source variants]
-    DAG[yard-core::airflow_dag<br/>collect_dags + generate_dag<br/>helpers.rs + triggers.rs]
     ORCH[yard-core::orchestrate<br/>apply / destroy / load_state]
     STORAGE[yard-core::storage<br/>StorageBackend trait]
-    PROV[yard-core::providers<br/>Provider trait]
-    AWS[(AWS: Glue, EMR,<br/>S3, MWAA)]
+    PROV[yard-core::providers<br/>get_provider_for_job]
+    HOST[yard-core::plugin_host<br/>download + spawner + provider]
+    PLUGIN[[provider plugin binary<br/>JSON over stdio]]
+    AWS[(target cloud service)]
 
     USER --> CLI
     CLI --> RESOLVE
@@ -68,43 +78,39 @@ graph TD
     RESOLVE --> CONFIG
     CONFIG --> VAL
     CONFIG --> DIFF
-    CONFIG --> CODEGEN
-    CONFIG --> DAG
-    TRIG --> DAG
     DIFF --> ORCH
     ORCH --> STORAGE
     ORCH --> PROV
-    PROV --> AWS
+    PROV --> HOST
+    HOST --> PLUGIN
+    PLUGIN --> AWS
     STORAGE --> AWS
 ```
 
-The v1.6 `Trigger` enum (5 source variants — `schedule`, `s3`, `dataset`,
-`sqs`, `api` — plus composite `all`/`any` shapes) is consumed by the
-Airflow DAG codegen pipeline at `airflow_dag/triggers.rs`, which dispatches
-per-source rendering branches for sensors, Datasets, and schedule strings.
-Hand-rolled `Serialize` / `Deserialize` impls on `Trigger` and
-`SingleSource` (`yard-structs/src/trigger.rs:24-26`) emit canonical-JSON
-ordering for HASH-02 stability and produce actionable typo-correction
-errors for unknown source names.
+Every arrow from `yard-core` to a cloud service now goes through the plugin
+boundary. `plugin_host::download` resolves and caches the binary, and
+`plugin_host::spawner` runs one child process per operation.
 
 ## Data flow — `yard apply`
 
 1. `yard-cli::main` boots a `tokio` runtime and calls `yard::run()` in `yard-cli/src/lib.rs`, which parses the `Cli` struct in `yard-cli/src/parser.rs` and dispatches to `commands/apply.rs`.
-2. `commands/apply.rs` calls `yard_core::resolve::resolve_project(base_path)` (`yard-core/src/resolve.rs`). This walks parent directories to find `yard.yaml`, loads each `account.yaml` / `region.yaml` / `dag.yaml` marker, discovers job YAML files, and assembles a `ResolvedProject { manifest, current_state, root_dir }`.
+2. `commands/apply.rs` calls `yard_core::resolve::resolve_project(base_path)` (`yard-core/src/resolve.rs`). This walks parent directories to find `yard.yaml`, loads each `account.yaml` / `region.yaml` context file, discovers job YAML files, and assembles a `ResolvedProject { manifest, current_state, root_dir }`.
 3. Provider-level config is merged with per-job overrides by `yard_core::config_merge::build_provider_config` (`yard-core/src/config_merge.rs`).
-4. `yard_core::diff::calculate_diff(&manifest, &state)` in `yard-core/src/diff.rs` generates each job's script via `codegen::generate_python_script`, concatenates script + serialised config, hashes with BLAKE3, and emits `JobDiff { Create | Modify { changes } | Delete }` entries.
+4. `yard_core::diff::calculate_diff(&manifest, &state)` in `yard-core/src/diff.rs` generates each job's script by calling the plugin's `codegen` operation, concatenates script + serialised config, hashes with BLAKE3, and emits `JobDiff { Create | Modify { changes } | Delete }` entries. It is `async` in v2.0 because codegen now runs out-of-process.
 5. `yard_core::orchestrate::apply` (`yard-core/src/orchestrate.rs`) acquires per-job locks via `Storage::lock_jobs` (atomic with rollback), then for each changed job:
-   - Instantiates a `Box<dyn Provider>` via `providers::get_provider(job_type, &merged_config)`.
+   - Instantiates a `Box<dyn Provider>` via `providers::get_provider_for_job(job_type, &merged_config, plugin_version, plugin_source, &plugin_host_config)`. This downloads and caches the plugin binary if needed, then wraps it in a `PluginProvider`. If the job declares neither `plugin_version` nor `plugin_source`, this is where the v1.x migration error is raised.
    - Calls `provider.deploy(job_name, &artifact, &job_config)` which uploads the generated script to S3 and creates/updates the target resource (Glue job, EMR step, etc.).
    - Writes the resulting `JobState { deployment: Deployment { resources, config_hash, status, applied_at, ... } }` via `Storage::write_job`.
-6. Airflow DAGs are handled in a parallel pipeline via `yard_core::dag_lifecycle::apply_dags` using `airflow_dag::collect_dags` and `airflow_dag::generate_dag`, with per-DAG state stored under the `_dag_` prefix (see `DAG_STATE_PREFIX` in `yard-core/src/storage.rs`).
-7. Locks are released (rollback-safe) and a summary is returned to `yard-cli`, which formats and prints it.
+6. Locks are released (rollback-safe) and a summary is returned to `yard-cli`, which formats and prints it.
 
 ## Key abstractions
 
 ### `Provider` trait — `yard-core/src/providers/mod.rs`
 
-All deploy targets implement this async trait. Implementations live alongside it (`glue.rs`, `emr.rs`). Adding a new provider (e.g. Databricks, EMR Serverless) means adding a new file and extending the `get_provider` dispatch — no changes to existing providers.
+In v2.0 this trait has exactly one implementation: `PluginProvider`
+(`yard-core/src/plugin_host/provider.rs`), which forwards each call across the
+stdio protocol to a plugin binary. Adding a new provider means shipping a new
+plugin binary — no changes to yard core.
 
 ```rust
 pub trait Provider: Send + Sync {
@@ -114,10 +120,26 @@ pub trait Provider: Send + Sync {
         -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
     fn verify_resources(&self, job_name: &str, resources: &[Resource])
         -> Pin<Box<dyn Future<Output = Result<Vec<ResourceStatus>>> + Send + '_>>;
+
+    // v2.0 additions, all defaulted so the trait stays cheap to implement:
+    fn validate(&self, job_name: &str, job_config: &Value)
+        -> Pin<Box<dyn Future<Output = Result<Vec<ValidationError>>> + Send + '_>>;
+    fn codegen(&self, job_name: &str, job_config: &Value)
+        -> Pin<Box<dyn Future<Output = Result<Option<String>>> + Send + '_>>;
+    fn schema(&self)
+        -> Pin<Box<dyn Future<Output = Result<Vec<SchemaField>>> + Send + '_>>;
 }
 ```
 
-`deploy` returns the `Resource`s it created so state can track them. `verify_resources` is used by drift detection to catch out-of-band deletions. Shared S3 script upload/delete helpers live on `S3ScriptOps` in the same file.
+`deploy` returns the `Resource`s it created so state can track them. `verify_resources` is used by drift detection to catch out-of-band deletions. `codegen` and `validate` moved here from the deleted core modules, and `schema` drives config-cascade validation.
+
+### `plugin_host` — `yard-core/src/plugin_host/`
+
+- `download.rs` — expands the `plugin_source` URL template (`${name}`, `${version}`, `${os}`, `${arch}`), downloads over HTTPS, caches the binary at `.yard/plugins/{name}-{version}-{arch}-{os}`, and records a SHA-256 in `yard.lock` (trust on first use).
+- `spawner.rs` — one child process per operation. Writes the request line to stdin, closes stdin, reads the response line from stdout. Verifies the cached binary's checksum against `yard.lock` before spawning.
+- `provider.rs` — `PluginProvider`, the `Provider` impl that maps trait methods onto protocol operations.
+
+The unidirectional flow (write request, close stdin, then read) is deliberate: it avoids the classic stdio deadlock where both sides block waiting on the other.
 
 ### `StateBackend` + `Storage` — `yard-core/src/storage.rs`
 
@@ -133,7 +155,7 @@ pub enum StateBackend {
 `get_storage` (in `yard-core/src/storage.rs`) maps this to a `Storage` enum (`Local(LocalStorage)` / `S3(S3Storage)`). Both backends implement the same surface:
 
 - **Per-job state**: `read_job`, `write_job`, `delete_job`, `list_jobs`. State files are `<job_name>.json` at the backend prefix.
-- **Per-DAG state**: `read_dag`, `write_dag`, `delete_dag`, `list_dags`. DAG state files are prefixed with `_dag_` (`DAG_STATE_PREFIX` constant) so they don't collide with job names.
+- **Per-DAG state**: `read_dag`, `write_dag`, `delete_dag`, `list_dags`. Retained in v2.0 only so existing `_dag_`-prefixed state files stay readable and are excluded from job listings; core no longer writes new DAG state.
 - **Locking**: `lock`, `unlock`, `force_unlock`, `lock_jobs`, `unlock_jobs`. Local uses `O_CREAT | O_EXCL` atomic file creation; S3 uses `PutObject` with `If-None-Match: *`. There is no global lock — each job has its own lock file, enabling concurrent deploys.
 
 ### `ProjectManifest` — `yard-structs/src/config.rs`
@@ -142,30 +164,25 @@ The in-memory representation of the resolved YAML tree. Holds the project name, 
 
 ### `JobDefinition` + `JobState` — `yard-structs/src/{config.rs,state.rs}`
 
-`JobDefinition` is what the user wrote in YAML after context inheritance: `job_type`, `sources: Vec<Source>`, `transforms: Vec<Transform>`, `sink: Option<Sink>`, Airflow metadata, partitioning directives, and an optional `body` / `job_file` escape hatch. `JobState` is what was deployed: `{ job_name, project, deployment: Deployment { config_hash, config, status, applied_at, resources } }`. The BLAKE3 `config_hash` in `Deployment` is compared against a freshly-hashed proposed config during `calculate_diff` to detect changes.
+`JobDefinition` is what the user wrote in YAML after context inheritance: `job_type` (a `JobType::Plugin(String)` in v2.0), `plugin_version` / `plugin_source`, `sources: Vec<Source>`, `transforms: Vec<Transform>`, `sink: Option<Sink>`, partitioning directives, and an optional `body` / `job_file` escape hatch. `JobState` is what was deployed: `{ job_name, project, deployment: Deployment { config_hash, config, status, applied_at, resources } }`. The BLAKE3 `config_hash` in `Deployment` is compared against a freshly-hashed proposed config during `calculate_diff` to detect changes.
 
-### `generate_python_script` — `yard-core/src/codegen/mod.rs`
+### Script generation — the plugin `codegen` operation
 
-Entry point for PySpark codegen. Dispatches on `job_type`:
+There is no codegen module in v2.0. `yard-core` asks the plugin for a script:
+`PluginProvider::codegen` sends a `codegen` request with the job name and merged
+config, and the plugin returns the script body (or `None` if the provider needs
+no script). Template engines, PySpark rendering and provider-specific dialects
+are entirely the plugin's business.
 
-- `"glue"` → renders `yard-core/src/templates/glue.py.tera` via `tera`.
-- `"emr"` → renders `yard-core/src/templates/emr.py.tera`.
-- Task-only types (e.g. `"bash"`) return an empty string; they participate only in Airflow DAG codegen.
-- A `job_file: path.py` field bypasses codegen entirely and uses the external script verbatim.
+Two things still happen in core:
 
-Source, transform, and sink rendering is split across `codegen/source.rs`, `codegen/transform.rs`, `codegen/sink.rs`, with shared helpers in `codegen/helpers.rs`. Iceberg sinks get additional null-coercion helpers inlined via the `ICEBERG_FILL_NULLS_HELPERS` constant.
+- A `job_file: path.py` field bypasses the plugin's codegen and uses the
+  external script verbatim.
+- The returned script is folded into the BLAKE3 config hash, so a change in
+  generated output shows up as a `Modify` diff.
 
-For the full PySpark codegen reference — template system, per-source/transform/sink dispatch, provider differences, escape hatches, and an end-to-end rendered example — see [codegen reference](../reference/codegen.md).
-
-### Airflow DAG codegen — `yard-core/src/airflow_dag/`
-
-- `collection.rs::collect_dags` groups jobs by their nearest `dag.yaml` marker file.
-- `resolve.rs` walks the Airflow config inheritance chain (`yard.yaml` → `account.yaml` → `region.yaml` → `dag.yaml` → per-job `airflow:` block; later layers shallow-override earlier ones; per-field cascade for `airflow.aws:` since v1.6 commit `691a950`).
-- `generation.rs::generate_dag` renders `yard-core/src/templates/airflow_dag.py.tera`.
-- `connections.rs` emits the Airflow connections a DAG needs (AWS conn id per account).
-- `helpers.rs` (v1.6 P30) — shared template helpers (per-source schedule rendering, `_yard_publish` synthetic terminal task, dataset URI normalisation).
-- `triggers.rs` (v1.6 P32) — per-`Trigger`-variant codegen branches: schedule → `schedule="<cron>"`; dataset → native Airflow Dataset list; s3/sqs → sensor task chain plus `_yard_join` `EmptyOperator`; api → `schedule=None`. Composite `any:` / `all:` rendering (homogeneous Datasets via `&` / `|`, heterogeneous via sensor chain) lives here.
-- DAG state is stored separately (see `DagState` / `DagDeployment` in `yard-structs/src/state.rs`) and hashed by generated Python content.
+See [how-to/build-a-plugin.md](../how-to/build-a-plugin.md) for the `codegen`
+request/response shape.
 
 ## Directory structure rationale
 
@@ -180,19 +197,16 @@ For the full PySpark codegen reference — template system, per-source/transform
 ### `yard-core/src/`
 
 - `resolve.rs` — walks the YAML tree to build a `ResolvedProject`.
-- `parsing.rs` — low-level YAML-to-struct parsing helpers (sources, sinks, transforms, Airflow blocks).
+- `parsing.rs` — low-level YAML-to-struct parsing helpers (sources, sinks, transforms).
 - `config_merge.rs` — layers provider defaults, account/region context, and job overrides into a single merged config blob.
-- `codegen/` — PySpark script generation (see "Key abstractions").
-- `templates/` — three Tera templates: `glue.py.tera`, `emr.py.tera`, `airflow_dag.py.tera` (compiled in via `include_str!`).
-- `providers/` — `Provider` trait + per-provider implementations. `aws_config()` centralises AssumeRole resolution.
+- `providers/` — the `Provider` trait and `get_provider_for_job`, the plugin-only dispatch that raises the v1.x migration error.
+- `plugin_host/` — plugin binary download/caching (`download.rs`), process lifecycle and checksum verification (`spawner.rs`), and the `Provider` impl over the protocol (`provider.rs`).
 - `storage.rs` — `StateBackend` → `Storage` factory; per-job file I/O and locking for both Local and S3.
 - `orchestrate.rs` — top-level `apply` / `destroy_all` / `destroy_job` / `force_unlock` / `init_state_backend` / `load_state` / `verify_deployed_resources`.
 - `diff.rs` — hash-and-compare between `ProjectManifest` and `ProjectState`.
-- `validation/` — schema validation (`rules.rs`) + Python syntax check of the generated script (`syntax.rs`).
-- `airflow_dag/` — DAG discovery, config resolution, generation, connection derivation. v1.6 added `helpers.rs` (shared template helpers, synthetic terminal task) and `triggers.rs` (per-`Trigger`-variant codegen).
-- `dag_lifecycle.rs` — mirrors `orchestrate.rs` for DAG state (apply / destroy / diff).
-- `list_targets.rs` — v1.3.4 `yard list targets [--json]` implementation. Manifest-driven enumeration (jobs from `manifest.jobs`, DAGs from `airflow_dag::collect_dags`); state files are NOT consulted, so un-applied targets appear in the output. Used by CI/CD matrix builders to fan out `apply --target` with per-account OIDC roles.
-- `show.rs` — implements `yard show <job>` and `yard show <dag>`.
+- `validation/` — structural schema validation (`rules.rs`), optionally refined by the plugin's `schema()` response; `syntax.rs` retains the Python syntax-check helper.
+- `list_targets.rs` — `yard list targets [--json]` implementation. Manifest-driven enumeration from `manifest.jobs`; state files are NOT consulted, so un-applied targets appear in the output. Used by CI/CD matrix builders to fan out `apply --target` with per-account OIDC roles.
+- `show.rs` — implements `yard show <job>`.
 - `utils.rs` — `calculate_hash` (BLAKE3) and misc helpers.
 
 ### `yard-structs/src/`

@@ -174,6 +174,15 @@ pub struct Deployment {
     pub applied_at: String,
     /// AWS resources created by this deployment.
     pub resources: Vec<Resource>,
+    /// Plugin binary version used for this deployment (e.g. `"0.3.1"`).
+    /// Persisted so that destroy operations can instantiate the correct
+    /// provider without requiring the job to still be in the manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_version: Option<String>,
+    /// URL template used to download the plugin binary for this deployment.
+    /// Persisted alongside `plugin_version` for destroy path recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_source: Option<String>,
 }
 
 /// Aggregate view of all per-job state files. Not persisted directly --
@@ -330,6 +339,8 @@ mod tests {
                 status: DeploymentStatus::Generated,
                 applied_at: "2026-01-01T00:00:00Z".to_string(),
                 resources: vec![],
+                plugin_version: None,
+                plugin_source: None,
             },
         };
 

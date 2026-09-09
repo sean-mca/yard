@@ -1,24 +1,24 @@
-//! AWS provider implementations for yard job deployment.
+//! Plugin-based provider dispatch for yard job deployment (D-04, D-07).
 //!
-//! This module defines the [`Provider`] trait that each cloud service
-//! (Glue, EMR, etc.) implements, plus shared infrastructure such as
-//! [`S3ScriptOps`] for uploading generated PySpark scripts and
-//! [`aws_config()`] for building SDK configs with optional `AssumeRole`.
+//! This module defines the [`Provider`] trait that each plugin implements,
+//! plus shared infrastructure: [`aws_config()`] for building SDK configs
+//! with optional `AssumeRole`, and [`validation_err()`] for constructing
+//! validation errors.
 //!
-//! Sub-modules:
-//! - [`glue`] -- AWS Glue ETL provider
-//! - [`emr`]  -- AWS EMR Serverless provider
+//! All provider types are now resolved through [`PluginProvider`] -- there
+//! are no compiled-in provider implementations. Jobs without `plugin_version`
+//! and `plugin_source` fields receive an actionable migration error.
 
-pub mod emr;
-pub mod glue;
-
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, bail};
 use aws_config::BehaviorVersion;
-use aws_sdk_s3::Client as S3Client;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
-use yard_structs::{JobType, Resource, ResourceStatus, ValidationError};
+use yard_structs::{JobType, Resource, ResourceStatus, SchemaField, ValidationError};
+
+use crate::plugin_host::download;
+use crate::plugin_host::PluginHostConfig;
+use crate::plugin_host::PluginProvider;
 
 /// Build a standard AWS SDK config with region, retry policy, and optional
 /// STS `AssumeRole` wrapped around the default credential provider chain.
@@ -70,112 +70,6 @@ pub async fn aws_config(region: &str, aws_cfg: Option<&Value>) -> aws_config::Sd
     base.load().await
 }
 
-/// Shared S3 script operations used by all providers that upload
-/// generated PySpark scripts to S3.
-pub struct S3ScriptOps {
-    /// The S3 client used for script upload/download/delete operations.
-    pub s3_client: S3Client,
-    /// The S3 bucket name where scripts are stored.
-    pub script_bucket: String,
-    /// The key prefix (folder path) within the bucket.
-    pub script_prefix: String,
-}
-
-impl S3ScriptOps {
-    /// Build the full S3 key for a job's generated PySpark script.
-    #[inline]
-    pub fn script_key(&self, job_name: &str) -> String {
-        let prefix = if self.script_prefix.ends_with('/') {
-            &self.script_prefix
-        } else {
-            return format!("{}/{}.py", self.script_prefix, job_name);
-        };
-        format!("{prefix}{job_name}.py")
-    }
-
-    /// Upload a generated PySpark script to S3 and return its `s3://` URI.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the S3 `PutObject` call fails.
-    pub async fn upload_script(&self, job_name: &str, artifact: &str) -> Result<String> {
-        let key = self.script_key(job_name);
-
-        self.s3_client
-            .put_object()
-            .bucket(&self.script_bucket)
-            .key(&key)
-            .body(artifact.as_bytes().to_vec().into())
-            .content_type("text/x-python")
-            .send()
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to upload script to s3://{}/{}",
-                    self.script_bucket, key
-                )
-            })?;
-
-        Ok(format!("s3://{}/{}", self.script_bucket, key))
-    }
-
-    /// Delete a previously uploaded PySpark script from S3.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the S3 `DeleteObject` call fails.
-    pub async fn delete_script(&self, job_name: &str) -> Result<()> {
-        let key = self.script_key(job_name);
-
-        self.s3_client
-            .delete_object()
-            .bucket(&self.script_bucket)
-            .key(&key)
-            .send()
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to delete script at s3://{}/{}",
-                    self.script_bucket, key
-                )
-            })?;
-
-        Ok(())
-    }
-
-    /// Check whether an S3 object exists in the script bucket.
-    ///
-    /// Returns `true` if the `HeadObject` call succeeds, `false` if
-    /// the object is not found.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the `HeadObject` call fails for a reason
-    /// other than "not found" (e.g. permission denied, network error).
-    pub async fn s3_object_exists(&self, key: &str) -> Result<bool> {
-        let result = self
-            .s3_client
-            .head_object()
-            .bucket(&self.script_bucket)
-            .key(key)
-            .send()
-            .await;
-
-        match result {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                if e.as_service_error()
-                    .is_some_and(|se| se.is_not_found())
-                {
-                    Ok(false)
-                } else {
-                    Err(e).with_context(|| format!("Failed to check S3 object: {key}"))
-                }
-            }
-        }
-    }
-}
-
 /// Construct a [`ValidationError`] with the given field name and message.
 ///
 /// This is the single canonical constructor shared by all provider and
@@ -190,14 +84,14 @@ pub fn validation_err(field: &str, message: &str) -> ValidationError {
 
 /// Trait for deploying and destroying job artifacts on a target service.
 ///
-/// Each provider (Glue, EMR, Databricks, etc.) implements this trait.
+/// Each provider plugin implements this trait via [`PluginProvider`].
 /// Provider config (deploy roles, buckets, etc.) is passed at construction time.
 /// Job config (execution roles, sources, etc.) is passed per-call.
 ///
 /// # Design note (D-10)
 ///
 /// Methods return `Pin<Box<dyn Future<...> + Send + '_>>` rather than using
-/// `async fn` in the trait definition. This is intentional: [`get_provider`]
+/// `async fn` in the trait definition. This is intentional: [`get_provider_for_job`]
 /// returns `Box<dyn Provider>`, which requires object safety. Native `async fn`
 /// in traits produces `impl Future` return types that are **not** object-safe,
 /// so this desugared form is the correct stdlib-only pattern for async +
@@ -241,49 +135,87 @@ pub trait Provider: Send + Sync {
         job_name: &str,
         resources: &[Resource],
     ) -> Pin<Box<dyn Future<Output = Result<Vec<ResourceStatus>>> + Send + '_>>;
+
+    /// Run provider-specific validation on the job config.
+    ///
+    /// Returns additional validation errors to append to yard-core's
+    /// structural validation. Default returns no errors.
+    fn validate(
+        &self,
+        _job_name: &str,
+        _job_config: &Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ValidationError>>> + Send + '_>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Generate the deployment script for a job.
+    ///
+    /// Returns `Some(script_content)` if the provider handles codegen,
+    /// or `None` if no script is needed. Default returns `None`.
+    fn codegen(
+        &self,
+        _job_name: &str,
+        _job_config: &Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<String>>> + Send + '_>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Return the config field descriptors this provider accepts.
+    ///
+    /// Used by config cascade validation. Default returns an empty schema.
+    fn schema(&self) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaField>>> + Send + '_>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
-/// Construct a provider from the job type and its provider-level config.
+/// Plugin-only provider dispatch (D-04).
+///
+/// Downloads the plugin binary (if not already cached) and constructs a
+/// [`PluginProvider`]. When `plugin_version` and `plugin_source` are both
+/// absent, returns an actionable migration error (D-01) directing users
+/// to `docs/reference/migrations/v2.0.md`.
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - The job type is `Bash` (bash jobs are task-only and have no provider)
-/// - The job type is unsupported
-/// - The provider's constructor fails (e.g. missing required config fields)
-pub async fn get_provider(job_type: JobType, provider_config: &Value) -> Result<Box<dyn Provider>> {
-    match job_type {
-        JobType::Glue => Ok(Box::new(glue::GlueProvider::new(provider_config).await?)),
-        JobType::Emr => Ok(Box::new(emr::EmrProvider::new(provider_config).await?)),
-        JobType::Bash => Err(anyhow!(
-            "No provider for job type: {job_type} (bash is task-only — should not reach get_provider)"
-        )),
-        _ => Err(anyhow!("unsupported job type: {job_type}")),
-    }
-}
+/// - Plugin download fails
+/// - Only one of `plugin_version` / `plugin_source` is set (both required)
+/// - Neither is set (v1.x user needs to migrate)
+pub async fn get_provider_for_job(
+    job_type: &JobType,
+    _provider_config: &Value,
+    plugin_version: Option<&str>,
+    plugin_source: Option<&str>,
+    plugin_host_config: &PluginHostConfig,
+) -> Result<Box<dyn Provider>> {
+    let type_name = job_type.to_string();
+    match (plugin_version, plugin_source) {
+        (Some(version), Some(source)) => {
+            let plugin_name = format!("yard-plugin-{type_name}");
+            let binary_path =
+                download::ensure_plugin_cached(&plugin_name, version, source, plugin_host_config)
+                    .await
+                    .with_context(|| {
+                        format!("failed to ensure plugin binary for {plugin_name} v{version}")
+                    })?;
 
-/// Validate a job's provider-specific config block. Dispatched from
-/// `validation::rules::validate_job` — the only validation-side site
-/// where `JobType` is matched in the workspace.
-///
-/// Note the asymmetry between the Glue and EMR arms: Glue receives the full
-/// `job_config` because the Glue `role` check (in `glue::validate_config`)
-/// reads from the top level of the job config, not from the inner `glue`
-/// block. EMR's arm preserves the inner-block extraction since
-/// `emr::validate_config` reads only from the inner `emr` block.
-pub fn validate_provider_config(
-    job_type: JobType,
-    job_config: &Value,
-    errors: &mut Vec<ValidationError>,
-) {
-    match job_type {
-        JobType::Glue => glue::validate_config(job_config, errors),
-        JobType::Emr => {
-            if let Some(config) = job_config.get("emr") {
-                emr::validate_config(config, errors);
-            }
+            Ok(Box::new(PluginProvider::from_binary(
+                binary_path,
+                plugin_name,
+                plugin_host_config.clone(),
+            )))
         }
-        JobType::Bash => {}
-        _ => {}
+        (Some(_), None) => {
+            bail!("job has plugin_version but no plugin_source -- both are required")
+        }
+        (None, Some(_)) => {
+            bail!("job has plugin_source but no plugin_version -- both are required")
+        }
+        (None, None) => {
+            bail!(
+                "provider '{type_name}' is now a plugin -- add plugin_version and plugin_source \
+                 to your job.yaml, see docs/reference/migrations/v2.0.md"
+            )
+        }
     }
 }

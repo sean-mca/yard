@@ -57,12 +57,16 @@ pub async fn execute(
     };
     job_names.sort();
 
+    // In v2.0, provider schemas come from plugin binaries (Provider::schema).
+    // Structural validation runs without a schema cache -- provider-specific
+    // validation is the plugin's responsibility via Provider::validate.
+
     for name in job_names {
         let job_def = match manifest.jobs.get(name) {
             Some(j) => j,
             None => continue,
         };
-        let errors = yard_core::validation::validate_job_full(name, job_def);
+        let errors = yard_core::validation::validate_job_full_with_schema(name, job_def, None);
 
         if errors.is_empty() {
             println!("[PASS] {}.yaml", name);

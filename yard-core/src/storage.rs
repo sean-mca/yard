@@ -1053,6 +1053,8 @@ mod tests {
                 status: DeploymentStatus::Generated,
                 applied_at: "2025-01-01T00:00:00Z".to_string(),
                 resources: Vec::new(),
+                plugin_version: None,
+                plugin_source: None,
             },
         }
     }
@@ -1609,6 +1611,8 @@ mod tests {
                 status: DeploymentStatus::Deployed,
                 applied_at: "2025-01-01T00:00:00Z".to_string(),
                 resources: Vec::new(),
+                plugin_version: None,
+                plugin_source: None,
             },
         };
 

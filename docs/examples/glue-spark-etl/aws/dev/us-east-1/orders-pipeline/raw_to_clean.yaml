@@ -1,4 +1,9 @@
 type: glue
+plugin_version: "0.1.0"
+# NOTE: the URL is written out in full. Placeholder templating is not usable
+# in a job file today -- see the "Known limitation" note in
+# docs/reference/migrations/v2.0.md.
+plugin_source: "https://github.com/your-org/yard-plugin-glue/releases/download/v0.1.0/yard-plugin-glue-0.1.0-aarch64-macos"
 role: arn:aws:iam::123456789012:role/acme-yard-glue-job
 
 sources:

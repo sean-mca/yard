@@ -45,7 +45,9 @@
       "create_timestamp": false,
       "config": {
         "type": "emr"
-      }
+      },
+      "plugin_version": null,
+      "plugin_source": null
     },
     "ingest-glue": {
       "job_type": "glue",
@@ -63,7 +65,9 @@
         "type": "glue",
         "glue": { "worker_type": "G.1X" },
         "_aws": { "assume_role": "arn:aws:iam::333333333333:role/PerJobOverride" }
-      }
+      },
+      "plugin_version": null,
+      "plugin_source": null
     },
     "trigger-bash": {
       "job_type": "bash",
@@ -80,7 +84,9 @@
       "config": {
         "type": "bash",
         "command": "echo hi"
-      }
+      },
+      "plugin_version": null,
+      "plugin_source": null
     },
     "pii-glue": {
       "job_type": "glue",
@@ -98,7 +104,9 @@
       "config": {
         "type": "glue",
         "role": "arn:aws:iam::555555555555:role/PiiRole"
-      }
+      },
+      "plugin_version": null,
+      "plugin_source": null
     }
   },
   "aws": {

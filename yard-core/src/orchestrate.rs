@@ -1,38 +1,35 @@
 //! Top-level orchestration for apply, plan, and destroy commands.
 //!
-//! This module composes the data-flow pipeline (resolve, diff, codegen,
-//! validation) with provider deployment and state persistence to implement
-//! the three core CLI operations:
+//! This module composes the data-flow pipeline (resolve, diff, validation)
+//! with provider deployment and state persistence to implement the three
+//! core CLI operations:
 //!
-//! - [`apply`] — validate, diff, deploy changed jobs/DAGs, persist state
-//! - [`plan`] — read-only diff preview (same validation, no side effects)
-//! - [`destroy_job`] / [`destroy_all`] — tear down resources, delete state
+//! - [`apply`] -- validate, diff, deploy changed jobs, persist state
+//! - [`plan`] -- read-only diff preview (same validation, no side effects)
+//! - [`destroy_job`] / [`destroy_all`] -- tear down resources, delete state
 //!
 //! All state mutations are protected by per-job locking via [`LockGuard`].
 //! Locks are acquired upfront and released on exit (success or error), with
 //! a TTL backstop for crash recovery.
 
 use anyhow::{Context, Result, anyhow};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
 use yard_structs::{
-    DagDiff, Deployment, DeploymentStatus, DiffType, JobDiff, JobName, JobState, JobType,
+    Deployment, DeploymentStatus, DiffType, JobDiff, JobName, JobState, JobType,
     ProjectManifest, ProjectState, ResourceStatus,
 };
 
-use crate::airflow_dag;
-use crate::codegen;
 use crate::providers;
 use crate::storage;
 use crate::storage::LockGuard;
 use crate::utils;
 use crate::validation;
 
-use crate::config_merge::{build_provider_config, is_task_only};
+use crate::config_merge::build_provider_config;
 use crate::diff::calculate_diff;
-use crate::dag_lifecycle::{apply_dags, destroy_all_dags};
+use crate::plugin_host::PluginHostConfig;
 
 /// Load the current project state by reading all per-job state files.
 ///
@@ -87,6 +84,7 @@ pub async fn load_state(
 pub async fn verify_deployed_resources(
     manifest: &ProjectManifest,
     state: &ProjectState,
+    plugin_host_config: &PluginHostConfig,
 ) -> Result<HashMap<String, Vec<ResourceStatus>>> {
     let mut results: HashMap<String, Vec<ResourceStatus>> = HashMap::new();
 
@@ -95,8 +93,7 @@ pub async fn verify_deployed_resources(
             continue;
         }
 
-        // Determine the job type from the deployment config. Unparseable or
-        // missing values silently skip — drift verification is best-effort.
+        // Determine the job type from the deployment config.
         let job_type: JobType = match deployment
             .config
             .get("type")
@@ -116,7 +113,22 @@ pub async fn verify_deployed_resources(
 
         let merged_config =
             build_provider_config(provider_defaults, &deployment.config, &provider_key);
-        let provider = providers::get_provider(job_type, &merged_config).await?;
+
+        // Look up job_def for plugin_version/plugin_source
+        let (plugin_version, plugin_source) = manifest
+            .jobs
+            .get(job_name)
+            .map(|j| (j.plugin_version.as_deref(), j.plugin_source.as_deref()))
+            .unwrap_or((None, None));
+
+        let provider = providers::get_provider_for_job(
+            &job_type,
+            &merged_config,
+            plugin_version,
+            plugin_source,
+            plugin_host_config,
+        )
+        .await?;
         let statuses = provider
             .verify_resources(job_name, &deployment.resources)
             .await?;
@@ -127,9 +139,9 @@ pub async fn verify_deployed_resources(
     Ok(results)
 }
 
-/// Result of applying changes to jobs and DAGs.
+/// Result of applying changes to jobs.
 ///
-/// Each field lists the names of jobs (or DAGs) that were created, modified,
+/// Each field lists the names of jobs that were created, modified,
 /// or deleted during the apply operation.
 #[derive(Debug)]
 pub struct ApplyResult {
@@ -139,56 +151,39 @@ pub struct ApplyResult {
     pub modified: Vec<String>,
     /// Job names that were removed from the manifest and destroyed.
     pub deleted: Vec<String>,
-    /// DAG names that were newly generated/deployed.
-    pub dag_created: Vec<String>,
-    /// DAG names whose content changed and were regenerated/redeployed.
-    pub dag_modified: Vec<String>,
-    /// DAG names that were removed and destroyed.
-    pub dag_deleted: Vec<String>,
-    /// Distinct cross-account Airflow connections required by created/modified
-    /// DAGs. Operators must configure these in MWAA before the DAG runs.
-    pub dag_required_connections: Vec<airflow_dag::RequiredConnection>,
 }
 
 /// Result of planning changes -- the already-filtered diff set.
-///
-/// Mirrors `ApplyResult` for grep parity; minimal two-field shape per D-06
-/// of Phase 13 (extend only when a concrete consumer needs more).
 #[derive(Debug)]
 pub struct PlanResult {
     /// Per-job diffs (create, modify, or delete).
     pub job_diffs: Vec<JobDiff>,
-    /// Per-DAG diffs (create, modify, or delete).
-    pub dag_diffs: Vec<DagDiff>,
 }
 
-/// Validate that `target` (if Some) matches either a job in `manifest.jobs`
-/// or a DAG in `pre_dags` by name. Returns `Ok(())` when target is `None`.
+/// Validate that `target` (if Some) matches a job in `manifest.jobs` by name.
+/// Returns `Ok(())` when target is `None`.
 ///
 /// Shared by `apply` and `plan` to guarantee an identical user-visible error
-/// contract across both commands (D-01 of Phase 13; mirrors Phase 12 D-01/D-02).
+/// contract across both commands.
 ///
 /// # Errors
 ///
-/// Returns an error if the target name does not match any known job or DAG.
+/// Returns an error if the target name does not match any known job.
 pub fn validate_target(
     manifest: &ProjectManifest,
-    pre_dags: &[airflow_dag::ResolvedDag],
     target: Option<&str>,
 ) -> Result<()> {
-    if let Some(name) = target {
-        let is_job = manifest.jobs.contains_key(name);
-        let is_dag = pre_dags.iter().any(|d| d.name == name);
-        if !is_job && !is_dag {
-            return Err(anyhow!(
-                "target '{name}' not found — no job or DAG with that name"
-            ));
-        }
+    if let Some(name) = target
+        && !manifest.jobs.contains_key(name)
+    {
+        return Err(anyhow!(
+            "target '{name}' not found -- no job with that name"
+        ));
     }
     Ok(())
 }
 
-/// Apply changes: generate scripts, deploy via provider, update state.
+/// Apply changes: deploy via provider, update state.
 ///
 /// `root_dir` is where `.yard/generated/` lives.
 /// All affected jobs are locked upfront before diffing to prevent race conditions.
@@ -206,10 +201,17 @@ pub async fn apply(
     dry_run: bool,
     target: Option<String>,
 ) -> Result<ApplyResult> {
-    // Validate all jobs up front (schema + syntax) — abort before making any changes
+    // Construct plugin host config for plugin-aware provider dispatch.
+    let plugin_host_config = PluginHostConfig {
+        plugins_dir: root_dir.join(".yard/plugins"),
+        lock_file_path: Some(root_dir.join("yard.lock")),
+        ..Default::default()
+    };
+
+    // Validate all jobs up front (schema) -- abort before making any changes
     let mut all_errors: Vec<(String, Vec<yard_structs::ValidationError>)> = Vec::with_capacity(manifest.jobs.len());
     for (name, job_def) in &manifest.jobs {
-        let errors = validation::validate_job_full(name, job_def);
+        let errors = validation::validate_job_full_with_schema(name, job_def, None);
         if !errors.is_empty() {
             all_errors.push((name.clone(), errors));
         }
@@ -224,57 +226,20 @@ pub async fn apply(
         return Err(anyhow!("{msg}"));
     }
 
-    // Validate orphan airflow blocks (airflow: on jobs outside any DAG dir)
-    let pre_dags = airflow_dag::collect_dags(root_dir, manifest)
-        .context("failed to collect DAGs for apply")?;
-    let orphans = airflow_dag::validate_orphan_airflow_blocks(manifest, &pre_dags);
-    if !orphans.is_empty() {
-        let mut msg = String::from("Validation failed:\n");
-        for (name, err) in &orphans {
-            let _ = writeln!(msg, "  [{name}] {err}");
-        }
-        return Err(anyhow!("{msg}"));
-    }
-
-    // Validate trigger config across all DAGs (TRIG-04..TRIG-07).
-    // Errors accumulate per DAG and roll up into a single anyhow::Error before any codegen.
-    let mut all_dag_errors: Vec<(String, Vec<yard_structs::ValidationError>)> = Vec::new();
-    for dag in &pre_dags {
-        let errors = validation::validate_dag_full(dag);
-        if !errors.is_empty() {
-            all_dag_errors.push((dag.name.clone(), errors));
-        }
-    }
-    if !all_dag_errors.is_empty() {
-        let mut msg = String::from("Validation failed:\n");
-        for (name, errors) in &all_dag_errors {
-            for e in errors {
-                let _ = writeln!(msg, "  [{}] {}: {}", name, e.field, e.message);
-            }
-        }
-        return Err(anyhow!("{msg}"));
-    }
-
-    // PUB-03: cross-DAG broken-link soft warning (D-07/D-08).
-    // Never returns Err — emits one stderr line per (DAG, missing-URI) pair.
-    for w in validation::validate_project(&pre_dags) {
-        eprintln!("{w}");
-    }
-
-    // Target validation: shared helper, identical contract for apply + plan (D-02).
-    validate_target(manifest, &pre_dags, target.as_deref())?;
+    // Target validation: shared helper, identical contract for apply + plan.
+    validate_target(manifest, target.as_deref())?;
 
     let storage = storage::get_storage(&manifest.state).await
         .context("failed to initialize storage for apply")?;
 
     // Preliminary diff to identify which jobs need locking
-    let mut preliminary_diffs = calculate_diff(manifest, current_state)
+    let mut preliminary_diffs = calculate_diff(manifest, current_state, &plugin_host_config).await
         .context("failed to compute preliminary diff for apply")?;
     if let Some(ref name) = target {
         preliminary_diffs.retain(|d| &d.name == name);
     }
 
-    // Lock ALL affected jobs upfront — prevents concurrent applies from
+    // Lock ALL affected jobs upfront -- prevents concurrent applies from
     // modifying state between diff calculation and execution
     let job_names: Vec<String> = preliminary_diffs.iter().map(|d| d.name.clone()).collect();
     let locks = if !job_names.is_empty() {
@@ -286,7 +251,8 @@ pub async fn apply(
 
     // All work happens inside this block so we always unlock on exit
     let apply_result = async {
-        // Re-read fresh state under lock — the passed-in current_state may be stale
+        // Re-read fresh state under lock -- the passed-in current_state may be stale.
+        // Only read state for the locked jobs (the preliminary-diff set).
         let mut fresh_deployments = HashMap::new();
         for name in &job_names {
             if let Some(job_state) = storage.read_job(name).await? {
@@ -299,8 +265,13 @@ pub async fn apply(
             deployments: fresh_deployments,
         };
 
-        // Authoritative diff against fresh state (full manifest preserved per TGT-03; filter runs on output).
-        let mut diffs = calculate_diff(manifest, &fresh_state)?;
+        // Scope manifest to locked jobs only so calculate_diff does not
+        // classify unlocked jobs (missing from fresh_state) as Creates.
+        let mut scoped_manifest = manifest.clone();
+        scoped_manifest.jobs.retain(|name, _| job_names.contains(name));
+
+        // Authoritative diff against fresh state
+        let mut diffs = calculate_diff(&scoped_manifest, &fresh_state, &plugin_host_config).await?;
         if let Some(ref name) = target {
             diffs.retain(|d| &d.name == name);
         }
@@ -309,10 +280,6 @@ pub async fn apply(
             created: Vec::new(),
             modified: Vec::new(),
             deleted: Vec::new(),
-            dag_created: Vec::new(),
-            dag_modified: Vec::new(),
-            dag_deleted: Vec::new(),
-            dag_required_connections: Vec::new(),
         };
 
         for diff in &diffs {
@@ -323,8 +290,30 @@ pub async fn apply(
                         .get(&diff.name)
                         .context("Job definition missing during apply")?;
 
-                    let script_content = codegen::generate_python_script(&diff.name, job_def)
-                        .context("Failed to generate Python script")?;
+                    // Generate script via plugin codegen
+                    let script_content = match providers::get_provider_for_job(
+                        &job_def.job_type,
+                        &job_def.config,
+                        job_def.plugin_version.as_deref(),
+                        job_def.plugin_source.as_deref(),
+                        &plugin_host_config,
+                    )
+                    .await
+                    {
+                        Ok(provider) => provider
+                            .codegen(&diff.name, &job_def.config)
+                            .await
+                            .unwrap_or(None)
+                            .unwrap_or_default(),
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: plugin codegen failed for job \"{}\", deploying empty script: {e}",
+                                diff.name
+                            );
+                            String::new()
+                        }
+                    };
+
                     let config_str = serde_json::to_string(&job_def.config).with_context(|| {
                         format!("Failed to serialize config for job \"{}\"", diff.name)
                     })?;
@@ -352,9 +341,7 @@ pub async fn apply(
                         .with_context(|| format!("failed to write generated script for job \"{}\"", diff.name))?;
 
                     // Deploy via provider if configured (skip in dry-run mode).
-                    // Task-only job types (bash, ...) have no Provider impl and
-                    // skip straight to state bookkeeping.
-                    let resources = if dry_run || is_task_only(job_def.job_type) {
+                    let resources = if dry_run {
                         Vec::new()
                     } else {
                         let provider_key = job_def.job_type.to_string();
@@ -366,8 +353,14 @@ pub async fn apply(
                                 &job_def.config,
                                 &provider_key,
                             );
-                            let provider =
-                                providers::get_provider(job_def.job_type, &merged_config).await?;
+                            let provider = providers::get_provider_for_job(
+                                &job_def.job_type,
+                                &merged_config,
+                                job_def.plugin_version.as_deref(),
+                                job_def.plugin_source.as_deref(),
+                                &plugin_host_config,
+                            )
+                            .await?;
                             provider
                                 .deploy(&diff.name, &script_content, &job_def.config)
                                 .await?
@@ -389,6 +382,8 @@ pub async fn apply(
                         applied_at: chrono::Utc::now().to_rfc3339(),
                         resources,
                         env: None,
+                        plugin_version: job_def.plugin_version.clone(),
+                        plugin_source: job_def.plugin_source.clone(),
                     };
 
                     storage
@@ -433,8 +428,14 @@ pub async fn apply(
                                 &existing.config,
                                 &provider_key,
                             );
-                            let provider =
-                                providers::get_provider(job_type, &merged_config).await?;
+                            let provider = providers::get_provider_for_job(
+                                &job_type,
+                                &merged_config,
+                                existing.plugin_version.as_deref(),
+                                existing.plugin_source.as_deref(),
+                                &plugin_host_config,
+                            )
+                            .await?;
                             provider.destroy(&diff.name, &existing.resources).await?;
                         }
                     }
@@ -455,50 +456,11 @@ pub async fn apply(
             }
         }
 
-        // --- DAG phase: generate, diff, deploy DAG files ---
-        // Skip entirely when target is a job name (D-09): narrow-scope applies
-        // must not touch DAG state for DAGs the operator didn't mention.
-        let target_is_job_only = match &target {
-            Some(name) => manifest.jobs.contains_key(name)
-                && !pre_dags.iter().any(|d| &d.name == name),
-            None => false,
-        };
-        if !target_is_job_only {
-            let mut dags = airflow_dag::collect_dags(root_dir, manifest)?;
-            // D-04: when target names a DAG (not a job), deploy only that DAG.
-            // Unrelated DAGs must not be diffed, deployed, or written to state.
-            if let Some(name) = &target {
-                dags.retain(|d| &d.name == name);
-            }
-            if !dags.is_empty() {
-                let dag_result =
-                    apply_dags(manifest, &dags, root_dir, dry_run, &storage).await?;
-                result.dag_created = dag_result.created;
-                result.dag_modified = dag_result.modified;
-                result.dag_deleted = dag_result.deleted;
-                result.dag_required_connections = dag_result.required_connections;
-            } else {
-                // No DAG dirs in the project — clean up any orphaned DAG state
-                let dag_names = storage.list_dags().await?;
-                for dag_name in dag_names {
-                    storage.delete_dag(&dag_name).await?;
-                    let dag_path = root_dir
-                        .join(".yard/generated/dags")
-                        .join(format!("{dag_name}.py"));
-                    if dag_path.exists() {
-                        let _ = tokio::fs::remove_file(dag_path).await;
-                    }
-                    result.dag_deleted.push(dag_name);
-                }
-            }
-        }
-
         Ok(result)
     }
     .await;
 
     // Always release all locks, even on error.
-    // Lock release is best-effort — TTL backstop (D-02) covers failures.
     if let Err(e) = lock_guard.release().await {
         eprintln!("Warning: lock release failed during apply: {e}");
     }
@@ -508,90 +470,38 @@ pub async fn apply(
 
 /// Compute the filtered diff set for a project -- the read-only mirror of `apply`.
 ///
-/// Returns already-filtered `job_diffs` and `dag_diffs` per the target contract.
-/// `target=None` returns the full diff set; `target=Some(name)` validates `name`
-/// against jobs+DAGs (D-04) and filters both diff vecs to that name (D-07/D-08 of Phase 13).
+/// Returns already-filtered `job_diffs` per the target contract.
+/// `target=None` returns the full diff set; `target=Some(name)` validates
+/// `name` against jobs and filters the diff vec to that name.
 ///
 /// # Errors
 ///
-/// Returns an error if validation fails, if DAG collection or diff computation
-/// fails, or if the target name does not match any known job or DAG.
+/// Returns an error if validation fails, diff computation fails, or if the
+/// target name does not match any known job.
 pub async fn plan(
     manifest: &ProjectManifest,
     current_state: &ProjectState,
     root_dir: &Path,
     target: Option<String>,
 ) -> Result<PlanResult> {
-    // Resolve DAGs from the full manifest (D-10 / TGT-03 invariant — unchanged manifest).
-    let pre_dags = airflow_dag::collect_dags(root_dir, manifest)
-        .context("failed to collect DAGs for plan")?;
+    // Construct plugin host config for diff computation.
+    let plugin_host_config = PluginHostConfig {
+        plugins_dir: root_dir.join(".yard/plugins"),
+        lock_file_path: Some(root_dir.join("yard.lock")),
+        ..Default::default()
+    };
 
-    // Orphan-airflow structural validation runs on the full manifest (D-11(c) disposition: KEEP).
-    let orphans = airflow_dag::validate_orphan_airflow_blocks(manifest, &pre_dags);
-    if !orphans.is_empty() {
-        let mut msg = String::from("Validation failed:\n");
-        for (name, err) in &orphans {
-            let _ = writeln!(msg, "  [{name}] {err}");
-        }
-        return Err(anyhow!("{msg}"));
-    }
-
-    // Validate trigger config across all DAGs (TRIG-04..TRIG-07).
-    // Errors accumulate per DAG and roll up into a single anyhow::Error before any codegen.
-    let mut all_dag_errors: Vec<(String, Vec<yard_structs::ValidationError>)> = Vec::new();
-    for dag in &pre_dags {
-        let errors = validation::validate_dag_full(dag);
-        if !errors.is_empty() {
-            all_dag_errors.push((dag.name.clone(), errors));
-        }
-    }
-    if !all_dag_errors.is_empty() {
-        let mut msg = String::from("Validation failed:\n");
-        for (name, errors) in &all_dag_errors {
-            for e in errors {
-                let _ = writeln!(msg, "  [{}] {}: {}", name, e.field, e.message);
-            }
-        }
-        return Err(anyhow!("{msg}"));
-    }
-
-    // PUB-03: cross-DAG broken-link soft warning (D-07/D-08).
-    // Never returns Err — emits one stderr line per (DAG, missing-URI) pair.
-    for w in validation::validate_project(&pre_dags) {
-        eprintln!("{w}");
-    }
-
-    // Target validation: shared helper, identical contract with apply (D-01 / D-04).
-    validate_target(manifest, &pre_dags, target.as_deref())?;
+    // Target validation: shared helper, identical contract with apply.
+    validate_target(manifest, target.as_deref())?;
 
     // Job diffs against the full manifest; filter on output.
-    let mut job_diffs = calculate_diff(manifest, current_state)
+    let mut job_diffs = calculate_diff(manifest, current_state, &plugin_host_config).await
         .context("failed to compute job diffs for plan")?;
     if let Some(ref name) = target {
         job_diffs.retain(|d| &d.name == name);
     }
 
-    // DAG diffs against the full manifest; filter on output.
-    let dag_state = crate::dag_lifecycle::load_dag_state(&manifest.state).await
-        .context("failed to load DAG state for plan")?;
-
-    // Pre-load JobStates so the renderer (via calculate_dag_diffs ->
-    // generate_dag) can read each Glue task's persisted script_location
-    // per DAG-02. Mirrors apply_dags' bulk-load.
-    let script_locations = crate::dag_lifecycle::load_script_locations(&manifest.state).await
-        .context("failed to load script locations for plan")?;
-
-    let mut dag_diffs = crate::dag_lifecycle::calculate_dag_diffs(
-        manifest,
-        &pre_dags,
-        &dag_state,
-        &script_locations,
-    )?;
-    if let Some(ref name) = target {
-        dag_diffs.retain(|d| &d.name == name);
-    }
-
-    Ok(PlanResult { job_diffs, dag_diffs })
+    Ok(PlanResult { job_diffs })
 }
 
 /// Validate the state backend is reachable.
@@ -615,9 +525,7 @@ pub async fn init_state_backend(
             println!("Initialized state at {}", path.display());
         }
         yard_structs::StateBackend::S3 { bucket, region, .. } => {
-            // The providers::aws_config boundary stays Value-typed (D-14);
-            // convert the typed credentials at the call site.
-            let aws_value: Option<Value> = aws_cfg
+            let aws_value: Option<serde_json::Value> = aws_cfg
                 .map(serde_json::to_value)
                 .transpose()
                 .context("Failed to serialize state-init AWS credentials to JSON")?;
@@ -631,7 +539,7 @@ pub async fn init_state_backend(
                 .with_context(|| format!("Failed to reach S3 bucket {bucket} in {region}"))?;
             println!("Verified S3 state bucket {bucket} ({region})");
         }
-        _ => anyhow::bail!("unsupported state backend variant"),
+        other => anyhow::bail!("unsupported state backend variant: {other:?}"),
     }
     Ok(())
 }
@@ -657,12 +565,10 @@ pub async fn force_unlock(
     Ok(existing)
 }
 
-/// Result of destroying jobs and DAGs.
+/// Result of destroying jobs.
 pub struct DestroyResult {
     /// Job names that were destroyed.
     pub destroyed: Vec<String>,
-    /// DAG names that were destroyed.
-    pub dags_destroyed: Vec<String>,
 }
 
 /// Destroy a single job: tear down provider resources, delete state, delete generated script.
@@ -675,7 +581,7 @@ pub struct DestroyResult {
 /// fails, if provider destruction fails, or if state deletion fails.
 pub async fn destroy_job(
     backend: &yard_structs::StateBackend,
-    provider_configs: &HashMap<String, Value>,
+    provider_configs: &HashMap<String, serde_json::Value>,
     job_name: &str,
     root_dir: &Path,
     dry_run: bool,
@@ -692,6 +598,12 @@ pub async fn destroy_job(
     let lock = storage.lock(job_name).await
         .with_context(|| format!("failed to acquire lock for job \"{job_name}\""))?;
     let lock_guard = LockGuard::new(&storage, vec![(job_name.to_string(), lock)]);
+
+    let plugin_host_config = PluginHostConfig {
+        plugins_dir: root_dir.join(".yard/plugins"),
+        lock_file_path: Some(root_dir.join("yard.lock")),
+        ..Default::default()
+    };
 
     let result: Result<()> = async {
         // Destroy provider resources if they exist
@@ -712,7 +624,14 @@ pub async fn destroy_job(
                     &job_state.deployment.config,
                     &provider_key,
                 );
-                let provider = providers::get_provider(job_type, &merged_config).await?;
+                let provider = providers::get_provider_for_job(
+                    &job_type,
+                    &merged_config,
+                    job_state.deployment.plugin_version.as_deref(),
+                    job_state.deployment.plugin_source.as_deref(),
+                    &plugin_host_config,
+                )
+                .await?;
                 provider
                     .destroy(job_name, &job_state.deployment.resources)
                     .await?;
@@ -734,7 +653,6 @@ pub async fn destroy_job(
     }
     .await;
 
-    // Lock release is best-effort — TTL backstop (D-02) covers failures.
     if let Err(e) = lock_guard.release().await {
         eprintln!("Warning: lock release failed during destroy_job: {e}");
     }
@@ -743,15 +661,15 @@ pub async fn destroy_job(
     Ok(true)
 }
 
-/// Destroy all jobs and DAGs that have state.
+/// Destroy all jobs that have state.
 ///
 /// # Errors
 ///
-/// Returns an error if any individual job or DAG destruction fails.
+/// Returns an error if any individual job destruction fails.
 pub async fn destroy_all(
     backend: &yard_structs::StateBackend,
-    provider_configs: &HashMap<String, Value>,
-    aws: Option<&yard_structs::AwsCredentialConfig>,
+    provider_configs: &HashMap<String, serde_json::Value>,
+    _aws: Option<&yard_structs::AwsCredentialConfig>,
     root_dir: &Path,
     dry_run: bool,
 ) -> Result<DestroyResult> {
@@ -761,7 +679,6 @@ pub async fn destroy_all(
         .context("failed to list jobs for destroy-all")?;
     let mut result = DestroyResult {
         destroyed: Vec::new(),
-        dags_destroyed: Vec::new(),
     };
 
     for name in job_names {
@@ -769,10 +686,6 @@ pub async fn destroy_all(
             result.destroyed.push(name);
         }
     }
-
-    // Also destroy all DAGs
-    let dag_result = destroy_all_dags(backend, provider_configs, aws, root_dir, dry_run).await?;
-    result.dags_destroyed = dag_result.destroyed;
 
     Ok(result)
 }
@@ -797,22 +710,6 @@ mod tests {
         let transforms = parse_transforms(&config, "test").expect("test fixture must parse");
         let airflow = parse_airflow_job_block(&config, "test").expect("test fixture must parse");
 
-        // Inject a default role for glue jobs so tests pass validation
-        let config = if job_type == JobType::Glue && config.get("role").is_none() {
-            let mut obj = config;
-            obj.as_object_mut()
-                .expect("config must be a JSON object")
-                .insert(
-                    "role".to_string(),
-                    serde_json::Value::String(
-                        "arn:aws:iam::123456789:role/TestGlueRole".to_string(),
-                    ),
-                );
-            obj
-        } else {
-            config
-        };
-
         JobDefinition {
             job_type,
             imports,
@@ -829,21 +726,9 @@ mod tests {
             config,
             dir: std::path::PathBuf::new(),
             base_name: String::new(),
+            plugin_version: None,
+            plugin_source: None,
         }
-    }
-
-    /// Compute the combined hash the same way calculate_diff does
-    fn job_hash(name: &str, job: &JobDefinition) -> String {
-        let script = crate::codegen::generate_python_script(name, job).unwrap();
-        let config_str = serde_json::to_string(&job.config).unwrap_or_default();
-        let trigger_str = job
-            .airflow
-            .as_ref()
-            .and_then(|a| a.overrides.trigger.as_ref())
-            .map(|t| serde_json::to_string(t).unwrap_or_default())
-            .unwrap_or_default();
-        let combined = format!("{script}\n{config_str}\n{trigger_str}");
-        crate::utils::calculate_hash(&combined)
     }
 
     fn make_deployment(config_hash: &str, config: serde_json::Value) -> Deployment {
@@ -854,6 +739,8 @@ mod tests {
             status: DeploymentStatus::Generated,
             applied_at: "2025-01-01T00:00:00Z".to_string(),
             resources: Vec::new(),
+            plugin_version: None,
+            plugin_source: None,
         }
     }
 
@@ -865,9 +752,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn diff_detects_create() {
-        let job = make_job(JobType::Glue, json!({"type": "glue", "script_name": "new_job"}));
+    fn test_plugin_config() -> PluginHostConfig {
+        PluginHostConfig {
+            plugins_dir: std::path::PathBuf::from("/tmp/yard-test-plugins"),
+            ..Default::default()
+        }
+    }
+
+    /// Compute the combined hash the same way calculate_diff does (without codegen)
+    fn job_hash_no_codegen(name: &str, job: &JobDefinition) -> String {
+        // In v2.0, without a plugin binary available, codegen returns empty string
+        let script = String::new();
+        let config_str = serde_json::to_string(&job.config).unwrap_or_default();
+        let trigger_str = job
+            .airflow
+            .as_ref()
+            .and_then(|a| a.overrides.trigger.as_ref())
+            .map(|t| serde_json::to_string(t).unwrap_or_default())
+            .unwrap_or_default();
+        let combined = format!("{script}\n{config_str}\n{trigger_str}");
+        crate::utils::calculate_hash(&combined)
+    }
+
+    #[tokio::test]
+    async fn diff_detects_create() {
+        let job = make_job(JobType::Plugin("glue".to_string()), json!({"type": "glue", "script_name": "new_job"}));
         let manifest = ProjectManifest {
             project: "test".to_string(),
             state: StateBackend::Local {
@@ -878,14 +787,14 @@ mod tests {
             aws: None,
         };
 
-        let diffs = calculate_diff(&manifest, &empty_state()).unwrap();
+        let diffs = calculate_diff(&manifest, &empty_state(), &test_plugin_config()).await.unwrap();
         assert_eq!(diffs.len(), 1);
         assert!(matches!(diffs[0].diff_type, DiffType::Create));
         assert_eq!(diffs[0].name, "new_job");
     }
 
-    #[test]
-    fn diff_detects_delete() {
+    #[tokio::test]
+    async fn diff_detects_delete() {
         let config = json!({"type": "glue"});
         let hash = crate::utils::calculate_hash("some old script");
         let state = ProjectState {
@@ -904,16 +813,16 @@ mod tests {
             aws: None,
         };
 
-        let diffs = calculate_diff(&manifest, &state).unwrap();
+        let diffs = calculate_diff(&manifest, &state, &test_plugin_config()).await.unwrap();
         assert_eq!(diffs.len(), 1);
         assert!(matches!(diffs[0].diff_type, DiffType::Delete));
         assert_eq!(diffs[0].name, "old_job");
     }
 
-    #[test]
-    fn diff_detects_no_change() {
-        let job = make_job(JobType::Glue, json!({"type": "glue", "script_name": "stable"}));
-        let hash = job_hash("stable", &job);
+    #[tokio::test]
+    async fn diff_detects_no_change() {
+        let job = make_job(JobType::Plugin("glue".to_string()), json!({"type": "glue", "script_name": "stable"}));
+        let hash = job_hash_no_codegen("stable", &job);
 
         let state = ProjectState {
             project: "test".to_string(),
@@ -934,18 +843,17 @@ mod tests {
             aws: None,
         };
 
-        let diffs = calculate_diff(&manifest, &state).unwrap();
+        let diffs = calculate_diff(&manifest, &state, &test_plugin_config()).await.unwrap();
         assert!(diffs.is_empty());
     }
 
-    #[test]
-    fn diff_detects_config_only_change() {
-        // Same script, different config (e.g. worker_type changed)
+    #[tokio::test]
+    async fn diff_detects_config_only_change() {
         let old_config = json!({"type": "glue", "glue": {"worker_type": "G.1X"}});
         let new_config = json!({"type": "glue", "glue": {"worker_type": "G.2X"}});
 
-        let old_job = make_job(JobType::Glue, old_config.clone());
-        let hash = job_hash("my_job", &old_job);
+        let old_job = make_job(JobType::Plugin("glue".to_string()), old_config.clone());
+        let hash = job_hash_no_codegen("my_job", &old_job);
 
         let state = ProjectState {
             project: "test".to_string(),
@@ -956,7 +864,7 @@ mod tests {
             )]),
         };
 
-        let new_job = make_job(JobType::Glue, new_config);
+        let new_job = make_job(JobType::Plugin("glue".to_string()), new_config);
         let manifest = ProjectManifest {
             project: "test".to_string(),
             state: StateBackend::Local {
@@ -967,15 +875,15 @@ mod tests {
             aws: None,
         };
 
-        let diffs = calculate_diff(&manifest, &state).unwrap();
+        let diffs = calculate_diff(&manifest, &state, &test_plugin_config()).await.unwrap();
         assert_eq!(diffs.len(), 1);
         assert!(matches!(diffs[0].diff_type, DiffType::Modify { .. }));
     }
 
-    #[test]
-    fn diff_detects_modify() {
+    #[tokio::test]
+    async fn diff_detects_modify() {
         let old_config = json!({"type": "glue", "script_name": "v1"});
-        let new_job = make_job(JobType::Glue, json!({"type": "glue", "script_name": "v2"}));
+        let new_job = make_job(JobType::Plugin("glue".to_string()), json!({"type": "glue", "script_name": "v2"}));
 
         let state = ProjectState {
             project: "test".to_string(),
@@ -996,15 +904,15 @@ mod tests {
             aws: None,
         };
 
-        let diffs = calculate_diff(&manifest, &state).unwrap();
+        let diffs = calculate_diff(&manifest, &state, &test_plugin_config()).await.unwrap();
         assert_eq!(diffs.len(), 1);
         assert!(matches!(diffs[0].diff_type, DiffType::Modify { .. }));
     }
 
-    #[test]
-    fn diff_mixed_create_modify_delete() {
-        let keep_job = make_job(JobType::Glue, json!({"type": "glue", "script_name": "keep"}));
-        let keep_hash = job_hash("keep", &keep_job);
+    #[tokio::test]
+    async fn diff_mixed_create_modify_delete() {
+        let keep_job = make_job(JobType::Plugin("glue".to_string()), json!({"type": "glue", "script_name": "keep"}));
+        let keep_hash = job_hash_no_codegen("keep", &keep_job);
 
         let state = ProjectState {
             project: "test".to_string(),
@@ -1035,17 +943,17 @@ mod tests {
                 ("keep".to_string(), keep_job),
                 (
                     "to_modify".to_string(),
-                    make_job(JobType::Glue, json!({"type": "glue", "v": "2"})),
+                    make_job(JobType::Plugin("glue".to_string()), json!({"type": "glue", "v": "2"})),
                 ),
                 (
                     "new_job".to_string(),
-                    make_job(JobType::Glue, json!({"type": "glue"})),
+                    make_job(JobType::Plugin("glue".to_string()), json!({"type": "glue"})),
                 ),
             ]),
             aws: None,
         };
 
-        let diffs = calculate_diff(&manifest, &state).unwrap();
+        let diffs = calculate_diff(&manifest, &state, &test_plugin_config()).await.unwrap();
         assert_eq!(diffs.len(), 3);
 
         let names: Vec<&str> = diffs.iter().map(|d| d.name.as_str()).collect();
@@ -1059,7 +967,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("yard_apply_{}", std::process::id()));
         let state_dir = dir.join(".yard/state");
 
-        let job = make_job(JobType::Glue, json!({"type": "glue", "script_name": "new_job"}));
+        let job = make_job(JobType::Plugin("glue".to_string()), json!({"type": "glue", "script_name": "new_job"}));
         let manifest = ProjectManifest {
             project: "test".to_string(),
             state: StateBackend::Local {
@@ -1096,7 +1004,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("yard_destroy_{}", std::process::id()));
         let state_dir = dir.join(".yard/state");
 
-        let job = make_job(JobType::Glue, json!({"type": "glue", "script_name": "doomed"}));
+        let job = make_job(JobType::Plugin("glue".to_string()), json!({"type": "glue", "script_name": "doomed"}));
         let backend = StateBackend::Local {
             path: state_dir.clone(),
         };
@@ -1154,11 +1062,11 @@ mod tests {
             jobs: HashMap::from([
                 (
                     "job_a".to_string(),
-                    make_job(JobType::Glue, json!({"type": "glue", "script_name": "a"})),
+                    make_job(JobType::Plugin("glue".to_string()), json!({"type": "glue", "script_name": "a"})),
                 ),
                 (
                     "job_b".to_string(),
-                    make_job(JobType::Glue, json!({"type": "glue", "script_name": "b"})),
+                    make_job(JobType::Plugin("glue".to_string()), json!({"type": "glue", "script_name": "b"})),
                 ),
             ]),
             aws: None,
@@ -1184,148 +1092,5 @@ mod tests {
         assert!(!dir.join(".yard/generated/job_b.py").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // Test `apply_rejects_invalid_jobs` was deleted in Phase 21 plan 21-01:
-    // Unknown job-type wire strings (e.g. "spark_streaming") are now rejected
-    // by serde at deserialize time via JobType's `unknown variant` error,
-    // which is structurally upstream of `apply` and cannot be exercised by
-    // constructing a JobDefinition directly. The behavior is covered by
-    // `yard-structs::config::tests::job_type_deserialize_unknown_rejects`.
-
-    // --- validate_dag_full integration tests (Phase 29 — TRIG-07 wiring) ---
-
-    /// Build a minimal on-disk yard project with one DAG dir holding a single
-    /// bash task. `dag_yaml_body` becomes the contents of `<root>/<dag_name>/dag.yaml`.
-    /// Returns (root_dir, manifest). Caller is responsible for cleanup via
-    /// `std::fs::remove_dir_all(&root_dir)`.
-    ///
-    /// The on-disk layout matches the airflow_dag-module test fixtures
-    /// (`yard.yaml` + `account.yaml` + `region.yaml` ancestry needed by
-    /// `resolve::load_context`). Bash task is chosen so `validate_job_full`
-    /// passes cleanly — the trigger gate fires AFTER job validation.
-    fn build_dag_project_fixture(
-        slug: &str,
-        dag_name: &str,
-        dag_yaml_body: &str,
-    ) -> (std::path::PathBuf, ProjectManifest) {
-        let root = std::env::temp_dir().join(format!(
-            "yard_validate_dag_full_{}_{}",
-            std::process::id(),
-            slug
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("yard.yaml"), "project: test\n").unwrap();
-        std::fs::write(root.join("account.yaml"), "account:\n  id: \"123\"\n").unwrap();
-        std::fs::write(root.join("region.yaml"), "region:\n  id: us-east-1\n").unwrap();
-
-        let dag_dir = root.join(dag_name);
-        std::fs::create_dir_all(&dag_dir).unwrap();
-        std::fs::write(dag_dir.join("dag.yaml"), dag_yaml_body).unwrap();
-
-        let bash = JobDefinition {
-            job_type: JobType::Bash,
-            config: json!({"type": "bash", "command": "echo hi"}),
-            dir: dag_dir.clone(),
-            ..Default::default()
-        };
-
-        let manifest = ProjectManifest {
-            project: "test".to_string(),
-            state: StateBackend::Local {
-                path: root.join(".yard/state"),
-            },
-            providers: HashMap::new(),
-            jobs: HashMap::from([("runit".to_string(), bash)]),
-            aws: None,
-        };
-
-        (root, manifest)
-    }
-
-    #[tokio::test]
-    async fn plan_rejects_dag_with_schedule_and_trigger() {
-        // dag.yaml carries BOTH top-level `schedule:` AND a `trigger:` block.
-        // The cascade resolver lifts both into the resolved AirflowSection
-        // (parsing.rs:279-297 preserves them independently), so TRIG-04 fires.
-        let (root, manifest) = build_dag_project_fixture(
-            "plan_sched_and_trig",
-            "pipeline",
-            "schedule: \"@daily\"\ntrigger:\n  dataset:\n    uri: \"s3://bucket/key\"\n",
-        );
-
-        let result = plan(&manifest, &empty_state(), &root, None).await;
-        let _ = std::fs::remove_dir_all(&root);
-
-        let err = result.expect_err("plan must reject dag with schedule + trigger").to_string();
-        assert!(err.contains("Validation failed:"), "got: {err}");
-        // The DAG name is project-prefixed + sanitized: `test_pipeline`.
-        assert!(err.contains("[test_pipeline]"), "got: {err}");
-        assert!(err.contains("airflow.trigger:"), "got: {err}");
-        assert!(err.contains("mutually exclusive"), "got: {err}");
-    }
-
-    #[tokio::test]
-    async fn apply_rejects_dag_with_empty_any() {
-        // dag.yaml has `trigger: { any: [] }` — TRIG-05b fires.
-        // Apply runs with `dry_run: true` so no AWS provider invocation.
-        let (root, manifest) = build_dag_project_fixture(
-            "apply_empty_any",
-            "pipeline",
-            "trigger:\n  any: []\n",
-        );
-
-        let result = apply(&manifest, &empty_state(), &root, true, None).await;
-        let _ = std::fs::remove_dir_all(&root);
-
-        let err = result.expect_err("apply must reject dag with empty any:").to_string();
-        assert!(err.contains("Validation failed:"), "got: {err}");
-        assert!(err.contains("[test_pipeline]"), "got: {err}");
-        assert!(err.contains("airflow.trigger.any:"), "got: {err}");
-        assert!(err.contains("empty 'any: []' composite"), "got: {err}");
-    }
-
-    // --- Phase 32 plan 32-02: validate_project soft-warning rollup wiring ---
-
-    #[tokio::test]
-    async fn validate_project_runs_in_plan_path_and_does_not_fail() {
-        // DAG triggers on a Dataset URI no DAG in the project publishes —
-        // PUB-03 emits a warning to stderr, but plan must still return Ok.
-        // (Stderr capture not asserted; the contract under test is "no Err".)
-        let (root, manifest) = build_dag_project_fixture(
-            "plan_broken_link",
-            "pipeline",
-            "trigger:\n  dataset:\n    uri: \"s3://nobody/publishes/this\"\n",
-        );
-
-        let result = plan(&manifest, &empty_state(), &root, None).await;
-        let _ = std::fs::remove_dir_all(&root);
-
-        assert!(
-            result.is_ok(),
-            "plan must NOT fail on cross-DAG broken Dataset link: {:?}",
-            result.err()
-        );
-    }
-
-    #[tokio::test]
-    async fn validate_project_runs_in_apply_path_and_does_not_fail() {
-        // Symmetric to the plan-path test: apply with dry_run=true MUST also
-        // return Ok in the presence of a broken cross-DAG Dataset link.
-        let (root, manifest) = build_dag_project_fixture(
-            "apply_broken_link",
-            "pipeline",
-            "trigger:\n  dataset:\n    uri: \"s3://nobody/publishes/this\"\n",
-        );
-
-        let result = apply(&manifest, &empty_state(), &root, true, None).await;
-        let _ = std::fs::remove_dir_all(&root);
-
-        assert!(
-            result.is_ok(),
-            "apply must NOT fail on cross-DAG broken Dataset link: {:?}",
-            result.err()
-        );
     }
 }

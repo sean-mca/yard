@@ -1,108 +1,124 @@
-# Requirements: yard v1.16 Rules Compliance Audit
+# Requirements: yard
 
-**Defined:** 2026-08-17
+**Defined:** 2026-08-31
 **Core Value:** The CLI must remain correct and easy to reason about — every refactor must preserve existing behavior and pass the full test suite.
 
-## v1.16 Requirements
+## v2.0 Requirements
 
-Full codebase audit of yard-cli, yard-core, and yard-structs against the 179 Rust coding standards in `rules/`. One requirement per rule category.
+Requirements for plugin architecture release. Each maps to roadmap phases.
 
-### Ownership & Borrowing (CRITICAL)
+### Plugin Protocol
 
-- [x] **OWN-01**: All production code passes the 12 ownership/borrowing rules (borrow-over-clone, slice-over-vec, cow, arc, rc, refcell, mutex, rwlock, copy-small, clone-explicit, move-large, lifetime-elision)
+- [x] **PROTO-01**: yard defines a JSON-over-stdio protocol with 6 typed operations (validate, codegen, deploy, destroy, verify, schema)
+- [x] **PROTO-02**: Plugin sends a version/capabilities handshake line on startup before receiving requests
+- [x] **PROTO-03**: Plugin can emit progress lines (`{"type":"progress"}`) during long-running operations
+- [x] **PROTO-04**: Protocol uses line-delimited JSON framing (one JSON object per line)
 
-### Error Handling (CRITICAL)
+### Plugin Host
 
-- [x] **ERR-01**: All production code passes the 12 error handling rules (thiserror/anyhow split, result-over-panic, context-chain, no-unwrap, expect-bugs-only, question-mark, from-impl, source-chain, lowercase-msg, doc-errors, custom-type)
+- [x] **HOST-01**: yard-core spawns plugin binaries as child processes with piped stdin/stdout and inherited stderr
+- [x] **HOST-02**: Plugin process terminates when stdin closes (EOF from core)
+- [x] **HOST-03**: yard-core enforces a configurable timeout on plugin operations and kills unresponsive processes
+- [x] **HOST-04**: PluginProvider adapter implements the Provider trait, transparent to orchestrate.rs
 
-### Memory Optimization (CRITICAL)
+### Plugin SDK
 
-- [x] **MEM-01**: All production code passes the 15 memory rules (with-capacity, smallvec, arrayvec, box-large-variant, boxed-slice, thinvec, clone-from, reuse-collections, avoid-format, write-over-format, arena, zero-copy, compact-string, smaller-integers, assert-type-size)
+- [x] **SDK-01**: `yard-plugin-sdk` workspace crate provides `PluginServer::run()` entry point and `PluginHandler` trait with 6 methods
+- [x] **SDK-02**: SDK owns stdout for protocol framing; plugin author code cannot accidentally corrupt the protocol channel
+- [x] **SDK-03**: SDK re-exports shared types (Resource, ResourceStatus) from yard-structs
 
-### API Design (HIGH)
+### Config Cascade
 
-- [x] **API-01**: All public APIs pass the 15 API design rules (builder, must-use, newtype, typestate, sealed, extension, parse-dont-validate, impl-into, impl-asref, must-use-result, non-exhaustive, from-not-into, default, common-traits, serde-optional)
+- [ ] **CASC-01**: Config cascade supports provider-scoped sections (`providers.<type>:`) at yard.yaml, account.yaml, region.yaml, and job.yaml levels
+- [ ] **CASC-02**: Only the matching provider's section merges into jobs of that type; common fields (`aws:`, `state:`) cascade universally
+- [ ] **CASC-03**: Plugin's `schema` operation tells core what config fields the provider accepts, replacing hardcoded validation lists
 
-### Async (HIGH)
+### Distribution
 
-- [x] **ASYNC-01**: All async code passes the 15 async rules (tokio-runtime, no-lock-await, spawn-blocking, tokio-fs, cancellation, join-parallel, try-join, select, bounded-channel, mpsc, broadcast, watch, oneshot, joinset, clone-before-await)
+- [ ] **DIST-01**: `yard init` reads provider declarations from `yard.yaml` and downloads platform-specific binaries from GitHub release URLs
+- [ ] **DIST-02**: Downloaded binaries are verified via SHA-256 checksum before caching
+- [ ] **DIST-03**: Binaries are cached at `~/.yard/plugins/<name>-<version>-<os>-<arch>`
+- [ ] **DIST-04**: Provider version is pinned in `yard.yaml`; version mismatch is an error at startup
 
-### Compiler Optimization (HIGH)
+### Core Slimming
 
-- [x] **OPT-01**: Release build config and hot paths pass the 12 optimization rules (inline, cold, likely, lto, codegen-units, pgo, target-cpu, bounds-check, simd, cache-friendly)
+- [ ] **SLIM-01**: `JobType::Plugin(String)` variant enables dynamic provider resolution without modifying the enum for each new provider
+- [ ] **SLIM-02**: Compiled-in Glue and EMR provider code is removed from yard-core
+- [ ] **SLIM-03**: aws-sdk-glue and aws-sdk-emr dependencies are removed from yard-core's Cargo.toml
 
-### Naming (MEDIUM)
+### Documentation
 
-- [x] **NAME-01**: All identifiers pass the 16 naming rules (types-camel, variants-camel, funcs-snake, consts-screaming, lifetime-short, type-param, as/to/into prefixes, no-get, is-has-bool, iter conventions, acronym-word, crate-no-rs)
-
-### Type Safety (MEDIUM)
-
-- [x] **TYPE-01**: All types pass the 10 type safety rules (newtype-ids, newtype-validated, enum-states, option-nullable, result-fallible, phantom, never, generic-bounds, no-stringly, repr-transparent)
-
-### Testing (MEDIUM)
-
-- [x] **TEST-01**: Test code follows the 13 testing rules (cfg-test-module, use-super, integration-dir, descriptive-names, arrange-act-assert, proptest, mockall, mock-traits, fixture-raii, tokio-async, should-panic, criterion, doctest)
-
-### Documentation (MEDIUM)
-
-- [x] **DOC-01**: Public items have documentation per the 11 doc rules (all-public, module-inner, examples, errors, panics, safety, question-mark, hidden-setup, intra-links, link-types, cargo-metadata)
-
-### Performance (MEDIUM)
-
-- [x] **PERF-01**: Performance patterns pass the 11 rules (iter-over-index, iter-lazy, collect-once, entry-api, drain-reuse, extend-batch, chain-avoid, collect-into, black-box, release-profile, profile-first)
-
-### Project Structure (LOW)
-
-- [x] **PROJ-01**: Project structure follows the 11 rules (lib-main-split, mod-by-feature, flat-small, mod-rs-dir, pub-crate, pub-super, pub-use, prelude, bin-dir, workspace-large, workspace-deps)
-
-### Linting (LOW)
-
-- [x] **LINT-01**: Lint configuration follows the 11 rules (deny-correctness, warn-suspicious/style/complexity/perf, pedantic-selective, missing-docs, unsafe-doc, cargo-metadata, rustfmt-check, workspace-lints)
-
-### Anti-patterns (REFERENCE)
-
-- [x] **ANTI-01**: No anti-pattern violations across the 15 rules (unwrap-abuse, expect-lazy, clone-excessive, lock-across-await, string-for-str, vec-for-slice, index-over-iter, panic-expected, empty-catch, over-abstraction, premature-optimize, type-erasure, format-hot-path, collect-intermediate, stringly-typed)
+- [ ] **DOC-01**: Migration guide covers v1.x → v2.0 breaking changes (provider config format, `yard init` requirement, plugin binary setup)
+- [ ] **DOC-02**: Plugin author guide documents the protocol, SDK usage, and how to build/release a provider plugin
 
 ## Future Requirements
 
-None — this is a point-in-time audit milestone.
+Deferred to post-v2.0. Tracked but not in current roadmap.
+
+### Databricks Provider
+
+- **DBX-01**: Databricks Jobs API provider (deploy, destroy, verify_resources) via OAuth M2M
+- **DBX-02**: Full PySpark codegen via Tera templates (`databricks.py.tera`)
+- **DBX-03**: Unity Catalog integration (default catalog/schema per job)
+- **DBX-04**: Cluster policy support (reference by ID in config)
+- **DBX-05**: Init scripts attachment
+- **DBX-06**: Airflow DAG integration via `DatabricksSubmitRunOperator`
+
+### Plugin Ecosystem
+
+- **ECO-01**: Cross-provider DAG orchestration (mixed provider tasks in one DAG)
+- **ECO-02**: Plugin-provided Airflow task templates (plugin returns rendered operator snippet)
+- **ECO-03**: Plugin registry / marketplace
 
 ## Out of Scope
 
 | Feature | Reason |
 |---------|--------|
-| yard-server audit | Excluded per precedent (v1.12); server has its own lifecycle |
-| New feature work | Audit only — no new capabilities |
-| Adding external crates for compliance | Fixes must use existing deps (e.g. won't add SmallVec/ArrayVec/CompactString unless separately approved) |
-| Performance benchmarking | Rules like profile-first and criterion-bench are advisory; no benchmark suite being created |
+| gRPC plugin protocol | yard's 6 operations are simple request/response; gRPC adds protobuf deps for no benefit |
+| Dynamic library / .so plugins | Rust has no stable ABI; process isolation is safer |
+| WASM plugins | wasmtime dep (~20MB), capability constraints (no fs/network without WASI) |
+| Auto-update plugins | Breaks reproducibility; use `yard init --upgrade` instead |
+| Long-lived plugin processes | yard operations are atomic; process-per-operation is simpler |
+| Plugin hot-reload | No persistent process to reload |
+| Databricks provider in this repo | Providers live in their own repos with independent release cycles |
+| Glue/EMR plugin repos | Separate projects; v2.0 only removes them from core |
 
 ## Traceability
 
+Which phases cover which requirements. Updated during roadmap creation.
+
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| OWN-01 | Phase 64, Phase 65 | Complete |
-| ERR-01 | Phase 64, Phase 65 | Complete |
-| MEM-01 | Phase 64, Phase 65 | Complete |
-| API-01 | Phase 64, Phase 65 | Complete |
-| ASYNC-01 | Phase 64, Phase 65 | Complete |
-| OPT-01 | Phase 64, Phase 65 | Complete |
-| NAME-01 | Phase 64, Phase 65 | Complete |
-| TYPE-01 | Phase 64, Phase 65 | Complete |
-| TEST-01 | Phase 64, Phase 65 | Complete |
-| DOC-01 | Phase 64, Phase 65 | Complete |
-| PERF-01 | Phase 64, Phase 65 | Complete |
-| PROJ-01 | Phase 64, Phase 65 | Complete |
-| LINT-01 | Phase 64, Phase 65 | Complete |
-| ANTI-01 | Phase 64, Phase 65 | Complete |
+| PROTO-01 | Phase 66 | Verified |
+| PROTO-02 | Phase 66 | Verified |
+| PROTO-03 | Phase 66 | Verified |
+| PROTO-04 | Phase 66 | Verified |
+| HOST-01 | Phase 66 | Verified |
+| HOST-02 | Phase 66 | Verified |
+| HOST-03 | Phase 66 | Verified |
+| HOST-04 | Phase 66 | Verified |
+| SDK-01 | Phase 67 | Complete |
+| SDK-02 | Phase 67 | Complete |
+| SDK-03 | Phase 67 | Complete |
+| CASC-01 | Phase 68 | Pending |
+| CASC-02 | Phase 68 | Pending |
+| CASC-03 | Phase 68 | Pending |
+| DIST-01 | Phase 69 | Pending |
+| DIST-02 | Phase 69 | Pending |
+| DIST-03 | Phase 69 | Pending |
+| DIST-04 | Phase 69 | Pending |
+| SLIM-01 | Phase 70 | Pending |
+| SLIM-02 | Phase 70 | Pending |
+| SLIM-03 | Phase 70 | Pending |
+| DOC-01 | Phase 70 | Pending |
+| DOC-02 | Phase 70 | Pending |
 
 **Coverage:**
 
-- v1.16 requirements: 14 total
-- Mapped to phases: 14 (all 14 map to both Phase 64 and Phase 65)
+- v2.0 requirements: 23 total
+- Mapped to phases: 23
 - Unmapped: 0
 
-**Coverage model:** Each requirement spans both phases. Phase 64 covers the requirement across yard-structs + yard-cli; Phase 65 covers it across yard-core. A requirement is complete when both phases have audited and fixed their crate subset.
-
 ---
-*Requirements defined: 2026-08-17*
-*Last updated: 2026-08-17 after roadmap creation*
+*Requirements defined: 2026-08-31*
+*Last updated: 2026-08-31 after roadmap creation*

@@ -1,3 +1,0 @@
-# DAG marker — schedule-only. Run once a day.
-# Mutually exclusive with `trigger:` (would be REJECTED at validation).
-schedule: "@daily"

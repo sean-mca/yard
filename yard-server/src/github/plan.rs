@@ -52,7 +52,13 @@ async fn plan_single_env(env_path: &Path) -> Result<Vec<JobDiff>, String> {
     let project = yard_core::resolve::resolve_project(env_path)
         .await
         .map_err(|e| format!("resolve failed: {e}"))?;
-    yard_core::calculate_diff(&project.manifest, &project.current_state)
+    let plugin_host_config = yard_core::plugin_host::PluginHostConfig {
+        plugins_dir: env_path.join(".yard/plugins"),
+        lock_file_path: Some(env_path.join("yard.lock")),
+        ..Default::default()
+    };
+    yard_core::calculate_diff(&project.manifest, &project.current_state, &plugin_host_config)
+        .await
         .map_err(|e| format!("diff failed: {e}"))
 }
 

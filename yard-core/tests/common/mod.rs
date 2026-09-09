@@ -73,7 +73,7 @@ pub fn empty_state() -> ProjectState {
 /// though Phase 12 tests always pass dry_run=true).
 fn bash_job(command: &str, dir: &Path) -> JobDefinition {
     JobDefinition {
-        job_type: JobType::Bash,
+        job_type: JobType::Plugin("bash".to_string()),
         config: json!({"type": "bash", "command": command}),
         dir: dir.to_path_buf(),
         ..Default::default()

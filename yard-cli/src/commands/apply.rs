@@ -44,7 +44,7 @@ pub async fn execute(
     )
     .await?;
 
-    if result.job_diffs.is_empty() && result.dag_diffs.is_empty() {
+    if result.job_diffs.is_empty() {
         println!("No changes to apply.");
         return Ok(());
     }
@@ -55,7 +55,6 @@ pub async fn execute(
         target.as_deref(),
         dir_scope.as_deref(),
         &result.job_diffs,
-        &result.dag_diffs,
     )?;
 
     if dry_run {
@@ -90,22 +89,6 @@ pub async fn execute(
     }
     for name in &result.deleted {
         println!("{}", color_delete(&format!("  - Deleted: {}", name)));
-    }
-    for name in &result.dag_created {
-        println!("{}", color_create(&format!("  + Created DAG: {}", name)));
-    }
-    for name in &result.dag_modified {
-        println!("{}", color_modify(&format!("  ~ Modified DAG: {}", name)));
-    }
-    for name in &result.dag_deleted {
-        println!("{}", color_delete(&format!("  - Deleted DAG: {}", name)));
-    }
-
-    if !result.dag_required_connections.is_empty() {
-        println!("\nRequired Airflow connections (create in MWAA before the DAG runs):");
-        for rc in &result.dag_required_connections {
-            println!("  - {}  ->  {}", rc.conn_id, rc.role_arn);
-        }
     }
 
     println!("\nState updated successfully.");

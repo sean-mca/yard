@@ -11,6 +11,9 @@
 //!   newtypes and `DeploymentStatus`/`DagDeploymentStatus` enums.
 //! - [`diff`] -- Diff types (`DiffType`, `Diff`) for plan/apply change detection.
 //! - [`error`] -- `ValidationError` for config validation results.
+//! - [`plugin`] -- JSON-over-stdio plugin protocol types
+//!   (`PluginOperation`, `HandshakeMessage`, `PluginRequest`, response
+//!   structs) shared between the host and external plugin binaries.
 //! - [`trigger`] -- Typed Airflow trigger model (`Trigger`, `SingleSource`)
 //!   supporting S3, Dataset, SQS, API, and composite triggers.
 
@@ -21,6 +24,8 @@ pub mod config;
 pub mod diff;
 /// `ValidationError` for config validation results.
 pub mod error;
+/// JSON-over-stdio plugin protocol types shared between host and plugins.
+pub mod plugin;
 /// Per-job and per-DAG deployment state types.
 pub mod state;
 /// Typed Airflow trigger model (`Trigger`, `SingleSource`) supporting S3,
@@ -30,5 +35,6 @@ pub mod trigger;
 pub use config::*;
 pub use diff::*;
 pub use error::*;
+pub use plugin::*;
 pub use state::*;
 pub use trigger::*;

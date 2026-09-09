@@ -15,9 +15,3 @@ providers:
     glue_version: "4.0"
     worker_type: G.1X
     number_of_workers: 2
-  airflow:
-    region: us-east-1
-    dags_bucket: acme-analytics-prod-mwaa-dags
-    dags_prefix: dags/
-    owner: data-team
-    retries: 1

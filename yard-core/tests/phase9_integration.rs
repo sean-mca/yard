@@ -61,6 +61,8 @@ fn sample_job_state(name: &str) -> JobState {
             status: DeploymentStatus::Generated,
             applied_at: "2026-04-22T00:00:00Z".to_string(),
             resources: Vec::new(),
+            plugin_version: None,
+            plugin_source: None,
         },
     }
 }
