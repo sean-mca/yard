@@ -3,9 +3,8 @@
 
 This document is for contributors running and writing tests inside the yard
 workspace. It covers the test taxonomy, how to invoke tests at different
-scopes, per-crate test layout, the in-memory test harness used by
-`yard-server`, the integration-test setup against the `ministack` docker
-container, and how CI invokes the suite.
+scopes, per-crate test layout, the integration-test setup against the
+`ministack` docker container, and how CI invokes the suite.
 
 For general developer setup, see [development](development.md).
 
@@ -19,7 +18,7 @@ No third-party test runners or snapshot frameworks are wired in.
 | Tool            | In use? | Notes                                                            |
 |-----------------|---------|------------------------------------------------------------------|
 | `cargo test`    | Yes     | Standard Rust harness; all tests run through it.                 |
-| `tokio::test`   | Yes     | For async tests (`yard-server`, async providers). Enabled via the `tokio = { version = "1.50.0", features = ["full"] }` dep already in every crate that needs it. |
+| `tokio::test`   | Yes     | For async tests (async providers). Enabled via the `tokio = { version = "1.50.0", features = ["full"] }` dep already in every crate that needs it. |
 | `tempfile`      | Yes     | Present in `Cargo.lock` for tests that need scratch directories. |
 | `insta` / snapshot tests | No | Not present in `Cargo.lock`. No golden-file fixtures exist in the tree. |
 | `mockito` / `wiremock` | No | Not present in `Cargo.lock`. HTTP mocks are avoided in favour of the in-process in-memory DB and `ministack` for AWS. |
@@ -35,7 +34,6 @@ There are three kinds of tests in the workspace:
 
 1. **In-crate unit tests** — the default Rust pattern: a `#[cfg(test)] mod tests { ... }` block at the bottom of each source file. These are the bulk of the suite and cover every crate.
 2. **Integration tests in `yard-core/tests/`** — two files (`emr_integration.rs`, `glue_integration.rs`) that exercise the real AWS SDK against a local `ministack` container. All of these tests are marked `#[ignore]` so they are skipped by default; they only run when you explicitly pass `-- --ignored` and have `ministack` up.
-3. **Server test harness** — `yard-server` ships a `test_support` module at `yard-server/src/db/mod.rs` that provides an `InMemoryDb` implementation of the `Database` trait, used by unit tests in the `api::*` and `alerting::*` modules.
 
 There are **no** end-to-end tests, no snapshot/golden-file fixtures, and
 no HTTP integration tests that spin up a live Axum server. The WebSocket
@@ -58,7 +56,6 @@ what CI runs.
 
 ```bash
 cargo test -p yard-core
-cargo test -p yard-server
 cargo test -p yard-cli
 cargo test -p yard-structs
 ```
@@ -73,7 +70,6 @@ Note that the CLI crate is registered under the package name `yard`
 cargo test -p yard-core diff::
 
 # A single test by name substring
-cargo test -p yard-server test_insert_and_list_webhook_events
 
 # All tests in a specific integration-test file
 cargo test -p yard-core --test glue_integration
@@ -156,83 +152,6 @@ In-crate unit tests across every module that contains logic:
 The `tests/` directory holds **only** the two `#[ignore]`d AWS-integration
 files described above.
 
-### `yard-server`
-
-In-crate unit tests in nearly every module:
-
-- `src/api/drift.rs`, `src/api/dashboard.rs`, `src/api/settings.rs`, `src/api/events.rs`, `src/api/error.rs` — HTTP handler tests that drive axum extractors (`State`, `Query`, `Json`) directly and assert on the `IntoResponse` output
-- `src/github/webhook.rs`, `src/github/router.rs` — GitHub webhook signature verification, action routing, and WebSocket event-emission contract tests
-- `src/alerting/slack.rs`, `src/alerting/threshold.rs` — Slack payload shape + threshold/cooldown decision logic
-- `src/db/mod.rs` — unit tests for the `InMemoryDb` implementation of the `Database` trait
-- `src/main.rs` — a single test for `required_env`
-
-## yard-server test harness
-
-Because the production database is DynamoDB, `yard-server` defines an
-in-process test double that implements the same trait. It lives at:
-
-`yard-server/src/db/mod.rs`, inside `#[cfg(test)] pub mod test_support`.
-
-```rust
-use crate::db::test_support::InMemoryDb;
-use crate::db::Database;
-use std::sync::Arc;
-
-let db: Arc<dyn Database> = Arc::new(InMemoryDb::new());
-```
-
-`InMemoryDb` is a `Mutex`-wrapped collection of `Vec`s and `HashMap`s that
-implements every method on the `Database` trait — webhooks, plan results,
-drift snapshots, settings, and cache. It has no persistence, no network,
-and no TTLs; fixtures vanish when the test ends.
-
-### Constructing an `ApiState` for handler tests
-
-Every axum handler takes `State<Arc<ApiState>>`, so the standard handler-test
-pattern in this repo is to build a fake state from the in-memory DB and a
-loose `broadcast` channel:
-
-```rust
-fn test_state() -> Arc<ApiState> {
-    let db = Arc::new(InMemoryDb::new());
-    let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
-    Arc::new(ApiState {
-        github_token: "t".into(),
-        repo_owner: "o".into(),
-        repo_name: "r".into(),
-        db: db as Arc<dyn Database>,
-        event_tx,
-    })
-}
-```
-
-You will find this helper copy-pasted into `api/drift.rs`, `api/dashboard.rs`,
-and `api/settings.rs`. Keep it aligned when you add fields to `ApiState`.
-
-### WebSocket / broadcast tests
-
-There is no live WebSocket test harness. The event bus is exercised in two
-ways:
-
-1. **Round-trip through the broadcast channel** — `new_event_channel()`
-   returns a `(Sender, Receiver)` pair; tests send an `Event` on the
-   sender and `recv` on the receiver under a `tokio::time::timeout` guard.
-   See `broadcast_round_trip_delivers_event` in `src/api/events.rs`.
-2. **Type-level router construction** — `events_router_compiles_with_api_state`
-   in the same file constructs `events_router(state)` with a fake `ApiState`
-   to prove the `WebSocketUpgrade`/`State`/`broadcast::Sender` type graph
-   still links. If that test compiles, the router builds.
-
-End-to-end WebSocket tests (real socket, real client) are intentionally out
-of scope; see the comment on `events_router_compiles_with_api_state` for
-rationale.
-
-### GitHub webhook signature tests
-
-`src/github/webhook.rs` builds `HeaderMap`s by hand, computes
-`sha256=` HMAC signatures with the test secret, and asserts on the parsed
-`WebhookAction`. No HTTP server is started.
-
 ## Coverage requirements
 
 **No coverage threshold is configured.** There is no `tarpaulin`, `grcov`,
@@ -312,16 +231,3 @@ new provider:
 4. Update `docker-compose.yml` if the provider needs a new ministack-side
    resource (bucket, table, IAM role).
 
-### Adding a test for a new `yard-server` API handler
-
-1. Add the handler to `src/api/*.rs` as usual.
-2. In the same file, inside `#[cfg(test)] mod tests { ... }`, copy the
-   local `test_state()` helper from `src/api/drift.rs` or
-   `src/api/dashboard.rs`.
-3. Call the handler directly with `State(state)` and any extractor wrappers
-   (`Query(...)`, `Json(...)`) it takes.
-4. Assert on either the strongly-typed return value or, for error paths,
-   the `StatusCode` you get from `.into_response()`.
-5. If the handler emits events, subscribe to the broadcast receiver
-   returned by `test_state()` (do not drop the `_rx`) and `recv()` under a
-   `tokio::time::timeout`.

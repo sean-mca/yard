@@ -72,11 +72,6 @@ Your caller identity needs permission to:
 - **EMR** (only if using the EMR provider): `AddJobFlowSteps`,
   `DescribeStep`, `CancelSteps` on the target cluster.
 
-For the full IAM policy sketches (DynamoDB runtime for `yard-server`,
-Glue + EMR + S3 + STS for `yard apply` from PRs, Secrets Manager for
-the v1.5 Slack webhook abstraction), see
-[deploy.md → AWS resources needed](how-to/deploy.md#aws-resources-needed).
-
 If you plan to use AssumeRole (for cross-account deploys), yard also reads
 `YARD_AWS_ASSUME_ROLE`, `YARD_AWS_SESSION_NAME`, and `YARD_AWS_EXTERNAL_ID`
 env vars — see [configuration](reference/configuration.md#yard-cli-environment-variables).
@@ -438,7 +433,7 @@ a yard project or you passed the wrong directory.
 You now have a working single-job yard project. From here:
 
 - **[architecture](explanation/architecture.md)** — how the yard-cli / yard-core /
-  yard-structs / yard-server crates fit together, the provider trait, state
+  yard-structs crates fit together, the provider trait, state
   storage, and the end-to-end data flow for `plan` / `apply`.
 - **[configuration](reference/configuration.md)** — the full reference for
   `yard.yaml`, `account.yaml`, `region.yaml`, `dag.yaml`, per-job fields
@@ -449,6 +444,4 @@ You now have a working single-job yard project. From here:
 - **README project structure** — the [hierarchical multi-account
   layout](../README.md#project-structure) for teams managing many accounts
   and regions.
-- **[deploy](how-to/deploy.md)** — deploying yard-server (the companion
-  service for GitHub-webhook-driven PR workflows and drift detection). Not
-  needed for the CLI-only workflow you just set up.
+

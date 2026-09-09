@@ -3,11 +3,11 @@
 
 The business-logic heart of [yard](../README.md) — all codegen, providers, state
 management, storage, and validation live here. The `yard-cli` binary is a thin
-wrapper over this crate, and `yard-server` consumes the same public API for
+wrapper over this crate, exposing its public API on the command line for
 webhook-driven apply/plan and drift detection.
 
 Part of the yard workspace. See the [root README](../README.md) and
-[docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md) for the system-level picture.
+[docs/ARCHITECTURE.md](../docs/explanation/architecture.md) for the system-level picture.
 
 ## Installation
 
@@ -95,7 +95,7 @@ Relies on the sibling `yard-structs` crate for all shared data types
 (`JobDefinition`, `Resource`, `ResourceStatus`, `DagState`, `JobState`,
 `LockInfo`, `StateBackend`, `ValidationError`, `AirflowSection`). Keep shared
 types in `yard-structs` rather than inside this crate so `yard-cli` and
-`yard-server` can depend on them without pulling in all business logic.
+downstream consumers can depend on them without pulling in all business logic.
 
 External deps include `tokio`, `anyhow`, `tera`, `yaml-rust2`, `serde_json`,
 `walkdir`, `chrono`, `blake3`, and the `aws-sdk-*` crates for Glue, EMR, and S3.

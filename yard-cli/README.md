@@ -5,7 +5,7 @@ Thin command-line wrapper for YARD. Parses arguments with [clap](https://crates.
 delegates to `yard-core` for all business logic, and formats the result for the terminal.
 
 Part of the [yard](../README.md) workspace. See the root [README](../README.md) and
-[docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md) for full project context.
+[docs/ARCHITECTURE.md](../docs/explanation/architecture.md) for full project context.
 
 ## Role in the workspace
 
@@ -70,7 +70,7 @@ cargo build --release -p yard
 # binary at target/release/yard
 ```
 
-For development commands (lint, test, format) see [docs/DEVELOPMENT.md](../docs/DEVELOPMENT.md).
+For development commands (lint, test, format) see [docs/DEVELOPMENT.md](../docs/contributing/development.md).
 
 ## License
 

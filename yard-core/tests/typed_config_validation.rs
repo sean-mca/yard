@@ -5,7 +5,7 @@
 //! Layered companion to the inline `mod tests` in `yard-core/src/parsing.rs`
 //! and the deny_unknown_fields tests in `yard-structs/src/config.rs`. This
 //! file exercises the public API surface of `parsing.rs` from outside the
-//! crate so a downstream consumer (yard-cli, yard-server) sees the same
+//! crate so a downstream consumer (yard-cli) sees the same
 //! contract for the typo-gate's error wording.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

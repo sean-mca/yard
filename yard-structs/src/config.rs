@@ -121,7 +121,7 @@ impl AwsCredentialConfig {
 /// Summary of a discovered environment from the `root/{env}/{region}/**`
 /// directory convention (D-05, D-06, D-12, D-13). Carries summary data only
 /// — name, optional account_id/role_arn, and per-region summaries. Lives in
-/// yard-structs so both yard-core (discovery logic) and yard-server
+/// yard-structs so yard-core (discovery logic) and downstream consumers
 /// (caching/display) share the same type.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct DiscoveredEnvironment {

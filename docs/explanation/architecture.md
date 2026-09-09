@@ -3,7 +3,7 @@
 
 ## System overview
 
-YARD is a Rust CLI and companion server for data-engineering infrastructure. It consumes a Terragrunt-style hierarchical YAML tree rooted at `yard.yaml`, resolves each job's configuration, tracks per-job deployment state, and delegates all provider-specific work — validation, script generation, deploy, destroy, verify — to **provider plugins**: standalone binaries that yard spawns and talks to over a JSON-over-stdio protocol. The companion `yard-server` adds a GitHub-webhook-driven PR workflow, periodic drift detection, and a Dioxus fullstack dashboard backed by DynamoDB.
+YARD is a Rust CLI for data-engineering infrastructure. It consumes a Terragrunt-style hierarchical YAML tree rooted at `yard.yaml`, resolves each job's configuration, tracks per-job deployment state, and delegates all provider-specific work — validation, script generation, deploy, destroy, verify — to **provider plugins**: standalone binaries that yard spawns and talks to over a JSON-over-stdio protocol.
 
 As of v2.0 the yard binary contains no provider implementations. It knows how to
 resolve config, diff state, and drive the plugin protocol; everything that
@@ -11,7 +11,7 @@ touches a cloud service lives in a plugin. See
 [how-to/build-a-plugin.md](../how-to/build-a-plugin.md) for the plugin side of
 the contract.
 
-The workspace is split into five Cargo crates with a strict layering rule: the CLI is a thin wrapper, all business logic lives in `yard-core`, and `yard-structs` holds the serialisable data types shared between the CLI, the core, the server, and the plugin SDK.
+The workspace is split into four Cargo crates with a strict layering rule: the CLI is a thin wrapper, all business logic lives in `yard-core`, and `yard-structs` holds the serialisable data types shared between the CLI, the core, and the plugin SDK.
 
 ## Workspace layout
 
@@ -20,7 +20,7 @@ The workspace is declared in `Cargo.toml` at the repository root:
 ```toml
 [workspace]
 resolver = "3"
-members = ["yard-cli", "yard-core", "yard-structs", "yard-server", "yard-plugin-sdk"]
+members = ["yard-cli", "yard-core", "yard-structs", "yard-plugin-sdk"]
 ```
 
 | Crate | Binary/library | Purpose |
@@ -29,7 +29,6 @@ members = ["yard-cli", "yard-core", "yard-structs", "yard-server", "yard-plugin-
 | `yard-core` | library | Plugin host, storage, validation, diff, orchestration, config cascade. v2.0 removed the compiled-in providers, the codegen module and the Airflow DAG module, and added `plugin_host/` (spawner, download, provider). |
 | `yard-structs` | library | Shared `serde` types: `ProjectManifest`, `JobDefinition`, `JobState`, `JobDiff`, `StateBackend`, `LockInfo`, `Resource`. v2.0 added `plugin.rs` (the JSON-over-stdio protocol types). Minimal deps (`serde`, `anyhow`, `serde_json`). |
 | `yard-plugin-sdk` | library | Published SDK for plugin authors. Wraps the protocol (handshake, request parsing, stdout protection, tracing) behind the `PluginHandler` trait so authors write business logic only. |
-| `yard-server` | Dioxus fullstack binary | GitHub webhooks, drift polling, Slack alerting, Axum API, Dioxus/Tailwind dashboard, DynamoDB persistence. v1.5 split into focused submodules — `auth/` (bearer + cookie middleware), `secrets/` (`SecretStore` over Secrets Manager), `polling/` (per-iteration timeouts + exp backoff). |
 
 ## Crate dependency graph
 
@@ -38,18 +37,15 @@ graph TD
     CLI[yard-cli<br/>clap + tokio]
     CORE[yard-core<br/>reqwest, blake3]
     STRUCTS[yard-structs<br/>serde, anyhow]
-    SERVER[yard-server<br/>dioxus, axum, dynamodb]
     SDK[yard-plugin-sdk<br/>serde_json, tracing]
 
     CLI --> CORE
     CLI --> STRUCTS
     CORE --> STRUCTS
-    SERVER --> CORE
-    SERVER --> STRUCTS
     SDK --> STRUCTS
 ```
 
-Only `yard-cli` and `yard-server` are top-level consumers. `yard-core` never depends on `yard-cli` or `yard-server`, and `yard-structs` depends on nothing inside the workspace — this keeps the shared types small and cheap to depend on. `yard-plugin-sdk` depends only on `yard-structs`, so plugin authors pull in the protocol types without pulling in the whole core.
+Only `yard-cli` is a top-level consumer. `yard-core` never depends on `yard-cli`, and `yard-structs` depends on nothing inside the workspace — this keeps the shared types small and cheap to depend on. `yard-plugin-sdk` depends only on `yard-structs`, so plugin authors pull in the protocol types without pulling in the whole core.
 
 Note the AWS SDK and templating crates are gone from `yard-core` in v2.0 — those dependencies now live in each provider plugin instead.
 
@@ -218,26 +214,6 @@ request/response shape.
 - `diff.rs` — `DiffType { Create, Modify { changes }, Delete }`, `JobDiff`, `DagDiff`.
 - `validation.rs` — `ValidationError { field, message }`.
 
-### `yard-server/src/`
-
-- `main.rs` — Dioxus router + `start_api_server()` which spawns an Axum server on its own tokio runtime in a separate OS thread, plus background tasks `drift_poll_loop` and `dashboard_poll_loop`. Builds the parent router by merging the GitHub webhook router (HMAC-secured), the cookie-session router (`auth/session` + `auth/logout`, outside the bearer layer), and the bearer-protected `/api/*` sub-router.
-- `api/` — Axum sub-routers merged into the main router:
-  - `dashboard.rs` — `GET /api/dashboard`, `/api/dashboard/cached`. Holds the shared `ApiState` (GitHub token, repo owner/name, `Arc<dyn Database>`, `Arc<dyn SecretStore>`, broadcast `event_tx`).
-  - `jobs.rs` — `GET /api/jobs`, `/api/jobs/file`.
-  - `drift.rs` — `GET /api/drift`, `/api/drift/cached`, `/api/drift/summary`; `run_drift_check` clones the repo at HEAD, runs core's `resolve_project` + `calculate_diff` + `verify_deployed_resources`, and stores results.
-  - `settings.rs` — `GET`/`POST /api/settings` with a validated allow-list of keys (`theme`, `drift_interval`, `slack_webhook_secret_arn`, alert settings, …). Legacy `slack_webhook_url` rejected.
-  - `events.rs` — `GET /api/ws/events`. WebSocket upgrade handler (gated by the bearer layer) fanning out a `tokio::sync::broadcast` stream of `Event { DriftRefreshed, DriftFailed, DashboardRefreshed, DashboardFailed, WebhookReceived, AlertSent }`.
-  - `auth_session.rs` (v1.5 P25) — `POST /api/auth/session` + `POST /api/auth/logout`. Constant-time `ct_eq` compare against `YARD_API_TOKEN`; returns `Set-Cookie: yard_session=<token>; HttpOnly; SameSite=Strict; Path=/; Secure`. Sits OUTSIDE the bearer-auth layer (chicken-and-egg: login can't require login) but inside the rate-limit layer.
-  - `error.rs` — `ApiError` → `IntoResponse` mapping.
-- `auth/` (v1.5 P25 SRV-01) — `mod.rs::require_bearer` middleware wires `Authorization: Bearer <YARD_API_TOKEN>` OR `Cookie: yard_session=<YARD_API_TOKEN>` against a hand-rolled constant-time `ct_eq`. Header beats cookie when both are present. Loopback-only dev bypass via `bypass_loopback` (set from `YARD_API_AUTH_DISABLED`); uses axum's `ConnectInfo<SocketAddr>` (kernel-level peer address; never trusts `X-Forwarded-For`).
-- `secrets/` (v1.5 P25 SRV-02) — `SecretStore` async trait + `AwsSecretStore` impl wrapping `aws_sdk_secretsmanager::Client::get_secret_value`. Used by the alerting loop to resolve the Slack webhook URL from a Secrets Manager ARN on every drift-alert tick. `test_support::InMemorySecretStore` (HashMap-backed) for unit tests.
-- `polling/` (v1.5 P26 SRV-03) — `supervised_iteration` wraps a `Future` in `tokio::time::timeout` and flattens to a `SupervisedResult { Ok | IterationFailed | IterationTimedOut }` enum. `compute_backoff_sleep` returns `min(interval, 30s * 2^min(consecutive_errors, 6))` for exponential backoff up to the configured tick interval. Iteration timeout overridable via `YARD_POLL_TIMEOUT_SECS` (range `1..=600`).
-- `github/` — `webhook.rs` parses and HMAC-verifies incoming payloads (`sha256=…`); `router.rs` mounts `POST /api/webhook/github` and drives the PR-comment plan workflow via `client.rs` (octocrab) and `git_ops.rs` (shallow clone at a SHA, guarded by `WorkdirGuard`).
-- `db/` — `Database` async trait (webhooks, plan results, drift snapshots, settings, cache) with a `DynamoDatabase` implementation (`db/dynamo.rs`) using a single-table design (`PK`, `SK`, `GSI1PK`, `GSI1SK`). `test_support::InMemoryDb` provides a mock for unit tests.
-- `alerting/` — `threshold.rs` is a pure `evaluate(drift, cfg, now) -> AlertDecision { BelowThreshold | Cooldown | Send }` (no I/O, testable); `slack.rs` does the webhook POST after resolving the URL via `SecretStore`.
-- `ui/` — Dioxus components: `dashboard.rs`, `jobs.rs`, `drift.rs`, `settings.rs`, `sheet.rs`, `sidebar.rs`, `metrics.rs`, `components.rs`. Real-time WebSocket plumbing in `connection.rs` (wasm32 only) + `connection_indicator.rs`.
-- `types.rs` — shared request/response DTOs between API handlers and the Dioxus UI.
-
 ### State backend options
 
 Two backends ship today, selected by the `state:` block in `yard.yaml`:
@@ -252,6 +228,5 @@ DAG state is stored alongside job state with a `_dag_` filename prefix in both b
 ### Why this split?
 
 - **`yard-structs` is tiny on purpose** — only `serde`, `anyhow`, `serde_json`. The server and CLI both link against it, so keeping it free of AWS SDKs and framework code keeps compile times reasonable.
-- **`yard-core` is a library, not an application** — it never prints to stdout, never parses args, never binds sockets. Both `yard-cli` (local deploys) and `yard-server` (PR-driven deploys, drift detection) drive the same core logic, guaranteeing CI parity with local runs.
-- **`yard-server` is cleanly split between native and wasm32 targets** — the Axum API, DynamoDB, octocrab, and alerting modules are all gated with `cfg(not(target_arch = "wasm32"))` in `main.rs`, so the Dioxus UI compiles to wasm without pulling in server-only crates.
-- **No global state lock** — every job has its own state file and its own lock. A plan/apply pipeline for `jobs/orders.yaml` cannot block a concurrent pipeline for `jobs/customers.yaml`, which is essential for the Atlantis-style PR workflow in `yard-server`.
+- **`yard-core` is a library, not an application** — it never prints to stdout, never parses args, never binds sockets. `yard-cli` is a thin driver over it, so any future consumer gets identical behaviour.
+- **No global state lock** — every job has its own state file and its own lock. A plan/apply pipeline for `jobs/orders.yaml` cannot block a concurrent pipeline for `jobs/customers.yaml`, which is essential for concurrent CI pipelines.

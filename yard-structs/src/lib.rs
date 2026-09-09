@@ -2,7 +2,7 @@
 //! Shared data types for the yard ecosystem.
 //!
 //! This crate defines the core types used across yard-core, yard-cli, and
-//! yard-server:
+//! yard-plugin-sdk:
 //!
 //! - [`config`] -- Project manifest, job definitions, sources, sinks, transforms,
 //!   and Airflow config types parsed from `yard.yaml` and job YAML files.

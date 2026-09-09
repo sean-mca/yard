@@ -3,8 +3,7 @@
 
 yard is configured through a hierarchy of YAML files that mirror your cloud
 topology, a small set of environment variables consumed by the CLI and
-providers, and — for `yard-server` — a separate set of env vars plus a
-Settings page persisted in DynamoDB.
+providers.
 
 This document enumerates every discoverable configuration surface:
 
@@ -12,10 +11,6 @@ This document enumerates every discoverable configuration surface:
   `region.yaml`, and per-job `<job>.yaml`
 - [yard CLI environment variables](#yard-cli-environment-variables) — AWS
   credentials, AssumeRole overrides, color settings
-- [yard-server environment variables](#yard-server-environment-variables) —
-  GitHub, DynamoDB, listen port
-- [yard-server Settings page](#yard-server-settings-page) — runtime settings
-  persisted to DynamoDB
 - [Required vs optional settings](#required-vs-optional-settings)
 - [Per-environment overrides](#per-environment-overrides)
 
@@ -467,7 +462,7 @@ Discovered by greping `std::env::var` across `yard-cli/src/` and
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `AWS_ACCESS_KEY_ID` | Conditional | — | Used by the AWS SDK default credential chain. Required unless another mechanism (AssumeRole, IMDS, SSO, `~/.aws/credentials`) provides credentials. The minimum IAM permissions for `yard apply` (Glue + EMR + S3 + STS + IAM:PassRole) are sketched at [deploy.md → AWS permissions for yard apply](../how-to/deploy.md#aws-permissions-for-yard-apply-webhook-triggered); cross-account guidance lives at [how-to/cross-account-deploy.md](../how-to/cross-account-deploy.md). |
+| `AWS_ACCESS_KEY_ID` | Conditional | — | Used by the AWS SDK default credential chain. Required unless another mechanism (AssumeRole, IMDS, SSO, `~/.aws/credentials`) provides credentials. Cross-account guidance lives at [how-to/cross-account-deploy.md](../how-to/cross-account-deploy.md). |
 | `AWS_SECRET_ACCESS_KEY` | Conditional | — | Paired with `AWS_ACCESS_KEY_ID`. |
 | `AWS_SESSION_TOKEN` | Conditional | — | For temporary credentials. |
 | `AWS_REGION` | No | `us-east-1` (provider fallback) | Consumed by the AWS SDK. Provider `region` config overrides it. |
@@ -483,90 +478,7 @@ Discovered by greping `std::env::var` across `yard-cli/src/` and
 
 ---
 
-## yard-server environment variables
-
-The server crate has two environment-variable surfaces: runtime variables
-read at server start (`yard-server/src/main.rs` and `yard-server/src/db/mod.rs`)
-and one compile-time variable consumed by the Dioxus UI
-(`yard-server/src/ui/mod.rs`).
-
-See `env.local.example` at the repo root for a working local-dev template.
-
-### Runtime (required)
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `YARD_GITHUB_TOKEN` | Yes | GitHub personal access token or app token. The server exits with `"YARD_GITHUB_TOKEN must be set"` if missing or empty. Minimum scopes: classic PAT with `repo` scope (or `public_repo` for public repos) is sufficient for clone + comment + read PR metadata; fine-grained PAT or GitHub App installation token needs **Pull requests: Read & Write** (PR comments), **Contents: Read** (clone), **Issues: Read & Write** (`issue_comment` events). See [deploy.md → Auth token scopes](../how-to/deploy.md#auth-token-scopes). |
-| `YARD_WEBHOOK_SECRET` | Yes | Shared secret used to validate `X-Hub-Signature-256` on incoming GitHub webhooks. |
-| `YARD_REPO_OWNER` | Yes | GitHub organization or user that owns the watched repo. |
-| `YARD_REPO_NAME` | Yes | Name of the watched repo (without owner prefix). |
-| `YARD_API_TOKEN` | Yes (always) | Bearer token required on every `Authorization: Bearer <token>` header for `/api/*` requests (v1.5 SRV-01). Required even when `YARD_API_AUTH_DISABLED` is set. The cookie-session path (`yard_session` cookie) carries the same token via `POST /api/auth/session`. **Charset constraint:** printable ASCII (`0x21..=0x7E`) excluding `;`, `,`, `"`, and `\` (RFC 6265 cookie-syntax). See [server/api.md → Authentication](../server/api.md#authentication) for the wire shape and [server/overview.md → Bearer-token auth](../server/overview.md#bearer-token-auth) for the canonical model. |
-
-### Runtime (optional)
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `YARD_PORT` | `3001` | TCP port the API+UI listen on. Server binds `0.0.0.0:<port>`. |
-| `YARD_DB_TABLE_PREFIX` | `yard` | Prefix for the DynamoDB table name. Final table is `{prefix}_yard` (e.g. default yields `yard_yard`). |
-| `YARD_DB_REGION` | Falls back to `AWS_REGION`, then `us-east-1` | Region for the DynamoDB client. |
-| `YARD_DB_ENDPOINT_URL` | (unset) | When set, points the DynamoDB client at a custom endpoint. Used for local development against `ministack` (`http://localhost:4566`). Unset in production so the client hits the real AWS endpoint. |
-| `RUST_LOG` | `info` | `tracing-subscriber` filter directive. Standard `env_logger`-style syntax (`debug`, `yard_server=debug`, etc.). |
-
-### Compile-time
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `YARD_API_BASE` | `http://127.0.0.1:3001` | Compile-time base URL used by the Dioxus UI to reach the API. Set to an empty string in production so the UI derives the host from `window().location()`. Resolved via `option_env!`, so rebuild is required to change it. |
-
-### AWS credentials for DynamoDB / S3
-
-The server uses the standard AWS SDK credential chain for DynamoDB (and,
-transitively, any S3 operations it performs). The same
-`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` /
-`AWS_PROFILE` / IMDS / SSO resolution applies as for the CLI.
-`env.local.example` uses `test` / `test` against `ministack`.
-
----
-
-## yard-server Settings page
-
-Runtime settings that can be changed without restarting the server are
-persisted in DynamoDB and exposed via `/api/settings` (`GET`/`POST`). The
-Settings page in the Dioxus UI reads and writes these keys.
-
-Allowed keys and their validation rules are defined in
-`yard-server/src/api/settings.rs` (`validate_setting`).
-
-| Key | Type | Allowed values | Default (if unset) | Description |
-|-----|------|----------------|--------------------|-------------|
-| `theme` | string | `light`, `dark`, `system` | `light` | UI theme. |
-| `drift_interval` | string (minutes) | `1`, `3`, `5`, `10` | `3` | Interval between drift-check runs. Applied by the `drift_poll_loop` background task each iteration. |
-| `dashboard_interval` | string (minutes) | any positive integer | `5` | Interval between dashboard cache refreshes. |
-| `slack_enabled` | string bool | `true`, `false` | `false` (alerts disabled) | Master switch for drift-threshold Slack alerts. |
-| `slack_webhook_secret_arn` | string (ARN) | any | (empty) | **NEW in v1.5 (SRV-02).** AWS Secrets Manager ARN whose secret value is the Slack incoming-webhook URL. Resolved on every drift-alert tick via `secretsmanager:GetSecretValue` (`yard-server/src/secrets/`). Slack workspace / channel / webhook URL provisioning is operator responsibility and lives outside the repo. The legacy `slack_webhook_url` key is **decommissioned** — POSTs containing it return `400 Bad Request`, and the server refuses to boot if a row with that key still exists in DynamoDB. See [server/overview.md → Slack webhook secret migration](../server/overview.md#slack-webhook-secret-migration) for the migration recipe. |
-| `alert_drift_threshold` | string (u32) | integer `>= 1` | (unset — alerts off) | Minimum number of drifted jobs that triggers a Slack alert. |
-| `alert_cooldown_minutes` | string (u64) | integer `>= 1` | `10` | Minimum minutes between consecutive alerts. |
-| `alert_last_sent_at` | string (RFC 3339) | any (server-written) | — | Timestamp of the last successful alert. Written by the alerting loop; not meant to be edited via the UI. |
-
-Invalid values cause `POST /api/settings` to return `400 Bad Request` and
-no keys are written (validation is all-or-nothing).
-
----
-
 ## Required vs optional settings
-
-The server will fail to start if any of these are missing or empty — they
-are validated up-front by `required_env()` in `yard-server/src/main.rs`:
-
-- `YARD_GITHUB_TOKEN`
-- `YARD_WEBHOOK_SECRET`
-- `YARD_REPO_OWNER`
-- `YARD_REPO_NAME`
-
-Additionally, DynamoDB connectivity is required at startup: the server
-calls `DynamoDatabase::connect(...).migrate()` during boot and exits if
-either call fails. This means AWS credentials resolvable by the default
-chain (or a reachable `YARD_DB_ENDPOINT_URL`) are effectively required.
 
 The CLI has no hard-required environment variables — AWS credential
 resolution falls through the default chain, and missing credentials
@@ -592,15 +504,6 @@ following per-environment patterns are discoverable from the repo:
   `aws/prod/`, etc. Each descendant job inherits the appropriate context
   by directory path. This is the primary mechanism for per-env
   differences (state buckets, IAM roles, VPC settings, etc.).
-- **Local dev vs production for the server.** `env.local.example` is the
-  template for local development against `ministack` — it sets
-  `YARD_DB_ENDPOINT_URL=http://localhost:4566` and `AWS_ACCESS_KEY_ID=test`.
-  In production, `YARD_DB_ENDPOINT_URL` is unset and real AWS credentials
-  are supplied via the default credential chain. No `.env.production` or
-  `.env.staging` file exists in the repo — production deployment platform
-  and env-var injection mechanism (Docker run, ECS task definition,
-  Fargate, Kubernetes ConfigMap/Secret, systemd unit, etc.) is operator
-  choice, not encoded in the repo.
 - **CI / AssumeRole overrides.** The `YARD_AWS_ASSUME_ROLE`,
   `YARD_AWS_SESSION_NAME`, and `YARD_AWS_EXTERNAL_ID` env vars exist
   specifically so CI can override any YAML-declared `aws:` block without
@@ -609,11 +512,6 @@ following per-environment patterns are discoverable from the repo:
   Account B), use `YARD_STATE_AWS_ASSUME_ROLE`,
   `YARD_STATE_AWS_SESSION_NAME`, and `YARD_STATE_AWS_EXTERNAL_ID`. See
   the state backend section above for the full cascade.
-- **UI API base URL.** `YARD_API_BASE` is resolved at compile time via
-  `option_env!`, so a production build of the server is typically
-  compiled with `YARD_API_BASE=""` (so the UI derives its host from
-  `window().location()`), while local dev uses the default
-  `http://127.0.0.1:3001`.
 
 ---
 

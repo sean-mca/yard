@@ -135,21 +135,9 @@ yard force-unlock <job>  Remove a stale lock
 
 All commands support `--no-color` and `--colorblind`. `--target <job>` scopes a command to a single job and `--dir <path>` to a directory subtree (mutually exclusive); both work on `plan`, `apply`, and `validate`. `--auto-approve` and `--dry-run` work on apply and destroy. See [docs/reference/cli.md](docs/reference/cli.md) for the full flag reference.
 
-## yard-server
-
-Web dashboard with GitHub webhook integration and drift detection. PR-driven workflow: plan runs automatically on PR open, apply triggered by commenting `yard apply`.
-
-![Dashboard](docs/images/dashboard.png)
-
-![Jobs](docs/images/job_with_content_sheet.png)
-
-![Drift Detection](docs/images/diff_with_content_sheet.png)
-
-See [docs/how-to/deploy.md](docs/how-to/deploy.md) for setup instructions.
-
 ## Architecture
 
-Rust workspace with five crates:
+Rust workspace with four crates:
 
 | Crate | Purpose |
 |-------|---------|
@@ -157,7 +145,6 @@ Rust workspace with five crates:
 | `yard-core` | Orchestrator -- plugin host, state, storage, validation, config cascade |
 | `yard-structs` | Shared types -- job definitions, state, config, plugin protocol |
 | `yard-plugin-sdk` | SDK for building provider plugins (implements PluginHandler trait) |
-| `yard-server` | Web dashboard -- Dioxus fullstack, axum API, DynamoDB |
 
 Provider plugins are external binaries. Build one by implementing the `PluginHandler` trait from `yard-plugin-sdk`.
 
@@ -180,8 +167,6 @@ Business Source License 1.1. See [LICENSE](LICENSE) for the full text.
 
 ## AI Disclosure
 Claude was used as follows:
-- yard-server
-    - UI creation as I'm horrible at FE but wanted to try Dioxus
 - Documentation: This README & `docs/**`
 - General: a partner "architect"
     - example: "I think I want to design feature X like this, give me pros, cons, and any critical issues"

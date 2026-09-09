@@ -2,10 +2,10 @@
 # yard-structs
 
 Shared data types for the [yard](../README.md) workspace — the foundational
-crate that `yard-core`, `yard-cli`, and `yard-server` all depend on.
+crate that `yard-core`, `yard-cli`, and `yard-plugin-sdk` all depend on.
 
 Part of the yard monorepo. See the [root README](../README.md) for an overview
-and [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md) for how this crate fits
+and [docs/ARCHITECTURE.md](../docs/explanation/architecture.md) for how this crate fits
 into the overall design.
 
 ## Purpose
@@ -16,9 +16,9 @@ flows through plan/apply diffs. No business logic lives here — just types,
 their serde attributes, and trivial `Display` impls.
 
 By isolating the type surface in its own crate, `yard-core` (providers,
-codegen, DAG generation) and `yard-server` (webhooks, drift detection,
-dashboard) can share a single definition of config, state, and diff shapes
-without depending on each other.
+plugin host) and `yard-plugin-sdk` (plugin authoring) can share a single
+definition of config, state, diff, and protocol shapes without depending on
+each other.
 
 ## Minimal dependencies
 
