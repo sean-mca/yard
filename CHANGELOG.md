@@ -42,3 +42,6 @@ See [v2.0 Migration Guide](docs/reference/migrations/v2.0.md) for upgrade instru
 - DAG lifecycle module (~1.1k lines)
 - PySpark Tera templates (`glue.py.tera`, `emr.py.tera`, `airflow_dag.py.tera`)
 - Provider-specific validation (now driven by plugin `schema()` operation)
+- Docs for removed subsystems: `reference/codegen.md`, `reference/airflow-dag.md`,
+  `how-to/schedule-a-dag.md`, `how-to/debug-codegen-output.md`,
+  `explanation/why-codegen.md`, and the `multi-job-dag` example

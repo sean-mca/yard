@@ -84,6 +84,16 @@ Per-version schema and behavior change notes. Each migration doc
 explains what changed, how to migrate existing yamls, and any
 deprecation timelines.
 
+- **v2.0** — **Breaking.** Providers moved out of the yard binary into
+  external plugin binaries. Every `<job>.yaml` must now declare
+  `plugin_version:` and `plugin_source:`. Airflow DAG generation and the
+  `yard show dag` command were removed from core.
+  [docs/reference/migrations/v2.0.md](../reference/migrations/v2.0.md)
+
+- **v1.11** — Version-aware DAG codegen (`airflow.version: "3"`) and the
+  `"asset"` trigger alias.
+  [docs/reference/migrations/v1.11.md](../reference/migrations/v1.11.md)
+
 - **v1.6** — Event-driven DAGs and the `triggered_by:` /
   `produces:` rename to `trigger:` / `publishes:`. Hard rename, no
   back-compat aliases.
@@ -96,5 +106,4 @@ on each release.
 ## See also
 
 - [docs/reference/cli.md](../reference/cli.md) — `yard --version`, `yard plan`, and full subcommand reference.
-- [docs/how-to/debug-codegen-output.md](debug-codegen-output.md) — how to read `yard plan` drift output if the upgrade verification surfaces unexpected diffs.
-- [docs/reference/migrations/v1.6.md](../reference/migrations/v1.6.md) — current latest migration.
+- [docs/reference/migrations/v2.0.md](../reference/migrations/v2.0.md) — current latest migration.

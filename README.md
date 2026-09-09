@@ -50,19 +50,23 @@ See [docs/quickstart.md](docs/quickstart.md) for prerequisites and first-run set
 # orders.yaml
 type: glue
 plugin_version: "0.1.0"
-plugin_source: "https://github.com/your-org/yard-plugin-glue/releases/download/v${version}/yard-plugin-glue-${version}-${os}-${arch}"
+plugin_source: "https://github.com/your-org/yard-plugin-glue/releases/download/v0.1.0/yard-plugin-glue-0.1.0-aarch64-macos"
 role: arn:aws:iam::123456789:role/GlueJobExecutionRole
 
-source:
-  type: s3
-  format: parquet
-  path: s3://data-lake/raw/orders/
+sources:
+  - name: orders
+    type: s3
+    format: parquet
+    path: s3://data-lake/raw/orders/
 
 transforms:
   - type: filter
-    condition: "col('status') != 'cancelled'"
+    source: orders
+    output: active_orders
+    condition: F.col("status") != "cancelled"
 
 sink:
+  source: active_orders
   type: s3
   format: parquet
   path: s3://data-lake/curated/orders/
@@ -119,7 +123,7 @@ Directory hierarchy mirrors your cloud topology. Context files (`account.yaml`, 
 ## CLI
 
 ```
-yard init              Initialize state for all jobs
+yard init              Scaffold a new project (dirs + starter yard.yaml)
 yard plan              Show what would change
 yard apply             Deploy changes (with confirmation)
 yard show <job>        Display the generated script
@@ -129,7 +133,7 @@ yard destroy [job]     Tear down deployed jobs
 yard force-unlock <job>  Remove a stale lock
 ```
 
-All commands support `--no-color` and `--colorblind`. `--target <job>` scopes plan/apply to a single job. `--auto-approve` and `--dry-run` work on apply and destroy.
+All commands support `--no-color` and `--colorblind`. `--target <job>` scopes a command to a single job and `--dir <path>` to a directory subtree (mutually exclusive); both work on `plan`, `apply`, and `validate`. `--auto-approve` and `--dry-run` work on apply and destroy. See [docs/reference/cli.md](docs/reference/cli.md) for the full flag reference.
 
 ## yard-server
 

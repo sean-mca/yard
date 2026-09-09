@@ -23,7 +23,7 @@ Add `yard-plugin-sdk` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-yard-plugin-sdk = { version = "0.1" }
+yard-plugin-sdk = { version = "2.0" }
 ```
 
 The SDK re-exports everything you need -- `PluginHandler`, `PluginServer`, all response types, `serde_json::Value`, `anyhow`, and `tracing`. No direct `yard-structs` dependency is required.
@@ -36,7 +36,7 @@ Create `src/main.rs`:
 
 ```rust
 use yard_plugin_sdk::{
-    PluginHandler, PluginServer,
+    anyhow, PluginHandler, PluginServer, Value,
     CodegenResponse, DeployResponse, DestroyResponse,
     Resource, SchemaResponse, SchemaField,
     ValidateResponse, VerifyResponse,
@@ -56,7 +56,7 @@ impl PluginHandler for ExampleProvider {
     fn validate(
         &self,
         _job_name: &str,
-        _job_config: &serde_json::Value,
+        _job_config: &Value,
     ) -> anyhow::Result<ValidateResponse> {
         // Return validation errors in the response, not as Err.
         // Err is for "validation could not run" (e.g. config parse failure).
@@ -66,7 +66,7 @@ impl PluginHandler for ExampleProvider {
     fn codegen(
         &self,
         job_name: &str,
-        _job_config: &serde_json::Value,
+        _job_config: &Value,
     ) -> anyhow::Result<CodegenResponse> {
         let script = format!("# Generated script for {job_name}\nprint('hello')");
         Ok(CodegenResponse { script: Some(script) })
@@ -75,7 +75,7 @@ impl PluginHandler for ExampleProvider {
     fn deploy(
         &self,
         _job_name: &str,
-        _job_config: &serde_json::Value,
+        _job_config: &Value,
         _artifact: &str,
     ) -> anyhow::Result<DeployResponse> {
         // Return the cloud resources created/updated.
@@ -144,16 +144,30 @@ The binary is at `target/release/yard-plugin-example`.
 
 Copy the binary into a yard project's plugin cache and configure a job to use it:
 
-```bash
-# Determine your platform key
-# macOS ARM: aarch64-apple-darwin
-# macOS Intel: x86_64-apple-darwin
-# Linux x86: x86_64-unknown-linux-gnu
-# Linux ARM: aarch64-unknown-linux-gnu
+yard looks for a cached binary at
+`.yard/plugins/{name}-{version}-{arch}-{os}` and only downloads when that
+file is missing. Pre-place your build there and yard will use it without
+ever hitting the network.
 
+The `{arch}-{os}` platform key comes from Rust's `std::env::consts` --
+`aarch64-macos`, `x86_64-macos`, `x86_64-linux`, `aarch64-linux`. Print
+your own with:
+
+```bash
+rustc --print cfg | grep -E 'target_arch|target_os'
+# target_arch="aarch64"
+# target_os="macos"      ->  platform key: aarch64-macos
+```
+
+Note the cache key uses Rust's *consts* spelling (`macos`, `linux`), not the
+target-triple spelling (`apple-darwin`, `unknown-linux-gnu`). `rustc -vV`'s
+`host:` line shows the triple, so do not copy the platform key from there.
+
+```bash
 mkdir -p .yard/plugins
+# On Apple Silicon:
 cp target/release/yard-plugin-example \
-   .yard/plugins/yard-plugin-example-0.1.0-aarch64-apple-darwin
+   .yard/plugins/yard-plugin-example-0.1.0-aarch64-macos
 ```
 
 Create a test job file referencing the plugin:
@@ -162,20 +176,29 @@ Create a test job file referencing the plugin:
 # test-job.yaml
 type: example
 plugin_version: "0.1.0"
-plugin_source: "file:///path/to/yard-plugin-example-${version}-${os}-${arch}"
+plugin_source: "https://example.invalid/yard-plugin-example-0.1.0-aarch64-macos"
 sources:
   - name: input
-    source_type: s3
-    location: s3://test-bucket/input/
+    type: s3
+    path: s3://test-bucket/input/
     format: parquet
 sink:
-  sink_type: s3
-  format: parquet
+  source: input
+  type: s3
   path: s3://test-bucket/output/
+  format: parquet
   mode: overwrite
 ```
 
-Run `yard plan` to verify the plugin is discovered and called correctly.
+`plugin_source` is required even for local testing, but it is never
+fetched as long as the cached binary above is in place -- yard short-circuits
+on the cache hit. It cannot point at a `file://` path: the downloader accepts
+only `https://` (plus `http://` on loopback for local test servers), so a
+`file://` URL fails the moment the cache misses.
+
+Run `yard plan` to verify the plugin is discovered and called correctly. If you
+see a download attempt, your cached filename does not match the expected
+platform key.
 
 ### Step 6: Logging
 
@@ -199,23 +222,49 @@ The SDK auto-initializes a stderr tracing subscriber with `RUST_LOG` env-filter 
 Create a GitHub release with a tag matching your version (e.g. `v0.1.0`). Upload platform-specific binaries following the naming convention:
 
 ```
-yard-plugin-example-0.1.0-aarch64-apple-darwin
-yard-plugin-example-0.1.0-x86_64-apple-darwin
-yard-plugin-example-0.1.0-x86_64-unknown-linux-gnu
-yard-plugin-example-0.1.0-aarch64-unknown-linux-gnu
+yard-plugin-example-0.1.0-macos-aarch64
+yard-plugin-example-0.1.0-macos-x86_64
+yard-plugin-example-0.1.0-linux-x86_64
+yard-plugin-example-0.1.0-linux-aarch64
 ```
 
-The general pattern is `{name}-{version}-{os}-{arch}` where:
-- `{name}` is the plugin binary name (e.g. `yard-plugin-example`)
-- `{version}` is the semver version (e.g. `0.1.0`)
-- `{os}` is one of `apple-darwin` or `unknown-linux-gnu`
-- `{arch}` is one of `aarch64` or `x86_64`
+Your asset names only have to match whatever `plugin_source` template your
+users write. What is *not* free-form is how yard expands the placeholders:
+
+| Placeholder | Expands to | Values |
+|-------------|-----------|--------|
+| `${name}` | `yard-plugin-<job type>` | Derived from the job's `type:` field |
+| `${version}` | Value of `plugin_version` | e.g. `0.1.0` |
+| `${os}` | `std::env::consts::OS` | `macos`, `linux` |
+| `${arch}` | `std::env::consts::ARCH` | `aarch64`, `x86_64` |
+
+`${os}` is **not** the target-triple fragment -- it is `macos`, not
+`apple-darwin`, and `linux`, not `unknown-linux-gnu`. Name your release assets
+to match, or your users' first `yard plan` will 404.
+> **Known limitation (v2.0).** Placeholder templating is **not currently usable
+> inside a `<job>.yaml`**. yard runs `${...}` context interpolation over the whole
+> job file before parsing it, so a `plugin_source` containing `${version}`,
+> `${os}` or `${arch}` fails to resolve with
+> `Missing Variable: Could not find 'version' in the provided context`. This
+> applies to YAML comments too. Until that is fixed, write the fully expanded
+> URL for the platform you are on:
+>
+> ```yaml
+> plugin_source: "https://github.com/your-org/yard-plugin-glue/releases/download/v0.3.1/yard-plugin-glue-0.3.1-aarch64-macos"
+> ```
+>
+> The placeholder expansion itself works correctly once a template reaches the
+> downloader -- it is only the job-file interpolation pass that rejects it.
+
+Also note `${name}` is derived from the job's `type:` field as
+`yard-plugin-<type>`. A job with `type: example` resolves to plugin name
+`yard-plugin-example`, so your binary must be named accordingly.
 
 Users reference your release in their `job.yaml`:
 
 ```yaml
 plugin_version: "0.1.0"
-plugin_source: "https://github.com/your-org/yard-plugin-example/releases/download/v${version}/yard-plugin-example-${version}-${os}-${arch}"
+plugin_source: "https://github.com/your-org/yard-plugin-example/releases/download/v0.1.0/yard-plugin-example-0.1.0-aarch64-macos"
 ```
 
 ### TOFU checksum model
@@ -284,7 +333,7 @@ Written by yard to the plugin's stdin, followed by EOF:
 | `operation` | string | All operations |
 | `job_name` | string | validate, codegen, deploy, destroy, verify |
 | `job_config` | object | validate, codegen, deploy |
-| `resources` | Resource[] | destroy, verify |
+| `resources` | Resource[] (`{"type","id","provider"}`) | destroy, verify |
 | `artifact` | string | deploy |
 
 ### Operations and responses
@@ -301,17 +350,22 @@ Written by yard to the plugin's stdin, followed by EOF:
 
 **deploy** -- deploy artifact to cloud service:
 ```json
-{"resources":[{"resource_type":"s3_object","id":"s3://bucket/key","provider":"example"}]}
+{"resources":[{"type":"s3_object","id":"s3://bucket/key","provider":"example"}]}
 ```
+
+Each resource is `{"type", "id", "provider"}`. Note the key is `type`, not
+`resource_type` -- yard stores these verbatim in job state and passes them back
+to `destroy` and `verify`.
 
 **destroy** -- tear down resources (empty response on success):
 ```json
 {}
 ```
 
-**verify** -- check resource existence:
+**verify** -- check resource existence. Each status wraps the whole resource
+object rather than flattening it:
 ```json
-{"statuses":[{"resource_type":"s3_object","id":"s3://bucket/key","exists":true}]}
+{"statuses":[{"resource":{"type":"s3_object","id":"s3://bucket/key","provider":"example"},"exists":true}]}
 ```
 
 **schema** -- describe accepted config fields:
