@@ -1,25 +1,29 @@
 <!-- generated-by: gsd-doc-writer -->
 # Build a provider plugin
 
-This guide is for developers building provider plugins for yard. A plugin is a standalone binary that yard spawns as a child process to perform provider-specific operations (validate, codegen, deploy, destroy, verify, schema) over a JSON-over-stdio protocol.
+This guide is for developers building provider plugins for yard. A plugin is a standalone executable that yard spawns as a child process to perform provider-specific operations (validate, codegen, deploy, destroy, verify, schema) over a JSON-over-stdio protocol.
 
-Two paths are covered:
+Part 1 walks through a minimal plugin in two languages side by side:
 
-1. **Rust SDK** (recommended) -- use the `yard-plugin-sdk` crate, which handles all protocol mechanics. You implement business logic only.
-2. **JSON protocol** -- build a plugin in any language by implementing the raw stdio protocol.
+- **Rust**, using the `yard-plugin-sdk` crate, which handles the protocol mechanics so you implement business logic only.
+- **Python**, implementing the protocol directly with the standard library, which shows that no SDK is required.
 
-## Part 1: Rust SDK tutorial
+Part 2 is the raw protocol spec, for building a plugin in any other language.
 
-### Step 1: Create a new project
+## Part 1: Build a plugin
+
+### Step 1: Create the project
+
+<!-- tabs:start -->
+<!-- tab: Rust -->
+**Rust**
 
 ```bash
 cargo init --name yard-plugin-example
 cd yard-plugin-example
 ```
 
-### Step 2: Add the SDK dependency
-
-Add `yard-plugin-sdk` to your `Cargo.toml`:
+Add `yard-plugin-sdk` to `Cargo.toml`:
 
 ```toml
 [dependencies]
@@ -27,8 +31,28 @@ yard-plugin-sdk = { version = "2.0" }
 ```
 
 The SDK re-exports everything you need -- `PluginHandler`, `PluginServer`, all response types, `serde_json::Value`, `anyhow`, and `tracing`. No direct `yard-structs` dependency is required.
+<!-- tab: Python -->
+**Python**
 
-### Step 3: Implement PluginHandler
+```bash
+mkdir yard-plugin-example
+cd yard-plugin-example
+touch yard-plugin-example.py
+chmod +x yard-plugin-example.py
+```
+
+There is no Python SDK; the protocol is small enough to implement with `json` and `sys`. The single script is the plugin executable, so it must start with a `#!/usr/bin/env python3` line.
+
+If your plugin needs third-party packages (a templating library, a cloud SDK), they must be installed for whichever `python3` is on the user's `PATH`. Keep dependencies minimal and document them, along with any credentials, roles, or other resources your plugin expects the user to provide.
+<!-- tabs:end -->
+
+### Step 2: Implement the handler
+
+A plugin implements six operations. The Rust SDK expresses them as the `PluginHandler` trait; in Python they are plain functions plus a small dispatch loop that mirrors what `PluginServer::run()` does.
+
+<!-- tabs:start -->
+<!-- tab: Rust -->
+**Rust**
 
 The `PluginHandler` trait has 8 required methods. There are no default implementations -- every method must be provided, even if some are trivial pass-throughs.
 
@@ -118,31 +142,160 @@ fn main() -> ! {
     PluginServer::run(ExampleProvider)
 }
 ```
+<!-- tab: Python -->
+**Python**
 
-**What each method does:**
+Each handler returns a plain `dict` that is written to stdout as one JSON line. Raise an exception only when the operation could not run at all; validation problems go in the `errors` list of the response.
 
-| Method | Purpose | Receives | Returns |
-|--------|---------|----------|---------|
-| `name()` | Plugin identity for handshake | -- | Plugin name string |
-| `version()` | Plugin version for handshake | -- | Semver string |
-| `validate()` | Check job config for errors | Job name, job config (JSON) | List of validation errors |
-| `codegen()` | Generate deployment script | Job name, job config (JSON) | Script content (or `None`) |
-| `deploy()` | Deploy artifact to cloud | Job name, job config, script content | List of created resources |
-| `destroy()` | Tear down deployed resources | Job name, list of resources | Success/failure |
-| `verify()` | Check if resources still exist | Job name, list of resources | Per-resource status |
-| `schema()` | Describe accepted config fields | -- | Field descriptors, supported types |
+Write `yard-plugin-example.py`:
 
-### Step 4: Build
+```python
+#!/usr/bin/env python3
+"""yard-plugin-example: a minimal yard provider plugin."""
+
+import json
+import logging
+import sys
+
+# All logging goes to stderr. stdout is reserved for protocol JSON.
+logging.basicConfig(stream=sys.stderr, level=logging.INFO,
+                    format="%(levelname)s: %(message)s")
+log = logging.getLogger("yard-plugin-example")
+
+PLUGIN_NAME = "yard-plugin-example"
+PLUGIN_VERSION = "0.1.0"
+PROTOCOL_VERSION = 1
+CAPABILITIES = ["validate", "codegen", "deploy", "destroy", "verify", "schema"]
+
+
+def handle_validate(job_name, job_config):
+    # Return validation errors in the response, not by raising.
+    # Raise only when validation could not run (e.g. malformed config).
+    return {"errors": []}
+
+
+def handle_codegen(job_name, job_config):
+    script = "# Generated script for {}\nprint('hello')".format(job_name)
+    return {"script": script}
+
+
+def handle_deploy(job_name, job_config, artifact):
+    # Return the cloud resources created/updated.
+    return {"resources": []}
+
+
+def handle_destroy(job_name, resources):
+    return {}
+
+
+def handle_verify(job_name, resources):
+    return {"statuses": []}
+
+
+def handle_schema():
+    return {
+        "fields": [
+            {
+                "name": "region",
+                "field_type": "string",
+                "required": False,
+                "description": "AWS region for the provider",
+            }
+        ],
+        "supported_source_types": None,
+        "supported_sink_types": None,
+    }
+
+
+def dispatch(request):
+    op = request.get("operation")
+    if op == "validate":
+        return handle_validate(request["job_name"], request["job_config"])
+    if op == "codegen":
+        return handle_codegen(request["job_name"], request["job_config"])
+    if op == "deploy":
+        return handle_deploy(request["job_name"], request["job_config"],
+                             request["artifact"])
+    if op == "destroy":
+        return handle_destroy(request["job_name"], request["resources"])
+    if op == "verify":
+        return handle_verify(request["job_name"], request["resources"])
+    if op == "schema":
+        return handle_schema()
+    raise ValueError("unknown operation: {}".format(op))
+
+
+def main():
+    """handshake -> read one request -> dispatch -> write one response -> exit"""
+    try:
+        handshake = {
+            "protocol_version": PROTOCOL_VERSION,
+            "name": PLUGIN_NAME,
+            "version": PLUGIN_VERSION,
+            "capabilities": CAPABILITIES,
+        }
+        sys.stdout.write(json.dumps(handshake) + "\n")
+        sys.stdout.flush()
+
+        line = sys.stdin.readline()
+        if not line.strip():
+            log.error("no request received on stdin")
+            sys.exit(1)
+
+        response = dispatch(json.loads(line))
+        sys.stdout.write(json.dumps(response) + "\n")
+        sys.stdout.flush()
+        sys.exit(0)
+    except Exception as exc:
+        log.error("%s", exc)
+        sys.stdout.write(json.dumps({"error": str(exc)}) + "\n")
+        sys.stdout.flush()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+```
+<!-- tabs:end -->
+
+**What each operation does:**
+
+| Operation | Purpose | Receives | Returns |
+|-----------|---------|----------|---------|
+| `name` / `version` | Plugin identity for the handshake | -- | Plugin name and semver string |
+| `validate` | Check job config for errors | Job name, job config (JSON) | List of validation errors |
+| `codegen` | Generate deployment script | Job name, job config (JSON) | Script content (or `None` / `null`) |
+| `deploy` | Deploy artifact to cloud | Job name, job config, script content | List of created resources |
+| `destroy` | Tear down deployed resources | Job name, list of resources | Success/failure |
+| `verify` | Check if resources still exist | Job name, list of resources | Per-resource status |
+| `schema` | Describe accepted config fields | -- | Field descriptors, supported types |
+
+### Step 3: Build
+
+<!-- tabs:start -->
+<!-- tab: Rust -->
+**Rust**
 
 ```bash
 cargo build --release
 ```
 
 The binary is at `target/release/yard-plugin-example`.
+<!-- tab: Python -->
+**Python**
 
-### Step 5: Test locally
+There is no build step. The script itself is the plugin executable. Check that it runs and answers a `schema` request:
 
-Copy the binary into a yard project's plugin cache and configure a job to use it:
+```bash
+echo '{"operation":"schema"}' | ./yard-plugin-example.py
+```
+
+You should see two JSON lines on stdout: the handshake, then the schema response.
+<!-- tabs:end -->
+
+### Step 4: Test locally
+
+Copy the plugin into a yard project's plugin cache and configure a job to use it.
 
 yard looks for a cached binary at
 `.yard/plugins/{name}-{version}-{arch}-{os}` and only downloads when that
@@ -162,6 +315,12 @@ rustc --print cfg | grep -E 'target_arch|target_os'
 Note the cache key uses Rust's *consts* spelling (`macos`, `linux`), not the
 target-triple spelling (`apple-darwin`, `unknown-linux-gnu`). `rustc -vV`'s
 `host:` line shows the triple, so do not copy the platform key from there.
+Without a Rust toolchain, `uname -m` gives the architecture (`arm64` means
+`aarch64`) and `uname -s` the OS (`Darwin` means `macos`).
+
+<!-- tabs:start -->
+<!-- tab: Rust -->
+**Rust**
 
 ```bash
 mkdir -p .yard/plugins
@@ -169,6 +328,19 @@ mkdir -p .yard/plugins
 cp target/release/yard-plugin-example \
    .yard/plugins/yard-plugin-example-0.1.0-aarch64-macos
 ```
+<!-- tab: Python -->
+**Python**
+
+```bash
+mkdir -p .yard/plugins
+# On Apple Silicon:
+cp yard-plugin-example.py \
+   .yard/plugins/yard-plugin-example-0.1.0-aarch64-macos
+chmod +x .yard/plugins/yard-plugin-example-0.1.0-aarch64-macos
+```
+
+The cached file keeps no `.py` extension; the shebang line is what makes it runnable.
+<!-- tabs:end -->
 
 Create a test job file referencing the plugin:
 
@@ -200,9 +372,15 @@ Run `yard plan` to verify the plugin is discovered and called correctly. If you
 see a download attempt, your cached filename does not match the expected
 platform key.
 
-### Step 6: Logging
+### Step 5: Logging
 
-The SDK captures stdout at the file descriptor level -- any `println!()` in your code or dependencies is automatically redirected to stderr. The protocol channel (stdout) stays clean.
+stdout is the protocol channel. Anything else written to it corrupts the stream, so all logging goes to stderr.
+
+<!-- tabs:start -->
+<!-- tab: Rust -->
+**Rust**
+
+The SDK captures stdout at the file descriptor level -- any `println!()` in your code or dependencies is automatically redirected to stderr.
 
 For structured logging, use `tracing` (re-exported by the SDK):
 
@@ -216,10 +394,24 @@ fn deploy(&self, job_name: &str, ...) -> anyhow::Result<DeployResponse> {
 ```
 
 The SDK auto-initializes a stderr tracing subscriber with `RUST_LOG` env-filter support. No setup required.
+<!-- tab: Python -->
+**Python**
 
-### Step 7: Release to GitHub
+Nothing protects stdout for you. Never call `print()` in handler code, and watch for libraries that print. Use the `logging` module configured for stderr, as in the scaffold above:
 
-Create a GitHub release with a tag matching your version (e.g. `v0.1.0`). Upload platform-specific binaries following the naming convention:
+```python
+def handle_deploy(job_name, job_config, artifact):
+    log.info("deploying %s", job_name)
+    # ...
+    return {"resources": []}
+```
+
+Non-zero exit tells yard the operation failed, and yard shows the last lines of stderr as the error message, so log the cause before exiting.
+<!-- tabs:end -->
+
+### Step 6: Release to GitHub
+
+Create a GitHub release with a tag matching your version (e.g. `v0.1.0`). Upload one asset per platform following the naming convention:
 
 ```
 yard-plugin-example-0.1.0-macos-aarch64
@@ -227,6 +419,17 @@ yard-plugin-example-0.1.0-macos-x86_64
 yard-plugin-example-0.1.0-linux-x86_64
 yard-plugin-example-0.1.0-linux-aarch64
 ```
+
+<!-- tabs:start -->
+<!-- tab: Rust -->
+**Rust**
+
+Cross-compile or build on each platform, and upload each binary under its platform name.
+<!-- tab: Python -->
+**Python**
+
+The script is the same on every platform, but `plugin_source` resolves to one asset per platform, so upload the same file under each platform name.
+<!-- tabs:end -->
 
 Your asset names only have to match whatever `plugin_source` template your
 users write. What is *not* free-form is how yard expands the placeholders:
@@ -250,7 +453,7 @@ to match, or your users' first `yard plan` will 404.
 > URL for the platform you are on:
 >
 > ```yaml
-> plugin_source: "https://github.com/your-org/yard-plugin-glue/releases/download/v0.3.1/yard-plugin-glue-0.3.1-aarch64-macos"
+> plugin_source: "https://<plugin-release-url>/yard-plugin-glue-0.1.0-aarch64-macos"
 > ```
 >
 > The placeholder expansion itself works correctly once a template reaches the
@@ -279,7 +482,7 @@ yard uses a trust-on-first-use (TOFU) checksum model for plugin binaries:
 
 ## Part 2: JSON protocol spec
 
-For developers building plugins in Go, Python, or other languages, here is the raw protocol that the Rust SDK abstracts.
+For developers building plugins in Go, TypeScript, or any other language, here is the raw protocol that the Rust SDK abstracts and the Python scaffold above implements by hand.
 
 ### Protocol flow
 

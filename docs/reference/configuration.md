@@ -1,9 +1,9 @@
 <!-- generated-by: gsd-doc-writer -->
 # Configuration
 
-yard is configured through a hierarchy of YAML files that mirror your cloud
-topology, a small set of environment variables consumed by the CLI and
-providers.
+yard is configured through a hierarchy of YAML files laid out by account and
+region, plus a small set of environment variables read by the CLI and the
+provider plugins.
 
 This document enumerates every discoverable configuration surface:
 
@@ -121,10 +121,9 @@ of the jobs that use it (`providers.glue` for `type: glue`, and so on).
 
 Since v2.0 the accepted fields are defined by the plugin, not by yard: core
 passes the merged block through to the plugin and validates it against whatever
-the plugin's `schema()` operation reports. For the field list, consult the
-plugin's own documentation — e.g. the `yard-plugin-glue` and `yard-plugin-emr`
-repositories (see [providers/glue.md](providers/glue.md) and
-[providers/emr.md](providers/emr.md)).
+the plugin's `schema()` operation reports. For the field list, and for any
+resources the plugin expects to exist (roles, buckets, clusters), consult the
+plugin's own documentation.
 
 #### `aws` (root-level)
 
@@ -159,6 +158,11 @@ and shallow-overrides the root `yard.yaml` `aws:` block per-job.
 ### `<job>.yaml` (individual job definitions)
 
 Defined by `JobDefinition` in `yard-structs/src/config.rs`.
+
+Only `type`, `plugin_version`, and `plugin_source` are required by yard
+itself. Which of the remaining fields a job uses, and whether a plugin needs
+fields not listed here, depends on the plugin: yard parses the fields below
+when present and passes the whole job through for the plugin to validate.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -208,9 +212,7 @@ When `source_type: jdbc`, the referenced AWS Secrets Manager secret's `SecretStr
 
 These keys are read literally by the emitted PySpark (`_secret["username"]` / `_secret["password"]`); other key names will cause the script to error at job execution time.
 
-Consumed by `render_secret_fetch` in `yard-core/src/codegen/helpers.rs` (line 101); the jdbc consumer is at `yard-core/src/codegen/source.rs` (line 80).
-
-**Gotcha (`secret_id` on non-jdbc):** If `secret_id` is set on a non-jdbc source (`s3`, `catalog`, `kafka`, `api`), `render_secret_fetch` still emits the boto3 SecretsManager fetch lines, but no codegen arm reads `_secret`. The fetch is silently unused — jobs run but waste a SecretsManager call. AWS Secrets Manager setup (creating the secret, granting `secretsmanager:GetSecretValue` to the job role) is out of scope for this page; see AWS docs.
+Since v2.0 the secret is fetched by the plugin's generated code, not by yard core. Whether a plugin honours `secret_id` on non-jdbc sources, and what permissions the job needs to read the secret, is up to the plugin — check its documentation. Creating the secret and granting access to it is your responsibility; yard does not manage it.
 
 #### `sink` fields (`Sink` struct)
 
@@ -229,7 +231,7 @@ Consumed by `render_secret_fetch` in `yard-core/src/codegen/helpers.rs` (line 10
 
 **`secret_id` JSON schema:**
 
-Same `{"username": "...", "password": "..."}` shape as for sources. Consumed when `sink_type: jdbc` — see `yard-core/src/codegen/sink.rs` (line 48). The non-jdbc dead-code gotcha applies the same way: setting `secret_id` on `s3` / `catalog` / `iceberg` sinks emits an unused SecretsManager fetch.
+Same `{"username": "...", "password": "..."}` shape as for sources. Consumed by the plugin's generated code when `sink_type: jdbc`.
 
 For the full schema and rationale, see the [Source `secret_id` schema](#sources-fields-source-struct) section above.
 
@@ -246,9 +248,10 @@ selects one of nine operations, and every transform may set `source`
 | `source` | all | Name of the DataFrame to operate on. Defaults to the first/only source, or the previous transform's output. |
 | `output` | all | Name for the result DataFrame. Defaults to the same value as `source` (overwrites it in place). |
 
-Per-type field reference follows. See `yard-core/src/codegen/transform.rs`
-for the exact dispatch logic and `yard-structs/src/config.rs` (struct
-`Transform`) for the full list of fields parsed from YAML.
+Per-type field reference follows. yard parses these fields (see
+`yard-structs/src/config.rs`, struct `Transform`) and passes them to the
+plugin; the generated code is the plugin's responsibility. The examples show
+the expressions as a PySpark-based plugin would interpret them.
 
 ##### `filter`
 
@@ -393,10 +396,9 @@ transforms:
 
 #### `mask_pii`
 
-`mask_pii` declares which PII entity types to detect and redact in the
-generated Glue script. Each entry names an AWS entity type; the codegen
-emits a single `EntityDetector.detect()` call that handles all listed
-types in one pass.
+`mask_pii` declares which PII entity types to detect and redact before the
+sink write. yard validates the list and passes it through in the job config;
+what the plugin does with it is the plugin's business.
 
 Defined by `JobDefinition` in `yard-structs/src/config.rs`.
 
@@ -421,39 +423,25 @@ sink:
   mode: overwrite
 ```
 
-**What the generated code does:**
+**What happens with it:**
 
-After all transforms run and before the sink write, the codegen inserts a
-PII masking block that:
-
-1. Converts the sink DataFrame to a `DynamicFrame` via
-   `DynamicFrame.fromDF()`.
-2. Calls `EntityDetector.detect()` with a fine-grained
-   `detectionParameters` dict — one key per entity type, each configured
-   with `REDACT` action and `"****"` mask text.
-3. Converts the result back to a DataFrame via `.toDF()`.
-4. Drops the `DetectedEntities` metadata column that `EntityDetector`
-   appends.
-
-All intermediate variables use the `_yard_pii_` prefix to avoid
-collisions with user-defined names.
+The plugin's `codegen` operation receives the list and is expected to insert
+a masking step after the transforms and before the sink write. How it does
+that, and which entity types it recognises, are documented by the plugin.
 
 **Constraints:**
 
-- **Glue 3.0+ required.** `EntityDetector` is part of the
-  `awsglueml.transforms` module available in Glue 3.0 and later. Jobs
-  targeting earlier Glue versions will fail at runtime.
 - **`body` / `job_file` silently skips PII.** When either override is
   set, yard replaces codegen entirely — the `mask_pii` entries have no
   effect. No warning is emitted because the override is intentional.
-- **EMR and Bash jobs are not supported.** Setting `mask_pii` on a
-  non-Glue job type is rejected at validation.
+- **Plugin support varies.** `mask_pii` is interpreted by the provider
+  plugin. A plugin that does not implement it should reject it in its
+  `validate` operation; check the plugin's documentation.
 
 **Entity type format:** Values must be `SCREAMING_SNAKE_CASE` (e.g.
 `USA_SSN`, `CREDIT_CARD`, `EMAIL`). Duplicates are rejected at
-validation. The full list of supported entity types is defined by AWS —
-see the
-[AWS Glue PII detection documentation](https://docs.aws.amazon.com/glue/latest/dg/detect-PII.html).
+validation. The set of entity types a plugin recognises is defined by the
+plugin and the service behind it.
 
 ## yard CLI environment variables
 
@@ -484,13 +472,15 @@ The CLI has no hard-required environment variables — AWS credential
 resolution falls through the default chain, and missing credentials
 surface as errors only when a provider command actually calls AWS.
 
-The following YAML fields are hard-required (validated in
-`yard-core/src/providers/*.rs`):
+The following YAML fields are hard-required by yard itself:
 
 - `yard.yaml`: `project`, `state`
-- `providers.glue`: `script_bucket`
-- `providers.emr`: `script_bucket`, `cluster_id`
-- Per-job: `job_type` (commonly `type:` in YAML)
+- Per-job: `type`, `plugin_version`, `plugin_source`
+
+Provider-specific requirements come from each plugin's `schema()` and
+`validate()` operations; a plugin that uploads scripts will typically require
+a bucket under `providers.<type>`, for example. Resources those fields refer
+to must already exist — yard does not create them.
 
 ---
 

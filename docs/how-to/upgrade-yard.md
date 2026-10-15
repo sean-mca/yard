@@ -1,36 +1,51 @@
 # Upgrade yard
 
-yard ships in three forms: a Cargo crate (when published to
-crates.io), a source build from the GitHub repo, and a Linux x86_64
-binary attached to GitHub releases. Pick the path that matches how
-you originally installed yard. After upgrading, run a drift check
-to confirm your existing yamls still validate against the new
-schema.
+yard ships in three forms: a Homebrew formula, prebuilt binaries
+attached to each GitHub release (macOS Apple Silicon and Intel, Linux
+x86_64 and ARM), and a source build from the GitHub repo. Pick the
+path that matches how you originally installed yard. After upgrading,
+run a drift check to confirm your existing yamls still validate
+against the new schema.
 
-For per-version schema changes, see
-[Previous migrations](#previous-migrations) below.
+If you are coming from v1.x, read the [v2.0 migration guide](../reference/migrations/v2.0.md)
+after upgrading: every job file needs two new fields before `yard plan` works.
 
 ## Upgrade procedure
 
-### From `cargo install`
+### From Homebrew
 
-> **Note:** yard is not currently published to crates.io. This path
-> is reserved for the future. Today, use the source build or
-> binary download below.
-
-Once yard is on crates.io, upgrade with:
+The tap is updated automatically on every release:
 
 ```bash
-cargo install yard --force
+brew update
+brew upgrade yard
 yard --version
 ```
 
-`--force` overwrites the existing binary. Without it, cargo refuses
-to reinstall an unchanged version.
+### From a GitHub release binary
+
+Each release attaches one tarball per platform, named
+`yard-<version>-<target>.tar.gz`, plus a `SHA256SUMS` file covering all
+of them. The targets are `aarch64-apple-darwin`, `x86_64-apple-darwin`,
+`x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`.
+
+```bash
+# Replace <version> with the release, e.g. 2.0.0, and <target> with your platform.
+BASE=https://github.com/sean-mca/yard/releases/download/v<version>
+curl -L -o yard-<version>-<target>.tar.gz "$BASE/yard-<version>-<target>.tar.gz"
+curl -L -o SHA256SUMS "$BASE/SHA256SUMS"
+shasum -a 256 -c SHA256SUMS --ignore-missing
+tar -xzf yard-<version>-<target>.tar.gz
+install -m 0755 yard ~/.local/bin/yard
+yard --version
+```
+
+The checksum step MUST print `OK` before you trust the binary. On Linux
+without `shasum`, use `sha256sum -c SHA256SUMS --ignore-missing`.
 
 ### From source (`git pull`)
 
-For developers who cloned the repo:
+For contributors who cloned the repo:
 
 ```bash
 cd /path/to/yard
@@ -45,26 +60,6 @@ Optionally copy the resulting binary into your `$PATH`:
 cp target/release/yard ~/.local/bin/yard
 ```
 
-### From a GitHub release binary
-
-For users on Linux x86_64 (the only platform yard publishes
-binaries for today):
-
-```bash
-# Replace <tag> with the desired release tag, e.g. v1.3.4
-curl -L -o yard-linux-x86_64 \
-  https://github.com/sean-mca/yard/releases/download/<tag>/yard-linux-x86_64
-curl -L -o yard-linux-x86_64.sha256 \
-  https://github.com/sean-mca/yard/releases/download/<tag>/yard-linux-x86_64.sha256
-sha256sum -c yard-linux-x86_64.sha256
-install -m 0755 yard-linux-x86_64 yard
-./yard --version
-```
-
-`sha256sum -c` MUST print `OK` before you trust the binary. macOS
-and Windows users currently build from source — yard does not
-publish binaries for those platforms.
-
 ### Verify the upgrade
 
 From a directory containing your yard project, run a drift check:
@@ -75,33 +70,17 @@ yard plan
 
 A clean upgrade prints `(no change)` for every target. Any `~ update`
 or validation error after upgrade likely means a schema change in the
-new version — check the relevant migration note in
-[Previous migrations](#previous-migrations).
+new version — check the [migration guide](#migrating-from-v1x).
 
-## Previous migrations
+## Migrating from v1.x
 
-Per-version schema and behavior change notes. Each migration doc
-explains what changed, how to migrate existing yamls, and any
-deprecation timelines.
+v2.0 is a breaking release. Providers moved out of the yard binary into
+plugin binaries, every `<job>.yaml` must declare `plugin_version:` and
+`plugin_source:`, and Airflow DAG generation moved to its own plugin.
+The [v2.0 migration guide](../reference/migrations/v2.0.md) has the steps.
 
-- **v2.0** — **Breaking.** Providers moved out of the yard binary into
-  external plugin binaries. Every `<job>.yaml` must now declare
-  `plugin_version:` and `plugin_source:`. Airflow DAG generation and the
-  `yard show dag` command were removed from core.
-  [docs/reference/migrations/v2.0.md](../reference/migrations/v2.0.md)
-
-- **v1.11** — Version-aware DAG codegen (`airflow.version: "3"`) and the
-  `"asset"` trigger alias.
-  [docs/reference/migrations/v1.11.md](../reference/migrations/v1.11.md)
-
-- **v1.6** — Event-driven DAGs and the `triggered_by:` /
-  `produces:` rename to `trigger:` / `publishes:`. Hard rename, no
-  back-compat aliases.
-  [docs/reference/migrations/v1.6.md](../reference/migrations/v1.6.md)
-
-Future migration docs land in the same folder
-(`docs/reference/migrations/<version>.md`) and gain a bullet here
-on each release.
+Migration notes for v1.x point releases stay in
+`docs/reference/migrations/` in the repository for anyone still on 1.x.
 
 ## See also
 

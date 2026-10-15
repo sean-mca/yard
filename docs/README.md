@@ -13,7 +13,7 @@ provider, start with [build a plugin](how-to/build-a-plugin.md).
 
 ## Quickstart
 
-- [quickstart.md](quickstart.md) — Zero-to-deployed walkthrough: prerequisites, building yard from source, scaffolding a project, authoring one job, and running `yard plan` / `yard apply`.
+- [quickstart.md](quickstart.md) — Zero-to-deployed walkthrough for any provider plugin: prerequisites, installing yard (Homebrew, release binary, or source), scaffolding a project, authoring one job, and running `yard plan` / `yard apply`.
 
 ## How-to
 
@@ -31,8 +31,8 @@ provider, start with [build a plugin](how-to/build-a-plugin.md).
 Provider configuration is documented by each plugin's own repository. These
 pages are forwarding stubs kept so v1.x links resolve.
 
-- [reference/providers/glue.md](reference/providers/glue.md) — Moved to the `yard-plugin-glue` repo.
-- [reference/providers/emr.md](reference/providers/emr.md) — Moved to the `yard-plugin-emr` repo.
+- [reference/providers/glue.md](reference/providers/glue.md) — Provider docs live with the Glue plugin.
+- [reference/providers/emr.md](reference/providers/emr.md) — Provider docs live with the EMR plugin.
 
 ### Migrations
 

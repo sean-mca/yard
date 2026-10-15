@@ -24,14 +24,15 @@ are coming from v1.x.
 
 ## How to run it
 
-From the repository root, validate the example layout:
+With yard installed, validate the example layout from the repository root:
 
 ```bash
-cargo run -p yard -- validate docs/examples/glue-spark-etl/
+yard validate docs/examples/glue-spark-etl/
 ```
 
 Expected output: `[PASS] orders-pipeline-raw_to_clean.yaml` and exit 0.
-This is what the `validate-examples` CI workflow runs on every PR.
+The `validate-examples` CI workflow runs the same check on every PR
+(via `cargo run -p yard -- validate …` against the checked-out source).
 
 To preview a real apply without touching AWS, copy the directory out and
 run `yard plan` from the copy:

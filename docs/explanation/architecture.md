@@ -227,6 +227,6 @@ DAG state is stored alongside job state with a `_dag_` filename prefix in both b
 
 ### Why this split?
 
-- **`yard-structs` is tiny on purpose** — only `serde`, `anyhow`, `serde_json`. The server and CLI both link against it, so keeping it free of AWS SDKs and framework code keeps compile times reasonable.
+- **`yard-structs` is tiny on purpose** — only `serde`, `anyhow`, `serde_json`. The CLI, the core, and the plugin SDK all link against it, so keeping it free of AWS SDKs and framework code keeps compile times reasonable for plugin authors too.
 - **`yard-core` is a library, not an application** — it never prints to stdout, never parses args, never binds sockets. `yard-cli` is a thin driver over it, so any future consumer gets identical behaviour.
 - **No global state lock** — every job has its own state file and its own lock. A plan/apply pipeline for `jobs/orders.yaml` cannot block a concurrent pipeline for `jobs/customers.yaml`, which is essential for concurrent CI pipelines.
