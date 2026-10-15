@@ -28,7 +28,7 @@ YARD replaces all of that with a single YAML-driven workflow:
 Install via Homebrew:
 
 ```bash
-brew install sean-mca/yard/yard
+brew install yggdrasilLabs/yard/yard
 ```
 
 Or download a binary from [GitHub Releases](https://github.com/sean-mca/yard/releases) (macOS ARM/Intel, Linux ARM/x86_64).

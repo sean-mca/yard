@@ -108,8 +108,8 @@ jobs:
       - name: Checkout tap repository
         uses: actions/checkout@v4
         with:
-          repository: sean-mca/homebrew-yard
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          repository: yggdrasilLabs/homebrew-yard
+          ssh-key: ${{ secrets.HOMEBREW_TAP_SSH_KEY }}
 
       - name: Update formula
         env:
