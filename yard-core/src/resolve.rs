@@ -388,57 +388,16 @@ fn discover_jobs(search_root: &Path, project_root: &Path) -> Result<HashMap<Stri
     Ok(all_jobs)
 }
 
-/// Check whether a context file (account.yaml / region.yaml) contains
-/// flat-style provider keys at the top level (e.g. `glue:` instead of
-/// `providers:\n  glue:`). Per D-02: hard error with actionable message.
-///
-/// In v2.0, `JobType` is `Plugin(String)` and accepts any string, so we
-/// cannot use `key.parse::<JobType>()` as a discriminator. Instead, we
-/// allow-list the known legitimate context-file keys and skip the check
-/// for unknown keys (provider block keys are dynamic in v2.0).
-fn reject_flat_provider_keys(value: &Value, context_path: &str) -> Result<()> {
-    // In v2.0, `JobType` is `Plugin(String)` -- every string parses as valid,
-    // so the previous heuristic (`key.parse::<JobType>().is_ok()`) is useless.
-    // Instead, allow-list the known legitimate context-file keys and warn on
-    // anything else, which likely indicates a misplaced provider block (e.g.
-    // `glue:` at the top level instead of under `providers:`).
-    const KNOWN_CONTEXT_KEYS: &[&str] = &[
-        "aws",
-        "account_id",
-        "providers",
-        "region",
-        "account",
-        "state",
-        "project",
-        "tags",
-    ];
-    if let Some(obj) = value.as_object() {
-        for key in obj.keys() {
-            if !KNOWN_CONTEXT_KEYS.contains(&key.as_str()) {
-                eprintln!(
-                    "Warning: unknown top-level key \"{key}\" in {context_path} -- \
-                     if this is a provider config, move it under `providers:`. \
-                     See docs/reference/migrations/v2.0.md"
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Extract a provider-specific field from the nearest ancestor context file
-/// by walking up from `dir`. Only looks under the `providers:` namespace
-/// (D-11). Returns `Value::Null` when the file doesn't exist, the
-/// `providers:` key is absent, or the provider type is absent.
+/// by walking up from `dir`. Only looks under the `providers:` namespace.
+/// Returns `Value::Null` when the file doesn't exist, the `providers:` key
+/// is absent, or the provider type is absent.
 ///
-/// # Errors
-///
-/// Returns an error if the context file contains flat-style provider keys
-/// (D-02 migration error).
+/// Context files accept arbitrary top-level keys for user-defined variable
+/// interpolation (`${account.*}`, `${region.*}`), so no key gating is applied.
 fn provider_context_field(dir: &Path, filename: &str, provider_type: &str) -> Result<Value> {
     match find_and_parse_context(dir, filename, false) {
         Ok(v) => {
-            reject_flat_provider_keys(&v, filename)?;
             Ok(v.get("providers")
                 .and_then(|p| p.get(provider_type))
                 .cloned()
@@ -1319,12 +1278,11 @@ mod tests {
         assert_eq!(provider_field(&out["j"], "glue", "from_job"), Some("job"));
     }
 
-    // --- D-02 flat provider key migration error ---
+    // --- Context file key gating ---
     //
-    // In v2.0, flat provider key rejection is disabled because JobType is now
-    // Plugin(String) and every string parses as a valid job type. The previous
-    // tests (flat_provider_key_in_account_yaml_rejected,
-    // flat_emr_key_in_region_yaml_rejected) are removed.
+    // Context files (account.yaml, region.yaml) accept arbitrary top-level
+    // keys for user-defined variable interpolation (e.g. hosts, databases,
+    // connections, bronze_location). No key gating is applied.
 
     #[test]
     fn nested_provider_key_in_account_yaml_accepted() {
@@ -1340,16 +1298,17 @@ mod tests {
     }
 
     #[test]
-    fn aws_at_top_level_not_rejected() {
-        // aws: is a legitimate top-level key, not a provider key
+    fn arbitrary_context_keys_accepted() {
+        // Users define arbitrary keys in account.yaml for ${account.*}
+        // interpolation — these must not produce warnings or errors.
         let tmp = TempDir::new();
         fs::write(
             tmp.0.join("account.yaml"),
-            "aws:\n  assume_role: some-role\n",
+            "name: dev\nbronze_location: s3://bucket/bronze\nhosts:\n  myservice: db.example.com\ndatabases:\n  myservice: myservice_dev\nconnections:\n  myservice: RDS MyService\nsink:\n  databases:\n    main: main_bronze\nsource:\n  auth:\n    kind: rds_iam\n",
         )
         .unwrap();
         let result = provider_context_field(&tmp.0, "account.yaml", "glue");
-        assert!(result.is_ok(), "aws: must not be rejected as flat provider key");
+        assert!(result.is_ok(), "arbitrary context keys must be accepted");
     }
 
     // --- job-doc allow-list (regression for missing `role:` top-level key) ---
