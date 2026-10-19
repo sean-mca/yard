@@ -18,7 +18,7 @@ use tokio::process::Command;
 
 use yard_structs::{
     CodegenResponse, DeployResponse, DestroyResponse, HandshakeMessage, PluginOperation,
-    PluginRequest, PluginValidationError, ProgressMessage, Resource, ResourceStatus, SchemaField,
+    PluginRequest, PluginValidationError, ProgressMessage, Resource, ResourceStatus,
     SchemaResponse, ValidateResponse, VerifyResponse, PROTOCOL_VERSION,
 };
 
@@ -34,8 +34,11 @@ pub struct PluginHostConfig {
     /// killed (default: 300).
     pub timeout_secs: u64,
     /// Path to the lock file containing expected checksums. When `None`,
-    /// defaults to `yard.lock` in the project root.
+    /// checksum verification and recording are skipped.
     pub lock_file_path: Option<PathBuf>,
+    /// Project root that relative `file://` plugin sources are resolved
+    /// against (default: the current directory).
+    pub project_root: PathBuf,
 }
 
 impl Default for PluginHostConfig {
@@ -44,6 +47,7 @@ impl Default for PluginHostConfig {
             plugins_dir: PathBuf::from(".yard/plugins"),
             timeout_secs: 300,
             lock_file_path: None,
+            project_root: PathBuf::from("."),
         }
     }
 }
@@ -477,12 +481,13 @@ impl PluginSpawner {
         Ok(resp.statuses)
     }
 
-    /// Run the schema operation and return config field descriptors.
+    /// Run the schema operation and return the plugin's config schema,
+    /// including any extra source/sink types it supports.
     ///
     /// # Errors
     ///
     /// Returns an error if the plugin process fails or returns invalid JSON.
-    pub async fn call_schema(&self) -> Result<Vec<SchemaField>> {
+    pub async fn call_schema(&self) -> Result<SchemaResponse> {
         let request = PluginRequest {
             operation: PluginOperation::Schema,
             job_name: None,
@@ -495,9 +500,7 @@ impl PluginSpawner {
                 eprintln!("[{}] {}", self.plugin_name, p.message);
             })
             .await?;
-        let resp: SchemaResponse = serde_json::from_value(raw)
-            .context("failed to deserialize schema response")?;
-        Ok(resp.fields)
+        serde_json::from_value(raw).context("failed to deserialize schema response")
     }
 }
 
@@ -656,10 +659,29 @@ pub async fn cleanup_plugin_cache(plugins_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Return the current platform key for lock file checksum lookup.
+/// Return the current platform key for lock file checksum lookup and
+/// cache file names.
 ///
 /// Format: `"{arch}-{os}"` (e.g. `"aarch64-macos"`, `"x86_64-linux"`).
 #[must_use]
 pub fn platform_key() -> String {
     format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
+}
+
+/// Return the Rust target triple that best describes the running binary.
+///
+/// This is the suffix yard appends to release asset names
+/// (`<name>-<version>-<target>`), so plugin authors can upload assets
+/// straight from a cargo cross-compile matrix. Linux is assumed to be
+/// `gnu`; publish under a `${target}` template if you ship `musl`.
+#[must_use]
+pub fn target_triple() -> String {
+    let arch = std::env::consts::ARCH;
+    match std::env::consts::OS {
+        "macos" => format!("{arch}-apple-darwin"),
+        "linux" => format!("{arch}-unknown-linux-gnu"),
+        "windows" => format!("{arch}-pc-windows-msvc"),
+        "freebsd" => format!("{arch}-unknown-freebsd"),
+        other => format!("{arch}-{other}"),
+    }
 }

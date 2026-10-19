@@ -19,8 +19,10 @@
 //! [`Provider`]: crate::providers::Provider
 
 pub mod download;
+pub mod git;
 pub mod provider;
 pub mod spawner;
 
+pub use download::{PluginSource, ResolvedBinary, ensure_plugin_cached, parse_plugin_source};
 pub use provider::PluginProvider;
-pub use spawner::{cleanup_plugin_cache, PluginHostConfig, PluginSpawner};
+pub use spawner::{PluginHostConfig, PluginSpawner, cleanup_plugin_cache, platform_key, target_triple};

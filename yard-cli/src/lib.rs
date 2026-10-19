@@ -62,7 +62,8 @@ pub async fn run() -> Result<()> {
             directory,
             target,
             dir,
-        } => commands::validate::execute(directory, target, dir).await?,
+            skip_plugins,
+        } => commands::validate::execute(directory, target, dir, skip_plugins).await?,
         parser::Commands::Destroy {
             job_name,
             directory,

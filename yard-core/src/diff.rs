@@ -19,10 +19,9 @@ use crate::utils;
 
 /// Compute the diff between the manifest and the current state.
 ///
-/// Uses plugin codegen (via [`providers::get_provider_for_job`]) to generate
-/// script content for hash computation. Falls back to empty script content
-/// when no plugin binary is available (e.g. during early project setup or
-/// for job types that don't produce scripts).
+/// Uses plugin codegen (via [`providers::codegen_job`]) to generate script
+/// content for hash computation. Jobs without a `plugin_source` hash an
+/// empty script; a configured plugin that fails codegen is an error.
 ///
 /// Phase 28 / D-14: iterates `manifest.jobs` and `state.deployments` via
 /// a BTreeMap-collect so output is deterministic across processes
@@ -30,7 +29,8 @@ use crate::utils;
 ///
 /// # Errors
 ///
-/// Returns an error if config serialization fails for any job in the manifest.
+/// Returns an error if config serialization fails for any job in the
+/// manifest, or if a job's plugin cannot be resolved or fails codegen.
 pub async fn calculate_diff(
     manifest: &ProjectManifest,
     state: &ProjectState,
@@ -40,31 +40,11 @@ pub async fn calculate_diff(
 
     let sorted_jobs: BTreeMap<&String, &JobDefinition> = manifest.jobs.iter().collect();
     for (name, job_def) in sorted_jobs {
-        // Attempt plugin codegen for script content. If the plugin is not
-        // available (no plugin_version/plugin_source, or binary missing),
-        // fall back to empty string. This keeps diff computation working
-        // for jobs that don't have a plugin configured yet.
-        let script_content = match providers::get_provider_for_job(
-            &job_def.job_type,
-            &job_def.config,
-            job_def.plugin_version.as_deref(),
-            job_def.plugin_source.as_deref(),
-            plugin_host_config,
-        )
-        .await
-        {
-            Ok(provider) => provider
-                .codegen(name, &job_def.config)
-                .await
-                .unwrap_or(None)
-                .unwrap_or_default(),
-            Err(e) => {
-                eprintln!(
-                    "Warning: plugin codegen failed for job \"{name}\", using empty script for hash: {e}"
-                );
-                String::new()
-            }
-        };
+        // Plugin codegen for script content. A job with no plugin_source
+        // hashes an empty script (with a warning); a configured plugin that
+        // fails is an error so the diff never silently drifts.
+        let script_content =
+            providers::codegen_job(&manifest.providers, name, job_def, plugin_host_config).await?;
 
         // Hash script + config + trigger so changes to any of them produce a
         // different state hash. Trigger flows through here because task-only

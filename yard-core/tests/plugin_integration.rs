@@ -66,6 +66,7 @@ fn make_spawner(mode: Option<&str>) -> PluginSpawner {
         plugins_dir: PathBuf::from("/tmp/yard-test-plugins"),
         timeout_secs: 5,
         lock_file_path: None,
+        ..Default::default()
     };
 
     let mut spawner = PluginSpawner::new(binary, "test-plugin".to_string(), config);
@@ -82,6 +83,7 @@ fn make_spawner_with_timeout(mode: Option<&str>, timeout_secs: u64) -> PluginSpa
         plugins_dir: PathBuf::from("/tmp/yard-test-plugins"),
         timeout_secs,
         lock_file_path: None,
+        ..Default::default()
     };
 
     let mut spawner = PluginSpawner::new(binary, "test-plugin".to_string(), config);
@@ -169,7 +171,7 @@ async fn test_schema_operation_returns_field_descriptors() {
     let spawner = make_spawner(None);
     let result = spawner.call_schema().await;
 
-    let fields = result.unwrap();
+    let fields = result.unwrap().fields;
     assert_eq!(fields.len(), 1);
     assert_eq!(fields[0].name, "region");
     assert_eq!(fields[0].field_type, "string");
@@ -260,6 +262,7 @@ async fn test_plugin_provider_implements_provider_trait() {
         plugins_dir: PathBuf::from("/tmp/yard-test-plugins"),
         timeout_secs: 5,
         lock_file_path: None,
+        ..Default::default()
     };
 
     let provider = PluginProvider::from_binary(
@@ -341,18 +344,19 @@ async fn test_ensure_plugin_cached_returns_path_when_binary_exists() {
         plugins_dir: plugins_dir.clone(),
         timeout_secs: 5,
         lock_file_path: Some(dir.path().join("yard.lock")),
+        ..Default::default()
     };
 
     // URL is bogus -- the binary is already cached so no HTTP request fires
     let result = ensure_plugin_cached(
         "test-plugin",
-        "1.0.0",
+        Some("1.0.0"),
         "http://bogus-should-not-be-called/${name}",
         &config,
     )
     .await;
 
-    let path = result.unwrap();
+    let path = result.unwrap().path;
     assert_eq!(path, cached_path, "should return the cached binary path");
     assert!(path.exists(), "cached binary should exist on disk");
 }
@@ -374,14 +378,15 @@ async fn test_ensure_plugin_cached_cache_miss_downloads() {
         plugins_dir: plugins_dir.clone(),
         timeout_secs: 10,
         lock_file_path: Some(lock_path.clone()),
+        ..Default::default()
     };
 
     let url_template = format!("http://{addr}/${{name}}-${{version}}");
-    let result = ensure_plugin_cached("test-plugin", "1.0.0", &url_template, &config).await;
+    let result = ensure_plugin_cached("test-plugin", Some("1.0.0"), &url_template, &config).await;
 
     server_handle.abort();
 
-    let path = result.unwrap();
+    let path = result.unwrap().path;
     let platform = platform_key();
     let expected_name = format!("test-plugin-1.0.0-{platform}");
     assert_eq!(
@@ -446,14 +451,15 @@ async fn test_version_mismatch_triggers_redownload() {
         plugins_dir: plugins_dir.clone(),
         timeout_secs: 10,
         lock_file_path: Some(lock_path.clone()),
+        ..Default::default()
     };
 
     let url_template = format!("http://{addr}/${{name}}-${{version}}");
-    let result = ensure_plugin_cached("test-plugin", "0.4.0", &url_template, &config).await;
+    let result = ensure_plugin_cached("test-plugin", Some("0.4.0"), &url_template, &config).await;
 
     server_handle.abort();
 
-    let path = result.unwrap();
+    let path = result.unwrap().path;
     let new_binary_name = format!("test-plugin-0.4.0-{platform}");
     assert_eq!(
         path.file_name().unwrap().to_str().unwrap(),

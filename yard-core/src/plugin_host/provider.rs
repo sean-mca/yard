@@ -13,7 +13,7 @@ use std::pin::Pin;
 
 use anyhow::Result;
 use serde_json::Value;
-use yard_structs::{Resource, ResourceStatus, SchemaField, ValidationError};
+use yard_structs::{Resource, ResourceStatus, SchemaResponse, ValidationError};
 
 use crate::providers::Provider;
 
@@ -139,7 +139,7 @@ impl Provider for PluginProvider {
         })
     }
 
-    fn schema(&self) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaField>>> + Send + '_>> {
+    fn schema(&self) -> Pin<Box<dyn Future<Output = Result<SchemaResponse>> + Send + '_>> {
         Box::pin(async move { self.spawner.call_schema().await })
     }
 }

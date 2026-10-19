@@ -1,6 +1,6 @@
 [package]
 name = "yard-structs"
-version = "2.1.1"
+version = "2.1.2"
 edition = "2024"
 
 [lints]

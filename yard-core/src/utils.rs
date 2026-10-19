@@ -59,16 +59,24 @@ fn canonicalize_value(val: &Value) -> Value {
 /// Replace `${...}` variable references in raw YAML with values from the
 /// YARD context (account, region, transforms, dag).
 ///
+/// Single-segment placeholders such as `${version}` or `${target}` are not
+/// context lookups (every context path is dotted, e.g. `${account.id}`), so
+/// they are left untouched for later consumers -- notably the
+/// `plugin_source` URL template expander.
+///
 /// # Errors
 ///
-/// Returns an error if any referenced variable path cannot be found in
-/// the provided context.
+/// Returns an error if any referenced dotted variable path cannot be found
+/// in the provided context.
 pub fn resolve_variables(raw_yaml: &str, ctx: &YARDContext) -> Result<String> {
     let re = &*VAR_RE;
     let mut err: Option<anyhow::Error> = None;
 
     let result = re.replace_all(raw_yaml, |caps: &regex::Captures| {
         let path = &caps["key"];
+        if !path.contains('.') {
+            return caps[0].to_string();
+        }
         match resolve_json_path(ctx, path) {
             Some(value) => match value {
                 serde_json::Value::String(s) => s,
@@ -267,6 +275,17 @@ mod tests {
         let input = "${account.nope}";
         let result = resolve_variables(input, &ctx);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_leaves_single_segment_placeholders_untouched() {
+        let ctx = test_context();
+        let input = "plugin_source: https://x/${name}-${version}-${target} id=${account.id}";
+        let result = resolve_variables(input, &ctx).unwrap();
+        assert_eq!(
+            result,
+            "plugin_source: https://x/${name}-${version}-${target} id=123456789"
+        );
     }
 
     #[test]

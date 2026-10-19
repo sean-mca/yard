@@ -44,9 +44,9 @@ pub mod validation;
 pub use config_merge::{build_provider_config, merge_provider_config};
 pub use diff::calculate_diff;
 pub use orchestrate::{
-    apply, destroy_all, destroy_job, force_unlock, init_state_backend,
-    load_state, plan, validate_target, verify_deployed_resources,
-    ApplyResult, DestroyResult, PlanResult,
+    ApplyResult, DestroyResult, JobValidation, PlanResult, apply, destroy_all, destroy_job,
+    force_unlock, init_state_backend, load_state, plan, plugin_host_config_for, validate_jobs,
+    validate_target, verify_deployed_resources,
 };
 pub use parsing::{
     merge_airflow_sections, parse_airflow_job_block, parse_airflow_section,

@@ -13,8 +13,9 @@ Copy it, edit a few placeholders, run `yard apply`.
   `drop_columns`), and writing parquet back. yard's resolver synthesizes the
   job name as `<env>-<folder>-<filename>` (here, `orders-pipeline-raw_to_clean`),
   which is what `[PASS]` lines and `--target` flags reference.
-- The `plugin_version` / `plugin_source` pair that tells yard which Glue
-  plugin binary to download and run (required for every job since v2.0).
+- The `plugin_source` / `plugin_version` pair that tells yard which Glue
+  plugin to run: the plugin's repository and the release to fetch for the
+  current platform (required for every job since v2.0).
 
 Glue-specific knobs are documented in the `yard-plugin-glue` repository. See
 [docs/reference/configuration.md](../../reference/configuration.md) for
@@ -73,8 +74,8 @@ keep as-is.
    together: `providers.glue.region` in `yard.yaml`, plus the
    `aws/dev/us-east-1/` directory name (the third path component is the
    region per yard's hierarchical context convention).
-5. **`plugin_source`** in `raw_to_clean.yaml` — point it at the real
-   `yard-plugin-glue` release URL for your org.
+5. **`plugin_source`** in `raw_to_clean.yaml` — point it at your org's
+   `yard-plugin-glue` repository (or a `file://` path to a local build).
 
 Optional knobs to tune in `yard.yaml` -> `providers.glue`:
 

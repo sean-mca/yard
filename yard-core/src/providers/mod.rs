@@ -6,19 +6,21 @@
 //! validation errors.
 //!
 //! All provider types are now resolved through [`PluginProvider`] -- there
-//! are no compiled-in provider implementations. Jobs without `plugin_version`
-//! and `plugin_source` fields receive an actionable migration error.
+//! are no compiled-in provider implementations. Jobs without a
+//! `plugin_source` field receive an actionable migration error.
 
 use anyhow::{Context, Result, bail};
 use aws_config::BehaviorVersion;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use yard_structs::{JobType, Resource, ResourceStatus, SchemaField, ValidationError};
+use yard_structs::{JobDefinition, JobType, Resource, ResourceStatus, SchemaResponse, ValidationError};
 
-use crate::plugin_host::download;
+use crate::config_merge::effective_job_config;
 use crate::plugin_host::PluginHostConfig;
 use crate::plugin_host::PluginProvider;
+use crate::plugin_host::download;
 
 /// Build a standard AWS SDK config with region, retry policy, and optional
 /// STS `AssumeRole` wrapped around the default credential provider chain.
@@ -160,62 +162,129 @@ pub trait Provider: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
-    /// Return the config field descriptors this provider accepts.
+    /// Return the config schema this provider accepts, including any
+    /// extra source/sink types it supports.
     ///
-    /// Used by config cascade validation. Default returns an empty schema.
-    fn schema(&self) -> Pin<Box<dyn Future<Output = Result<Vec<SchemaField>>> + Send + '_>> {
-        Box::pin(async { Ok(Vec::new()) })
+    /// Used by schema-aware validation. Default returns an empty schema.
+    fn schema(&self) -> Pin<Box<dyn Future<Output = Result<SchemaResponse>> + Send + '_>> {
+        Box::pin(async {
+            Ok(SchemaResponse {
+                fields: Vec::new(),
+                supported_source_types: None,
+                supported_sink_types: None,
+            })
+        })
     }
 }
 
 /// Plugin-only provider dispatch (D-04).
 ///
-/// Downloads the plugin binary (if not already cached) and constructs a
-/// [`PluginProvider`]. When `plugin_version` and `plugin_source` are both
-/// absent, returns an actionable migration error (D-01) directing users
-/// to `docs/reference/migrations/v2.0.md`.
+/// Resolves the plugin binary named by `plugin_source` (downloading,
+/// cloning, or building it if not already cached) and constructs a
+/// [`PluginProvider`]. `plugin_version` is required for git and URL
+/// sources and ignored for local `file://` sources.
+///
+/// When `plugin_source` is absent, returns an actionable migration error
+/// (D-01) directing users to `docs/reference/migrations/v2.0.md`.
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - Plugin download fails
-/// - Only one of `plugin_version` / `plugin_source` is set (both required)
-/// - Neither is set (v1.x user needs to migrate)
+/// - The plugin binary cannot be resolved (download, clone, or build fails)
+/// - `plugin_version` is missing for a git or URL source
+/// - `plugin_source` is missing (v1.x user needs to migrate)
 pub async fn get_provider_for_job(
     job_type: &JobType,
-    _provider_config: &Value,
     plugin_version: Option<&str>,
     plugin_source: Option<&str>,
     plugin_host_config: &PluginHostConfig,
 ) -> Result<Box<dyn Provider>> {
     let type_name = job_type.to_string();
-    match (plugin_version, plugin_source) {
-        (Some(version), Some(source)) => {
-            let plugin_name = format!("yard-plugin-{type_name}");
-            let binary_path =
-                download::ensure_plugin_cached(&plugin_name, version, source, plugin_host_config)
-                    .await
-                    .with_context(|| {
-                        format!("failed to ensure plugin binary for {plugin_name} v{version}")
-                    })?;
+    let Some(source) = plugin_source else {
+        if plugin_version.is_some() {
+            bail!("job has plugin_version but no plugin_source");
+        }
+        bail!(
+            "provider '{type_name}' is now a plugin -- add plugin_source (and plugin_version) \
+             to your job.yaml, see docs/reference/migrations/v2.0.md"
+        )
+    };
 
-            Ok(Box::new(PluginProvider::from_binary(
-                binary_path,
-                plugin_name,
-                plugin_host_config.clone(),
-            )))
-        }
-        (Some(_), None) => {
-            bail!("job has plugin_version but no plugin_source -- both are required")
-        }
-        (None, Some(_)) => {
-            bail!("job has plugin_source but no plugin_version -- both are required")
-        }
-        (None, None) => {
-            bail!(
-                "provider '{type_name}' is now a plugin -- add plugin_version and plugin_source \
-                 to your job.yaml, see docs/reference/migrations/v2.0.md"
-            )
-        }
+    let plugin_name = format!("yard-plugin-{type_name}");
+    let resolved = download::ensure_plugin_cached(
+        &plugin_name,
+        plugin_version,
+        source,
+        plugin_host_config,
+    )
+    .await
+    .with_context(|| format!("failed to resolve plugin binary for {plugin_name} from {source}"))?;
+
+    // Only downloaded binaries are checksum-locked; local files and git
+    // builds change legitimately between runs.
+    let mut spawner_config = plugin_host_config.clone();
+    if !resolved.locked {
+        spawner_config.lock_file_path = None;
     }
+
+    Ok(Box::new(PluginProvider::from_binary(
+        resolved.path,
+        plugin_name,
+        spawner_config,
+    )))
+}
+
+/// Resolve the provider for a job definition.
+///
+/// Convenience wrapper around [`get_provider_for_job`] that reads the
+/// plugin fields from the job.
+///
+/// # Errors
+///
+/// See [`get_provider_for_job`].
+pub async fn provider_for(
+    job_def: &JobDefinition,
+    plugin_host_config: &PluginHostConfig,
+) -> Result<Box<dyn Provider>> {
+    get_provider_for_job(
+        &job_def.job_type,
+        job_def.plugin_version.as_deref(),
+        job_def.plugin_source.as_deref(),
+        plugin_host_config,
+    )
+    .await
+}
+
+/// Generate a job's script through its plugin.
+///
+/// Returns an empty string, with a warning on stderr, when the job has no
+/// `plugin_source` (nothing can generate it). A configured plugin that
+/// fails to resolve or fails codegen is a hard error -- silently hashing
+/// or deploying an empty script would hide the problem.
+///
+/// # Errors
+///
+/// Returns an error if the plugin cannot be resolved, the effective job
+/// config cannot be built, or the plugin's codegen operation fails.
+pub async fn codegen_job(
+    providers: &HashMap<String, Value>,
+    job_name: &str,
+    job_def: &JobDefinition,
+    plugin_host_config: &PluginHostConfig,
+) -> Result<String> {
+    if job_def.plugin_source.is_none() {
+        eprintln!(
+            "Warning: job \"{job_name}\" has no plugin_source -- no script can be generated for it"
+        );
+        return Ok(String::new());
+    }
+
+    let provider = provider_for(job_def, plugin_host_config).await?;
+    let config = effective_job_config(providers, job_def)
+        .with_context(|| format!("failed to build effective config for job \"{job_name}\""))?;
+    let script = provider
+        .codegen(job_name, &config)
+        .await
+        .with_context(|| format!("plugin codegen failed for job \"{job_name}\""))?;
+    Ok(script.unwrap_or_default())
 }

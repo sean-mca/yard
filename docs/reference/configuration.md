@@ -159,16 +159,16 @@ and shallow-overrides the root `yard.yaml` `aws:` block per-job.
 
 Defined by `JobDefinition` in `yard-structs/src/config.rs`.
 
-Only `type`, `plugin_version`, and `plugin_source` are required by yard
-itself. Which of the remaining fields a job uses, and whether a plugin needs
+Only `type` and `plugin_source` are required by yard itself (`plugin_version`
+too, unless the source is a local file). Which of the remaining fields a job uses, and whether a plugin needs
 fields not listed here, depends on the plugin: yard parses the fields below
 when present and passes the whole job through for the plugin to validate.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `type` (→ `job_type`) | string | Yes | Plugin provider type, e.g. `glue`, `emr`. Resolves the plugin binary name as `yard-plugin-<type>`. |
-| `plugin_version` | string | Yes | Version of the provider plugin to use, e.g. `"0.3.1"`. Must be set together with `plugin_source`. |
-| `plugin_source` | string | Yes | URL template yard downloads the plugin binary from. Supports `${name}`, `${version}`, `${os}`, `${arch}`. Must be set together with `plugin_version`. |
+| `plugin_version` | string | Usually | Plugin release to download, or git ref (tag, branch, commit) to build, e.g. `"0.3.1"`. Ignored for `file://` sources. |
+| `plugin_source` | string | Yes | Where the plugin comes from: GitHub repository, git repository, local file, or download URL. See [`plugin_source` forms](#plugin_source-forms). |
 | `sources` | array | Usually | Input datasets — see source fields below. |
 | `sink` | object | Usually | Output dataset — see sink fields below. |
 | `transforms` | array | No | Ordered transform steps. |
@@ -181,6 +181,33 @@ when present and passes the whole job through for the plugin to validate.
 | `partition_timestamp_column` | string | No | Existing timestamp column to derive year/month/day from. Mutually exclusive with `create_timestamp`. |
 | `create_timestamp` | bool | No | If true, adds `ingestion_timestamp = current_timestamp()` and derives partitions. Mutually exclusive with `partition_timestamp_column`. |
 | `config` | object | No | Free-form provider-specific config merged with `providers.<type>` from `yard.yaml`. |
+
+#### `plugin_source` forms
+
+`plugin_source` names where a job's plugin comes from. yard never needs an
+operating system or architecture spelled out; it derives the asset for the
+machine it runs on, so one job file works on every platform.
+
+| Form | Example | `plugin_version` | Checksummed in `yard.lock` |
+|------|---------|------------------|----------------------------|
+| GitHub repository | `https://github.com/org/yard-plugin-glue` | Release tag (`v<version>`, then `<version>`) | Yes |
+| Directory URL (trailing `/`) | `https://cdn.example.com/plugins/` | Appended to the asset name | Yes |
+| URL template | `https://host/${name}-${version}-${target}` | Substituted | Yes |
+| Explicit URL | `https://host/path/yard-plugin-glue-0.1.0-aarch64-apple-darwin` | Used for caching only | Yes |
+| Git repository | `git::https://my-repo/plugins/whatever`, `git+ssh://...`, `git@host:org/repo.git`, `https://host/org/repo.git//subdir` | Tag, branch, or commit to check out | No |
+| Local file | `file:///abs/path`, `file://relative/to/project/root`, `./bin/plugin`, `~/bin/plugin` | Ignored | No |
+
+For the download forms the asset is named `<name>-<version>-<target>` where
+`<name>` is `yard-plugin-<type>` and `<target>` is the Rust target triple of
+the running `yard` (`aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, ...).
+Template placeholders: `${name}`, `${version}`, `${target}`, `${os}`,
+`${arch}`, `${platform}` (`${arch}-${os}`).
+
+For git sources yard clones the repository at the ref, then looks for an
+executable named `yard-plugin-<type>` (or `yard-plugin-<type>.<ext>`, or
+`bin/yard-plugin-<type>`) and otherwise runs `cargo build --release` when a
+`Cargo.toml` is present. The result is cached under `.yard/plugins/` by ref;
+delete that directory to rebuild a moving branch.
 
 #### `sources[]` fields (`Source` struct)
 
@@ -475,7 +502,7 @@ surface as errors only when a provider command actually calls AWS.
 The following YAML fields are hard-required by yard itself:
 
 - `yard.yaml`: `project`, `state`
-- Per-job: `type`, `plugin_version`, `plugin_source`
+- Per-job: `type`, `plugin_source` (and `plugin_version` unless the source is a local file)
 
 Provider-specific requirements come from each plugin's `schema()` and
 `validate()` operations; a plugin that uploads scripts will typically require
