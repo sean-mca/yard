@@ -21,7 +21,7 @@ YARD replaces all of that with a single YAML-driven workflow:
 - **One file per job.** No Terraform modules, no CloudFormation, no copy-pasted boilerplate.
 - **Plugin providers.** Provider logic runs as external binaries over a JSON protocol. Install `yard-plugin-glue` or `yard-plugin-emr`, or build your own with `yard-plugin-sdk`.
 - **Plan/apply lifecycle.** See what will change before it changes. State is per-job, so teams deploy concurrently without locks.
-- **Auto-download.** Plugins are downloaded from GitHub Releases on first use with TOFU checksum verification (`yard.lock`).
+- **Auto-download.** Point `plugin_source` at a GitHub repo and yard fetches the release asset for your platform on first use, with TOFU checksum verification (`yard.lock`). Git repositories (built from source) and local `file://` binaries work too.
 
 ## Installation
 
@@ -50,7 +50,7 @@ See [docs/quickstart.md](docs/quickstart.md) for prerequisites and first-run set
 # orders.yaml
 type: glue
 plugin_version: "0.1.0"
-plugin_source: "https://github.com/your-org/yard-plugin-glue/releases/download/v0.1.0/yard-plugin-glue-0.1.0-aarch64-macos"
+plugin_source: "https://github.com/your-org/yard-plugin-glue"
 role: arn:aws:iam::123456789:role/GlueJobExecutionRole
 
 sources:

@@ -102,6 +102,10 @@ pub enum Commands {
         /// Scope to all jobs under a directory subtree
         #[arg(long, conflicts_with = "target")]
         dir: Option<String>,
+
+        /// Run yard's structural checks only; do not resolve or call plugins
+        #[arg(long)]
+        skip_plugins: bool,
     },
 
     /// Destroy deployed jobs and remove state

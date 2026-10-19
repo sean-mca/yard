@@ -94,7 +94,8 @@ boundary. `plugin_host::download` resolves and caches the binary, and
 3. Provider-level config is merged with per-job overrides by `yard_core::config_merge::build_provider_config` (`yard-core/src/config_merge.rs`).
 4. `yard_core::diff::calculate_diff(&manifest, &state)` in `yard-core/src/diff.rs` generates each job's script by calling the plugin's `codegen` operation, concatenates script + serialised config, hashes with BLAKE3, and emits `JobDiff { Create | Modify { changes } | Delete }` entries. It is `async` in v2.0 because codegen now runs out-of-process.
 5. `yard_core::orchestrate::apply` (`yard-core/src/orchestrate.rs`) acquires per-job locks via `Storage::lock_jobs` (atomic with rollback), then for each changed job:
-   - Instantiates a `Box<dyn Provider>` via `providers::get_provider_for_job(job_type, &merged_config, plugin_version, plugin_source, &plugin_host_config)`. This downloads and caches the plugin binary if needed, then wraps it in a `PluginProvider`. If the job declares neither `plugin_version` nor `plugin_source`, this is where the v1.x migration error is raised.
+   - Instantiates a `Box<dyn Provider>` via `providers::provider_for(&job_def, &plugin_host_config)`. This resolves the plugin binary named by `plugin_source` (local file, git checkout + build, or download) and caches it if needed, then wraps it in a `PluginProvider`. If the job has no `plugin_source`, this is where the v1.x migration error is raised.
+   - Builds the plugin's `job_config` with `config_merge::effective_job_config`: the parsed job plus the `providers.<type>` block from `yard.yaml` deep-merged with the job's own `<type>:` block.
    - Calls `provider.deploy(job_name, &artifact, &job_config)` which uploads the generated script to S3 and creates/updates the target resource (Glue job, EMR step, etc.).
    - Writes the resulting `JobState { deployment: Deployment { resources, config_hash, status, applied_at, ... } }` via `Storage::write_job`.
 6. Locks are released (rollback-safe) and a summary is returned to `yard-cli`, which formats and prints it.
@@ -131,7 +132,8 @@ pub trait Provider: Send + Sync {
 
 ### `plugin_host` — `yard-core/src/plugin_host/`
 
-- `download.rs` — expands the `plugin_source` URL template (`${name}`, `${version}`, `${os}`, `${arch}`), downloads over HTTPS, caches the binary at `.yard/plugins/{name}-{version}-{arch}-{os}`, and records a SHA-256 in `yard.lock` (trust on first use).
+- `download.rs` — parses `plugin_source` into a `PluginSource` (local file, git, or HTTP), derives the release asset URL for the current target triple (GitHub repository shorthand, directory URL, or `${...}` template), downloads over HTTPS, caches the binary under `.yard/plugins/`, and records a SHA-256 in `yard.lock` (trust on first use). Local and git-built binaries are never checksummed.
+- `git.rs` — clones a git source at the ref named by `plugin_version`, then locates the plugin executable or builds it with `cargo build --release`.
 - `spawner.rs` — one child process per operation. Writes the request line to stdin, closes stdin, reads the response line from stdout. Verifies the cached binary's checksum against `yard.lock` before spawning.
 - `provider.rs` — `PluginProvider`, the `Provider` impl that maps trait methods onto protocol operations.
 

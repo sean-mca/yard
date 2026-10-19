@@ -15,11 +15,7 @@ use anyhow::Result;
 pub async fn execute(name: String, directory: Option<String>) -> Result<()> {
     let project = resolve_project(directory).await?;
 
-    let plugin_host_config = yard_core::plugin_host::PluginHostConfig {
-        plugins_dir: project.root_dir.join(".yard/plugins"),
-        lock_file_path: Some(project.root_dir.join("yard.lock")),
-        ..Default::default()
-    };
+    let plugin_host_config = yard_core::plugin_host_config_for(&project.root_dir);
 
     let script = yard_core::show(&project.manifest, &name, &plugin_host_config).await?;
     print!("{script}");

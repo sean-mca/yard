@@ -295,60 +295,37 @@ You should see two JSON lines on stdout: the handshake, then the schema response
 
 ### Step 4: Test locally
 
-Copy the plugin into a yard project's plugin cache and configure a job to use it.
-
-yard looks for a cached binary at
-`.yard/plugins/{name}-{version}-{arch}-{os}` and only downloads when that
-file is missing. Pre-place your build there and yard will use it without
-ever hitting the network.
-
-The `{arch}-{os}` platform key comes from Rust's `std::env::consts` --
-`aarch64-macos`, `x86_64-macos`, `x86_64-linux`, `aarch64-linux`. Print
-your own with:
-
-```bash
-rustc --print cfg | grep -E 'target_arch|target_os'
-# target_arch="aarch64"
-# target_os="macos"      ->  platform key: aarch64-macos
-```
-
-Note the cache key uses Rust's *consts* spelling (`macos`, `linux`), not the
-target-triple spelling (`apple-darwin`, `unknown-linux-gnu`). `rustc -vV`'s
-`host:` line shows the triple, so do not copy the platform key from there.
-Without a Rust toolchain, `uname -m` gives the architecture (`arm64` means
-`aarch64`) and `uname -s` the OS (`Darwin` means `macos`).
+Point a job at your build with a `file://` source. Nothing is downloaded,
+nothing is checksummed, and `plugin_version` is ignored, so you can rebuild
+and re-run as often as you like:
 
 <!-- tabs:start -->
 <!-- tab: Rust -->
 **Rust**
 
-```bash
-mkdir -p .yard/plugins
-# On Apple Silicon:
-cp target/release/yard-plugin-example \
-   .yard/plugins/yard-plugin-example-0.1.0-aarch64-macos
+```yaml
+# test-job.yaml
+type: example
+plugin_source: "file://../yard-plugin-example/target/release/yard-plugin-example"
+sources:
+  - name: input
+    type: s3
+    path: s3://test-bucket/input/
+    format: parquet
+sink:
+  source: input
+  type: s3
+  path: s3://test-bucket/output/
+  format: parquet
+  mode: overwrite
 ```
 <!-- tab: Python -->
 **Python**
 
-```bash
-mkdir -p .yard/plugins
-# On Apple Silicon:
-cp yard-plugin-example.py \
-   .yard/plugins/yard-plugin-example-0.1.0-aarch64-macos
-chmod +x .yard/plugins/yard-plugin-example-0.1.0-aarch64-macos
-```
-
-The cached file keeps no `.py` extension; the shebang line is what makes it runnable.
-<!-- tabs:end -->
-
-Create a test job file referencing the plugin:
-
 ```yaml
 # test-job.yaml
 type: example
-plugin_version: "0.1.0"
-plugin_source: "https://example.invalid/yard-plugin-example-0.1.0-aarch64-macos"
+plugin_source: "file://../yard-plugin-example/yard-plugin-example.py"
 sources:
   - name: input
     type: s3
@@ -362,15 +339,16 @@ sink:
   mode: overwrite
 ```
 
-`plugin_source` is required even for local testing, but it is never
-fetched as long as the cached binary above is in place -- yard short-circuits
-on the cache hit. It cannot point at a `file://` path: the downloader accepts
-only `https://` (plus `http://` on loopback for local test servers), so a
-`file://` URL fails the moment the cache misses.
+The script needs its shebang line and the executable bit (`chmod +x`).
+<!-- tabs:end -->
 
-Run `yard plan` to verify the plugin is discovered and called correctly. If you
-see a download attempt, your cached filename does not match the expected
-platform key.
+Relative paths resolve against the project root (the directory holding
+`yard.yaml`); absolute paths (`file:///opt/...`) and `~/` work too. A bare
+path starting with `./`, `../`, `/`, or `~/` is accepted as shorthand for
+`file://`.
+
+Run `yard validate` to see the plugin's `schema` and `validate` operations
+called, and `yard show <job>` to print its `codegen` output.
 
 ### Step 5: Logging
 
@@ -411,64 +389,78 @@ Non-zero exit tells yard the operation failed, and yard shows the last lines of 
 
 ### Step 6: Release to GitHub
 
-Create a GitHub release with a tag matching your version (e.g. `v0.1.0`). Upload one asset per platform following the naming convention:
+Create a GitHub release with a tag matching your version (`v0.1.0`) and
+upload one asset per platform named
 
 ```
-yard-plugin-example-0.1.0-macos-aarch64
-yard-plugin-example-0.1.0-macos-x86_64
-yard-plugin-example-0.1.0-linux-x86_64
-yard-plugin-example-0.1.0-linux-aarch64
+<plugin name>-<version>-<target triple>
 ```
+
+for example:
+
+```
+yard-plugin-example-0.1.0-aarch64-apple-darwin
+yard-plugin-example-0.1.0-x86_64-apple-darwin
+yard-plugin-example-0.1.0-x86_64-unknown-linux-gnu
+yard-plugin-example-0.1.0-aarch64-unknown-linux-gnu
+```
+
+The suffix is the Rust target triple, exactly what a cargo cross-compile
+matrix gives you as `${{ matrix.target }}`. yard works out the triple of the
+machine it runs on and fetches the matching asset; users never spell out an
+OS or architecture. On Linux yard assumes a `gnu` toolchain.
 
 <!-- tabs:start -->
 <!-- tab: Rust -->
 **Rust**
 
-Cross-compile or build on each platform, and upload each binary under its platform name.
+Cross-compile or build on each platform, and upload each binary under its
+target name.
 <!-- tab: Python -->
 **Python**
 
-The script is the same on every platform, but `plugin_source` resolves to one asset per platform, so upload the same file under each platform name.
+The script is the same on every platform, but yard asks for one asset per
+target, so upload the same file under each target name.
 <!-- tabs:end -->
 
-Your asset names only have to match whatever `plugin_source` template your
-users write. What is *not* free-form is how yard expands the placeholders:
-
-| Placeholder | Expands to | Values |
-|-------------|-----------|--------|
-| `${name}` | `yard-plugin-<job type>` | Derived from the job's `type:` field |
-| `${version}` | Value of `plugin_version` | e.g. `0.1.0` |
-| `${os}` | `std::env::consts::OS` | `macos`, `linux` |
-| `${arch}` | `std::env::consts::ARCH` | `aarch64`, `x86_64` |
-
-`${os}` is **not** the target-triple fragment -- it is `macos`, not
-`apple-darwin`, and `linux`, not `unknown-linux-gnu`. Name your release assets
-to match, or your users' first `yard plan` will 404.
-> **Known limitation (v2.0).** Placeholder templating is **not currently usable
-> inside a `<job>.yaml`**. yard runs `${...}` context interpolation over the whole
-> job file before parsing it, so a `plugin_source` containing `${version}`,
-> `${os}` or `${arch}` fails to resolve with
-> `Missing Variable: Could not find 'version' in the provided context`. This
-> applies to YAML comments too. Until that is fixed, write the fully expanded
-> URL for the platform you are on:
->
-> ```yaml
-> plugin_source: "https://<plugin-release-url>/yard-plugin-glue-0.1.0-aarch64-macos"
-> ```
->
-> The placeholder expansion itself works correctly once a template reaches the
-> downloader -- it is only the job-file interpolation pass that rejects it.
-
-Also note `${name}` is derived from the job's `type:` field as
-`yard-plugin-<type>`. A job with `type: example` resolves to plugin name
-`yard-plugin-example`, so your binary must be named accordingly.
-
-Users reference your release in their `job.yaml`:
+Users then reference the repository and the version in their `job.yaml`:
 
 ```yaml
 plugin_version: "0.1.0"
-plugin_source: "https://github.com/your-org/yard-plugin-example/releases/download/v0.1.0/yard-plugin-example-0.1.0-aarch64-macos"
+plugin_source: "https://github.com/your-org/yard-plugin-example"
 ```
+
+yard turns that into
+`https://github.com/your-org/yard-plugin-example/releases/download/v0.1.0/yard-plugin-example-0.1.0-<target>`
+(falling back to a tag without the `v` prefix).
+
+Other hosting works too. A `plugin_source` ending in `/` gets
+`<name>-<version>-<target>` appended, and a URL template is expanded with
+these placeholders:
+
+| Placeholder | Expands to | Example |
+|-------------|-----------|---------|
+| `${name}` | `yard-plugin-<job type>` | `yard-plugin-example` |
+| `${version}` | Value of `plugin_version` | `0.1.0` |
+| `${target}` | Rust target triple of the running yard | `aarch64-apple-darwin` |
+| `${os}` | `std::env::consts::OS` | `macos`, `linux` |
+| `${arch}` | `std::env::consts::ARCH` | `aarch64`, `x86_64` |
+| `${platform}` | `${arch}-${os}` | `aarch64-macos` |
+
+A fully explicit URL with no placeholders is used verbatim, which ties the
+job file to one platform; prefer the repository form.
+
+Users without a release can build from source instead. A git source
+(`git::https://...`, a URL ending in `.git`, or `git@...`) is cloned at the
+tag, branch, or commit named by `plugin_version`; yard then runs
+`cargo build --release` if it finds a `Cargo.toml`, or uses a script named
+after the plugin. Append `//<subdir>` to select a directory inside a
+monorepo. Git builds are cached by ref and are not recorded in `yard.lock`.
+
+Note `${name}` is derived from the job's `type:` field as
+`yard-plugin-<type>`. A job with `type: example` resolves to plugin name
+`yard-plugin-example`, so your binary, package, and release assets must be
+named accordingly.
 
 ### TOFU checksum model
 
@@ -478,7 +470,7 @@ yard uses a trust-on-first-use (TOFU) checksum model for plugin binaries:
 2. **Subsequent runs:** yard verifies the cached binary's checksum against `yard.lock`. A mismatch aborts the operation.
 3. **Version bumps:** changing `plugin_version` in `job.yaml` triggers a re-download. The new checksum replaces the old entry in `yard.lock`.
 
-`yard.lock` should be committed to version control. Team members on different platforms accumulate their platform-specific checksums in the same file -- the lock file grows organically.
+`yard.lock` should be committed to version control. Team members on different platforms accumulate their platform-specific checksums in the same file -- the lock file grows organically. Only downloaded binaries are locked; `file://` and git sources are never checksummed.
 
 ## Part 2: JSON protocol spec
 

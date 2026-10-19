@@ -32,10 +32,9 @@ The rest of this document explains each step.
 Decide which provider you are deploying to and find its plugin. From the
 plugin's documentation you need three things:
 
-- **A release to point at.** Each job file carries `plugin_version` and
-  `plugin_source`, the URL yard downloads the plugin binary from. Plugins
-  publish one binary per platform, so pick the asset for the machine yard
-  runs on.
+- **A release to point at.** Each job file carries `plugin_source` (usually
+  the plugin's GitHub repository URL) and `plugin_version`. yard fetches the
+  release asset for the machine it runs on; you never name a platform.
 - **The config it accepts.** The block under `providers.<type>` in
   `yard.yaml`, and any provider-specific fields in job files, are defined by
   the plugin. yard validates them against the schema the plugin reports and
@@ -213,11 +212,13 @@ plugin_version: "<version>"
 plugin_source: "<url>"
 ```
 
-`type` selects the plugin. `plugin_version` and `plugin_source` are required
-on every job in v2.0: they tell yard which plugin release to download and from
-where. Write the full URL for your platform's asset; placeholder expansion
-inside job files is not available yet (see the
-[v2.0 migration guide](reference/migrations/v2.0.md)).
+`type` selects the plugin. `plugin_source` says where it comes from: a GitHub
+repository (`https://github.com/<org>/yard-plugin-<type>`, the release asset
+for your platform is picked automatically), a git repository to build from
+(`git::<url>`), or a local binary (`file://<path>`). `plugin_version` is the
+release or git ref to use, and is ignored for `file://` sources. See
+[configuration](reference/configuration.md#plugin_source-forms) for every
+form.
 
 Everything else in the file is defined by the plugin. yard passes it through
 and validates it against the schema the plugin reports, so the shape of a job
@@ -234,7 +235,7 @@ needs the IAM role the job runs as:
 ```yaml
 type: glue
 plugin_version: "0.1.0"
-plugin_source: "https://<plugin-release-url>/yard-plugin-glue-0.1.0-aarch64-macos"
+plugin_source: "https://github.com/<org>/yard-plugin-glue"
 role: arn:aws:iam::123456789012:role/GlueJobExecutionRole
 
 sources:
@@ -262,7 +263,7 @@ runs, and its tasks. There are no sources or sinks.
 ```yaml
 type: airflow
 plugin_version: "0.1.0"
-plugin_source: "https://<plugin-release-url>/yard-plugin-airflow-0.1.0-aarch64-macos"
+plugin_source: "https://github.com/<org>/yard-plugin-airflow"
 dags_bucket: my-airflow-dags
 
 schedule: "@daily"

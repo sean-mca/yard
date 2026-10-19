@@ -117,7 +117,6 @@ async fn destroy_dir_filters_to_subdirectory() {
     for name in &names {
         let destroyed = yard_core::destroy_job(
             &p.manifest.state,
-            &p.manifest.providers,
             name,
             root,
             true,

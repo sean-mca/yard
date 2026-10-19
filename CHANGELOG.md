@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `plugin_source` accepts local binaries (`file://path`, or a bare `./`, `../`, `/`, `~/` path); `plugin_version` is ignored for them and no checksum is recorded.
+- `plugin_source` accepts git repositories (`git::<url>`, `git+<url>`, `git@...`, `ssh://`, or any URL ending in `.git`, with an optional `//subdir`). The repo is cloned at the tag, branch, or commit named by `plugin_version`, then built with cargo or used as a script.
+- `plugin_source` accepts a bare GitHub repository URL; yard derives the release asset `<name>-<version>-<target triple>` for the running platform. Directory URLs (trailing `/`) and `${name}`/`${version}`/`${target}`/`${os}`/`${arch}`/`${platform}` templates are also supported.
+- `yard validate` now calls each job's plugin: its `schema` operation (so plugin-declared source/sink types validate) and its `validate` operation. `--skip-plugins` restores structural-only checks.
+- `yard_core::validate_jobs` and `yard_core::plugin_host_config_for` for callers embedding yard.
+
+### Changed
+
+- Plugins now receive the `providers.<type>` block from `yard.yaml` (deep-merged with the job's own `<type>:` block) nested under `<type>` in `job_config`, alongside the parsed job. Previously the provider block was dropped before reaching the plugin.
+- Deploy, destroy, and verify no longer require a `providers.<type>` block in `yard.yaml`; they run whenever the job has a `plugin_source`.
+- A configured plugin that fails codegen is now an error in `plan` and `apply` instead of silently hashing or deploying an empty script.
+- `${name}`, `${version}`, and other single-segment placeholders in job files are no longer rejected by context interpolation.
+- Release asset naming convention is now `<name>-<version>-<target triple>` (e.g. `yard-plugin-glue-0.1.0-aarch64-apple-darwin`), matching cargo cross-compile targets.
+- `providers::get_provider_for_job` no longer takes a provider config argument; `destroy_job` / `destroy_all` no longer take the providers map; `Provider::schema` returns the full `SchemaResponse`.
+
 ## [2.0.0] - 2026-09-02
 
 ### Breaking Changes

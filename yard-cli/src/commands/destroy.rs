@@ -65,7 +65,6 @@ pub async fn execute(
         for name in &names {
             let destroyed = yard_core::destroy_job(
                 &project.manifest.state,
-                &project.manifest.providers,
                 name,
                 &project.root_dir,
                 dry_run,
@@ -105,7 +104,6 @@ pub async fn execute(
 
             let destroyed_job = yard_core::destroy_job(
                 &project.manifest.state,
-                &project.manifest.providers,
                 &name,
                 &project.root_dir,
                 dry_run,
@@ -156,7 +154,6 @@ pub async fn execute(
 
             let result = yard_core::destroy_all(
                 &project.manifest.state,
-                &project.manifest.providers,
                 project.manifest.aws.as_ref(),
                 &project.root_dir,
                 dry_run,

@@ -27,7 +27,7 @@ use crate::storage::LockGuard;
 use crate::utils;
 use crate::validation;
 
-use crate::config_merge::build_provider_config;
+use crate::config_merge::effective_job_config;
 use crate::diff::calculate_diff;
 use crate::plugin_host::PluginHostConfig;
 
@@ -71,6 +71,122 @@ pub async fn load_state(
     })
 }
 
+/// Build the [`PluginHostConfig`] for a project rooted at `root_dir`.
+///
+/// Plugins are cached under `.yard/plugins/`, checksums live in
+/// `yard.lock`, and relative `file://` sources resolve against the root.
+#[must_use]
+pub fn plugin_host_config_for(root_dir: &Path) -> PluginHostConfig {
+    PluginHostConfig {
+        plugins_dir: root_dir.join(".yard/plugins"),
+        lock_file_path: Some(root_dir.join("yard.lock")),
+        project_root: root_dir.to_path_buf(),
+        ..Default::default()
+    }
+}
+
+/// Validation outcome for a single job.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobValidation {
+    /// Job name.
+    pub name: String,
+    /// Errors found; empty means the job passed.
+    pub errors: Vec<yard_structs::ValidationError>,
+}
+
+/// Validate jobs structurally and, when `use_plugins` is set, through
+/// their plugins.
+///
+/// For each job this runs yard's structural checks, then (with
+/// `use_plugins`) resolves the job's plugin, fetches its schema so
+/// plugin-declared source/sink types are accepted, and appends whatever
+/// the plugin's `validate` operation reports. A plugin that cannot be
+/// resolved or fails to answer is reported as an error on that job rather
+/// than aborting the whole run. Jobs without `plugin_source` get
+/// structural checks only, with a warning.
+///
+/// # Errors
+///
+/// Returns an error if a named job does not exist in the manifest or a
+/// job's effective config cannot be assembled.
+pub async fn validate_jobs(
+    manifest: &ProjectManifest,
+    job_names: &[&str],
+    root_dir: &Path,
+    use_plugins: bool,
+) -> Result<Vec<JobValidation>> {
+    let plugin_host_config = plugin_host_config_for(root_dir);
+    let mut results = Vec::with_capacity(job_names.len());
+
+    for &name in job_names {
+        let job_def = manifest
+            .jobs
+            .get(name)
+            .ok_or_else(|| anyhow!("target '{name}' not found -- no job with that name"))?;
+
+        if !use_plugins || job_def.plugin_source.is_none() {
+            if use_plugins {
+                eprintln!(
+                    "Warning: job \"{name}\" has no plugin_source -- structural checks only"
+                );
+            }
+            results.push(JobValidation {
+                name: name.to_owned(),
+                errors: validation::validate_job_full_with_schema(name, job_def, None),
+            });
+            continue;
+        }
+
+        let mut errors = Vec::new();
+
+        let provider = match providers::provider_for(job_def, &plugin_host_config).await {
+            Ok(p) => p,
+            Err(e) => {
+                errors.push(providers::validation_err("plugin_source", &format!("{e:#}")));
+                errors.extend(validation::validate_job_full_with_schema(name, job_def, None));
+                results.push(JobValidation {
+                    name: name.to_owned(),
+                    errors,
+                });
+                continue;
+            }
+        };
+
+        let schema = match provider.schema().await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                errors.push(providers::validation_err(
+                    "plugin",
+                    &format!("schema request failed: {e:#}"),
+                ));
+                None
+            }
+        };
+        errors.extend(validation::validate_job_full_with_schema(
+            name,
+            job_def,
+            schema.as_ref(),
+        ));
+
+        let job_config = effective_job_config(&manifest.providers, job_def)
+            .with_context(|| format!("failed to build effective config for job \"{name}\""))?;
+        match provider.validate(name, &job_config).await {
+            Ok(plugin_errors) => errors.extend(plugin_errors),
+            Err(e) => errors.push(providers::validation_err(
+                "plugin",
+                &format!("validate request failed: {e:#}"),
+            )),
+        }
+
+        results.push(JobValidation {
+            name: name.to_owned(),
+            errors,
+        });
+    }
+
+    Ok(results)
+}
+
 /// Verify that deployed resources still exist in their target services.
 ///
 /// For each deployed job with resources and a known provider, instantiates the
@@ -104,26 +220,26 @@ pub async fn verify_deployed_resources(
             None => continue,
         };
 
-        // Need provider config from the manifest to instantiate the provider
-        let provider_key = job_type.to_string();
-        let provider_defaults = match manifest.providers.get(&provider_key) {
-            Some(config) => config,
-            None => continue,
+        // Plugin fields: prefer the manifest's current job, fall back to
+        // what was recorded in state at deploy time.
+        let (plugin_version, plugin_source) = match manifest.jobs.get(job_name) {
+            Some(j) if j.plugin_source.is_some() => {
+                (j.plugin_version.as_deref(), j.plugin_source.as_deref())
+            }
+            _ => (
+                deployment.plugin_version.as_deref(),
+                deployment.plugin_source.as_deref(),
+            ),
         };
-
-        let merged_config =
-            build_provider_config(provider_defaults, &deployment.config, &provider_key);
-
-        // Look up job_def for plugin_version/plugin_source
-        let (plugin_version, plugin_source) = manifest
-            .jobs
-            .get(job_name)
-            .map(|j| (j.plugin_version.as_deref(), j.plugin_source.as_deref()))
-            .unwrap_or((None, None));
+        if plugin_source.is_none() {
+            eprintln!(
+                "Warning: job \"{job_name}\" has no plugin_source -- skipping resource verification"
+            );
+            continue;
+        }
 
         let provider = providers::get_provider_for_job(
             &job_type,
-            &merged_config,
             plugin_version,
             plugin_source,
             plugin_host_config,
@@ -202,25 +318,18 @@ pub async fn apply(
     target: Option<String>,
 ) -> Result<ApplyResult> {
     // Construct plugin host config for plugin-aware provider dispatch.
-    let plugin_host_config = PluginHostConfig {
-        plugins_dir: root_dir.join(".yard/plugins"),
-        lock_file_path: Some(root_dir.join("yard.lock")),
-        ..Default::default()
-    };
+    let plugin_host_config = plugin_host_config_for(root_dir);
 
-    // Validate all jobs up front (schema) -- abort before making any changes
-    let mut all_errors: Vec<(String, Vec<yard_structs::ValidationError>)> = Vec::with_capacity(manifest.jobs.len());
-    for (name, job_def) in &manifest.jobs {
-        let errors = validation::validate_job_full_with_schema(name, job_def, None);
-        if !errors.is_empty() {
-            all_errors.push((name.clone(), errors));
-        }
-    }
-    if !all_errors.is_empty() {
+    // Validate all jobs up front (structural + plugin) -- abort before
+    // making any changes.
+    let all_job_names: Vec<&str> = manifest.jobs.keys().map(String::as_str).collect();
+    let results = validate_jobs(manifest, &all_job_names, root_dir, true).await?;
+    let mut failed = results.iter().filter(|r| !r.errors.is_empty()).peekable();
+    if failed.peek().is_some() {
         let mut msg = String::from("Validation failed:\n");
-        for (name, errors) in &all_errors {
-            for e in errors {
-                let _ = writeln!(msg, "  [{}] {}: {}", name, e.field, e.message);
+        for r in failed {
+            for e in &r.errors {
+                let _ = writeln!(msg, "  [{}] {}: {}", r.name, e.field, e.message);
             }
         }
         return Err(anyhow!("{msg}"));
@@ -291,28 +400,13 @@ pub async fn apply(
                         .context("Job definition missing during apply")?;
 
                     // Generate script via plugin codegen
-                    let script_content = match providers::get_provider_for_job(
-                        &job_def.job_type,
-                        &job_def.config,
-                        job_def.plugin_version.as_deref(),
-                        job_def.plugin_source.as_deref(),
+                    let script_content = providers::codegen_job(
+                        &manifest.providers,
+                        &diff.name,
+                        job_def,
                         &plugin_host_config,
                     )
-                    .await
-                    {
-                        Ok(provider) => provider
-                            .codegen(&diff.name, &job_def.config)
-                            .await
-                            .unwrap_or(None)
-                            .unwrap_or_default(),
-                        Err(e) => {
-                            eprintln!(
-                                "Warning: plugin codegen failed for job \"{}\", deploying empty script: {e}",
-                                diff.name
-                            );
-                            String::new()
-                        }
-                    };
+                    .await?;
 
                     let config_str = serde_json::to_string(&job_def.config).with_context(|| {
                         format!("Failed to serialize config for job \"{}\"", diff.name)
@@ -343,30 +437,22 @@ pub async fn apply(
                     // Deploy via provider if configured (skip in dry-run mode).
                     let resources = if dry_run {
                         Vec::new()
+                    } else if job_def.plugin_source.is_some() {
+                        let job_config = effective_job_config(&manifest.providers, job_def)
+                            .with_context(|| {
+                                format!("failed to build effective config for job \"{}\"", diff.name)
+                            })?;
+                        let provider =
+                            providers::provider_for(job_def, &plugin_host_config).await?;
+                        provider
+                            .deploy(&diff.name, &script_content, &job_config)
+                            .await?
                     } else {
-                        let provider_key = job_def.job_type.to_string();
-                        if let Some(provider_defaults) =
-                            manifest.providers.get(&provider_key)
-                        {
-                            let merged_config = build_provider_config(
-                                provider_defaults,
-                                &job_def.config,
-                                &provider_key,
-                            );
-                            let provider = providers::get_provider_for_job(
-                                &job_def.job_type,
-                                &merged_config,
-                                job_def.plugin_version.as_deref(),
-                                job_def.plugin_source.as_deref(),
-                                &plugin_host_config,
-                            )
-                            .await?;
-                            provider
-                                .deploy(&diff.name, &script_content, &job_def.config)
-                                .await?
-                        } else {
-                            Vec::new()
-                        }
+                        eprintln!(
+                            "Warning: job \"{}\" has no plugin_source -- skipping deploy",
+                            diff.name
+                        );
+                        Vec::new()
                     };
 
                     let status = if resources.is_empty() {
@@ -421,22 +507,21 @@ pub async fn apply(
                                 format!("invalid job type in state for job '{}'", diff.name)
                             })?;
 
-                        let provider_key = job_type.to_string();
-                        if let Some(provider_defaults) = manifest.providers.get(&provider_key) {
-                            let merged_config = build_provider_config(
-                                provider_defaults,
-                                &existing.config,
-                                &provider_key,
-                            );
+                        if existing.plugin_source.is_some() {
                             let provider = providers::get_provider_for_job(
                                 &job_type,
-                                &merged_config,
                                 existing.plugin_version.as_deref(),
                                 existing.plugin_source.as_deref(),
                                 &plugin_host_config,
                             )
                             .await?;
                             provider.destroy(&diff.name, &existing.resources).await?;
+                        } else {
+                            eprintln!(
+                                "Warning: job \"{}\" state has no plugin_source -- \
+                                 removing state without destroying resources",
+                                diff.name
+                            );
                         }
                     }
 
@@ -485,11 +570,7 @@ pub async fn plan(
     target: Option<String>,
 ) -> Result<PlanResult> {
     // Construct plugin host config for diff computation.
-    let plugin_host_config = PluginHostConfig {
-        plugins_dir: root_dir.join(".yard/plugins"),
-        lock_file_path: Some(root_dir.join("yard.lock")),
-        ..Default::default()
-    };
+    let plugin_host_config = plugin_host_config_for(root_dir);
 
     // Target validation: shared helper, identical contract with apply.
     validate_target(manifest, target.as_deref())?;
@@ -581,7 +662,6 @@ pub struct DestroyResult {
 /// fails, if provider destruction fails, or if state deletion fails.
 pub async fn destroy_job(
     backend: &yard_structs::StateBackend,
-    provider_configs: &HashMap<String, serde_json::Value>,
     job_name: &str,
     root_dir: &Path,
     dry_run: bool,
@@ -599,11 +679,7 @@ pub async fn destroy_job(
         .with_context(|| format!("failed to acquire lock for job \"{job_name}\""))?;
     let lock_guard = LockGuard::new(&storage, vec![(job_name.to_string(), lock)]);
 
-    let plugin_host_config = PluginHostConfig {
-        plugins_dir: root_dir.join(".yard/plugins"),
-        lock_file_path: Some(root_dir.join("yard.lock")),
-        ..Default::default()
-    };
+    let plugin_host_config = plugin_host_config_for(root_dir);
 
     let result: Result<()> = async {
         // Destroy provider resources if they exist
@@ -617,16 +693,9 @@ pub async fn destroy_job(
                 .parse()
                 .with_context(|| format!("invalid job type in state for job '{job_name}'"))?;
 
-            let provider_key = job_type.to_string();
-            if let Some(provider_defaults) = provider_configs.get(&provider_key) {
-                let merged_config = build_provider_config(
-                    provider_defaults,
-                    &job_state.deployment.config,
-                    &provider_key,
-                );
+            if job_state.deployment.plugin_source.is_some() {
                 let provider = providers::get_provider_for_job(
                     &job_type,
-                    &merged_config,
                     job_state.deployment.plugin_version.as_deref(),
                     job_state.deployment.plugin_source.as_deref(),
                     &plugin_host_config,
@@ -635,6 +704,11 @@ pub async fn destroy_job(
                 provider
                     .destroy(job_name, &job_state.deployment.resources)
                     .await?;
+            } else {
+                eprintln!(
+                    "Warning: job \"{job_name}\" state has no plugin_source -- \
+                     removing state without destroying resources"
+                );
             }
         }
 
@@ -668,7 +742,6 @@ pub async fn destroy_job(
 /// Returns an error if any individual job destruction fails.
 pub async fn destroy_all(
     backend: &yard_structs::StateBackend,
-    provider_configs: &HashMap<String, serde_json::Value>,
     _aws: Option<&yard_structs::AwsCredentialConfig>,
     root_dir: &Path,
     dry_run: bool,
@@ -682,7 +755,7 @@ pub async fn destroy_all(
     };
 
     for name in job_names {
-        if destroy_job(backend, provider_configs, &name, root_dir, dry_run).await? {
+        if destroy_job(backend, &name, root_dir, dry_run).await? {
             result.destroyed.push(name);
         }
     }
@@ -760,7 +833,7 @@ mod tests {
     }
 
     /// Compute the combined hash the same way calculate_diff does (without codegen)
-    fn job_hash_no_codegen(name: &str, job: &JobDefinition) -> String {
+    fn job_hash_no_codegen(_name: &str, job: &JobDefinition) -> String {
         // In v2.0, without a plugin binary available, codegen returns empty string
         let script = String::new();
         let config_str = serde_json::to_string(&job.config).unwrap_or_default();
@@ -1022,7 +1095,7 @@ mod tests {
         assert!(dir.join(".yard/generated/doomed.py").exists());
 
         // Destroy it
-        let destroyed = destroy_job(&backend, &HashMap::new(), "doomed", &dir, true)
+        let destroyed = destroy_job(&backend, "doomed", &dir, true)
             .await
             .unwrap();
         assert!(destroyed);
@@ -1041,7 +1114,7 @@ mod tests {
             path: dir.join(".yard/state"),
         };
 
-        let destroyed = destroy_job(&backend, &HashMap::new(), "nope", &dir, true)
+        let destroyed = destroy_job(&backend, "nope", &dir, true)
             .await
             .unwrap();
         assert!(!destroyed);
@@ -1078,7 +1151,7 @@ mod tests {
         assert!(state_dir.join("job_b.json").exists());
 
         // Destroy all
-        let result = destroy_all(&backend, &HashMap::new(), None, &dir, true)
+        let result = destroy_all(&backend, None, &dir, true)
             .await
             .unwrap();
         let mut destroyed = result.destroyed.clone();

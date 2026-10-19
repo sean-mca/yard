@@ -8,8 +8,10 @@ use std::path::Path;
 ///
 /// When `target` is `Some`, validates only that single job. When `dir` is
 /// `Some`, validates only jobs under that directory subtree. When both are
-/// `None`, validates all jobs. Prints `[PASS]` or `[FAIL]` per job and
-/// exits with an error if any job fails validation.
+/// `None`, validates all jobs. Each job gets yard's structural checks plus
+/// its plugin's schema and `validate` operation, unless `skip_plugins` is
+/// set. Prints `[PASS]` or `[FAIL]` per job and exits with an error if any
+/// job fails validation.
 ///
 /// # Errors
 ///
@@ -19,6 +21,7 @@ pub async fn execute(
     directory: Option<String>,
     target: Option<String>,
     dir: Option<String>,
+    skip_plugins: bool,
 ) -> Result<()> {
     let project = resolve_project(directory).await?;
 
@@ -50,30 +53,23 @@ pub async fn execute(
     let mut total_pass = 0;
     let mut total_fail = 0;
 
-    let mut job_names: Vec<&String> = if let Some(ref name) = target {
-        vec![name]
+    let mut job_names: Vec<&str> = if let Some(ref name) = target {
+        vec![name.as_str()]
     } else {
-        manifest.jobs.keys().collect()
+        manifest.jobs.keys().map(String::as_str).collect()
     };
     job_names.sort();
 
-    // In v2.0, provider schemas come from plugin binaries (Provider::schema).
-    // Structural validation runs without a schema cache -- provider-specific
-    // validation is the plugin's responsibility via Provider::validate.
+    let results =
+        yard_core::validate_jobs(&manifest, &job_names, &project.root_dir, !skip_plugins).await?;
 
-    for name in job_names {
-        let job_def = match manifest.jobs.get(name) {
-            Some(j) => j,
-            None => continue,
-        };
-        let errors = yard_core::validation::validate_job_full_with_schema(name, job_def, None);
-
-        if errors.is_empty() {
-            println!("[PASS] {}.yaml", name);
+    for result in &results {
+        if result.errors.is_empty() {
+            println!("[PASS] {}.yaml", result.name);
             total_pass += 1;
         } else {
-            println!("[FAIL] {}.yaml", name);
-            for error in &errors {
+            println!("[FAIL] {}.yaml", result.name);
+            for error in &result.errors {
                 println!("  - {}", error);
             }
             total_fail += 1;

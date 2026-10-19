@@ -3,17 +3,18 @@
 //! Provides read-only generation of job scripts without deploying or
 //! modifying state. Used by `yard show <name>` CLI command.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use yard_structs::ProjectManifest;
 
+use crate::config_merge::effective_job_config;
 use crate::plugin_host::PluginHostConfig;
 use crate::providers;
 
 /// Generate and return the script for a job without deploying or modifying state.
 ///
-/// Uses plugin codegen (via [`providers::get_provider_for_job`]) to generate
-/// the script content. Returns the generated script or an error if the job
-/// is not found or plugin codegen fails.
+/// Uses plugin codegen (via [`providers::provider_for`]) to generate the
+/// script content. Returns the generated script or an error if the job is
+/// not found, has no plugin, or plugin codegen fails.
 ///
 /// # Errors
 ///
@@ -29,20 +30,17 @@ pub async fn show(
         .get(job_name)
         .ok_or_else(|| anyhow!("Job \"{job_name}\" not found in manifest"))?;
 
-    let provider = providers::get_provider_for_job(
-        &job_def.job_type,
-        &job_def.config,
-        job_def.plugin_version.as_deref(),
-        job_def.plugin_source.as_deref(),
-        plugin_host_config,
-    )
-    .await
-    .with_context(|| format!("Failed to get provider for job \"{job_name}\""))?;
+    let provider = providers::provider_for(job_def, plugin_host_config)
+        .await
+        .with_context(|| format!("failed to get provider for job \"{job_name}\""))?;
+
+    let job_config = effective_job_config(&manifest.providers, job_def)
+        .with_context(|| format!("failed to build effective config for job \"{job_name}\""))?;
 
     let script = provider
-        .codegen(job_name, &job_def.config)
+        .codegen(job_name, &job_config)
         .await
-        .with_context(|| format!("Failed to generate script for job \"{job_name}\""))?;
+        .with_context(|| format!("failed to generate script for job \"{job_name}\""))?;
 
     Ok(script.unwrap_or_default())
 }

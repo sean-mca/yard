@@ -3,8 +3,13 @@
 //! [`build_provider_config`] and [`merge_provider_config`] perform recursive
 //! deep-merge of provider-level defaults with per-job overrides. Nested
 //! objects merge key-by-key; arrays and scalars are replaced wholesale.
+//! [`effective_job_config`] assembles the single JSON document a plugin
+//! receives as `job_config`.
 
+use anyhow::{Context, Result};
 use serde_json::Value;
+use std::collections::HashMap;
+use yard_structs::JobDefinition;
 
 /// Build the `Value` passed to `get_provider`: provider defaults shallow-
 /// merged with the job's `<job_type>:` block, plus the per-job `_aws` block
@@ -23,6 +28,49 @@ pub fn build_provider_config(
         obj.insert("_aws".to_string(), aws.clone());
     }
     merged
+}
+
+/// Build the `job_config` document sent to a plugin.
+///
+/// The document is the job as yard parsed it (typed `sources`, `sink`,
+/// `transforms`, `job_file`, `partition_by`, ... plus the raw `config`),
+/// with every top-level key of the job file that yard does not model
+/// (`role`, custom blocks) copied alongside, and the job's `<type>` block
+/// replaced by `providers.<type>` from `yard.yaml` deep-merged with the
+/// job's own block. The per-job `_aws` block rides along inside it.
+///
+/// `providers` is the manifest's `providers` map; when it has no block for
+/// this job's type the plugin sees `{}` merged with whatever the job
+/// declared.
+///
+/// # Errors
+///
+/// Returns an error if the job definition cannot be serialized to JSON.
+pub fn effective_job_config(
+    providers: &HashMap<String, Value>,
+    job_def: &JobDefinition,
+) -> Result<Value> {
+    let mut doc = serde_json::to_value(job_def).context("failed to serialize job definition")?;
+    let type_key = job_def.job_type.to_string();
+    let provider_defaults = providers.get(&type_key).unwrap_or(&Value::Null);
+
+    let Some(obj) = doc.as_object_mut() else {
+        return Ok(doc);
+    };
+
+    if let Some(raw) = job_def.config.as_object() {
+        for (key, value) in raw {
+            obj.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+
+    let mut merged = build_provider_config(provider_defaults, &job_def.config, &type_key);
+    if merged.is_null() {
+        merged = Value::Object(serde_json::Map::new());
+    }
+    obj.insert(type_key, merged);
+
+    Ok(doc)
 }
 
 /// Merge provider-level defaults with job-level overrides.
@@ -51,6 +99,7 @@ pub fn merge_provider_config(provider_defaults: &Value, job_overrides: &Value) -
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -146,4 +195,68 @@ mod tests {
         assert_eq!(merged["a"]["b"]["d"], 2);
     }
 
+    // --- effective_job_config ---
+
+    fn glue_job() -> JobDefinition {
+        JobDefinition {
+            job_type: yard_structs::JobType::Plugin("glue".to_string()),
+            sources: vec![yard_structs::Source {
+                name: "orders".into(),
+                source_type: "s3".into(),
+                path: Some("s3://b/raw/".into()),
+                ..Default::default()
+            }],
+            config: json!({
+                "type": "glue",
+                "role": "arn:aws:iam::1:role/r",
+                "sources": [{"name": "orders", "type": "s3", "path": "s3://b/raw/"}],
+                "glue": {"worker_type": "G.2X"},
+                "_aws": {"assume_role": "arn:aws:iam::1:role/deploy"}
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn effective_job_config_nests_merged_provider_block_under_type_key() {
+        let providers = HashMap::from([(
+            "glue".to_string(),
+            json!({"script_bucket": "bkt", "worker_type": "G.1X"}),
+        )]);
+
+        let doc = effective_job_config(&providers, &glue_job()).unwrap();
+
+        assert_eq!(doc["glue"]["script_bucket"], "bkt");
+        assert_eq!(doc["glue"]["worker_type"], "G.2X", "job block wins");
+        assert_eq!(doc["glue"]["_aws"]["assume_role"], "arn:aws:iam::1:role/deploy");
+    }
+
+    #[test]
+    fn effective_job_config_keeps_typed_fields_and_copies_raw_keys() {
+        let doc = effective_job_config(&HashMap::new(), &glue_job()).unwrap();
+
+        // Typed form (what codegen consumes) wins over the raw YAML shape.
+        assert_eq!(doc["job_type"], "glue");
+        assert_eq!(doc["sources"][0]["source_type"], "s3");
+        assert!(doc["sources"][0].get("type").is_none());
+        // Raw top-level keys yard does not model are passed through.
+        assert_eq!(doc["role"], "arn:aws:iam::1:role/r");
+        assert_eq!(doc["type"], "glue");
+        // The raw config is still available verbatim.
+        assert_eq!(doc["config"]["role"], "arn:aws:iam::1:role/r");
+    }
+
+    #[test]
+    fn effective_job_config_without_provider_block_yields_job_block_or_empty_object() {
+        let doc = effective_job_config(&HashMap::new(), &glue_job()).unwrap();
+        assert_eq!(doc["glue"]["worker_type"], "G.2X");
+
+        let bare = JobDefinition {
+            job_type: yard_structs::JobType::Plugin("emr".to_string()),
+            config: json!({"type": "emr"}),
+            ..Default::default()
+        };
+        let doc = effective_job_config(&HashMap::new(), &bare).unwrap();
+        assert_eq!(doc["emr"], json!({}));
+    }
 }

@@ -55,6 +55,7 @@ fn make_sdk_spawner() -> PluginSpawner {
         plugins_dir: PathBuf::from("/tmp/yard-test-plugins-sdk"),
         timeout_secs: 5,
         lock_file_path: None,
+        ..Default::default()
     };
     PluginSpawner::new(binary, "test-plugin-sdk".to_string(), config)
 }
@@ -136,7 +137,7 @@ async fn test_sdk_schema_operation() {
     let spawner = make_sdk_spawner();
     let result = spawner.call_schema().await;
 
-    let fields = result.unwrap();
+    let fields = result.unwrap().fields;
     assert_eq!(fields.len(), 1);
     assert_eq!(fields[0].name, "region");
     assert_eq!(fields[0].field_type, "string");
