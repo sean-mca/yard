@@ -174,7 +174,7 @@ when present and passes the whole job through for the plugin to validate.
 | `transforms` | array | No | Ordered transform steps. |
 | `imports` | array | No | Extra Python imports injected into the generated script. |
 | `body` | string | No | Inline Python body appended to the generated script. |
-| `job_file` | string | No | Path to an external Python file that replaces codegen entirely. |
+| `job_file` | string | No | Path to an external Python file that replaces codegen entirely. Resolved relative to the job YAML's directory by default; prefix with `~/` to resolve relative to the project root (`yard.yaml`'s directory), e.g. `~/scripts/shared.py`. |
 | `airflow` | object | No | *Vestigial in v2.0.* Core no longer generates Airflow DAGs, so this block produces no output. It is still parsed, and `airflow.trigger` is still mixed into the job's config hash — editing it will show up as a diff in `yard plan`. |
 | `partition_by` | array | No | Iceberg partition columns. Only `year`, `month`, `day` are supported. |
 | `mask_pii` | array | No | PII entity types to detect and redact. Interpreted by the provider plugin. See [`mask_pii`](#mask_pii) below. |

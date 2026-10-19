@@ -177,7 +177,7 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
         base_path.to_path_buf()
     };
 
-    let all_jobs = discover_jobs(&search_root)?;
+    let all_jobs = discover_jobs(&search_root, &root_dir)?;
 
     // 4. Parse providers config
     let mut providers = HashMap::new();
@@ -229,7 +229,7 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
     })
 }
 
-fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
+fn discover_jobs(search_root: &Path, project_root: &Path) -> Result<HashMap<String, JobDefinition>> {
     let mut all_jobs = HashMap::new();
     let mut context_cache: HashMap<PathBuf, YARDContext> = HashMap::new();
 
@@ -335,9 +335,15 @@ fn discover_jobs(search_root: &Path) -> Result<HashMap<String, JobDefinition>> {
         let transforms = crate::parse_transforms(&config, &job_path)?;
         let airflow = crate::parse_airflow_job_block(&config, &job_path)?;
 
-        // Resolve job_file path relative to the job YAML's directory
+        // Resolve job_file path: `~/` prefix means relative to the project
+        // root (yard.yaml's directory); otherwise relative to the job YAML's
+        // directory.
         let job_file = crate::parse_job_file(&config).map(|p| {
-            let resolved = job_dir.join(&p);
+            let resolved = if let Some(stripped) = p.strip_prefix("~/") {
+                project_root.join(stripped)
+            } else {
+                job_dir.join(&p)
+            };
             resolved.to_string_lossy().to_string()
         });
 
@@ -1362,7 +1368,7 @@ mod tests {
             "type: glue\nrole: arn:aws:iam::123456789012:role/GlueJob\nglue:\n  script_bucket: my-bucket\n",
         )
         .unwrap();
-        let jobs = discover_jobs(&tmp.0).expect("discover must accept role at top level");
+        let jobs = discover_jobs(&tmp.0, &tmp.0).expect("discover must accept role at top level");
         assert_eq!(jobs.len(), 1, "got: {:?}", jobs.keys());
         let (_, def) = jobs.iter().next().unwrap();
         assert_eq!(
@@ -1382,7 +1388,7 @@ mod tests {
             "type: glue\nrolle: arn:aws:iam::123456789012:role/GlueJob\n",
         )
         .unwrap();
-        let err = discover_jobs(&tmp.0).expect_err("typo must reject");
+        let err = discover_jobs(&tmp.0, &tmp.0).expect_err("typo must reject");
         let msg = format!("{err}");
         assert!(msg.contains("unknown field 'rolle'"), "got: {msg}");
     }
@@ -1666,5 +1672,68 @@ mod tests {
         let manifest = manifest_with_jobs(&[("job_a", &sub_a)]);
         let result = filter_manifest_by_dir(&manifest, Path::new("sub_a"), &tmp.0).unwrap();
         assert_eq!(result.display_path, "sub_a/");
+    }
+
+    #[test]
+    fn job_file_tilde_resolves_relative_to_project_root() {
+        // Set up a project root with a shared script and a nested job that
+        // references it via ~/
+        let tmp = TempDir::new();
+        let job_dir = tmp.0.join("envs").join("dev").join("domain");
+        fs::create_dir_all(&job_dir).unwrap();
+        let scripts_dir = tmp.0.join("scripts");
+        fs::create_dir_all(&scripts_dir).unwrap();
+
+        fs::write(scripts_dir.join("shared.py"), "# shared script").unwrap();
+        fs::write(tmp.0.join("account.yaml"), "{}").unwrap();
+        fs::write(tmp.0.join("region.yaml"), "{}").unwrap();
+        fs::write(job_dir.join("account.yaml"), "{}").unwrap();
+        fs::write(job_dir.join("region.yaml"), "{}").unwrap();
+        fs::write(
+            job_dir.join("my_job.yaml"),
+            "type: glue\njob_file: ~/scripts/shared.py\n",
+        )
+        .unwrap();
+
+        let jobs = discover_jobs(&tmp.0, &tmp.0).expect("discover must succeed");
+        assert_eq!(jobs.len(), 1);
+        let (_, def) = jobs.iter().next().unwrap();
+        let resolved = def.job_file.as_ref().expect("job_file should be set");
+        let expected = tmp.0.join("scripts").join("shared.py");
+        assert_eq!(
+            resolved,
+            &expected.to_string_lossy().to_string(),
+            "~/scripts/shared.py should resolve to project root"
+        );
+    }
+
+    #[test]
+    fn job_file_relative_resolves_to_job_dir() {
+        // Existing behavior: relative paths resolve against the job YAML's dir
+        let tmp = TempDir::new();
+        let job_dir = tmp.0.join("envs").join("dev").join("domain");
+        fs::create_dir_all(&job_dir).unwrap();
+
+        fs::write(job_dir.join("local.py"), "# local script").unwrap();
+        fs::write(tmp.0.join("account.yaml"), "{}").unwrap();
+        fs::write(tmp.0.join("region.yaml"), "{}").unwrap();
+        fs::write(job_dir.join("account.yaml"), "{}").unwrap();
+        fs::write(job_dir.join("region.yaml"), "{}").unwrap();
+        fs::write(
+            job_dir.join("my_job.yaml"),
+            "type: glue\njob_file: ./local.py\n",
+        )
+        .unwrap();
+
+        let jobs = discover_jobs(&tmp.0, &tmp.0).expect("discover must succeed");
+        assert_eq!(jobs.len(), 1);
+        let (_, def) = jobs.iter().next().unwrap();
+        let resolved = def.job_file.as_ref().expect("job_file should be set");
+        let expected = job_dir.join("./local.py");
+        assert_eq!(
+            resolved,
+            &expected.to_string_lossy().to_string(),
+            "./local.py should resolve to job directory"
+        );
     }
 }
