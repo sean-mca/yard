@@ -1,9 +1,4 @@
 type: glue
-plugin_version: "0.1.0"
-# The plugin's GitHub repository. yard downloads the v0.1.0 release asset
-# for whatever platform it runs on. A git URL (git::...) builds from source;
-# a file:// path uses a local binary.
-plugin_source: "https://github.com/your-org/yard-plugin-glue"
 role: arn:aws:iam::123456789012:role/acme-yard-glue-job
 
 sources:

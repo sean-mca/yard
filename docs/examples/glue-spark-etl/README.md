@@ -7,15 +7,17 @@ Copy it, edit a few placeholders, run `yard apply`.
 
 ## What this shows
 
-- Project root manifest (`yard.yaml`) with `providers.glue` defaults.
+- Project root manifest (`yard.yaml`) with `providers.glue` defaults and the
+  `plugins.glue` pin.
 - One Glue job, defined in `aws/dev/us-east-1/orders-pipeline/raw_to_clean.yaml`,
   reading parquet from S3, applying three transforms (`sql`, `filter`,
   `drop_columns`), and writing parquet back. yard's resolver synthesizes the
   job name as `<env>-<folder>-<filename>` (here, `orders-pipeline-raw_to_clean`),
   which is what `[PASS]` lines and `--target` flags reference.
-- The `plugin_source` / `plugin_version` pair that tells yard which Glue
-  plugin to run: the plugin's repository and the release to fetch for the
-  current platform (required for every job since v2.0).
+- The `plugins.glue` block in `yard.yaml`, which tells yard which Glue plugin
+  to run: the plugin's repository (`source`) and the release to fetch for the
+  current platform (`version`). Every glue job inherits it, and a job can
+  override it with its own `plugin_version` / `plugin_source`.
 
 Glue-specific knobs are documented in the `yard-plugin-glue` repository. See
 [docs/reference/configuration.md](../../reference/configuration.md) for
@@ -45,7 +47,7 @@ yard plan
 ```
 
 To actually deploy the job (requires the AWS resources listed in the next
-section, plus a reachable `yard-plugin-glue` release at `plugin_source`), run:
+section, plus a reachable `yard-plugin-glue` release at `plugins.glue.source`), run:
 
 ```bash
 yard apply
@@ -74,7 +76,7 @@ keep as-is.
    together: `providers.glue.region` in `yard.yaml`, plus the
    `aws/dev/us-east-1/` directory name (the third path component is the
    region per yard's hierarchical context convention).
-5. **`plugin_source`** in `raw_to_clean.yaml` — point it at your org's
+5. **`plugins.glue.source`** in `yard.yaml` — point it at your org's
    `yard-plugin-glue` repository (or a `file://` path to a local build).
 
 Optional knobs to tune in `yard.yaml` -> `providers.glue`:

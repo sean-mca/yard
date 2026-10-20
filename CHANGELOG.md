@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- A top-level `plugins:` block in `yard.yaml`, keyed by job type, pins a plugin once with `version` and `source` instead of repeating `plugin_version` / `plugin_source` in every job file. The same block may appear in `account.yaml` and `region.yaml`; pins cascade `yard.yaml` -> `account.yaml` -> `region.yaml` -> job file field by field, and the job file wins.
+- `yard_structs::PluginPin` and `ProjectManifest.plugins` expose the `yard.yaml` pins to embedders; the map is left out of serialized manifests when empty.
+
+### Changed
+
+- `plugin_version` / `plugin_source` under `providers.<type>` (in any layer, or a job's own `<type>:` block) is now an error that points at `plugins.<type>`. Previously they were silently passed to the plugin as config and the job ran unpinned.
+- `plugins` is now a reserved key in `account.yaml` / `region.yaml`; entries with unknown keys are rejected.
+- Per-job `plugin_version` / `plugin_source` are optional when a `plugins` entry covers the job's type.
+
 ## [2.1.2] - 2026-10-19
 
 ### Added
