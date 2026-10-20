@@ -220,7 +220,7 @@ deployed. Do not put `plugin_version` or `plugin_source` there: they belong in
 
 ### 3. Add one job
 
-Create a file `orders.yaml` next to `yard.yaml`. Only one field is yard's:
+Create a file `orders.yaml` next to `yard.yaml`. Only one field is required by yard:
 
 ```yaml
 type: <type>
@@ -252,6 +252,7 @@ needs the IAM role the job runs as:
 
 ```yaml
 type: glue
+name: orders
 role: arn:aws:iam::123456789012:role/GlueJobExecutionRole
 
 sources:
@@ -278,6 +279,7 @@ runs, and its tasks. There are no sources or sinks.
 
 ```yaml
 type: airflow
+name: orders
 dags_bucket: my-airflow-dags
 
 schedule: "@daily"
@@ -303,7 +305,10 @@ yard-tutorial/
     state/
 ```
 
-The filename `orders.yaml` becomes the job name (`orders`) — yard discovers
+`name: orders` makes `orders` the job's name, which the commands below use;
+without it yard derives the name from the file's location
+(`<folder>-<file>`, `yard-tutorial-orders` here) — see
+[`name`](reference/configuration.md#name--job-identity). yard discovers
 job files by walking the directory tree from `yard.yaml` downward. For a
 hierarchical multi-account layout (e.g. `aws/dev/us-east-2/orders.yaml`), see
 the project structure section of the [README](../README.md#project-structure)

@@ -226,6 +226,7 @@ when present and passes the whole job through for the plugin to validate.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `type` (→ `job_type`) | string | Yes | Plugin provider type, e.g. `glue`, `emr`. Resolves the plugin binary name as `yard-plugin-<type>`. |
+| `name` | string | No | The job's identity: state key, lock, `--target` value, `yard list targets` row, and the job name passed to the plugin. Defaults to a name generated from the file's path. See [`name`](#name--job-identity). |
 | `plugin_version` | string | Unless provided by `plugins:` cascade | Plugin release to download, or git ref (tag, branch, commit) to build, e.g. `"0.3.1"`. Ignored for `file://` sources. |
 | `plugin_source` | string | Unless provided by `plugins:` cascade | Where the plugin comes from: GitHub repository, git repository, local file, or download URL. See [`plugin_source` forms](#plugin_source-forms). |
 | `sources` | array | Usually | Input datasets — see source fields below. |
@@ -240,6 +241,38 @@ when present and passes the whole job through for the plugin to validate.
 | `partition_timestamp_column` | string | No | Existing timestamp column to derive year/month/day from. Mutually exclusive with `create_timestamp`. |
 | `create_timestamp` | bool | No | If true, adds `ingestion_timestamp = current_timestamp()` and derives partitions. Mutually exclusive with `partition_timestamp_column`. |
 | `config` | object | No | Free-form provider-specific config merged with `providers.<type>` from `yard.yaml`. |
+
+#### `name` — job identity
+
+`name` sets the job's identity. It is the key the job is stored under, so it
+controls the state file `<name>.json` and its lock, the value `--target`
+accepts, the row in `yard list targets`, and the `job_name` the plugin
+receives (the Glue plugin, for example, uses it as the Glue job name).
+
+```yaml
+type: glue
+name: orders
+```
+
+Without `name`, yard generates `<env>-<folder>-<file>`: `<env>` is the
+directory right after an `envs/` directory (left out when there is none),
+`<folder>` is the job file's directory, and `<file>` is the file name without
+`.yaml`. So `envs/dev/sales/orders.yaml` is `dev-sales-orders`.
+
+- Allowed characters are ASCII letters, digits, `.`, `_` and `-`. A name that
+  is `.` on its own, contains `..`, starts with `_dag_` or ends in `.lock` is
+  also rejected, because state storage uses those forms.
+- The value is checked after `${...}` interpolation, so
+  `name: ${account.name}-orders` works in layouts where the same file exists
+  once per environment.
+- Names must be unique across the project. Two job files that resolve to the
+  same name, where at least one sets `name`, are an error that names both
+  files.
+- `name` is not part of the config hash. Setting it to the name yard would
+  have generated shows no change in `yard plan`. Any other value is a rename:
+  `yard plan` shows a Delete of the old name and a Create of the new one, and
+  `yard apply` destroys what the plugin deployed under the old name and
+  deploys again under the new one. State is not migrated in place.
 
 #### `plugin_source` forms
 

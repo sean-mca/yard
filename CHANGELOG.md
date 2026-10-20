@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A top-level `plugins:` block in `yard.yaml`, keyed by job type, pins a plugin once with `version` and `source` instead of repeating `plugin_version` / `plugin_source` in every job file. The same block may appear in `account.yaml` and `region.yaml`; pins cascade `yard.yaml` -> `account.yaml` -> `region.yaml` -> job file field by field, and the job file wins.
 - `yard_structs::PluginPin` and `ProjectManifest.plugins` expose the `yard.yaml` pins to embedders; the map is left out of serialized manifests when empty.
+- An optional top-level `name:` in a job file sets the job's identity: the state key, lock, `--target` value, `yard list targets` row, and the job name passed to the plugin. Without it the generated `<env>-<folder>-<file>` name is used as before. A name may contain only ASCII letters, digits, `.`, `_` and `-`, must not contain `..`, must not start with `_dag_` or end in `.lock`, and must be unique: two job files that resolve to the same name are an error when at least one sets `name:`. Setting `name:` to the generated value changes nothing in `yard plan`; any other value is a rename, which plan shows as a delete of the old name plus a create of the new one, and `apply` carries out by destroying and redeploying.
 
 ### Changed
 
