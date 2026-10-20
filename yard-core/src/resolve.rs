@@ -21,6 +21,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fs;
 use std::path::{Path, PathBuf};
 use yaml_rust2::YamlLoader;
@@ -190,7 +191,11 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
         base_path.to_path_buf()
     };
 
-    let all_jobs = discover_jobs(&search_root, &root_dir)?;
+    // Raw (uninterpolated) per-directory contexts, shared by job discovery and
+    // both cascades. yard.yaml itself is never interpolated: it sits above
+    // every account and region, so there is no context to substitute from.
+    let mut contexts = ContextCache::new();
+    let all_jobs = discover_jobs(&search_root, &root_dir, &mut contexts)?;
 
     // 4. Parse providers config
     let mut providers = HashMap::new();
@@ -215,13 +220,13 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
     // codegen and validation see the merged view (e.g. warehouse, default_engine).
     // Deploy-time provider instantiation still re-merges via `merge_provider_config`;
     // this cascade only widens visibility — precedence is unchanged.
-    let all_jobs = cascade_provider_defaults(all_jobs, &providers, &root_aws)?;
+    let all_jobs = cascade_provider_defaults(all_jobs, &providers, &root_aws, &mut contexts)?;
 
     // Plugin pins cascade the same way (yard.yaml -> account.yaml ->
     // region.yaml -> job file) and fill `plugin_version` / `plugin_source`.
     // The root layer was already validated by `parse_root_plugins`.
     let root_plugins_value = root_value.get("plugins").cloned().unwrap_or(Value::Null);
-    let all_jobs = cascade_plugin_pins(all_jobs, &root_plugins_value)?;
+    let all_jobs = cascade_plugin_pins(all_jobs, &root_plugins_value, &mut contexts)?;
 
     let typed_root_aws: Option<yard_structs::AwsCredentialConfig> = if root_aws.is_null() {
         None
@@ -376,12 +381,38 @@ fn take_explicit_job_name(config: &mut Value, path: &Path) -> Result<Option<Stri
     Ok(Some(name))
 }
 
-fn discover_jobs(search_root: &Path, project_root: &Path) -> Result<HashMap<String, JobDefinition>> {
+/// Raw (uninterpolated) [`YARDContext`] per job directory.
+///
+/// It is the source of `${...}` values for job files and for the
+/// `account.yaml` / `region.yaml` layers that cascade into a job.
+type ContextCache = HashMap<PathBuf, YARDContext>;
+
+/// Return the cached context for `dir`, loading it with [`load_context`] on
+/// a miss.
+///
+/// # Errors
+///
+/// Returns an error if `dir` has no loadable `account.yaml` / `region.yaml`.
+fn cached_context<'a>(contexts: &'a mut ContextCache, dir: &Path) -> Result<&'a YARDContext> {
+    match contexts.entry(dir.to_path_buf()) {
+        Entry::Occupied(entry) => Ok(entry.into_mut()),
+        Entry::Vacant(entry) => Ok(entry.insert(load_context(dir)?)),
+    }
+}
+
+/// Walk `search_root` for job files and parse them into [`JobDefinition`]s.
+///
+/// Each job directory's context is loaded once and stored in `contexts` so
+/// the cascades can reuse it.
+fn discover_jobs(
+    search_root: &Path,
+    project_root: &Path,
+    contexts: &mut ContextCache,
+) -> Result<HashMap<String, JobDefinition>> {
     let mut all_jobs = HashMap::new();
     // Where each job name came from and whether it was set explicitly, so a
     // clash that involves an explicit `name:` can report both files.
     let mut origins: HashMap<String, (PathBuf, bool)> = HashMap::new();
-    let mut context_cache: HashMap<PathBuf, YARDContext> = HashMap::new();
 
     for entry in walkdir::WalkDir::new(search_root)
         .into_iter()
@@ -409,19 +440,7 @@ fn discover_jobs(search_root: &Path, project_root: &Path) -> Result<HashMap<Stri
             .ok_or_else(|| anyhow!("Job file has no parent directory: {}", path.display()))?
             .to_path_buf();
 
-        let ctx = match context_cache.get(&job_dir) {
-            Some(cached) => cached,
-            None => {
-                let loaded = load_context(&job_dir)?;
-                context_cache.insert(job_dir.clone(), loaded);
-                context_cache.get(&job_dir).ok_or_else(|| {
-                    anyhow!(
-                        "Failed to retrieve cached context for {}",
-                        job_dir.display()
-                    )
-                })?
-            }
-        };
+        let ctx = cached_context(contexts, &job_dir)?;
 
         let raw_job_content = fs::read_to_string(path)
             .with_context(|| format!("failed to read job file {}", path.display()))?;
@@ -556,33 +575,26 @@ fn discover_jobs(search_root: &Path, project_root: &Path) -> Result<HashMap<Stri
     Ok(all_jobs)
 }
 
-/// Extract a provider-specific field from the nearest ancestor context file
-/// by walking up from `dir`. Only looks under the `providers:` namespace.
-/// Returns `Value::Null` when the file doesn't exist, the `providers:` key
-/// is absent, or the provider type is absent.
+/// Extract a provider-specific field from a parsed context document. Only
+/// looks under the `providers:` namespace. Returns `Value::Null` when the
+/// `providers:` key is absent or the provider type is absent.
 ///
 /// Context files accept arbitrary top-level keys for user-defined variable
 /// interpolation (`${account.*}`, `${region.*}`), so no key gating is applied.
-fn provider_context_field(dir: &Path, filename: &str, provider_type: &str) -> Result<Value> {
-    match find_and_parse_context(dir, filename, false) {
-        Ok(v) => {
-            Ok(v.get("providers")
-                .and_then(|p| p.get(provider_type))
-                .cloned()
-                .unwrap_or(Value::Null))
-        }
-        Err(_) => Ok(Value::Null),
-    }
+/// The value is returned as written; callers run [`interpolate_strings`] on it.
+fn provider_context_field(context: &Value, provider_type: &str) -> Value {
+    context
+        .get("providers")
+        .and_then(|p| p.get(provider_type))
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
-/// Extract a common (non-provider) field from the nearest ancestor context
-/// file by walking up from `dir`. Used for fields like `aws:` that cascade
-/// universally regardless of provider type (D-09).
-fn common_context_field(dir: &Path, filename: &str, field: &str) -> Value {
-    find_and_parse_context(dir, filename, false)
-        .ok()
-        .and_then(|v| v.get(field).cloned())
-        .unwrap_or(Value::Null)
+/// Extract a common (non-provider) field from a parsed context document.
+/// Used for fields like `aws:` that cascade universally regardless of
+/// provider type (D-09). Returns `Value::Null` when the field is absent.
+fn common_context_field(context: &Value, field: &str) -> Value {
+    context.get(field).cloned().unwrap_or(Value::Null)
 }
 
 /// Deep-merge cascade applied to every job:
@@ -602,14 +614,22 @@ fn common_context_field(dir: &Path, filename: &str, field: &str) -> Value {
 /// # Errors
 ///
 /// Returns an error if any context file contains flat-style provider keys
-/// (D-02 migration error), or if `plugin_version` / `plugin_source` appear
-/// under `providers.<type>` in any layer (they belong in `plugins.<type>`).
+/// (D-02 migration error), if `plugin_version` / `plugin_source` appear
+/// under `providers.<type>` in any layer (they belong in `plugins.<type>`),
+/// or if a dotted `${...}` reference in the `providers` or `aws` block of
+/// `account.yaml` / `region.yaml` cannot be resolved.
 fn cascade_provider_defaults(
     mut jobs: HashMap<String, JobDefinition>,
     providers: &HashMap<String, Value>,
     root_aws: &Value,
+    contexts: &mut ContextCache,
 ) -> Result<HashMap<String, JobDefinition>> {
     for (name, job) in &mut jobs {
+        let ctx = cached_context(contexts, &job.dir)?;
+        let context_err = || format!("failed to load context for job '{name}'");
+        let account = load_context_layer(&job.dir, "account.yaml").with_context(context_err)?;
+        let region = load_context_layer(&job.dir, "region.yaml").with_context(context_err)?;
+
         // --- providers.<type> cascade ---
         // The providers HashMap is keyed by wire-string job type ("glue",
         // "emr", "bash"); JobType::to_string() gives the canonical wire form.
@@ -618,8 +638,16 @@ fn cascade_provider_defaults(
             .get(&job_type_key)
             .cloned()
             .unwrap_or(Value::Null);
-        let account_provider = provider_context_field(&job.dir, "account.yaml", &job_type_key)?;
-        let region_provider = provider_context_field(&job.dir, "region.yaml", &job_type_key)?;
+        let account_provider = interpolate_strings(
+            &provider_context_field(&account.doc, &job_type_key),
+            ctx,
+            &account.path,
+        )?;
+        let region_provider = interpolate_strings(
+            &provider_context_field(&region.doc, &job_type_key),
+            ctx,
+            &region.path,
+        )?;
         let job_inline_provider = job
             .config
             .get(&job_type_key)
@@ -648,8 +676,13 @@ fn cascade_provider_defaults(
         }
 
         // --- aws cascade (D-09: common fields cascade universally) ---
-        let account_aws = common_context_field(&job.dir, "account.yaml", "aws");
-        let region_aws = common_context_field(&job.dir, "region.yaml", "aws");
+        let account_aws = interpolate_strings(
+            &common_context_field(&account.doc, "aws"),
+            ctx,
+            &account.path,
+        )?;
+        let region_aws =
+            interpolate_strings(&common_context_field(&region.doc, "aws"), ctx, &region.path)?;
         let job_inline_aws = job.config.get("aws").cloned().unwrap_or(Value::Null);
 
         let merged_aws = cascade_merge(&[root_aws, &account_aws, &region_aws, &job_inline_aws]);
@@ -660,9 +693,9 @@ fn cascade_provider_defaults(
     Ok(jobs)
 }
 
-/// Extract the `plugins.<job_type>` entry from the nearest ancestor context
-/// file by walking up from `dir`. Returns `Value::Null` when the file has no
-/// `plugins` block or no entry for the job type.
+/// Extract the `plugins.<job_type>` entry from a parsed context document.
+/// Returns `Value::Null` when the document has no `plugins` block or no entry
+/// for the job type. `filename` is only used in error messages.
 ///
 /// Context files otherwise stay ungated (they accept arbitrary keys for
 /// `${account.*}` / `${region.*}` interpolation), but `plugins` is a
@@ -672,10 +705,9 @@ fn cascade_provider_defaults(
 ///
 /// # Errors
 ///
-/// Returns an error if the context file cannot be read or parsed, if
-/// `plugins` is not a map, or if the entry for `job_type` is malformed.
-fn plugin_context_field(dir: &Path, filename: &str, job_type: &str) -> Result<Value> {
-    let context = find_and_parse_context(dir, filename, false)?;
+/// Returns an error if `plugins` is not a map or if the entry for `job_type`
+/// is malformed.
+fn plugin_context_field(context: &Value, filename: &str, job_type: &str) -> Result<Value> {
     let Some(block) = context.get("plugins").filter(|v| !v.is_null()) else {
         return Ok(Value::Null);
     };
@@ -704,10 +736,12 @@ fn plugin_context_field(dir: &Path, filename: &str, job_type: &str) -> Result<Va
 /// # Errors
 ///
 /// Returns an error if an account.yaml / region.yaml `plugins` block is
-/// malformed (non-map, unknown key, non-string field) or cannot be read.
+/// malformed (non-map, unknown key, non-string field), cannot be read, or
+/// contains a dotted `${...}` reference that cannot be resolved.
 fn cascade_plugin_pins(
     mut jobs: HashMap<String, JobDefinition>,
     root_plugins: &Value,
+    contexts: &mut ContextCache,
 ) -> Result<HashMap<String, JobDefinition>> {
     for (name, job) in &mut jobs {
         let job_type_key = job.job_type.to_string();
@@ -716,9 +750,14 @@ fn cascade_plugin_pins(
             .cloned()
             .unwrap_or(Value::Null);
         let context_err = || format!("failed to resolve plugin pin for job '{name}'");
-        let account_pin = plugin_context_field(&job.dir, "account.yaml", &job_type_key)
+        let ctx = cached_context(contexts, &job.dir).with_context(context_err)?;
+        let account = load_context_layer(&job.dir, "account.yaml").with_context(context_err)?;
+        let region = load_context_layer(&job.dir, "region.yaml").with_context(context_err)?;
+        let account_pin = plugin_context_field(&account.doc, "account.yaml", &job_type_key)
+            .and_then(|pin| interpolate_strings(&pin, ctx, &account.path))
             .with_context(context_err)?;
-        let region_pin = plugin_context_field(&job.dir, "region.yaml", &job_type_key)
+        let region_pin = plugin_context_field(&region.doc, "region.yaml", &job_type_key)
+            .and_then(|pin| interpolate_strings(&pin, ctx, &region.path))
             .with_context(context_err)?;
         let merged = cascade_merge(&[&root_pin, &account_pin, &region_pin]);
 
@@ -785,6 +824,83 @@ pub fn find_in_parent_folders(start_path: &Path, filename: &str) -> Option<PathB
     None
 }
 
+/// Read and parse one YAML context file into JSON, with no substitution.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, is not valid YAML, or is empty.
+fn parse_context_file(path: &Path) -> Result<Value> {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let docs = YamlLoader::load_from_str(&content)
+        .map_err(|e| anyhow!("YAML error in {}: {}", path.display(), e))?;
+    let doc = docs
+        .first()
+        .ok_or_else(|| anyhow!("{} is empty", path.display()))?;
+    Ok(yaml_to_json(doc))
+}
+
+/// A nearest-ancestor context file as written on disk, plus where it lives.
+struct ContextLayer {
+    /// Path of the file, used to name it in error messages. When no file
+    /// exists this is just the bare file name.
+    path: PathBuf,
+    /// Parsed, uninterpolated document (an empty object when absent).
+    doc: Value,
+}
+
+/// Find the nearest `filename` above `start_path` and parse it raw.
+///
+/// A missing file gives an empty document, as
+/// `find_and_parse_context(.., false)` does.
+///
+/// # Errors
+///
+/// Returns an error if the file exists but cannot be read or parsed.
+fn load_context_layer(start_path: &Path, filename: &str) -> Result<ContextLayer> {
+    match find_in_parent_folders(start_path, filename) {
+        Some(path) => {
+            let doc = parse_context_file(&path)?;
+            Ok(ContextLayer { path, doc })
+        }
+        None => Ok(ContextLayer {
+            path: PathBuf::from(filename),
+            doc: Value::Object(serde_json::Map::new()),
+        }),
+    }
+}
+
+/// Substitute `${...}` references in every string of `value` against `ctx`,
+/// returning a new value. `file` only names the source in error messages.
+///
+/// Objects and arrays are walked recursively; other scalars pass through
+/// unchanged. Substitution is one pass: a substituted value that itself
+/// contains `${...}` is not expanded again, and single-segment placeholders
+/// such as `${version}` are left for later consumers. Substituted values are
+/// always strings (a numeric `account.id` becomes `"123"`).
+///
+/// # Errors
+///
+/// Returns an error naming `file` if a dotted reference cannot be resolved.
+fn interpolate_strings(value: &Value, ctx: &YARDContext, file: &Path) -> Result<Value> {
+    match value {
+        Value::String(text) => crate::utils::resolve_variables(text, ctx)
+            .map(Value::String)
+            .with_context(|| format!("failed to resolve variables in {}", file.display())),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| interpolate_strings(item, ctx, file))
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Array),
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, item)| Ok((key.clone(), interpolate_strings(item, ctx, file)?)))
+            .collect::<Result<serde_json::Map<_, _>>>()
+            .map(Value::Object),
+        other => Ok(other.clone()),
+    }
+}
+
 /// Find and parse a YAML context file (`account.yaml`, `region.yaml`, etc.)
 /// by walking from `start_path` upward. If `required` is `true`, returns an
 /// error when the file is not found; otherwise returns an empty JSON object.
@@ -799,14 +915,7 @@ pub fn find_and_parse_context(start_path: &Path, filename: &str, required: bool)
     loop {
         let target = current.join(filename);
         if target.exists() {
-            let content = fs::read_to_string(&target)
-                .with_context(|| format!("Failed to read {}", target.display()))?;
-            let docs = YamlLoader::load_from_str(&content)
-                .map_err(|e| anyhow!("YAML error in {}: {}", target.display(), e))?;
-            let doc = docs
-                .first()
-                .ok_or_else(|| anyhow!("{} is empty", target.display()))?;
-            return Ok(yaml_to_json(doc));
+            return parse_context_file(&target);
         }
         if !current.pop() {
             break;
@@ -1218,6 +1327,22 @@ mod tests {
         }
     }
 
+    /// Seed a [`ContextCache`] leniently for tests that call a cascade
+    /// directly: temp dirs often lack `region.yaml` (or `account.yaml`), which
+    /// the strict [`load_context`] would reject.
+    fn lenient_contexts(jobs: &HashMap<String, JobDefinition>) -> ContextCache {
+        jobs.values()
+            .map(|job| {
+                let ctx = YARDContext {
+                    account: find_and_parse_context(&job.dir, "account.yaml", false).unwrap(),
+                    region: find_and_parse_context(&job.dir, "region.yaml", false).unwrap(),
+                    ..Default::default()
+                };
+                (job.dir.clone(), ctx)
+            })
+            .collect()
+    }
+
     fn run_cascade(
         jobs: Vec<(String, JobDefinition)>,
         root_aws: Value,
@@ -1231,7 +1356,8 @@ mod tests {
         providers: HashMap<String, Value>,
     ) -> HashMap<String, JobDefinition> {
         let map: HashMap<String, JobDefinition> = jobs.into_iter().collect();
-        cascade_provider_defaults(map, &providers, &root_aws).unwrap()
+        let mut contexts = lenient_contexts(&map);
+        cascade_provider_defaults(map, &providers, &root_aws, &mut contexts).unwrap()
     }
 
     fn aws_field<'a>(job: &'a JobDefinition, key: &str) -> Option<&'a str> {
@@ -1349,7 +1475,9 @@ mod tests {
     }
 
     fn pin_one(job: JobDefinition, root: &Value) -> JobDefinition {
-        cascade_plugin_pins(job_map(job), root)
+        let map = job_map(job);
+        let mut contexts = lenient_contexts(&map);
+        cascade_plugin_pins(map, root, &mut contexts)
             .unwrap()
             .remove("job")
             .unwrap()
@@ -1497,7 +1625,8 @@ mod tests {
         write_context(&tmp, "{}", "plugins:\n  glue:\n    verison: \"0.5.0\"\n");
         let map = job_map(glue_job(&tmp.0, None));
 
-        let err = cascade_plugin_pins(map, &root_glue_pin()).unwrap_err();
+        let mut contexts = lenient_contexts(&map);
+        let err = cascade_plugin_pins(map, &root_glue_pin(), &mut contexts).unwrap_err();
 
         assert!(
             format!("{err:#}").contains("unknown field 'verison' at region.yaml.plugins.glue"),
@@ -1517,7 +1646,9 @@ mod tests {
         .into_iter()
         .collect();
 
-        let err = cascade_provider_defaults(map, &providers, &Value::Null).unwrap_err();
+        let mut contexts = lenient_contexts(&map);
+        let err =
+            cascade_provider_defaults(map, &providers, &Value::Null, &mut contexts).unwrap_err();
 
         let msg = format!("{err:#}");
         assert!(msg.contains("plugin_version"), "got: {msg}");
@@ -1531,7 +1662,9 @@ mod tests {
         write_context(&tmp, "providers:\n  glue:\n    plugin_source: x\n", "{}");
         let map = job_map(glue_job(&tmp.0, None));
 
-        let err = cascade_provider_defaults(map, &HashMap::new(), &Value::Null).unwrap_err();
+        let mut contexts = lenient_contexts(&map);
+        let err = cascade_provider_defaults(map, &HashMap::new(), &Value::Null, &mut contexts)
+            .unwrap_err();
 
         let msg = format!("{err:#}");
         assert!(msg.contains("plugin_source"), "got: {msg}");
@@ -1562,6 +1695,118 @@ mod tests {
         let job = resolved.manifest.jobs.values().next().unwrap();
         assert_eq!(job.plugin_version.as_deref(), Some("0.3.1"));
         assert_eq!(job.plugin_source.as_deref(), Some(GLUE_URL));
+    }
+
+    // --- ${...} interpolation in account.yaml / region.yaml cascade layers ---
+
+    /// Build a project with a `yard.yaml`, the given context files and one
+    /// glue job, ready for `resolve_project`.
+    fn context_interp_project(yard_extra: &str, account: &str, region: &str) -> TempDir {
+        let tmp = TempDir::new();
+        fs::create_dir_all(tmp.0.join(".yard/state")).unwrap();
+        let yard_yaml =
+            format!("project: interp\nstate:\n  type: local\n  path: .yard/state\n{yard_extra}");
+        fs::write(tmp.0.join("yard.yaml"), yard_yaml).unwrap();
+        write_context(&tmp, account, region);
+        fs::write(tmp.0.join("orders.yaml"), "type: glue\n").unwrap();
+        tmp
+    }
+
+    #[tokio::test]
+    async fn context_interp_region_provider_resolves_account_variable() {
+        let tmp = context_interp_project(
+            "",
+            "name: dev\nbucket: acme-dev-scripts\n",
+            "name: us-east-1\nproviders:\n  glue:\n    script_bucket: ${account.bucket}\n",
+        );
+
+        let resolved = resolve_project(&tmp.0).await.unwrap();
+
+        let job = resolved.manifest.jobs.values().next().unwrap();
+        assert_eq!(
+            provider_field(job, "glue", "script_bucket"),
+            Some("acme-dev-scripts")
+        );
+    }
+
+    #[tokio::test]
+    async fn context_interp_account_aws_resolves_account_and_region_variables() {
+        let tmp = context_interp_project(
+            "",
+            "name: dev\nid: \"123456789012\"\naws:\n  assume_role: arn:aws:iam::${account.id}:role/x\n  session_name: yard-${region.name}\n",
+            "name: us-east-1\n",
+        );
+
+        let resolved = resolve_project(&tmp.0).await.unwrap();
+
+        let job = resolved.manifest.jobs.values().next().unwrap();
+        assert_eq!(
+            aws_field(job, "assume_role"),
+            Some("arn:aws:iam::123456789012:role/x")
+        );
+        assert_eq!(aws_field(job, "session_name"), Some("yard-us-east-1"));
+    }
+
+    #[tokio::test]
+    async fn context_interp_region_plugin_version_resolves_account_variable() {
+        // Both the quoted and the bare form are strings in YAML, so both work.
+        for placeholder in ["\"${account.glue_version}\"", "${account.glue_version}"] {
+            let region = format!(
+                "name: us-east-1\nplugins:\n  glue:\n    version: {placeholder}\n    source: \"{GLUE_URL}\"\n"
+            );
+            let tmp = context_interp_project("", "name: dev\nglue_version: \"0.4.0\"\n", &region);
+
+            let resolved = resolve_project(&tmp.0).await.unwrap();
+
+            let job = resolved.manifest.jobs.values().next().unwrap();
+            assert_eq!(job.plugin_version.as_deref(), Some("0.4.0"));
+        }
+    }
+
+    #[tokio::test]
+    async fn context_interp_unknown_variable_in_region_yaml_names_file() {
+        let tmp = context_interp_project(
+            "",
+            "name: dev\n",
+            "name: us-east-1\nproviders:\n  glue:\n    script_bucket: ${account.nope}\n",
+        );
+
+        let Err(err) = resolve_project(&tmp.0).await else {
+            panic!("unresolvable variable must fail resolution");
+        };
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("region.yaml"), "got: {msg}");
+        assert!(msg.contains("account.nope"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn context_interp_single_segment_placeholder_in_plugin_source_is_untouched() {
+        let source = "https://example.com/glue-${version}-${target}";
+        let region = format!("name: us-east-1\nplugins:\n  glue:\n    source: \"{source}\"\n");
+        let tmp = context_interp_project("", "name: dev\n", &region);
+
+        let resolved = resolve_project(&tmp.0).await.unwrap();
+
+        let job = resolved.manifest.jobs.values().next().unwrap();
+        assert_eq!(job.plugin_source.as_deref(), Some(source));
+    }
+
+    #[tokio::test]
+    async fn context_interp_yard_yaml_is_not_interpolated() {
+        let tmp = context_interp_project(
+            "providers:\n  glue:\n    script_bucket: ${account.bucket}\n",
+            "name: dev\nbucket: acme-dev-scripts\n",
+            "name: us-east-1\n",
+        );
+
+        let resolved = resolve_project(&tmp.0).await.unwrap();
+
+        let job = resolved.manifest.jobs.values().next().unwrap();
+        assert_eq!(
+            provider_field(job, "glue", "script_bucket"),
+            Some("${account.bucket}")
+        );
     }
 
     // --- aws cascade: root → account → region → job ---
@@ -1898,8 +2143,10 @@ mod tests {
             "providers:\n  glue:\n    script_bucket: bucket\n",
         )
         .unwrap();
-        let result = provider_context_field(&tmp.0, "account.yaml", "glue");
-        let val = result.expect("nested provider key must be accepted");
+        let layer = load_context_layer(&tmp.0, "account.yaml").unwrap();
+        let doc = interpolate_strings(&layer.doc, &YARDContext::default(), &layer.path)
+            .expect("nested provider key must be accepted");
+        let val = provider_context_field(&doc, "glue");
         assert_eq!(val.get("script_bucket").and_then(|v| v.as_str()), Some("bucket"));
     }
 
@@ -1913,7 +2160,8 @@ mod tests {
             "name: dev\nbronze_location: s3://bucket/bronze\nhosts:\n  myservice: db.example.com\ndatabases:\n  myservice: myservice_dev\nconnections:\n  myservice: RDS MyService\nsink:\n  databases:\n    main: main_bronze\nsource:\n  auth:\n    kind: rds_iam\n",
         )
         .unwrap();
-        let result = provider_context_field(&tmp.0, "account.yaml", "glue");
+        let layer = load_context_layer(&tmp.0, "account.yaml").unwrap();
+        let result = interpolate_strings(&layer.doc, &YARDContext::default(), &layer.path);
         assert!(result.is_ok(), "arbitrary context keys must be accepted");
     }
 
@@ -1933,7 +2181,8 @@ mod tests {
             "type: glue\nrole: arn:aws:iam::123456789012:role/GlueJob\nglue:\n  script_bucket: my-bucket\n",
         )
         .unwrap();
-        let jobs = discover_jobs(&tmp.0, &tmp.0).expect("discover must accept role at top level");
+        let jobs = discover_jobs(&tmp.0, &tmp.0, &mut ContextCache::new())
+            .expect("discover must accept role at top level");
         assert_eq!(jobs.len(), 1, "got: {:?}", jobs.keys());
         let (_, def) = jobs.iter().next().unwrap();
         assert_eq!(
@@ -1953,7 +2202,8 @@ mod tests {
             "type: glue\nrolle: arn:aws:iam::123456789012:role/GlueJob\n",
         )
         .unwrap();
-        let err = discover_jobs(&tmp.0, &tmp.0).expect_err("typo must reject");
+        let err =
+            discover_jobs(&tmp.0, &tmp.0, &mut ContextCache::new()).expect_err("typo must reject");
         let msg = format!("{err}");
         assert!(msg.contains("unknown field 'rolle'"), "got: {msg}");
     }
@@ -1984,7 +2234,7 @@ mod tests {
             "type: glue\nname: orders\n",
         );
 
-        let jobs = discover_jobs(&tmp.0, &tmp.0).unwrap();
+        let jobs = discover_jobs(&tmp.0, &tmp.0, &mut ContextCache::new()).unwrap();
 
         assert!(jobs.contains_key("orders"), "got: {:?}", jobs.keys());
         assert!(
@@ -2000,7 +2250,7 @@ mod tests {
         let tmp = job_project();
         write_job(&tmp, "envs/dev/sales", "orders.yaml", "type: glue\n");
 
-        let jobs = discover_jobs(&tmp.0, &tmp.0).unwrap();
+        let jobs = discover_jobs(&tmp.0, &tmp.0, &mut ContextCache::new()).unwrap();
 
         assert!(
             jobs.contains_key("dev-sales-orders"),
@@ -2020,7 +2270,7 @@ mod tests {
             let tmp = job_project();
             let path = write_job(&tmp, "envs/dev/sales", "orders.yaml", body);
 
-            let err = discover_jobs(&tmp.0, &tmp.0).unwrap_err();
+            let err = discover_jobs(&tmp.0, &tmp.0, &mut ContextCache::new()).unwrap_err();
 
             let msg = format!("{err:#}");
             assert!(
@@ -2041,7 +2291,7 @@ mod tests {
             "type: glue\nname: 42\n",
         );
 
-        let err = discover_jobs(&tmp.0, &tmp.0).unwrap_err();
+        let err = discover_jobs(&tmp.0, &tmp.0, &mut ContextCache::new()).unwrap_err();
 
         let msg = format!("{err:#}");
         assert!(msg.contains("name must be a string"), "got: {msg}");
@@ -2055,7 +2305,7 @@ mod tests {
             let body = format!("type: glue\nname: \"{name}\"\n");
             let path = write_job(&tmp, "envs/dev/sales", "orders.yaml", &body);
 
-            let err = discover_jobs(&tmp.0, &tmp.0).unwrap_err();
+            let err = discover_jobs(&tmp.0, &tmp.0, &mut ContextCache::new()).unwrap_err();
 
             let msg = format!("{err:#}");
             assert!(
@@ -2073,7 +2323,7 @@ mod tests {
             let body = format!("type: glue\nname: \"{name}\"\n");
             let path = write_job(&tmp, "envs/dev/sales", "orders.yaml", &body);
 
-            let err = discover_jobs(&tmp.0, &tmp.0).unwrap_err();
+            let err = discover_jobs(&tmp.0, &tmp.0, &mut ContextCache::new()).unwrap_err();
 
             let msg = format!("{err:#}");
             assert!(
@@ -2090,7 +2340,7 @@ mod tests {
         let first = write_job(&tmp, "envs/dev/a", "x.yaml", "type: glue\nname: orders\n");
         let second = write_job(&tmp, "envs/dev/b", "y.yaml", "type: glue\nname: orders\n");
 
-        let err = discover_jobs(&tmp.0, &tmp.0).unwrap_err();
+        let err = discover_jobs(&tmp.0, &tmp.0, &mut ContextCache::new()).unwrap_err();
 
         let msg = format!("{err:#}");
         assert!(msg.contains("duplicate job name 'orders'"), "got: {msg}");
@@ -2109,7 +2359,7 @@ mod tests {
             "type: glue\nname: dev-sales-orders\n",
         );
 
-        let err = discover_jobs(&tmp.0, &tmp.0).unwrap_err();
+        let err = discover_jobs(&tmp.0, &tmp.0, &mut ContextCache::new()).unwrap_err();
 
         let msg = format!("{err:#}");
         assert!(
@@ -2139,8 +2389,9 @@ mod tests {
             &format!("type: glue\n{body}"),
         );
 
-        let named = discover_jobs(&with_name.0, &with_name.0).unwrap();
-        let plain = discover_jobs(&without_name.0, &without_name.0).unwrap();
+        let named = discover_jobs(&with_name.0, &with_name.0, &mut ContextCache::new()).unwrap();
+        let plain =
+            discover_jobs(&without_name.0, &without_name.0, &mut ContextCache::new()).unwrap();
 
         let named_json = serde_json::to_string(&named["dev-sales-orders"].config).unwrap();
         let plain_json = serde_json::to_string(&plain["dev-sales-orders"].config).unwrap();
@@ -2157,7 +2408,7 @@ mod tests {
             "type: glue\nname: ${account.name}-orders\n",
         );
 
-        let jobs = discover_jobs(&tmp.0, &tmp.0).unwrap();
+        let jobs = discover_jobs(&tmp.0, &tmp.0, &mut ContextCache::new()).unwrap();
 
         assert!(jobs.contains_key("dev-orders"), "got: {:?}", jobs.keys());
     }
@@ -2548,7 +2799,8 @@ mod tests {
         )
         .unwrap();
 
-        let jobs = discover_jobs(&tmp.0, &tmp.0).expect("discover must succeed");
+        let jobs =
+            discover_jobs(&tmp.0, &tmp.0, &mut ContextCache::new()).expect("discover must succeed");
         assert_eq!(jobs.len(), 1);
         let (_, def) = jobs.iter().next().unwrap();
         let resolved = def.job_file.as_ref().expect("job_file should be set");
@@ -2578,7 +2830,8 @@ mod tests {
         )
         .unwrap();
 
-        let jobs = discover_jobs(&tmp.0, &tmp.0).expect("discover must succeed");
+        let jobs =
+            discover_jobs(&tmp.0, &tmp.0, &mut ContextCache::new()).expect("discover must succeed");
         assert_eq!(jobs.len(), 1);
         let (_, def) = jobs.iter().next().unwrap();
         let resolved = def.job_file.as_ref().expect("job_file should be set");

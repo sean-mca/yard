@@ -354,6 +354,8 @@ called, and `yard show <job>` to print its `codegen` output.
 
 stdout is the protocol channel. Anything else written to it corrupts the stream, so all logging goes to stderr.
 
+yard runs plugins with `RUST_LOG=warn` unless `RUST_LOG` or `YARD_PLUGIN_LOG` is set, so info and debug lines are hidden by default; set `YARD_PLUGIN_LOG=info` (or `debug`) to see them. The Rust SDK's subscriber reads `RUST_LOG` automatically; a plugin in another language can read `RUST_LOG` to choose its level.
+
 <!-- tabs:start -->
 <!-- tab: Rust -->
 **Rust**
