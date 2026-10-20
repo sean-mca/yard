@@ -3201,7 +3201,7 @@ dependencies = [
 
 [[package]]
 name = "yard"
-version = "2.1.4"
+version = "2.1.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3217,7 +3217,7 @@ dependencies = [
 
 [[package]]
 name = "yard-core"
-version = "2.1.4"
+version = "2.1.5"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -3238,7 +3238,7 @@ dependencies = [
 
 [[package]]
 name = "yard-plugin-sdk"
-version = "2.1.4"
+version = "2.1.5"
 dependencies = [
  "anyhow",
  "libc",
@@ -3251,7 +3251,7 @@ dependencies = [
 
 [[package]]
 name = "yard-structs"
-version = "2.1.4"
+version = "2.1.5"
 dependencies = [
  "anyhow",
  "serde",
