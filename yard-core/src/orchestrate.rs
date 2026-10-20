@@ -856,6 +856,7 @@ mod tests {
                 path: ".yard/state".into(),
             },
             providers: HashMap::new(),
+            plugins: HashMap::new(),
             jobs: HashMap::from([("new_job".to_string(), job)]),
             aws: None,
         };
@@ -882,6 +883,7 @@ mod tests {
                 path: ".yard/state".into(),
             },
             providers: HashMap::new(),
+            plugins: HashMap::new(),
             jobs: HashMap::new(),
             aws: None,
         };
@@ -912,6 +914,7 @@ mod tests {
                 path: ".yard/state".into(),
             },
             providers: HashMap::new(),
+            plugins: HashMap::new(),
             jobs: HashMap::from([("stable".to_string(), job)]),
             aws: None,
         };
@@ -944,6 +947,7 @@ mod tests {
                 path: ".yard/state".into(),
             },
             providers: HashMap::new(),
+            plugins: HashMap::new(),
             jobs: HashMap::from([("my_job".to_string(), new_job)]),
             aws: None,
         };
@@ -973,6 +977,7 @@ mod tests {
                 path: ".yard/state".into(),
             },
             providers: HashMap::new(),
+            plugins: HashMap::new(),
             jobs: HashMap::from([("my_job".to_string(), new_job)]),
             aws: None,
         };
@@ -1012,6 +1017,7 @@ mod tests {
                 path: ".yard/state".into(),
             },
             providers: HashMap::new(),
+            plugins: HashMap::new(),
             jobs: HashMap::from([
                 ("keep".to_string(), keep_job),
                 (
@@ -1047,6 +1053,7 @@ mod tests {
                 path: state_dir.clone(),
             },
             providers: HashMap::new(),
+            plugins: HashMap::new(),
             jobs: HashMap::from([("new_job".to_string(), job)]),
             aws: None,
         };
@@ -1085,6 +1092,7 @@ mod tests {
             project: "test".to_string(),
             state: backend.clone(),
             providers: HashMap::new(),
+            plugins: HashMap::new(),
             jobs: HashMap::from([("doomed".to_string(), job)]),
             aws: None,
         };
@@ -1132,6 +1140,7 @@ mod tests {
             project: "test".to_string(),
             state: backend.clone(),
             providers: HashMap::new(),
+            plugins: HashMap::new(),
             jobs: HashMap::from([
                 (
                     "job_a".to_string(),

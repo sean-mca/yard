@@ -42,6 +42,7 @@ Defined by `ProjectManifest` in `yard-structs/src/config.rs`.
 | `project` | string | Yes | Project name — used in state keys and plan output. |
 | `state` | object | Yes | State backend config (see below). |
 | `providers` | map | No | Per-provider default config, keyed by job type (e.g. `glue`, `emr`). Values are passed as-is to the provider. |
+| `plugins` | map | No | Plugin pins keyed by job type, each `{ version, source }`. Cascades through `account.yaml` / `region.yaml`; a job's own `plugin_version` / `plugin_source` override it. See [`plugins.<type>`](#pluginstype--plugin-pins). |
 | `jobs` | map | No | Job definitions, normally populated by discovering `<job>.yaml` files rather than authored inline. |
 | `aws` | object | No | Root-level AWS credential config (AssumeRole target, session name, external id, region). Per-job and per-DAG `account.yaml` `aws:` blocks shallow-override this. When absent, providers fall back to the default AWS credential provider chain. |
 
@@ -125,6 +126,57 @@ the plugin's `schema()` operation reports. For the field list, and for any
 resources the plugin expects to exist (roles, buckets, clusters), consult the
 plugin's own documentation.
 
+#### `plugins.<type>` — plugin pins
+
+Each key under `plugins:` names a job type and pins the plugin that runs jobs
+of that type, so the pin is written once instead of in every job file.
+
+```yaml
+plugins:
+  glue:
+    version: "0.3.1"
+    source: https://github.com/your-org/yard-plugin-glue
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `version` | string | No | Release tag or git ref. Ignored for local-file sources. Quote it in YAML so `0.3` is not read as a number. |
+| `source` | string | Yes (in `yard.yaml`) | Where the plugin comes from, in any form from the [`plugin_source` forms](#plugin_source-forms) table. |
+
+Only `version` and `source` are accepted. A typo such as `verison` is rejected
+with an `unknown field 'verison' at yard.yaml.plugins.glue` error instead of
+leaving the job unpinned.
+
+**Cascade.** Pins resolve through the same hierarchy as `providers.<type>`:
+
+```text
+yard.yaml  ->  account.yaml  ->  region.yaml  ->  job file
+```
+
+The job file wins. Layers merge field by field, so a lower layer can override
+only `version` and inherit `source` from above. For example, with the
+`yard.yaml` block above, this `region.yaml` moves one region to a newer release
+and keeps the same source:
+
+```yaml
+# region.yaml
+plugins:
+  glue:
+    version: "0.4.0"
+```
+
+`source` is therefore optional in `plugins.<type>` entries in `account.yaml`
+and `region.yaml`. A job's own top-level `plugin_version` / `plugin_source`
+override every layer, again per field. Relative local sources
+(`file://bin/yard-plugin-glue`) resolve against the project root whichever
+layer sets them.
+
+**Do not put pins under `providers.<type>`.** `plugin_version` and
+`plugin_source` there would be passed to the plugin as config and the job would
+run unpinned, so yard rejects them: `plugin_version belongs in the
+plugins.<type> block or at the top level of the job file, not under
+providers.<type>`.
+
 #### `aws` (root-level)
 
 Controls how yard itself obtains AWS credentials. Shape is free-form JSON
@@ -155,20 +207,28 @@ recognized are:
 An `aws:` block may also appear at the `account.yaml` / `region.yaml` layer
 and shallow-overrides the root `yard.yaml` `aws:` block per-job.
 
+A `plugins:` block with the same shape as the one in `yard.yaml` may also
+appear at these layers. `plugins` is a yard-reserved key there, so its entries
+are checked for typos, and `source` is optional at these layers. See
+[`plugins.<type>`](#pluginstype--plugin-pins).
+
 ### `<job>.yaml` (individual job definitions)
 
 Defined by `JobDefinition` in `yard-structs/src/config.rs`.
 
-Only `type` and `plugin_source` are required by yard itself (`plugin_version`
-too, unless the source is a local file). Which of the remaining fields a job uses, and whether a plugin needs
+Only `type` is always required by yard itself. `plugin_source` (and
+`plugin_version`, unless the source is a local file) is required unless the
+[`plugins:` cascade](#pluginstype--plugin-pins) supplies it; when it does, the
+per-job fields are optional overrides. Which of the remaining fields a job uses, and whether a plugin needs
 fields not listed here, depends on the plugin: yard parses the fields below
 when present and passes the whole job through for the plugin to validate.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `type` (→ `job_type`) | string | Yes | Plugin provider type, e.g. `glue`, `emr`. Resolves the plugin binary name as `yard-plugin-<type>`. |
-| `plugin_version` | string | Usually | Plugin release to download, or git ref (tag, branch, commit) to build, e.g. `"0.3.1"`. Ignored for `file://` sources. |
-| `plugin_source` | string | Yes | Where the plugin comes from: GitHub repository, git repository, local file, or download URL. See [`plugin_source` forms](#plugin_source-forms). |
+| `name` | string | No | The job's identity: state key, lock, `--target` value, `yard list targets` row, and the job name passed to the plugin. Defaults to a name generated from the file's path. See [`name`](#name--job-identity). |
+| `plugin_version` | string | Unless provided by `plugins:` cascade | Plugin release to download, or git ref (tag, branch, commit) to build, e.g. `"0.3.1"`. Ignored for `file://` sources. |
+| `plugin_source` | string | Unless provided by `plugins:` cascade | Where the plugin comes from: GitHub repository, git repository, local file, or download URL. See [`plugin_source` forms](#plugin_source-forms). |
 | `sources` | array | Usually | Input datasets — see source fields below. |
 | `sink` | object | Usually | Output dataset — see sink fields below. |
 | `transforms` | array | No | Ordered transform steps. |
@@ -181,6 +241,38 @@ when present and passes the whole job through for the plugin to validate.
 | `partition_timestamp_column` | string | No | Existing timestamp column to derive year/month/day from. Mutually exclusive with `create_timestamp`. |
 | `create_timestamp` | bool | No | If true, adds `ingestion_timestamp = current_timestamp()` and derives partitions. Mutually exclusive with `partition_timestamp_column`. |
 | `config` | object | No | Free-form provider-specific config merged with `providers.<type>` from `yard.yaml`. |
+
+#### `name` — job identity
+
+`name` sets the job's identity. It is the key the job is stored under, so it
+controls the state file `<name>.json` and its lock, the value `--target`
+accepts, the row in `yard list targets`, and the `job_name` the plugin
+receives (the Glue plugin, for example, uses it as the Glue job name).
+
+```yaml
+type: glue
+name: orders
+```
+
+Without `name`, yard generates `<env>-<folder>-<file>`: `<env>` is the
+directory right after an `envs/` directory (left out when there is none),
+`<folder>` is the job file's directory, and `<file>` is the file name without
+`.yaml`. So `envs/dev/sales/orders.yaml` is `dev-sales-orders`.
+
+- Allowed characters are ASCII letters, digits, `.`, `_` and `-`. A name that
+  is `.` on its own, contains `..`, starts with `_dag_` or ends in `.lock` is
+  also rejected, because state storage uses those forms.
+- The value is checked after `${...}` interpolation, so
+  `name: ${account.name}-orders` works in layouts where the same file exists
+  once per environment.
+- Names must be unique across the project. Two job files that resolve to the
+  same name, where at least one sets `name`, are an error that names both
+  files.
+- `name` is not part of the config hash. Setting it to the name yard would
+  have generated shows no change in `yard plan`. Any other value is a rename:
+  `yard plan` shows a Delete of the old name and a Create of the new one, and
+  `yard apply` destroys what the plugin deployed under the old name and
+  deploys again under the new one. State is not migrated in place.
 
 #### `plugin_source` forms
 

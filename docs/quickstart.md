@@ -32,8 +32,9 @@ The rest of this document explains each step.
 Decide which provider you are deploying to and find its plugin. From the
 plugin's documentation you need three things:
 
-- **A release to point at.** Each job file carries `plugin_source` (usually
-  the plugin's GitHub repository URL) and `plugin_version`. yard fetches the
+- **A release to point at.** You pin it once in `yard.yaml` under
+  `plugins.<type>` (a `version` and a `source`, usually the plugin's GitHub
+  repository URL), and every job of that type inherits it. yard fetches the
   release asset for the machine it runs on; you never name a platform.
 - **The config it accepts.** The block under `providers.<type>` in
   `yard.yaml`, and any provider-specific fields in job files, are defined by
@@ -178,12 +179,12 @@ state:
 providers:
 ```
 
-### 2. Fill in the provider block
+### 2. Fill in the provider and plugin blocks
 
-Open `yard.yaml` and add a block under `providers:` keyed by your plugin's
-job type. The fields inside it are whatever the plugin documents. A Glue
-plugin wants a bucket for generated scripts and a region; an Airflow plugin
-wants the bucket its DAG files go to.
+Open `yard.yaml` and add two blocks keyed by your plugin's job type.
+`plugins:` says which plugin to run; `providers:` holds the fields the plugin
+documents. A Glue plugin wants a bucket for generated scripts and a region; an
+Airflow plugin wants the bucket its DAG files go to.
 
 ```yaml
 project: yard-tutorial
@@ -192,38 +193,55 @@ state:
   type: local
   path: .yard/state
 
+plugins:
+  <type>:
+    version: "<version>"
+    source: "<url>"
+
 providers:
   <type>:
     # fields defined by the plugin -- see its documentation
 ```
 
-Everything in this block is passed to the plugin with every job of that type,
-after being merged with the `<type>:` block in the job file, if there is one.
-yard checks the block against the plugin's schema during `validate`, so a
-missing required field is reported before anything is deployed.
+`plugins.<type>.source` says where the plugin comes from: a GitHub repository
+(`https://github.com/<org>/yard-plugin-<type>`, the release asset for your
+platform is picked automatically), a git repository to build from
+(`git::<url>`), or a local binary (`file://<path>`). `version` is the release
+or git ref to use, and is ignored for `file://` sources. See
+[configuration](reference/configuration.md#plugin_source-forms) for every
+form. Every job of that type inherits this pin.
+
+Everything under `providers.<type>` is passed to the plugin with every job of
+that type, after being merged with the `<type>:` block in the job file, if
+there is one. yard checks the block against the plugin's schema during
+`validate`, so a missing required field is reported before anything is
+deployed. Do not put `plugin_version` or `plugin_source` there: they belong in
+`plugins.<type>`.
 
 ### 3. Add one job
 
-Create a file `orders.yaml` next to `yard.yaml`. Three fields are yard's:
+Create a file `orders.yaml` next to `yard.yaml`. Only one field is required by yard:
 
 ```yaml
 type: <type>
-plugin_version: "<version>"
-plugin_source: "<url>"
 ```
 
-`type` selects the plugin. `plugin_source` says where it comes from: a GitHub
-repository (`https://github.com/<org>/yard-plugin-<type>`, the release asset
-for your platform is picked automatically), a git repository to build from
-(`git::<url>`), or a local binary (`file://<path>`). `plugin_version` is the
-release or git ref to use, and is ignored for `file://` sources. See
-[configuration](reference/configuration.md#plugin_source-forms) for every
-form.
+`type` selects the plugin, and the job picks up the `plugins.<type>` pin from
+`yard.yaml`. To pin one job differently, set `plugin_version` and/or
+`plugin_source` at the top level of the job file; they override the `plugins`
+block for that job only:
+
+```yaml
+type: <type>
+plugin_version: "<other-version>"
+plugin_source: "<other-url>"
+```
 
 Everything else in the file is defined by the plugin. yard passes it through
 and validates it against the schema the plugin reports, so the shape of a job
 depends entirely on which plugin it names. Two examples, using the Glue and
-Airflow plugins:
+Airflow plugins. Both examples assume `plugins.glue` and `plugins.airflow`
+entries in `yard.yaml`, so the jobs carry no pin of their own:
 
 <!-- tabs:start -->
 <!-- tab: Glue plugin -->
@@ -234,8 +252,7 @@ needs the IAM role the job runs as:
 
 ```yaml
 type: glue
-plugin_version: "0.1.0"
-plugin_source: "https://github.com/<org>/yard-plugin-glue"
+name: orders
 role: arn:aws:iam::123456789012:role/GlueJobExecutionRole
 
 sources:
@@ -262,8 +279,7 @@ runs, and its tasks. There are no sources or sinks.
 
 ```yaml
 type: airflow
-plugin_version: "0.1.0"
-plugin_source: "https://github.com/<org>/yard-plugin-airflow"
+name: orders
 dags_bucket: my-airflow-dags
 
 schedule: "@daily"
@@ -289,7 +305,10 @@ yard-tutorial/
     state/
 ```
 
-The filename `orders.yaml` becomes the job name (`orders`) — yard discovers
+`name: orders` makes `orders` the job's name, which the commands below use;
+without it yard derives the name from the file's location
+(`<folder>-<file>`, `yard-tutorial-orders` here) — see
+[`name`](reference/configuration.md#name--job-identity). yard discovers
 job files by walking the directory tree from `yard.yaml` downward. For a
 hierarchical multi-account layout (e.g. `aws/dev/us-east-2/orders.yaml`), see
 the project structure section of the [README](../README.md#project-structure)
@@ -335,11 +354,11 @@ Done.
   + Create job [orders]
 ```
 
-The first `plan` downloads the plugin binary declared in `orders.yaml`,
-caches it under `.yard/plugins/`, and records its SHA-256 checksum in
-`yard.lock` at the project root. Commit `yard.lock`; later runs verify the
-cached binary against it and never re-download unless `plugin_version`
-changes.
+The first `plan` downloads the plugin binary declared by the `plugins` block in
+`yard.yaml` (or by the job's own override), caches it under `.yard/plugins/`,
+and records its SHA-256 checksum in `yard.lock` at the project root. Commit
+`yard.lock`; later runs verify the cached binary against it and never
+re-download unless the pinned version changes.
 
 The `+` means "create" — yard has no existing state for `orders` and will
 create it on apply. Subsequent runs after an `apply` show `No changes`
@@ -433,10 +452,17 @@ work here too.
 
 **`yard plan` fails with `provider '<type>' is now a plugin -- add plugin_version and plugin_source`.**
 
-The job file is missing the two plugin fields that v2.0 requires. Add
-`plugin_version` and `plugin_source` as shown in step 3; see the
+The job has no plugin pin. Add a `plugins.<type>` entry in `yard.yaml` as shown
+in step 2, or set `plugin_version` and `plugin_source` in the job file; see the
 [v2.0 migration guide](reference/migrations/v2.0.md) if you are upgrading an
 existing project.
+
+**`yard plan` fails with `plugin_version belongs in the plugins.<type> block ...`.**
+
+`plugin_version` or `plugin_source` is set under `providers.<type>` (in
+`yard.yaml`, `account.yaml`, `region.yaml` or the job's `<type>:` block). There
+they would be handed to the plugin as config and the job would run unpinned.
+Move the keys into `plugins.<type>` as `version` and `source`.
 
 **`yard plan` fails while downloading the plugin (404 or checksum mismatch).**
 

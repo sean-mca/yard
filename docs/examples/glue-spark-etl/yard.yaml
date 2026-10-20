@@ -7,6 +7,15 @@ state:
   type: local
   path: .yard/state
 
+# Which plugin runs `type: glue` jobs. The source is the plugin's GitHub
+# repository: yard downloads the v0.1.0 release asset for whatever platform it
+# runs on. A git URL (git::...) builds from source; a file:// path uses a
+# local binary. Every glue job inherits this pin unless it sets its own.
+plugins:
+  glue:
+    version: "0.1.0"
+    source: "https://github.com/your-org/yard-plugin-glue"
+
 providers:
   glue:
     script_bucket: acme-analytics-prod-glue-scripts

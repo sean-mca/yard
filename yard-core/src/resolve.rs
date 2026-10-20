@@ -9,8 +9,8 @@
 //!
 //! The primary entry point is [`resolve_project`], which finds `yard.yaml`,
 //! discovers all jobs via recursive directory walking, cascades provider
-//! defaults and AWS credential configs through the hierarchy, and loads the
-//! current deployment state from the configured backend.
+//! defaults, plugin pins and AWS credential configs through the hierarchy, and
+//! loads the current deployment state from the configured backend.
 //!
 //! Secondary entry points:
 //! - [`discover_environments`] — enumerate environments and regions without
@@ -18,21 +18,26 @@
 //! - [`find_in_parent_folders`] — walk upward looking for a named file
 //! - [`yaml_to_json`] — convert `yaml_rust2::Yaml` values to `serde_json::Value`
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use yaml_rust2::YamlLoader;
 use yard_structs::{
-    DiscoveredEnvironment, JobDefinition, JobType, ProjectManifest, ProjectState, RegionSummary,
-    StateBackend, YARDContext,
+    DiscoveredEnvironment, JobDefinition, JobType, PluginPin, ProjectManifest, ProjectState,
+    RegionSummary, StateBackend, YARDContext,
 };
 
 /// Allowed top-level keys on a yard.yaml manifest (TYPE-03 D-19). Any other
 /// key surfaces as an `unknown field 'X' at yard.yaml ...` error at parse
-/// time.
-const ALLOWED_TOP_LEVEL: &[&str] = &["project", "state", "providers", "jobs", "aws"];
+/// time. `plugins` holds the per-job-type plugin pins.
+const ALLOWED_TOP_LEVEL: &[&str] = &["project", "state", "providers", "plugins", "jobs", "aws"];
+
+/// Allowed keys on a `plugins.<type>` entry (D-1). Only `version` and
+/// `source` exist, so a typo such as `verison` fails at parse time instead of
+/// leaving the job silently unpinned.
+const ALLOWED_PLUGIN_PIN: &[&str] = &["version", "source"];
 
 /// Allowed keys on a yard.yaml `state:` block (StateBackend wire surface).
 /// Both `Local` (path) and `S3` (bucket/region/key/aws) variants share the
@@ -43,7 +48,13 @@ const ALLOWED_STATE_BLOCK: &[&str] = &["type", "bucket", "region", "key", "path"
 /// the user types it in `<job>.yaml`). Dynamic provider-block keys (the
 /// wire strings from each `JobType` variant) are appended at runtime per
 /// D-21 to keep this list in sync with TYPE-01.
+///
+/// `name` is the job's identity key. `discover_jobs` removes it from the
+/// job config before this allow-list is applied, so it never reaches the
+/// config hash or the plugin job config; it is listed here so the key is
+/// documented as part of the job-doc surface.
 const STATIC_JOB_DOC_ALLOWED: &[&str] = &[
+    "name",
     "type",
     "role",
     "imports",
@@ -135,6 +146,8 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
         )?;
     }
 
+    let root_plugins = parse_root_plugins(&root_value)?;
+
     // 2. Extract global config
     let project = root_doc["project"]
         .as_str()
@@ -204,6 +217,12 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
     // this cascade only widens visibility — precedence is unchanged.
     let all_jobs = cascade_provider_defaults(all_jobs, &providers, &root_aws)?;
 
+    // Plugin pins cascade the same way (yard.yaml -> account.yaml ->
+    // region.yaml -> job file) and fill `plugin_version` / `plugin_source`.
+    // The root layer was already validated by `parse_root_plugins`.
+    let root_plugins_value = root_value.get("plugins").cloned().unwrap_or(Value::Null);
+    let all_jobs = cascade_plugin_pins(all_jobs, &root_plugins_value)?;
+
     let typed_root_aws: Option<yard_structs::AwsCredentialConfig> = if root_aws.is_null() {
         None
     } else {
@@ -215,6 +234,7 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
         project: project.clone(),
         state: state_backend.clone(),
         providers,
+        plugins: root_plugins,
         jobs: all_jobs,
         aws: typed_root_aws,
     };
@@ -229,8 +249,138 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
     })
 }
 
+/// Validate one `plugins.<type>` entry (D-1).
+///
+/// `path` is the dotted location used in error messages, for example
+/// `yard.yaml.plugins.glue`. Context layers (account.yaml, region.yaml) pass
+/// `require_source = false` so a lower layer can override only `version` or
+/// only `source`.
+///
+/// # Errors
+///
+/// Returns an error if the entry is not a map, carries a key other than
+/// `version` or `source`, has a non-string or empty `source`, has a
+/// non-string `version`, or (when `require_source` is true) has no `source`.
+fn validate_plugin_entry(entry: &Value, path: &str, require_source: bool) -> Result<()> {
+    if !entry.is_object() {
+        return Err(anyhow!(
+            "{path} must be a map with 'version' and/or 'source'"
+        ));
+    }
+    crate::parsing::validate_unknown_keys(entry, ALLOWED_PLUGIN_PIN, path)?;
+    for field in ALLOWED_PLUGIN_PIN {
+        if let Some(value) = entry.get(*field)
+            && !value.is_string()
+        {
+            return Err(anyhow!(
+                "{path}.{field} must be a string (quote it in YAML, e.g. \"0.3.1\")"
+            ));
+        }
+    }
+    match entry.get("source").and_then(Value::as_str) {
+        Some(source) if source.trim().is_empty() => Err(anyhow!("{path}.source must not be empty")),
+        None if require_source => Err(anyhow!("missing required field 'source' at {path}")),
+        _ => Ok(()),
+    }
+}
+
+/// Parse the top-level `plugins:` block of `yard.yaml` into typed pins.
+///
+/// A missing or null block gives an empty map.
+///
+/// # Errors
+///
+/// Returns an error if `plugins` is not a map keyed by job type, or if any
+/// entry fails [`validate_plugin_entry`] with `require_source = true`.
+fn parse_root_plugins(root_value: &Value) -> Result<HashMap<String, PluginPin>> {
+    let Some(block) = root_value.get("plugins").filter(|v| !v.is_null()) else {
+        return Ok(HashMap::new());
+    };
+    let entries = block.as_object().ok_or_else(|| {
+        anyhow!("yard.yaml.plugins must be a map keyed by job type (e.g. plugins.glue)")
+    })?;
+    let mut pins = HashMap::with_capacity(entries.len());
+    for (job_type, entry) in entries {
+        let path = format!("yard.yaml.plugins.{job_type}");
+        validate_plugin_entry(entry, &path, true)?;
+        let source = entry
+            .get("source")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing required field 'source' at {path}"))?
+            .to_string();
+        let version = entry
+            .get("version")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        pins.insert(job_type.clone(), PluginPin { version, source });
+    }
+    Ok(pins)
+}
+
+/// Remove the optional top-level `name:` key from a job config and return
+/// it as the job's explicit identity.
+///
+/// The key is stripped here (and nowhere else) so `job.config` is identical
+/// with or without it: the config hash and the plugin job config never see
+/// `name`.
+///
+/// # Errors
+///
+/// Returns an error naming `path` when `name` is not a string, is empty or
+/// whitespace-only, contains characters other than ASCII letters, digits,
+/// `.`, `_` and `-`, is `.` or contains `..`, or uses a form reserved by
+/// state storage (a `_dag_` prefix or a `.lock` suffix).
+fn take_explicit_job_name(config: &mut Value, path: &Path) -> Result<Option<String>> {
+    let Some(raw) = config.as_object_mut().and_then(|map| map.remove("name")) else {
+        return Ok(None);
+    };
+    let name = match raw {
+        Value::String(s) => s,
+        Value::Null => bail!(
+            "invalid job name in {}: name must not be empty",
+            path.display()
+        ),
+        _ => bail!(
+            "invalid job name in {}: name must be a string; quote it if it looks like a number",
+            path.display()
+        ),
+    };
+    if name.trim().is_empty() {
+        bail!(
+            "invalid job name in {}: name must not be empty",
+            path.display()
+        );
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        bail!(
+            "invalid job name {name:?} in {}: only ASCII letters, digits, '.', '_' and '-' are allowed",
+            path.display()
+        );
+    }
+    if name == "." || name.contains("..") {
+        bail!(
+            "invalid job name {name:?} in {}: name must not be '.' or contain '..'",
+            path.display()
+        );
+    }
+    if name.starts_with(crate::storage::DAG_STATE_PREFIX) || name.ends_with(".lock") {
+        bail!(
+            "invalid job name {name:?} in {}: names starting with '{}' or ending in '.lock' are reserved for yard state files",
+            path.display(),
+            crate::storage::DAG_STATE_PREFIX
+        );
+    }
+    Ok(Some(name))
+}
+
 fn discover_jobs(search_root: &Path, project_root: &Path) -> Result<HashMap<String, JobDefinition>> {
     let mut all_jobs = HashMap::new();
+    // Where each job name came from and whether it was set explicitly, so a
+    // clash that involves an explicit `name:` can report both files.
+    let mut origins: HashMap<String, (PathBuf, bool)> = HashMap::new();
     let mut context_cache: HashMap<PathBuf, YARDContext> = HashMap::new();
 
     for entry in walkdir::WalkDir::new(search_root)
@@ -299,11 +449,17 @@ fn discover_jobs(search_root: &Path, project_root: &Path) -> Result<HashMap<Stri
                 .position(|p| p == "envs")
                 .and_then(|i| parts.get(i + 1).cloned())
         };
-        let job_name = [env, folder, Some(base_name.clone())]
+        let generated_name = [env, folder, Some(base_name.clone())]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>()
             .join("-");
+        // `name:` is stripped from the config so the config hash is the same
+        // with or without it; it only decides the manifest key.
+        let mut config = yaml_to_json(job_doc);
+        let explicit = take_explicit_job_name(&mut config, path)?;
+        let is_explicit = explicit.is_some();
+        let job_name = explicit.unwrap_or(generated_name);
         let job_type: JobType = job_doc["type"]
             .as_str()
             .ok_or_else(|| {
@@ -314,7 +470,6 @@ fn discover_jobs(search_root: &Path, project_root: &Path) -> Result<HashMap<Stri
             })?
             .parse()
             .with_context(|| format!("invalid job type for job '{job_name}'"))?;
-        let config = yaml_to_json(job_doc);
 
         // TYPE-03 D-19/D-21: gate the job doc against the static
         // `JobDefinition` keys plus the dynamic `JobType`-derived
@@ -360,6 +515,19 @@ fn discover_jobs(search_root: &Path, project_root: &Path) -> Result<HashMap<Stri
             .get("plugin_source")
             .and_then(|v| v.as_str())
             .map(String::from);
+
+        // Two generated names that collide keep the long-standing last-wins
+        // behavior; only a clash involving an explicit name is an error.
+        if let Some((prev_path, prev_explicit)) = origins.get(&job_name)
+            && (*prev_explicit || is_explicit)
+        {
+            bail!(
+                "duplicate job name '{job_name}': defined by {} and {}",
+                prev_path.display(),
+                path.display()
+            );
+        }
+        origins.insert(job_name.clone(), (path.to_path_buf(), is_explicit));
 
         all_jobs.insert(
             job_name,
@@ -434,13 +602,14 @@ fn common_context_field(dir: &Path, filename: &str, field: &str) -> Value {
 /// # Errors
 ///
 /// Returns an error if any context file contains flat-style provider keys
-/// (D-02 migration error).
+/// (D-02 migration error), or if `plugin_version` / `plugin_source` appear
+/// under `providers.<type>` in any layer (they belong in `plugins.<type>`).
 fn cascade_provider_defaults(
     mut jobs: HashMap<String, JobDefinition>,
     providers: &HashMap<String, Value>,
     root_aws: &Value,
 ) -> Result<HashMap<String, JobDefinition>> {
-    for job in jobs.values_mut() {
+    for (name, job) in &mut jobs {
         // --- providers.<type> cascade ---
         // The providers HashMap is keyed by wire-string job type ("glue",
         // "emr", "bash"); JobType::to_string() gives the canonical wire form.
@@ -463,6 +632,17 @@ fn cascade_provider_defaults(
             &region_provider,
             &job_inline_provider,
         ]);
+        // D-5: a pin under providers.<type> would be passed to the plugin as
+        // config and the job would silently run unpinned. `merged` already
+        // folds all four layers, so one check covers them all.
+        for key in ["plugin_version", "plugin_source"] {
+            if merged.get(key).is_some() {
+                return Err(anyhow!(
+                    "job '{name}': {key} belongs in the plugins.{job_type_key} block or at the \
+                     top level of the job file, not under providers.{job_type_key}"
+                ));
+            }
+        }
         if let Some(obj) = job.config.as_object_mut() {
             obj.insert(job_type_key, merged);
         }
@@ -475,6 +655,102 @@ fn cascade_provider_defaults(
         let merged_aws = cascade_merge(&[root_aws, &account_aws, &region_aws, &job_inline_aws]);
         if let Some(obj) = job.config.as_object_mut() {
             obj.insert("_aws".to_string(), merged_aws);
+        }
+    }
+    Ok(jobs)
+}
+
+/// Extract the `plugins.<job_type>` entry from the nearest ancestor context
+/// file by walking up from `dir`. Returns `Value::Null` when the file has no
+/// `plugins` block or no entry for the job type.
+///
+/// Context files otherwise stay ungated (they accept arbitrary keys for
+/// `${account.*}` / `${region.*}` interpolation), but `plugins` is a
+/// yard-reserved key in them: its entries are checked with
+/// [`validate_plugin_entry`], and `source` is optional so a lower layer can
+/// override only `version` or only `source`.
+///
+/// # Errors
+///
+/// Returns an error if the context file cannot be read or parsed, if
+/// `plugins` is not a map, or if the entry for `job_type` is malformed.
+fn plugin_context_field(dir: &Path, filename: &str, job_type: &str) -> Result<Value> {
+    let context = find_and_parse_context(dir, filename, false)?;
+    let Some(block) = context.get("plugins").filter(|v| !v.is_null()) else {
+        return Ok(Value::Null);
+    };
+    let entries = block.as_object().ok_or_else(|| {
+        anyhow!("{filename}.plugins must be a map keyed by job type (e.g. plugins.glue)")
+    })?;
+    let Some(entry) = entries.get(job_type) else {
+        return Ok(Value::Null);
+    };
+    validate_plugin_entry(entry, &format!("{filename}.plugins.{job_type}"), false)?;
+    Ok(entry.clone())
+}
+
+/// Cascade `plugins.<type>` pins onto each job's `plugin_version` /
+/// `plugin_source` (D-2, D-3):
+///
+/// ```text
+/// yard.yaml plugins  ->  account.yaml plugins  ->  region.yaml plugins  ->  job file
+/// ```
+///
+/// Layers merge field by field, later layers winning. The job file's own
+/// top-level `plugin_version` / `plugin_source` win over every layer, again
+/// per field, so a job that sets only `plugin_version` still inherits
+/// `source` from the layers.
+///
+/// # Errors
+///
+/// Returns an error if an account.yaml / region.yaml `plugins` block is
+/// malformed (non-map, unknown key, non-string field) or cannot be read.
+fn cascade_plugin_pins(
+    mut jobs: HashMap<String, JobDefinition>,
+    root_plugins: &Value,
+) -> Result<HashMap<String, JobDefinition>> {
+    for (name, job) in &mut jobs {
+        let job_type_key = job.job_type.to_string();
+        let root_pin = root_plugins
+            .get(&job_type_key)
+            .cloned()
+            .unwrap_or(Value::Null);
+        let context_err = || format!("failed to resolve plugin pin for job '{name}'");
+        let account_pin = plugin_context_field(&job.dir, "account.yaml", &job_type_key)
+            .with_context(context_err)?;
+        let region_pin = plugin_context_field(&job.dir, "region.yaml", &job_type_key)
+            .with_context(context_err)?;
+        let merged = cascade_merge(&[&root_pin, &account_pin, &region_pin]);
+
+        if job.plugin_version.is_none() {
+            job.plugin_version = merged
+                .get("version")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+        if job.plugin_source.is_none() {
+            job.plugin_source = merged
+                .get("source")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+
+        // Mirror the effective pin into job.config, the same two top-level
+        // keys a per-job pin produces. diff.rs hashes job.config and shows
+        // config changes with compare_json, so (a) moving a pin from a job
+        // file into yard.yaml yields byte-identical config and no spurious
+        // Modify in `yard plan` (Map is BTreeMap-ordered, so insertion order
+        // does not matter), and (b) bumping plugins.<type>.version still
+        // shows as a Modify, exactly like the per-job form. Without the
+        // mirror a yard.yaml version bump would be invisible to plan whenever
+        // codegen output is unchanged.
+        if let Some(obj) = job.config.as_object_mut() {
+            if let Some(version) = &job.plugin_version {
+                obj.insert("plugin_version".to_string(), Value::String(version.clone()));
+            }
+            if let Some(source) = &job.plugin_source {
+                obj.insert("plugin_source".to_string(), Value::String(source.clone()));
+            }
         }
     }
     Ok(jobs)
@@ -753,12 +1029,20 @@ pub fn discover_environments(root_path: &Path) -> Result<Vec<DiscoveredEnvironme
                     .map_err(|e| anyhow!("YAML error in {}: {}", file_path.display(), e))?;
 
                 if let Some(doc) = docs.first() {
-                    let job_value = yaml_to_json(doc);
+                    let mut job_value = yaml_to_json(doc);
                     if let Some(type_str) = job_value.get("type").and_then(|v| v.as_str())
                         && let Ok(job_type) = type_str.parse::<JobType>()
                     {
+                        // An explicit `name:` is the job's identity. This walk
+                        // reads the raw file without `${...}` interpolation, so
+                        // a name that needs context variables is validated as
+                        // written; an invalid one falls back to the file stem.
+                        let name = take_explicit_job_name(&mut job_value, &file_path)
+                            .ok()
+                            .flatten()
+                            .unwrap_or(job_name);
                         jobs.push(yard_structs::JobSummary {
-                            name: job_name,
+                            name,
                             job_type,
                             config_yaml: Some(content.clone()),
                         });
@@ -956,6 +1240,328 @@ mod tests {
 
     fn provider_field<'a>(job: &'a JobDefinition, provider: &str, key: &str) -> Option<&'a str> {
         job.config.get(provider)?.get(key)?.as_str()
+    }
+
+    // --- yard.yaml plugins block: parsing and key gating (D-1) ---
+
+    #[test]
+    fn root_plugins_block_parses_into_typed_pins() {
+        let root = json!({"plugins": {"glue": {
+            "version": "0.3.1",
+            "source": "https://github.com/org/yard-plugin-glue"
+        }}});
+
+        let pins = parse_root_plugins(&root).unwrap();
+
+        assert_eq!(pins.len(), 1);
+        assert_eq!(
+            pins.get("glue"),
+            Some(&PluginPin {
+                version: Some("0.3.1".to_string()),
+                source: "https://github.com/org/yard-plugin-glue".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn root_plugins_absent_or_null_is_empty() {
+        assert!(parse_root_plugins(&json!({})).unwrap().is_empty());
+        assert!(
+            parse_root_plugins(&json!({"plugins": null}))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn root_plugins_entry_unknown_key_is_rejected() {
+        let root = json!({"plugins": {"glue": {"verison": "0.3.1", "source": "x"}}});
+
+        let err = parse_root_plugins(&root).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("unknown field 'verison' at yard.yaml.plugins.glue"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn root_plugins_entry_missing_source_is_rejected() {
+        let root = json!({"plugins": {"glue": {"version": "0.3.1"}}});
+
+        let err = parse_root_plugins(&root).unwrap_err();
+
+        assert!(
+            format!("{err:#}")
+                .contains("missing required field 'source' at yard.yaml.plugins.glue"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn root_plugins_entry_non_string_version_is_rejected() {
+        let root = json!({"plugins": {"glue": {"version": 0.3, "source": "x"}}});
+
+        let err = parse_root_plugins(&root).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("yard.yaml.plugins.glue.version must be a string"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn root_plugins_non_map_is_rejected() {
+        let root = json!({"plugins": ["glue"]});
+
+        let err = parse_root_plugins(&root).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("yard.yaml.plugins must be a map"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn root_plugins_top_level_key_is_allowed() {
+        let root = json!({"project": "p", "plugins": {}});
+
+        let result = crate::parsing::validate_unknown_keys(&root, ALLOWED_TOP_LEVEL, "yard.yaml");
+
+        assert!(result.is_ok(), "got: {result:?}");
+    }
+
+    // --- plugins cascade: yard.yaml -> account.yaml -> region.yaml -> job (D-2, D-3) ---
+
+    const GLUE_URL: &str = "https://github.com/org/yard-plugin-glue";
+
+    fn root_glue_pin() -> Value {
+        json!({"glue": {"version": "0.3.1", "source": GLUE_URL}})
+    }
+
+    fn write_context(tmp: &TempDir, account: &str, region: &str) {
+        fs::write(tmp.0.join("account.yaml"), account).unwrap();
+        fs::write(tmp.0.join("region.yaml"), region).unwrap();
+    }
+
+    fn job_map(job: JobDefinition) -> HashMap<String, JobDefinition> {
+        HashMap::from([("job".to_string(), job)])
+    }
+
+    fn pin_one(job: JobDefinition, root: &Value) -> JobDefinition {
+        cascade_plugin_pins(job_map(job), root)
+            .unwrap()
+            .remove("job")
+            .unwrap()
+    }
+
+    #[test]
+    fn plugin_pin_root_only_populates_job() {
+        let tmp = TempDir::new();
+        write_context(&tmp, "{}", "{}");
+
+        let job = pin_one(glue_job(&tmp.0, None), &root_glue_pin());
+
+        assert_eq!(job.plugin_version.as_deref(), Some("0.3.1"));
+        assert_eq!(job.plugin_source.as_deref(), Some(GLUE_URL));
+    }
+
+    #[test]
+    fn plugin_pin_account_overrides_root() {
+        let tmp = TempDir::new();
+        write_context(
+            &tmp,
+            "plugins:\n  glue:\n    version: \"0.4.0\"\n    source: \"https://github.com/acct/yard-plugin-glue\"\n",
+            "{}",
+        );
+
+        let job = pin_one(glue_job(&tmp.0, None), &root_glue_pin());
+
+        assert_eq!(job.plugin_version.as_deref(), Some("0.4.0"));
+        assert_eq!(
+            job.plugin_source.as_deref(),
+            Some("https://github.com/acct/yard-plugin-glue")
+        );
+    }
+
+    #[test]
+    fn plugin_pin_region_overrides_account() {
+        let tmp = TempDir::new();
+        write_context(
+            &tmp,
+            "plugins:\n  glue:\n    version: \"0.4.0\"\n    source: \"https://github.com/acct/yard-plugin-glue\"\n",
+            "plugins:\n  glue:\n    version: \"0.5.0\"\n    source: \"git::https://example.com/region/plugins\"\n",
+        );
+
+        let job = pin_one(glue_job(&tmp.0, None), &root_glue_pin());
+
+        assert_eq!(job.plugin_version.as_deref(), Some("0.5.0"));
+        assert_eq!(
+            job.plugin_source.as_deref(),
+            Some("git::https://example.com/region/plugins")
+        );
+    }
+
+    #[test]
+    fn plugin_pin_job_level_overrides_region() {
+        let tmp = TempDir::new();
+        write_context(
+            &tmp,
+            "{}",
+            "plugins:\n  glue:\n    version: \"0.5.0\"\n    source: \"git::https://example.com/region/plugins\"\n",
+        );
+        let mut job = glue_job(&tmp.0, None);
+        job.plugin_version = Some("0.6.0".to_string());
+        job.plugin_source = Some("file://bin/yard-plugin-glue".to_string());
+
+        let job = pin_one(job, &root_glue_pin());
+
+        assert_eq!(job.plugin_version.as_deref(), Some("0.6.0"));
+        assert_eq!(
+            job.plugin_source.as_deref(),
+            Some("file://bin/yard-plugin-glue")
+        );
+    }
+
+    #[test]
+    fn plugin_pin_partial_override_inherits_source() {
+        let tmp = TempDir::new();
+        write_context(&tmp, "{}", "plugins:\n  glue:\n    version: \"0.5.0\"\n");
+
+        let job = pin_one(glue_job(&tmp.0, None), &root_glue_pin());
+
+        assert_eq!(job.plugin_version.as_deref(), Some("0.5.0"));
+        assert_eq!(job.plugin_source.as_deref(), Some(GLUE_URL));
+    }
+
+    #[test]
+    fn plugin_pin_job_version_only_inherits_layer_source() {
+        let tmp = TempDir::new();
+        write_context(&tmp, "{}", "{}");
+        let mut job = glue_job(&tmp.0, None);
+        job.plugin_version = Some("0.6.0".to_string());
+
+        let job = pin_one(job, &root_glue_pin());
+
+        assert_eq!(job.plugin_version.as_deref(), Some("0.6.0"));
+        assert_eq!(job.plugin_source.as_deref(), Some(GLUE_URL));
+    }
+
+    #[test]
+    fn plugin_pin_absent_everywhere_leaves_fields_none() {
+        let tmp = TempDir::new();
+        write_context(&tmp, "{}", "{}");
+
+        let job = pin_one(glue_job(&tmp.0, None), &json!({}));
+
+        assert_eq!(job.plugin_version, None);
+        assert_eq!(job.plugin_source, None);
+        assert!(job.config.get("plugin_version").is_none());
+        assert!(job.config.get("plugin_source").is_none());
+    }
+
+    #[test]
+    fn plugin_pin_other_job_type_unaffected() {
+        let tmp = TempDir::new();
+        write_context(&tmp, "{}", "{}");
+        let root = json!({"emr": {"version": "1.0.0", "source": "https://github.com/org/yard-plugin-emr"}});
+
+        let job = pin_one(glue_job(&tmp.0, None), &root);
+
+        assert_eq!(job.plugin_version, None);
+        assert_eq!(job.plugin_source, None);
+    }
+
+    #[test]
+    fn plugin_pin_mirrors_into_config_matching_per_job_form() {
+        let tmp = TempDir::new();
+        write_context(&tmp, "{}", "{}");
+        let inherited = glue_job(&tmp.0, None);
+        let mut per_job = glue_job(&tmp.0, None);
+        per_job.plugin_version = Some("0.3.1".to_string());
+        per_job.plugin_source = Some(GLUE_URL.to_string());
+        if let Some(obj) = per_job.config.as_object_mut() {
+            obj.insert("plugin_version".into(), json!("0.3.1"));
+            obj.insert("plugin_source".into(), json!(GLUE_URL));
+        }
+
+        let inherited = pin_one(inherited, &root_glue_pin());
+        let per_job = pin_one(per_job, &json!({}));
+
+        assert_eq!(inherited.config, per_job.config);
+    }
+
+    #[test]
+    fn plugin_pin_context_entry_unknown_key_is_rejected() {
+        let tmp = TempDir::new();
+        write_context(&tmp, "{}", "plugins:\n  glue:\n    verison: \"0.5.0\"\n");
+        let map = job_map(glue_job(&tmp.0, None));
+
+        let err = cascade_plugin_pins(map, &root_glue_pin()).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("unknown field 'verison' at region.yaml.plugins.glue"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn providers_block_with_plugin_version_is_rejected() {
+        let tmp = TempDir::new();
+        write_context(&tmp, "{}", "{}");
+        let map = job_map(glue_job(&tmp.0, None));
+        let providers: HashMap<String, Value> = [(
+            "glue".to_string(),
+            json!({"plugin_version": "0.3.1", "script_bucket": "b"}),
+        )]
+        .into_iter()
+        .collect();
+
+        let err = cascade_provider_defaults(map, &providers, &Value::Null).unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("plugin_version"), "got: {msg}");
+        assert!(msg.contains("plugins.glue"), "got: {msg}");
+        assert!(msg.contains("not under providers.glue"), "got: {msg}");
+    }
+
+    #[test]
+    fn providers_block_in_account_yaml_with_plugin_source_is_rejected() {
+        let tmp = TempDir::new();
+        write_context(&tmp, "providers:\n  glue:\n    plugin_source: x\n", "{}");
+        let map = job_map(glue_job(&tmp.0, None));
+
+        let err = cascade_provider_defaults(map, &HashMap::new(), &Value::Null).unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("plugin_source"), "got: {msg}");
+        assert!(msg.contains("plugins.glue"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn plugin_pin_resolve_project_end_to_end() {
+        let tmp = TempDir::new();
+        fs::create_dir_all(tmp.0.join(".yard/state")).unwrap();
+        fs::write(
+            tmp.0.join("yard.yaml"),
+            "project: smoke-test\nstate:\n  type: local\n  path: .yard/state\nplugins:\n  glue:\n    version: \"0.3.1\"\n    source: \"https://github.com/org/yard-plugin-glue\"\n",
+        )
+        .unwrap();
+        write_context(&tmp, "name: dev\n", "name: us-east-1\n");
+        fs::write(tmp.0.join("orders.yaml"), "type: glue\n").unwrap();
+
+        let resolved = resolve_project(&tmp.0).await.unwrap();
+
+        assert_eq!(
+            resolved.manifest.plugins.get("glue"),
+            Some(&PluginPin {
+                version: Some("0.3.1".to_string()),
+                source: GLUE_URL.to_string(),
+            })
+        );
+        let job = resolved.manifest.jobs.values().next().unwrap();
+        assert_eq!(job.plugin_version.as_deref(), Some("0.3.1"));
+        assert_eq!(job.plugin_source.as_deref(), Some(GLUE_URL));
     }
 
     // --- aws cascade: root → account → region → job ---
@@ -1352,6 +1958,261 @@ mod tests {
         assert!(msg.contains("unknown field 'rolle'"), "got: {msg}");
     }
 
+    // --- explicit job name (quick 261020-fh7) ---
+
+    fn job_project() -> TempDir {
+        let tmp = TempDir::new();
+        write_context(&tmp, "name: dev\n", "name: us-east-1\n");
+        tmp
+    }
+
+    fn write_job(tmp: &TempDir, rel_dir: &str, file: &str, body: &str) -> PathBuf {
+        let dir = tmp.0.join(rel_dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(file);
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn job_name_explicit_becomes_manifest_key() {
+        let tmp = job_project();
+        write_job(
+            &tmp,
+            "envs/dev/sales",
+            "orders.yaml",
+            "type: glue\nname: orders\n",
+        );
+
+        let jobs = discover_jobs(&tmp.0, &tmp.0).unwrap();
+
+        assert!(jobs.contains_key("orders"), "got: {:?}", jobs.keys());
+        assert!(
+            !jobs.contains_key("dev-sales-orders"),
+            "got: {:?}",
+            jobs.keys()
+        );
+        assert!(jobs["orders"].config.get("name").is_none());
+    }
+
+    #[test]
+    fn job_name_absent_uses_generated_key() {
+        let tmp = job_project();
+        write_job(&tmp, "envs/dev/sales", "orders.yaml", "type: glue\n");
+
+        let jobs = discover_jobs(&tmp.0, &tmp.0).unwrap();
+
+        assert!(
+            jobs.contains_key("dev-sales-orders"),
+            "got: {:?}",
+            jobs.keys()
+        );
+        assert_eq!(jobs.len(), 1);
+    }
+
+    #[test]
+    fn job_name_empty_is_rejected() {
+        for body in [
+            "type: glue\nname: \"\"\n",
+            "type: glue\nname: \"   \"\n",
+            "type: glue\nname:\n",
+        ] {
+            let tmp = job_project();
+            let path = write_job(&tmp, "envs/dev/sales", "orders.yaml", body);
+
+            let err = discover_jobs(&tmp.0, &tmp.0).unwrap_err();
+
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("name must not be empty"),
+                "body {body:?}, got: {msg}"
+            );
+            assert!(msg.contains(&path.display().to_string()), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn job_name_non_string_is_rejected() {
+        let tmp = job_project();
+        let path = write_job(
+            &tmp,
+            "envs/dev/sales",
+            "orders.yaml",
+            "type: glue\nname: 42\n",
+        );
+
+        let err = discover_jobs(&tmp.0, &tmp.0).unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("name must be a string"), "got: {msg}");
+        assert!(msg.contains(&path.display().to_string()), "got: {msg}");
+    }
+
+    #[test]
+    fn job_name_invalid_chars_are_rejected() {
+        for name in ["a/b", "../x", "a b", "a\\\\b"] {
+            let tmp = job_project();
+            let body = format!("type: glue\nname: \"{name}\"\n");
+            let path = write_job(&tmp, "envs/dev/sales", "orders.yaml", &body);
+
+            let err = discover_jobs(&tmp.0, &tmp.0).unwrap_err();
+
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("only ASCII letters, digits, '.', '_' and '-' are allowed"),
+                "name {name:?}, got: {msg}"
+            );
+            assert!(msg.contains(&path.display().to_string()), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn job_name_dot_and_reserved_forms_are_rejected() {
+        for name in ["..", ".", "orders..v2", "_dag_orders", "orders.lock"] {
+            let tmp = job_project();
+            let body = format!("type: glue\nname: \"{name}\"\n");
+            let path = write_job(&tmp, "envs/dev/sales", "orders.yaml", &body);
+
+            let err = discover_jobs(&tmp.0, &tmp.0).unwrap_err();
+
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("invalid job name"),
+                "name {name:?}, got: {msg}"
+            );
+            assert!(msg.contains(&path.display().to_string()), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn job_name_duplicate_explicit_names_are_rejected() {
+        let tmp = job_project();
+        let first = write_job(&tmp, "envs/dev/a", "x.yaml", "type: glue\nname: orders\n");
+        let second = write_job(&tmp, "envs/dev/b", "y.yaml", "type: glue\nname: orders\n");
+
+        let err = discover_jobs(&tmp.0, &tmp.0).unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("duplicate job name 'orders'"), "got: {msg}");
+        assert!(msg.contains(&first.display().to_string()), "got: {msg}");
+        assert!(msg.contains(&second.display().to_string()), "got: {msg}");
+    }
+
+    #[test]
+    fn job_name_explicit_colliding_with_generated_is_rejected() {
+        let tmp = job_project();
+        let generated = write_job(&tmp, "envs/dev/sales", "orders.yaml", "type: glue\n");
+        let explicit = write_job(
+            &tmp,
+            "envs/dev/sales",
+            "other.yaml",
+            "type: glue\nname: dev-sales-orders\n",
+        );
+
+        let err = discover_jobs(&tmp.0, &tmp.0).unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("duplicate job name 'dev-sales-orders'"),
+            "got: {msg}"
+        );
+        assert!(msg.contains(&generated.display().to_string()), "got: {msg}");
+        assert!(msg.contains(&explicit.display().to_string()), "got: {msg}");
+    }
+
+    #[test]
+    fn job_name_matching_generated_value_keeps_config_byte_identical() {
+        let body =
+            "glue:\n  script_bucket: my-bucket\nrole: arn:aws:iam::123456789012:role/GlueJob\n";
+        let with_name = job_project();
+        write_job(
+            &with_name,
+            "envs/dev/sales",
+            "orders.yaml",
+            &format!("name: dev-sales-orders\ntype: glue\n{body}"),
+        );
+        let without_name = job_project();
+        write_job(
+            &without_name,
+            "envs/dev/sales",
+            "orders.yaml",
+            &format!("type: glue\n{body}"),
+        );
+
+        let named = discover_jobs(&with_name.0, &with_name.0).unwrap();
+        let plain = discover_jobs(&without_name.0, &without_name.0).unwrap();
+
+        let named_json = serde_json::to_string(&named["dev-sales-orders"].config).unwrap();
+        let plain_json = serde_json::to_string(&plain["dev-sales-orders"].config).unwrap();
+        assert_eq!(named_json, plain_json);
+    }
+
+    #[test]
+    fn job_name_interpolates_context_variables() {
+        let tmp = job_project();
+        write_job(
+            &tmp,
+            "envs/dev/sales",
+            "orders.yaml",
+            "type: glue\nname: ${account.name}-orders\n",
+        );
+
+        let jobs = discover_jobs(&tmp.0, &tmp.0).unwrap();
+
+        assert!(jobs.contains_key("dev-orders"), "got: {:?}", jobs.keys());
+    }
+
+    #[tokio::test]
+    async fn job_name_explicit_scopes_target_and_list_targets() {
+        let tmp = TempDir::new();
+        fs::create_dir_all(tmp.0.join(".yard/state")).unwrap();
+        fs::write(
+            tmp.0.join("yard.yaml"),
+            "project: smoke-test\nstate:\n  type: local\n  path: .yard/state\n",
+        )
+        .unwrap();
+        write_context(&tmp, "name: dev\n", "name: us-east-1\n");
+        write_job(
+            &tmp,
+            "envs/dev/sales",
+            "orders.yaml",
+            "type: glue\nname: orders\n",
+        );
+        write_job(&tmp, "envs/dev/sales", "customers.yaml", "type: glue\n");
+
+        let resolved = resolve_project(&tmp.0).await.unwrap();
+        let scoped = crate::orchestrate::plan(
+            &resolved.manifest,
+            &resolved.current_state,
+            &tmp.0,
+            Some("orders".to_string()),
+        )
+        .await
+        .unwrap();
+        let generated_target = crate::orchestrate::plan(
+            &resolved.manifest,
+            &resolved.current_state,
+            &tmp.0,
+            Some("dev-sales-orders".to_string()),
+        )
+        .await;
+        let rows = crate::list_targets::list_targets(&resolved.manifest, &tmp.0).unwrap();
+
+        let mut keys: Vec<&String> = resolved.manifest.jobs.keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["dev-sales-customers", "orders"]);
+        assert_eq!(scoped.job_diffs.len(), 1);
+        assert_eq!(scoped.job_diffs[0].name, "orders");
+        assert_eq!(
+            scoped.job_diffs[0].diff_type,
+            yard_structs::DiffType::Create
+        );
+        let msg = format!("{:#}", generated_target.unwrap_err());
+        assert!(msg.contains("not found"), "got: {msg}");
+        let targets: Vec<&str> = rows.iter().map(|r| r.target.as_str()).collect();
+        assert_eq!(targets, ["dev-sales-customers", "orders"]);
+    }
+
     // --- discover_environments (Phase 40) ---
 
     /// Helper: create a minimal yard project fixture with env/region structure.
@@ -1501,6 +2362,38 @@ mod tests {
     }
 
     #[test]
+    fn discover_environments_reports_explicit_job_name() {
+        let tmp = TempDir::new();
+        make_yard_project(&tmp.0);
+        let env_dir = tmp.0.join("production");
+        let region_dir = env_dir.join("us-east-1");
+        fs::create_dir_all(&region_dir).unwrap();
+        fs::write(env_dir.join("account.yaml"), "{}").unwrap();
+        fs::write(region_dir.join("region.yaml"), "{}").unwrap();
+        fs::write(
+            region_dir.join("orders_job.yaml"),
+            "type: glue\nname: orders\n",
+        )
+        .unwrap();
+        fs::write(
+            region_dir.join("users.yaml"),
+            "type: glue\nname: \"bad/name\"\n",
+        )
+        .unwrap();
+        fs::write(region_dir.join("plain.yaml"), "type: glue\n").unwrap();
+
+        let envs = discover_environments(&tmp.0).unwrap();
+
+        let mut names: Vec<&str> = envs[0].regions[0]
+            .jobs
+            .iter()
+            .map(|j| j.name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["orders", "plain", "users"]);
+    }
+
+    #[test]
     fn discover_environments_no_yard_yaml_errors() {
         let tmp = TempDir::new();
         // No yard.yaml at all
@@ -1532,6 +2425,7 @@ mod tests {
                 path: ".yard/state".into(),
             },
             providers: HashMap::new(),
+            plugins: HashMap::new(),
             jobs,
             aws: None,
         }

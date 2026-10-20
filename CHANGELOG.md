@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- A top-level `plugins:` block in `yard.yaml`, keyed by job type, pins a plugin once with `version` and `source` instead of repeating `plugin_version` / `plugin_source` in every job file. The same block may appear in `account.yaml` and `region.yaml`; pins cascade `yard.yaml` -> `account.yaml` -> `region.yaml` -> job file field by field, and the job file wins.
+- `yard_structs::PluginPin` and `ProjectManifest.plugins` expose the `yard.yaml` pins to embedders; the map is left out of serialized manifests when empty.
+- An optional top-level `name:` in a job file sets the job's identity: the state key, lock, `--target` value, `yard list targets` row, and the job name passed to the plugin. Without it the generated `<env>-<folder>-<file>` name is used as before. A name may contain only ASCII letters, digits, `.`, `_` and `-`, must not contain `..`, must not start with `_dag_` or end in `.lock`, and must be unique: two job files that resolve to the same name are an error when at least one sets `name:`. Setting `name:` to the generated value changes nothing in `yard plan`; any other value is a rename, which plan shows as a delete of the old name plus a create of the new one, and `apply` carries out by destroying and redeploying.
+
+### Changed
+
+- `plugin_version` / `plugin_source` under `providers.<type>` (in any layer, or a job's own `<type>:` block) is now an error that points at `plugins.<type>`. Previously they were silently passed to the plugin as config and the job ran unpinned.
+- `plugins` is now a reserved key in `account.yaml` / `region.yaml`; entries with unknown keys are rejected.
+- Per-job `plugin_version` / `plugin_source` are optional when a `plugins` entry covers the job's type.
+
 ## [2.1.2] - 2026-10-19
 
 ### Added

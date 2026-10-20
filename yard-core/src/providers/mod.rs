@@ -206,7 +206,8 @@ pub async fn get_provider_for_job(
         }
         bail!(
             "provider '{type_name}' is now a plugin -- add plugin_source (and plugin_version) \
-             to your job.yaml, see docs/reference/migrations/v2.0.md"
+             to your job.yaml, or declare the pin once in a plugins.{type_name} block in \
+             yard.yaml, see docs/reference/migrations/v2.0.md"
         )
     };
 
@@ -287,4 +288,27 @@ pub async fn codegen_job(
         .await
         .with_context(|| format!("plugin codegen failed for job \"{job_name}\""))?;
     Ok(script.unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unpinned_plugin_error_mentions_plugins_block() {
+        let job_type = JobType::Plugin("glue".to_string());
+        let config = PluginHostConfig::default();
+
+        let result = get_provider_for_job(&job_type, None, None, &config).await;
+
+        let Err(err) = result else {
+            panic!("expected an error for a job without plugin_source");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("plugins.glue block in yard.yaml"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("add plugin_source"), "got: {msg}");
+    }
 }

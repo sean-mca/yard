@@ -163,6 +163,7 @@ mod tests {
                 path: std::path::PathBuf::new(),
             },
             providers: HashMap::new(),
+            plugins: HashMap::new(),
             jobs: HashMap::new(),
             aws: None,
         }
