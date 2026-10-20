@@ -1194,6 +1194,29 @@ pub struct DirFilterResult {
     pub display_path: String,
 }
 
+impl DirFilterResult {
+    /// Restrict `state` to the jobs retained in [`Self::manifest`].
+    ///
+    /// A directory scope must only ever touch the jobs that live under that
+    /// directory. Deployed jobs outside it, and jobs whose YAML no longer
+    /// exists anywhere, are dropped so a diff against the returned state
+    /// cannot report them as deletes. Without this, `--dir` would plan (and
+    /// `apply` would destroy) every deployed job outside the directory.
+    #[must_use]
+    pub fn scope_state(&self, state: &ProjectState) -> ProjectState {
+        ProjectState {
+            project: state.project.clone(),
+            last_updated: state.last_updated.clone(),
+            deployments: state
+                .deployments
+                .iter()
+                .filter(|(name, _)| self.manifest.jobs.contains_key(name.as_str()))
+                .map(|(name, deployment)| (name.clone(), deployment.clone()))
+                .collect(),
+        }
+    }
+}
+
 /// Filter a project manifest to retain only jobs whose directory is at or
 /// below `dir_path`.
 ///
@@ -2696,6 +2719,50 @@ mod tests {
         assert_eq!(result.manifest.jobs.len(), 1);
         assert!(result.manifest.jobs.contains_key("job_a"));
         assert!(result.display_path.ends_with("sub_a/"));
+    }
+
+    fn deployment(hash: &str) -> yard_structs::Deployment {
+        yard_structs::Deployment {
+            env: None,
+            config_hash: hash.to_string(),
+            config: json!({}),
+            status: yard_structs::DeploymentStatus::Deployed,
+            applied_at: "2026-01-01T00:00:00Z".to_string(),
+            resources: Vec::new(),
+            plugin_version: None,
+            plugin_source: None,
+        }
+    }
+
+    #[test]
+    fn dir_filter_scope_state_keeps_only_in_scope_deployments() {
+        let tmp = TempDir::new();
+        make_yard_project(&tmp.0);
+        let sub_a = tmp.0.join("sub_a");
+        let sub_b = tmp.0.join("sub_b");
+        fs::create_dir_all(&sub_a).unwrap();
+        fs::create_dir_all(&sub_b).unwrap();
+        let manifest = manifest_with_jobs(&[("job_a", &sub_a), ("job_b", &sub_b)]);
+        let mut deployments = HashMap::new();
+        deployments.insert("job_a".to_string(), deployment("a"));
+        deployments.insert("job_b".to_string(), deployment("b"));
+        // Deployed, but its YAML is gone: not attributable to any directory.
+        deployments.insert("orphan".to_string(), deployment("o"));
+        let state = ProjectState {
+            project: "test".to_string(),
+            last_updated: "2026-01-01T00:00:00Z".to_string(),
+            deployments,
+        };
+
+        let result = filter_manifest_by_dir(&manifest, Path::new("sub_a"), &tmp.0).unwrap();
+        let scoped = result.scope_state(&state);
+
+        assert_eq!(scoped.project, "test");
+        assert_eq!(scoped.last_updated, "2026-01-01T00:00:00Z");
+        assert_eq!(scoped.deployments.len(), 1);
+        assert_eq!(scoped.deployments["job_a"].config_hash, "a");
+        assert!(!scoped.deployments.contains_key("job_b"));
+        assert!(!scoped.deployments.contains_key("orphan"));
     }
 
     #[test]

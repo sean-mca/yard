@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `yard plan --dir` and `yard apply --dir` no longer treat deployed jobs outside the directory as deletes. The manifest was scoped to the directory but state was not, so every job deployed elsewhere appeared as `- Delete`, and `apply --dir` would have destroyed them. State is now scoped to the same job set as the manifest.
+
 ## [2.1.4] - 2026-10-20
 
 ### Changed

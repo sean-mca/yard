@@ -50,7 +50,7 @@ Apply pending changes to AWS. For each target in the project, the provider plugi
 | `--dry-run` | No | unset | Skip provider deployment (codegen and state only). |
 | `--auto-approve` | No | unset | Skip confirmation prompt. |
 | `--target <TARGET>` | No | unset | Only apply a specific job. Mutually exclusive with `--dir`. |
-| `--dir <DIR>` | No | unset | Scope to all jobs under a directory subtree. Mutually exclusive with `--target`. |
+| `--dir <DIR>` | No | unset | Scope to all jobs under a directory subtree. Deployed jobs outside it are not planned, changed or deleted. Mutually exclusive with `--target`. |
 | Global flags | — | — | Inherits `--no-color`, `--colorblind`, `--help`. See [Global flags](#global-flags). |
 
 Examples:
@@ -185,7 +185,7 @@ Compute the diff between current AWS state and the desired state derived from th
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
 | `--target <TARGET>` | No | unset | Only plan a specific job. Mutually exclusive with `--dir`. |
-| `--dir <DIR>` | No | unset | Scope to all jobs under a directory subtree. Mutually exclusive with `--target`. |
+| `--dir <DIR>` | No | unset | Scope to all jobs under a directory subtree. Deployed jobs outside it are not planned, changed or deleted. Mutually exclusive with `--target`. |
 | Global flags | — | — | Inherits `--no-color`, `--colorblind`, `--help`. See [Global flags](#global-flags). |
 
 Examples:
@@ -233,7 +233,7 @@ Validate every job in the project: schema-check the YAMLs and run the provider p
 | Flag | Required | Default | Description |
 |------|----------|---------|-------------|
 | `--target <TARGET>` | No | unset | Only validate a specific job. Mutually exclusive with `--dir`. |
-| `--dir <DIR>` | No | unset | Scope to all jobs under a directory subtree. Mutually exclusive with `--target`. |
+| `--dir <DIR>` | No | unset | Scope to all jobs under a directory subtree. Deployed jobs outside it are not planned, changed or deleted. Mutually exclusive with `--target`. |
 | Global flags | — | — | Inherits `--no-color`, `--colorblind`, `--help`. See [Global flags](#global-flags). |
 
 Examples:

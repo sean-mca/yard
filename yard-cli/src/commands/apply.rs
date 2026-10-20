@@ -4,6 +4,7 @@ use super::resolve_project;
 use crate::commands::display::print_plan_summary;
 use crate::utils::{color_create, color_delete, color_modify, confirm};
 use anyhow::Result;
+use std::borrow::Cow;
 use std::io;
 use std::path::Path;
 
@@ -28,21 +29,26 @@ pub async fn execute(
 ) -> Result<()> {
     let project = resolve_project(directory).await?;
 
-    let (manifest, dir_scope) = if let Some(ref dir_path) = dir {
-        let filtered =
-            yard_core::resolve::filter_manifest_by_dir(&project.manifest, Path::new(dir_path), &project.root_dir)?;
-        (filtered.manifest, Some(filtered.display_path))
+    // Under --dir both sides of the diff are scoped to the directory's
+    // jobs; otherwise deployed jobs outside it would surface as deletes.
+    let (manifest, current_state, dir_scope) = if let Some(ref dir_path) = dir {
+        let filtered = yard_core::resolve::filter_manifest_by_dir(
+            &project.manifest,
+            Path::new(dir_path),
+            &project.root_dir,
+        )?;
+        let state = Cow::Owned(filtered.scope_state(&project.current_state));
+        (filtered.manifest, state, Some(filtered.display_path))
     } else {
-        (project.manifest.clone(), None)
+        (
+            project.manifest.clone(),
+            Cow::Borrowed(&project.current_state),
+            None,
+        )
     };
 
-    let result = yard_core::plan(
-        &manifest,
-        &project.current_state,
-        &project.root_dir,
-        target.clone(),
-    )
-    .await?;
+    let result =
+        yard_core::plan(&manifest, &current_state, &project.root_dir, target.clone()).await?;
 
     if result.job_diffs.is_empty() {
         println!("No changes to apply.");
@@ -74,7 +80,7 @@ pub async fn execute(
 
     let result = yard_core::apply(
         &manifest,
-        &project.current_state,
+        &current_state,
         &project.root_dir,
         dry_run,
         target,

@@ -649,7 +649,9 @@ equivalent of `--target` (which selects a single job by name).
 `--dir` takes a path relative to the project root (where `yard.yaml` lives)
 or an absolute path. yard canonicalizes both the provided path and the
 project root, then retains only jobs whose resolved directory starts with
-the `--dir` path prefix.
+the `--dir` path prefix. State is scoped the same way: deployed jobs outside
+the directory, and deployed jobs whose YAML no longer exists anywhere, are
+not planned, changed or deleted. Run without `--dir` to see those deletes.
 
 ```bash
 # Plan only jobs under staging/us-east-1/
