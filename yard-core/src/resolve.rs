@@ -9,8 +9,8 @@
 //!
 //! The primary entry point is [`resolve_project`], which finds `yard.yaml`,
 //! discovers all jobs via recursive directory walking, cascades provider
-//! defaults and AWS credential configs through the hierarchy, and loads the
-//! current deployment state from the configured backend.
+//! defaults, plugin pins and AWS credential configs through the hierarchy, and
+//! loads the current deployment state from the configured backend.
 //!
 //! Secondary entry points:
 //! - [`discover_environments`] — enumerate environments and regions without
@@ -210,6 +210,12 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
     // Deploy-time provider instantiation still re-merges via `merge_provider_config`;
     // this cascade only widens visibility — precedence is unchanged.
     let all_jobs = cascade_provider_defaults(all_jobs, &providers, &root_aws)?;
+
+    // Plugin pins cascade the same way (yard.yaml -> account.yaml ->
+    // region.yaml -> job file) and fill `plugin_version` / `plugin_source`.
+    // The root layer was already validated by `parse_root_plugins`.
+    let root_plugins_value = root_value.get("plugins").cloned().unwrap_or(Value::Null);
+    let all_jobs = cascade_plugin_pins(all_jobs, &root_plugins_value)?;
 
     let typed_root_aws: Option<yard_structs::AwsCredentialConfig> = if root_aws.is_null() {
         None
@@ -510,13 +516,14 @@ fn common_context_field(dir: &Path, filename: &str, field: &str) -> Value {
 /// # Errors
 ///
 /// Returns an error if any context file contains flat-style provider keys
-/// (D-02 migration error).
+/// (D-02 migration error), or if `plugin_version` / `plugin_source` appear
+/// under `providers.<type>` in any layer (they belong in `plugins.<type>`).
 fn cascade_provider_defaults(
     mut jobs: HashMap<String, JobDefinition>,
     providers: &HashMap<String, Value>,
     root_aws: &Value,
 ) -> Result<HashMap<String, JobDefinition>> {
-    for job in jobs.values_mut() {
+    for (name, job) in &mut jobs {
         // --- providers.<type> cascade ---
         // The providers HashMap is keyed by wire-string job type ("glue",
         // "emr", "bash"); JobType::to_string() gives the canonical wire form.
@@ -539,6 +546,17 @@ fn cascade_provider_defaults(
             &region_provider,
             &job_inline_provider,
         ]);
+        // D-5: a pin under providers.<type> would be passed to the plugin as
+        // config and the job would silently run unpinned. `merged` already
+        // folds all four layers, so one check covers them all.
+        for key in ["plugin_version", "plugin_source"] {
+            if merged.get(key).is_some() {
+                return Err(anyhow!(
+                    "job '{name}': {key} belongs in the plugins.{job_type_key} block or at the \
+                     top level of the job file, not under providers.{job_type_key}"
+                ));
+            }
+        }
         if let Some(obj) = job.config.as_object_mut() {
             obj.insert(job_type_key, merged);
         }
@@ -551,6 +569,102 @@ fn cascade_provider_defaults(
         let merged_aws = cascade_merge(&[root_aws, &account_aws, &region_aws, &job_inline_aws]);
         if let Some(obj) = job.config.as_object_mut() {
             obj.insert("_aws".to_string(), merged_aws);
+        }
+    }
+    Ok(jobs)
+}
+
+/// Extract the `plugins.<job_type>` entry from the nearest ancestor context
+/// file by walking up from `dir`. Returns `Value::Null` when the file has no
+/// `plugins` block or no entry for the job type.
+///
+/// Context files otherwise stay ungated (they accept arbitrary keys for
+/// `${account.*}` / `${region.*}` interpolation), but `plugins` is a
+/// yard-reserved key in them: its entries are checked with
+/// [`validate_plugin_entry`], and `source` is optional so a lower layer can
+/// override only `version` or only `source`.
+///
+/// # Errors
+///
+/// Returns an error if the context file cannot be read or parsed, if
+/// `plugins` is not a map, or if the entry for `job_type` is malformed.
+fn plugin_context_field(dir: &Path, filename: &str, job_type: &str) -> Result<Value> {
+    let context = find_and_parse_context(dir, filename, false)?;
+    let Some(block) = context.get("plugins").filter(|v| !v.is_null()) else {
+        return Ok(Value::Null);
+    };
+    let entries = block.as_object().ok_or_else(|| {
+        anyhow!("{filename}.plugins must be a map keyed by job type (e.g. plugins.glue)")
+    })?;
+    let Some(entry) = entries.get(job_type) else {
+        return Ok(Value::Null);
+    };
+    validate_plugin_entry(entry, &format!("{filename}.plugins.{job_type}"), false)?;
+    Ok(entry.clone())
+}
+
+/// Cascade `plugins.<type>` pins onto each job's `plugin_version` /
+/// `plugin_source` (D-2, D-3):
+///
+/// ```text
+/// yard.yaml plugins  ->  account.yaml plugins  ->  region.yaml plugins  ->  job file
+/// ```
+///
+/// Layers merge field by field, later layers winning. The job file's own
+/// top-level `plugin_version` / `plugin_source` win over every layer, again
+/// per field, so a job that sets only `plugin_version` still inherits
+/// `source` from the layers.
+///
+/// # Errors
+///
+/// Returns an error if an account.yaml / region.yaml `plugins` block is
+/// malformed (non-map, unknown key, non-string field) or cannot be read.
+fn cascade_plugin_pins(
+    mut jobs: HashMap<String, JobDefinition>,
+    root_plugins: &Value,
+) -> Result<HashMap<String, JobDefinition>> {
+    for (name, job) in &mut jobs {
+        let job_type_key = job.job_type.to_string();
+        let root_pin = root_plugins
+            .get(&job_type_key)
+            .cloned()
+            .unwrap_or(Value::Null);
+        let context_err = || format!("failed to resolve plugin pin for job '{name}'");
+        let account_pin = plugin_context_field(&job.dir, "account.yaml", &job_type_key)
+            .with_context(context_err)?;
+        let region_pin = plugin_context_field(&job.dir, "region.yaml", &job_type_key)
+            .with_context(context_err)?;
+        let merged = cascade_merge(&[&root_pin, &account_pin, &region_pin]);
+
+        if job.plugin_version.is_none() {
+            job.plugin_version = merged
+                .get("version")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+        if job.plugin_source.is_none() {
+            job.plugin_source = merged
+                .get("source")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+
+        // Mirror the effective pin into job.config, the same two top-level
+        // keys a per-job pin produces. diff.rs hashes job.config and shows
+        // config changes with compare_json, so (a) moving a pin from a job
+        // file into yard.yaml yields byte-identical config and no spurious
+        // Modify in `yard plan` (Map is BTreeMap-ordered, so insertion order
+        // does not matter), and (b) bumping plugins.<type>.version still
+        // shows as a Modify, exactly like the per-job form. Without the
+        // mirror a yard.yaml version bump would be invisible to plan whenever
+        // codegen output is unchanged.
+        if let Some(obj) = job.config.as_object_mut() {
+            if let Some(version) = &job.plugin_version {
+                obj.insert("plugin_version".to_string(), Value::String(version.clone()));
+            }
+            if let Some(source) = &job.plugin_source {
+                obj.insert("plugin_source".to_string(), Value::String(source.clone()));
+            }
         }
     }
     Ok(jobs)
@@ -1121,6 +1235,239 @@ mod tests {
         let result = crate::parsing::validate_unknown_keys(&root, ALLOWED_TOP_LEVEL, "yard.yaml");
 
         assert!(result.is_ok(), "got: {result:?}");
+    }
+
+    // --- plugins cascade: yard.yaml -> account.yaml -> region.yaml -> job (D-2, D-3) ---
+
+    const GLUE_URL: &str = "https://github.com/org/yard-plugin-glue";
+
+    fn root_glue_pin() -> Value {
+        json!({"glue": {"version": "0.3.1", "source": GLUE_URL}})
+    }
+
+    fn write_context(tmp: &TempDir, account: &str, region: &str) {
+        fs::write(tmp.0.join("account.yaml"), account).unwrap();
+        fs::write(tmp.0.join("region.yaml"), region).unwrap();
+    }
+
+    fn job_map(job: JobDefinition) -> HashMap<String, JobDefinition> {
+        HashMap::from([("job".to_string(), job)])
+    }
+
+    fn pin_one(job: JobDefinition, root: &Value) -> JobDefinition {
+        cascade_plugin_pins(job_map(job), root)
+            .unwrap()
+            .remove("job")
+            .unwrap()
+    }
+
+    #[test]
+    fn plugin_pin_root_only_populates_job() {
+        let tmp = TempDir::new();
+        write_context(&tmp, "{}", "{}");
+
+        let job = pin_one(glue_job(&tmp.0, None), &root_glue_pin());
+
+        assert_eq!(job.plugin_version.as_deref(), Some("0.3.1"));
+        assert_eq!(job.plugin_source.as_deref(), Some(GLUE_URL));
+    }
+
+    #[test]
+    fn plugin_pin_account_overrides_root() {
+        let tmp = TempDir::new();
+        write_context(
+            &tmp,
+            "plugins:\n  glue:\n    version: \"0.4.0\"\n    source: \"https://github.com/acct/yard-plugin-glue\"\n",
+            "{}",
+        );
+
+        let job = pin_one(glue_job(&tmp.0, None), &root_glue_pin());
+
+        assert_eq!(job.plugin_version.as_deref(), Some("0.4.0"));
+        assert_eq!(
+            job.plugin_source.as_deref(),
+            Some("https://github.com/acct/yard-plugin-glue")
+        );
+    }
+
+    #[test]
+    fn plugin_pin_region_overrides_account() {
+        let tmp = TempDir::new();
+        write_context(
+            &tmp,
+            "plugins:\n  glue:\n    version: \"0.4.0\"\n    source: \"https://github.com/acct/yard-plugin-glue\"\n",
+            "plugins:\n  glue:\n    version: \"0.5.0\"\n    source: \"git::https://example.com/region/plugins\"\n",
+        );
+
+        let job = pin_one(glue_job(&tmp.0, None), &root_glue_pin());
+
+        assert_eq!(job.plugin_version.as_deref(), Some("0.5.0"));
+        assert_eq!(
+            job.plugin_source.as_deref(),
+            Some("git::https://example.com/region/plugins")
+        );
+    }
+
+    #[test]
+    fn plugin_pin_job_level_overrides_region() {
+        let tmp = TempDir::new();
+        write_context(
+            &tmp,
+            "{}",
+            "plugins:\n  glue:\n    version: \"0.5.0\"\n    source: \"git::https://example.com/region/plugins\"\n",
+        );
+        let mut job = glue_job(&tmp.0, None);
+        job.plugin_version = Some("0.6.0".to_string());
+        job.plugin_source = Some("file://bin/yard-plugin-glue".to_string());
+
+        let job = pin_one(job, &root_glue_pin());
+
+        assert_eq!(job.plugin_version.as_deref(), Some("0.6.0"));
+        assert_eq!(
+            job.plugin_source.as_deref(),
+            Some("file://bin/yard-plugin-glue")
+        );
+    }
+
+    #[test]
+    fn plugin_pin_partial_override_inherits_source() {
+        let tmp = TempDir::new();
+        write_context(&tmp, "{}", "plugins:\n  glue:\n    version: \"0.5.0\"\n");
+
+        let job = pin_one(glue_job(&tmp.0, None), &root_glue_pin());
+
+        assert_eq!(job.plugin_version.as_deref(), Some("0.5.0"));
+        assert_eq!(job.plugin_source.as_deref(), Some(GLUE_URL));
+    }
+
+    #[test]
+    fn plugin_pin_job_version_only_inherits_layer_source() {
+        let tmp = TempDir::new();
+        write_context(&tmp, "{}", "{}");
+        let mut job = glue_job(&tmp.0, None);
+        job.plugin_version = Some("0.6.0".to_string());
+
+        let job = pin_one(job, &root_glue_pin());
+
+        assert_eq!(job.plugin_version.as_deref(), Some("0.6.0"));
+        assert_eq!(job.plugin_source.as_deref(), Some(GLUE_URL));
+    }
+
+    #[test]
+    fn plugin_pin_absent_everywhere_leaves_fields_none() {
+        let tmp = TempDir::new();
+        write_context(&tmp, "{}", "{}");
+
+        let job = pin_one(glue_job(&tmp.0, None), &json!({}));
+
+        assert_eq!(job.plugin_version, None);
+        assert_eq!(job.plugin_source, None);
+        assert!(job.config.get("plugin_version").is_none());
+        assert!(job.config.get("plugin_source").is_none());
+    }
+
+    #[test]
+    fn plugin_pin_other_job_type_unaffected() {
+        let tmp = TempDir::new();
+        write_context(&tmp, "{}", "{}");
+        let root = json!({"emr": {"version": "1.0.0", "source": "https://github.com/org/yard-plugin-emr"}});
+
+        let job = pin_one(glue_job(&tmp.0, None), &root);
+
+        assert_eq!(job.plugin_version, None);
+        assert_eq!(job.plugin_source, None);
+    }
+
+    #[test]
+    fn plugin_pin_mirrors_into_config_matching_per_job_form() {
+        let tmp = TempDir::new();
+        write_context(&tmp, "{}", "{}");
+        let inherited = glue_job(&tmp.0, None);
+        let mut per_job = glue_job(&tmp.0, None);
+        per_job.plugin_version = Some("0.3.1".to_string());
+        per_job.plugin_source = Some(GLUE_URL.to_string());
+        if let Some(obj) = per_job.config.as_object_mut() {
+            obj.insert("plugin_version".into(), json!("0.3.1"));
+            obj.insert("plugin_source".into(), json!(GLUE_URL));
+        }
+
+        let inherited = pin_one(inherited, &root_glue_pin());
+        let per_job = pin_one(per_job, &json!({}));
+
+        assert_eq!(inherited.config, per_job.config);
+    }
+
+    #[test]
+    fn plugin_pin_context_entry_unknown_key_is_rejected() {
+        let tmp = TempDir::new();
+        write_context(&tmp, "{}", "plugins:\n  glue:\n    verison: \"0.5.0\"\n");
+        let map = job_map(glue_job(&tmp.0, None));
+
+        let err = cascade_plugin_pins(map, &root_glue_pin()).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("unknown field 'verison' at region.yaml.plugins.glue"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn providers_block_with_plugin_version_is_rejected() {
+        let tmp = TempDir::new();
+        write_context(&tmp, "{}", "{}");
+        let map = job_map(glue_job(&tmp.0, None));
+        let providers: HashMap<String, Value> = [(
+            "glue".to_string(),
+            json!({"plugin_version": "0.3.1", "script_bucket": "b"}),
+        )]
+        .into_iter()
+        .collect();
+
+        let err = cascade_provider_defaults(map, &providers, &Value::Null).unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("plugin_version"), "got: {msg}");
+        assert!(msg.contains("plugins.glue"), "got: {msg}");
+        assert!(msg.contains("not under providers.glue"), "got: {msg}");
+    }
+
+    #[test]
+    fn providers_block_in_account_yaml_with_plugin_source_is_rejected() {
+        let tmp = TempDir::new();
+        write_context(&tmp, "providers:\n  glue:\n    plugin_source: x\n", "{}");
+        let map = job_map(glue_job(&tmp.0, None));
+
+        let err = cascade_provider_defaults(map, &HashMap::new(), &Value::Null).unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("plugin_source"), "got: {msg}");
+        assert!(msg.contains("plugins.glue"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn plugin_pin_resolve_project_end_to_end() {
+        let tmp = TempDir::new();
+        fs::create_dir_all(tmp.0.join(".yard/state")).unwrap();
+        fs::write(
+            tmp.0.join("yard.yaml"),
+            "project: smoke-test\nstate:\n  type: local\n  path: .yard/state\nplugins:\n  glue:\n    version: \"0.3.1\"\n    source: \"https://github.com/org/yard-plugin-glue\"\n",
+        )
+        .unwrap();
+        write_context(&tmp, "name: dev\n", "name: us-east-1\n");
+        fs::write(tmp.0.join("orders.yaml"), "type: glue\n").unwrap();
+
+        let resolved = resolve_project(&tmp.0).await.unwrap();
+
+        assert_eq!(
+            resolved.manifest.plugins.get("glue"),
+            Some(&PluginPin {
+                version: Some("0.3.1".to_string()),
+                source: GLUE_URL.to_string(),
+            })
+        );
+        let job = resolved.manifest.jobs.values().next().unwrap();
+        assert_eq!(job.plugin_version.as_deref(), Some("0.3.1"));
+        assert_eq!(job.plugin_source.as_deref(), Some(GLUE_URL));
     }
 
     // --- aws cascade: root → account → region → job ---
