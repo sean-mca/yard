@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Plugins now run with `RUST_LOG=warn` unless `RUST_LOG` or the new `YARD_PLUGIN_LOG` is set, so `yard validate` no longer prints a pair of info-level lines per job from SDK-based plugins. `YARD_PLUGIN_LOG` sets the plugins' log filter (for example `info` or `debug`) and takes precedence over `RUST_LOG`.
 
+### Fixed
+
+- `${account.*}` / `${region.*}` references in the `providers`, `aws` and `plugins` blocks of `account.yaml` and `region.yaml` are now substituted before they cascade into jobs; previously they reached jobs as literal text. Both files see the same context, so either may reference the other. An unresolvable dotted `${...}` in those blocks is now an error naming the file, as it already is in job files. Substituted values are always strings. `yard.yaml` is still not interpolated.
+
 ## [2.1.3] - 2026-10-20
 
 ### Added

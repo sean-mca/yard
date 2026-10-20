@@ -212,6 +212,19 @@ appear at these layers. `plugins` is a yard-reserved key there, so its entries
 are checked for typos, and `source` is optional at these layers. See
 [`plugins.<type>`](#pluginstype--plugin-pins).
 
+`${account.*}` and `${region.*}` references (also `${transforms.*}` and
+`${dag.*}`) in the strings of these files' `providers`, `aws` and `plugins`
+blocks are substituted before the block cascades into a job, the same way they
+are in job files, using that job's context. Both files are substituted against
+the unsubstituted values in a single pass, so `region.yaml` may reference
+`${account.*}` and `account.yaml` may reference `${region.*}`, but a value that
+itself contains `${...}` is not expanded again. Single-segment placeholders
+such as `${version}` are left for the `plugin_source` template, and an
+unresolvable dotted reference in one of these blocks is an error naming the
+file. Substituted values are always strings (a numeric `account.id` becomes
+`"123"`). `yard.yaml` is not interpolated, because it sits above every account
+and region.
+
 ### `<job>.yaml` (individual job definitions)
 
 Defined by `JobDefinition` in `yard-structs/src/config.rs`.
