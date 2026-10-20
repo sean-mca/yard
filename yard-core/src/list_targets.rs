@@ -119,6 +119,7 @@ mod tests {
                 path: ".yard/state".into(),
             },
             providers: HashMap::new(),
+            plugins: HashMap::new(),
             jobs: job_map,
             aws: None,
         }

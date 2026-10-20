@@ -212,6 +212,35 @@ pub enum StateBackend {
     },
 }
 
+/// One `plugins.<type>` entry from `yard.yaml`: where to get a job type's
+/// plugin and which release to use.
+///
+/// This is the `yard.yaml` layer only. The effective per-job pin, after the
+/// account.yaml / region.yaml / job-file cascade, lands on the
+/// [`JobDefinition`] `plugin_version` / `plugin_source` fields.
+///
+/// # Examples
+///
+/// ```
+/// use yard_structs::PluginPin;
+///
+/// let pin = PluginPin {
+///     version: Some("0.3.1".to_string()),
+///     source: "https://github.com/org/yard-plugin-glue".to_string(),
+/// };
+/// assert_eq!(pin.version.as_deref(), Some("0.3.1"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginPin {
+    /// Release tag or git ref. Ignored for local-file sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Plugin source in any `plugin_source` form (GitHub repo URL, `git::`
+    /// URL, `file://` path, or directory URL).
+    pub source: String,
+}
+
 /// Top-level project manifest parsed from `yard.yaml`.
 ///
 /// # Examples
@@ -236,6 +265,16 @@ pub struct ProjectManifest {
     /// Each value is the raw provider config block from yard.yaml.
     #[serde(default)]
     pub providers: HashMap<String, serde_json::Value>,
+    /// Plugin pins keyed by job type (e.g. "glue"). Holds the `yard.yaml`
+    /// layer only; effective per-job pins live on
+    /// [`JobDefinition`] `plugin_version` / `plugin_source`.
+    ///
+    /// Wire-format note: `default` keeps manifests serialized before this
+    /// field existed deserializing under `deny_unknown_fields`, and
+    /// `skip_serializing_if` leaves the key out when nothing is pinned so the
+    /// serialized shape is unchanged for projects without a `plugins:` block.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub plugins: HashMap<String, PluginPin>,
     /// Job definitions keyed by fully-qualified job name.
     #[serde(default)]
     pub jobs: HashMap<String, JobDefinition>,
@@ -1112,6 +1151,46 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("unknown field"), "got: {msg}");
         assert!(msg.contains("wat"), "got: {msg}");
+    }
+
+    #[test]
+    fn project_manifest_without_plugins_key_deserializes_empty() {
+        let input = json!({
+            "project": "test",
+            "state": {"type": "local", "path": ".yard/state"},
+            "providers": {},
+            "jobs": {},
+        });
+        let manifest = serde_json::from_value::<ProjectManifest>(input).unwrap();
+        assert!(manifest.plugins.is_empty());
+    }
+
+    #[test]
+    fn project_manifest_empty_plugins_omitted_on_serialize() {
+        let input = json!({
+            "project": "test",
+            "state": {"type": "local", "path": ".yard/state"},
+            "providers": {},
+            "jobs": {},
+        });
+        let manifest = serde_json::from_value::<ProjectManifest>(input).unwrap();
+        let out = serde_json::to_value(&manifest).unwrap();
+        assert!(out.get("plugins").is_none(), "got: {out}");
+    }
+
+    #[test]
+    fn plugin_pin_without_version_roundtrips() {
+        let input = json!({"source": "file://bin/yard-plugin-glue"});
+        let pin = serde_json::from_value::<PluginPin>(input.clone()).unwrap();
+        assert_eq!(pin.version, None);
+        assert_eq!(serde_json::to_value(&pin).unwrap(), input);
+    }
+
+    #[test]
+    fn plugin_pin_rejects_unknown_fields() {
+        let input = json!({"source": "x", "verison": "1"});
+        let err = serde_json::from_value::<PluginPin>(input).unwrap_err();
+        assert!(format!("{err}").contains("unknown field"), "got: {err}");
     }
 
     #[test]

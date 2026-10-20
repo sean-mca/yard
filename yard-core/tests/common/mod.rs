@@ -170,6 +170,7 @@ pub fn build_target_matrix_project() -> TargetMatrixProject {
         project: "test".to_string(),
         state: StateBackend::Local { path: state_dir },
         providers: HashMap::new(),
+        plugins: HashMap::new(),
         jobs,
         aws: None,
     };
@@ -244,6 +245,7 @@ pub fn build_dir_scoped_project() -> DirScopedProject {
         project: "test".to_string(),
         state: StateBackend::Local { path: state_dir },
         providers: HashMap::new(),
+        plugins: HashMap::new(),
         jobs,
         aws: None,
     };

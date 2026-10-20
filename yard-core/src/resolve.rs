@@ -25,14 +25,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use yaml_rust2::YamlLoader;
 use yard_structs::{
-    DiscoveredEnvironment, JobDefinition, JobType, ProjectManifest, ProjectState, RegionSummary,
-    StateBackend, YARDContext,
+    DiscoveredEnvironment, JobDefinition, JobType, PluginPin, ProjectManifest, ProjectState,
+    RegionSummary, StateBackend, YARDContext,
 };
 
 /// Allowed top-level keys on a yard.yaml manifest (TYPE-03 D-19). Any other
 /// key surfaces as an `unknown field 'X' at yard.yaml ...` error at parse
-/// time.
-const ALLOWED_TOP_LEVEL: &[&str] = &["project", "state", "providers", "jobs", "aws"];
+/// time. `plugins` holds the per-job-type plugin pins.
+const ALLOWED_TOP_LEVEL: &[&str] = &["project", "state", "providers", "plugins", "jobs", "aws"];
+
+/// Allowed keys on a `plugins.<type>` entry (D-1). Only `version` and
+/// `source` exist, so a typo such as `verison` fails at parse time instead of
+/// leaving the job silently unpinned.
+const ALLOWED_PLUGIN_PIN: &[&str] = &["version", "source"];
 
 /// Allowed keys on a yard.yaml `state:` block (StateBackend wire surface).
 /// Both `Local` (path) and `S3` (bucket/region/key/aws) variants share the
@@ -135,6 +140,8 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
         )?;
     }
 
+    let root_plugins = parse_root_plugins(&root_value)?;
+
     // 2. Extract global config
     let project = root_doc["project"]
         .as_str()
@@ -215,6 +222,7 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
         project: project.clone(),
         state: state_backend.clone(),
         providers,
+        plugins: root_plugins,
         jobs: all_jobs,
         aws: typed_root_aws,
     };
@@ -227,6 +235,74 @@ pub async fn resolve_project(base_path: &Path) -> Result<ResolvedProject> {
         current_state,
         root_dir,
     })
+}
+
+/// Validate one `plugins.<type>` entry (D-1).
+///
+/// `path` is the dotted location used in error messages, for example
+/// `yard.yaml.plugins.glue`. Context layers (account.yaml, region.yaml) pass
+/// `require_source = false` so a lower layer can override only `version` or
+/// only `source`.
+///
+/// # Errors
+///
+/// Returns an error if the entry is not a map, carries a key other than
+/// `version` or `source`, has a non-string or empty `source`, has a
+/// non-string `version`, or (when `require_source` is true) has no `source`.
+fn validate_plugin_entry(entry: &Value, path: &str, require_source: bool) -> Result<()> {
+    if !entry.is_object() {
+        return Err(anyhow!(
+            "{path} must be a map with 'version' and/or 'source'"
+        ));
+    }
+    crate::parsing::validate_unknown_keys(entry, ALLOWED_PLUGIN_PIN, path)?;
+    for field in ALLOWED_PLUGIN_PIN {
+        if let Some(value) = entry.get(*field)
+            && !value.is_string()
+        {
+            return Err(anyhow!(
+                "{path}.{field} must be a string (quote it in YAML, e.g. \"0.3.1\")"
+            ));
+        }
+    }
+    match entry.get("source").and_then(Value::as_str) {
+        Some(source) if source.trim().is_empty() => Err(anyhow!("{path}.source must not be empty")),
+        None if require_source => Err(anyhow!("missing required field 'source' at {path}")),
+        _ => Ok(()),
+    }
+}
+
+/// Parse the top-level `plugins:` block of `yard.yaml` into typed pins.
+///
+/// A missing or null block gives an empty map.
+///
+/// # Errors
+///
+/// Returns an error if `plugins` is not a map keyed by job type, or if any
+/// entry fails [`validate_plugin_entry`] with `require_source = true`.
+fn parse_root_plugins(root_value: &Value) -> Result<HashMap<String, PluginPin>> {
+    let Some(block) = root_value.get("plugins").filter(|v| !v.is_null()) else {
+        return Ok(HashMap::new());
+    };
+    let entries = block.as_object().ok_or_else(|| {
+        anyhow!("yard.yaml.plugins must be a map keyed by job type (e.g. plugins.glue)")
+    })?;
+    let mut pins = HashMap::with_capacity(entries.len());
+    for (job_type, entry) in entries {
+        let path = format!("yard.yaml.plugins.{job_type}");
+        validate_plugin_entry(entry, &path, true)?;
+        let source = entry
+            .get("source")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing required field 'source' at {path}"))?
+            .to_string();
+        let version = entry
+            .get("version")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        pins.insert(job_type.clone(), PluginPin { version, source });
+    }
+    Ok(pins)
 }
 
 fn discover_jobs(search_root: &Path, project_root: &Path) -> Result<HashMap<String, JobDefinition>> {
@@ -958,6 +1034,95 @@ mod tests {
         job.config.get(provider)?.get(key)?.as_str()
     }
 
+    // --- yard.yaml plugins block: parsing and key gating (D-1) ---
+
+    #[test]
+    fn root_plugins_block_parses_into_typed_pins() {
+        let root = json!({"plugins": {"glue": {
+            "version": "0.3.1",
+            "source": "https://github.com/org/yard-plugin-glue"
+        }}});
+
+        let pins = parse_root_plugins(&root).unwrap();
+
+        assert_eq!(pins.len(), 1);
+        assert_eq!(
+            pins.get("glue"),
+            Some(&PluginPin {
+                version: Some("0.3.1".to_string()),
+                source: "https://github.com/org/yard-plugin-glue".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn root_plugins_absent_or_null_is_empty() {
+        assert!(parse_root_plugins(&json!({})).unwrap().is_empty());
+        assert!(
+            parse_root_plugins(&json!({"plugins": null}))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn root_plugins_entry_unknown_key_is_rejected() {
+        let root = json!({"plugins": {"glue": {"verison": "0.3.1", "source": "x"}}});
+
+        let err = parse_root_plugins(&root).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("unknown field 'verison' at yard.yaml.plugins.glue"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn root_plugins_entry_missing_source_is_rejected() {
+        let root = json!({"plugins": {"glue": {"version": "0.3.1"}}});
+
+        let err = parse_root_plugins(&root).unwrap_err();
+
+        assert!(
+            format!("{err:#}")
+                .contains("missing required field 'source' at yard.yaml.plugins.glue"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn root_plugins_entry_non_string_version_is_rejected() {
+        let root = json!({"plugins": {"glue": {"version": 0.3, "source": "x"}}});
+
+        let err = parse_root_plugins(&root).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("yard.yaml.plugins.glue.version must be a string"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn root_plugins_non_map_is_rejected() {
+        let root = json!({"plugins": ["glue"]});
+
+        let err = parse_root_plugins(&root).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("yard.yaml.plugins must be a map"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn root_plugins_top_level_key_is_allowed() {
+        let root = json!({"project": "p", "plugins": {}});
+
+        let result = crate::parsing::validate_unknown_keys(&root, ALLOWED_TOP_LEVEL, "yard.yaml");
+
+        assert!(result.is_ok(), "got: {result:?}");
+    }
+
     // --- aws cascade: root → account → region → job ---
 
     #[test]
@@ -1532,6 +1697,7 @@ mod tests {
                 path: ".yard/state".into(),
             },
             providers: HashMap::new(),
+            plugins: HashMap::new(),
             jobs,
             aws: None,
         }
