@@ -7,6 +7,7 @@
 //! file before execution.
 
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -21,6 +22,15 @@ use yard_structs::{
     PluginRequest, PluginValidationError, ProgressMessage, Resource, ResourceStatus,
     SchemaResponse, ValidateResponse, VerifyResponse, PROTOCOL_VERSION,
 };
+
+/// Environment variable plugins read to pick their log filter.
+const RUST_LOG_VAR: &str = "RUST_LOG";
+
+/// Environment variable that sets the log filter yard passes to plugins.
+const YARD_PLUGIN_LOG_VAR: &str = "YARD_PLUGIN_LOG";
+
+/// Log filter plugins run with when the user configured neither variable.
+const DEFAULT_PLUGIN_LOG_LEVEL: &str = "warn";
 
 /// Runtime configuration for the plugin host.
 ///
@@ -83,7 +93,8 @@ impl PluginSpawner {
 
     /// Set extra environment variables to pass to the child process.
     ///
-    /// These are merged with the inherited environment on each spawn.
+    /// These are merged with the inherited environment on each spawn and
+    /// override the plugin log default (`RUST_LOG=warn`).
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env_vars.insert(key.into(), value.into());
         self
@@ -168,6 +179,13 @@ impl PluginSpawner {
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());
+        // Applied before the explicit env_vars loop so `with_env` overrides it.
+        if let Some((key, value)) = plugin_log_env(
+            std::env::var_os(RUST_LOG_VAR).as_deref(),
+            std::env::var_os(YARD_PLUGIN_LOG_VAR).as_deref(),
+        ) {
+            cmd.env(key, value);
+        }
         for (k, v) in &self.env_vars {
             cmd.env(k, v);
         }
@@ -668,6 +686,28 @@ pub fn platform_key() -> String {
     format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
 }
 
+/// Decide which `RUST_LOG` value, if any, to hand to a spawned plugin.
+///
+/// - `yard_plugin_log` set: its value becomes the plugin's `RUST_LOG`.
+/// - only `rust_log` set: nothing is returned and the plugin inherits it.
+/// - neither set: `RUST_LOG=warn`.
+///
+/// SDK-based plugins default to `info` on the inherited stderr, and yard
+/// spawns each plugin several times per job during `yard validate`, so
+/// without a quieter default the terminal fills with plugin chatter.
+/// Presence is what counts: a set-but-empty value is treated as set.
+#[must_use]
+fn plugin_log_env(
+    rust_log: Option<&OsStr>,
+    yard_plugin_log: Option<&OsStr>,
+) -> Option<(&'static str, OsString)> {
+    match (yard_plugin_log, rust_log) {
+        (Some(value), _) => Some((RUST_LOG_VAR, value.to_os_string())),
+        (None, Some(_)) => None,
+        (None, None) => Some((RUST_LOG_VAR, OsString::from(DEFAULT_PLUGIN_LOG_LEVEL))),
+    }
+}
+
 /// Return the Rust target triple that best describes the running binary.
 ///
 /// This is the suffix yard appends to release asset names
@@ -683,5 +723,47 @@ pub fn target_triple() -> String {
         "windows" => format!("{arch}-pc-windows-msvc"),
         "freebsd" => format!("{arch}-unknown-freebsd"),
         other => format!("{arch}-{other}"),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_log_env_defaults_to_warn_when_nothing_set() {
+        // Arrange / Act
+        let result = plugin_log_env(None, None);
+
+        // Assert
+        assert_eq!(result, Some(("RUST_LOG", OsString::from("warn"))));
+    }
+
+    #[test]
+    fn plugin_log_env_leaves_inherited_rust_log_alone() {
+        // Arrange / Act
+        let result = plugin_log_env(Some(OsStr::new("debug")), None);
+
+        // Assert
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn plugin_log_env_forwards_yard_plugin_log_as_rust_log() {
+        // Arrange / Act
+        let result = plugin_log_env(None, Some(OsStr::new("info")));
+
+        // Assert
+        assert_eq!(result, Some(("RUST_LOG", OsString::from("info"))));
+    }
+
+    #[test]
+    fn plugin_log_env_prefers_yard_plugin_log_over_rust_log() {
+        // Arrange / Act
+        let result = plugin_log_env(Some(OsStr::new("debug")), Some(OsStr::new("trace")));
+
+        // Assert
+        assert_eq!(result, Some(("RUST_LOG", OsString::from("trace"))));
     }
 }

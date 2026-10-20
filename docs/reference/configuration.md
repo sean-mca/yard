@@ -580,6 +580,7 @@ Discovered by greping `std::env::var` across `yard-cli/src/` and
 | `YARD_STATE_AWS_ASSUME_ROLE` | No | — | Overrides `state.aws.assume_role`. Applies ONLY to the S3 state backend — provider credentials are controlled by `YARD_AWS_ASSUME_ROLE` (separate scope). |
 | `YARD_STATE_AWS_SESSION_NAME` | No | `yard` | STS session name for the state backend AssumeRole. |
 | `YARD_STATE_AWS_EXTERNAL_ID` | No | — | STS external id for cross-account state access. |
+| `YARD_PLUGIN_LOG` | No | — | Log filter passed to plugins as their `RUST_LOG` (for example `info` or `debug`). When neither `YARD_PLUGIN_LOG` nor `RUST_LOG` is set, plugins run with `RUST_LOG=warn`. When only `RUST_LOG` is set, plugins inherit it. `YARD_PLUGIN_LOG` wins when both are set. |
 | `NO_COLOR` | No | — | Disables ANSI colors in CLI output (https://no-color.org). The `--no-color` CLI flag has the same effect. |
 | `USER` / `USERNAME` | No | `unknown` | Used as the lock owner in state lock files. |
 
