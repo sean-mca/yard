@@ -18,7 +18,7 @@
 //! - [`find_in_parent_folders`] — walk upward looking for a named file
 //! - [`yaml_to_json`] — convert `yaml_rust2::Yaml` values to `serde_json::Value`
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -48,7 +48,13 @@ const ALLOWED_STATE_BLOCK: &[&str] = &["type", "bucket", "region", "key", "path"
 /// the user types it in `<job>.yaml`). Dynamic provider-block keys (the
 /// wire strings from each `JobType` variant) are appended at runtime per
 /// D-21 to keep this list in sync with TYPE-01.
+///
+/// `name` is the job's identity key. `discover_jobs` removes it from the
+/// job config before this allow-list is applied, so it never reaches the
+/// config hash or the plugin job config; it is listed here so the key is
+/// documented as part of the job-doc surface.
 const STATIC_JOB_DOC_ALLOWED: &[&str] = &[
+    "name",
     "type",
     "role",
     "imports",
@@ -311,8 +317,70 @@ fn parse_root_plugins(root_value: &Value) -> Result<HashMap<String, PluginPin>> 
     Ok(pins)
 }
 
+/// Remove the optional top-level `name:` key from a job config and return
+/// it as the job's explicit identity.
+///
+/// The key is stripped here (and nowhere else) so `job.config` is identical
+/// with or without it: the config hash and the plugin job config never see
+/// `name`.
+///
+/// # Errors
+///
+/// Returns an error naming `path` when `name` is not a string, is empty or
+/// whitespace-only, contains characters other than ASCII letters, digits,
+/// `.`, `_` and `-`, is `.` or contains `..`, or uses a form reserved by
+/// state storage (a `_dag_` prefix or a `.lock` suffix).
+fn take_explicit_job_name(config: &mut Value, path: &Path) -> Result<Option<String>> {
+    let Some(raw) = config.as_object_mut().and_then(|map| map.remove("name")) else {
+        return Ok(None);
+    };
+    let name = match raw {
+        Value::String(s) => s,
+        Value::Null => bail!(
+            "invalid job name in {}: name must not be empty",
+            path.display()
+        ),
+        _ => bail!(
+            "invalid job name in {}: name must be a string; quote it if it looks like a number",
+            path.display()
+        ),
+    };
+    if name.trim().is_empty() {
+        bail!(
+            "invalid job name in {}: name must not be empty",
+            path.display()
+        );
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        bail!(
+            "invalid job name {name:?} in {}: only ASCII letters, digits, '.', '_' and '-' are allowed",
+            path.display()
+        );
+    }
+    if name == "." || name.contains("..") {
+        bail!(
+            "invalid job name {name:?} in {}: name must not be '.' or contain '..'",
+            path.display()
+        );
+    }
+    if name.starts_with(crate::storage::DAG_STATE_PREFIX) || name.ends_with(".lock") {
+        bail!(
+            "invalid job name {name:?} in {}: names starting with '{}' or ending in '.lock' are reserved for yard state files",
+            path.display(),
+            crate::storage::DAG_STATE_PREFIX
+        );
+    }
+    Ok(Some(name))
+}
+
 fn discover_jobs(search_root: &Path, project_root: &Path) -> Result<HashMap<String, JobDefinition>> {
     let mut all_jobs = HashMap::new();
+    // Where each job name came from and whether it was set explicitly, so a
+    // clash that involves an explicit `name:` can report both files.
+    let mut origins: HashMap<String, (PathBuf, bool)> = HashMap::new();
     let mut context_cache: HashMap<PathBuf, YARDContext> = HashMap::new();
 
     for entry in walkdir::WalkDir::new(search_root)
@@ -381,11 +449,17 @@ fn discover_jobs(search_root: &Path, project_root: &Path) -> Result<HashMap<Stri
                 .position(|p| p == "envs")
                 .and_then(|i| parts.get(i + 1).cloned())
         };
-        let job_name = [env, folder, Some(base_name.clone())]
+        let generated_name = [env, folder, Some(base_name.clone())]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>()
             .join("-");
+        // `name:` is stripped from the config so the config hash is the same
+        // with or without it; it only decides the manifest key.
+        let mut config = yaml_to_json(job_doc);
+        let explicit = take_explicit_job_name(&mut config, path)?;
+        let is_explicit = explicit.is_some();
+        let job_name = explicit.unwrap_or(generated_name);
         let job_type: JobType = job_doc["type"]
             .as_str()
             .ok_or_else(|| {
@@ -396,7 +470,6 @@ fn discover_jobs(search_root: &Path, project_root: &Path) -> Result<HashMap<Stri
             })?
             .parse()
             .with_context(|| format!("invalid job type for job '{job_name}'"))?;
-        let config = yaml_to_json(job_doc);
 
         // TYPE-03 D-19/D-21: gate the job doc against the static
         // `JobDefinition` keys plus the dynamic `JobType`-derived
@@ -442,6 +515,19 @@ fn discover_jobs(search_root: &Path, project_root: &Path) -> Result<HashMap<Stri
             .get("plugin_source")
             .and_then(|v| v.as_str())
             .map(String::from);
+
+        // Two generated names that collide keep the long-standing last-wins
+        // behavior; only a clash involving an explicit name is an error.
+        if let Some((prev_path, prev_explicit)) = origins.get(&job_name)
+            && (*prev_explicit || is_explicit)
+        {
+            bail!(
+                "duplicate job name '{job_name}': defined by {} and {}",
+                prev_path.display(),
+                path.display()
+            );
+        }
+        origins.insert(job_name.clone(), (path.to_path_buf(), is_explicit));
 
         all_jobs.insert(
             job_name,
@@ -943,12 +1029,20 @@ pub fn discover_environments(root_path: &Path) -> Result<Vec<DiscoveredEnvironme
                     .map_err(|e| anyhow!("YAML error in {}: {}", file_path.display(), e))?;
 
                 if let Some(doc) = docs.first() {
-                    let job_value = yaml_to_json(doc);
+                    let mut job_value = yaml_to_json(doc);
                     if let Some(type_str) = job_value.get("type").and_then(|v| v.as_str())
                         && let Ok(job_type) = type_str.parse::<JobType>()
                     {
+                        // An explicit `name:` is the job's identity. This walk
+                        // reads the raw file without `${...}` interpolation, so
+                        // a name that needs context variables is validated as
+                        // written; an invalid one falls back to the file stem.
+                        let name = take_explicit_job_name(&mut job_value, &file_path)
+                            .ok()
+                            .flatten()
+                            .unwrap_or(job_name);
                         jobs.push(yard_structs::JobSummary {
-                            name: job_name,
+                            name,
                             job_type,
                             config_yaml: Some(content.clone()),
                         });
@@ -1864,6 +1958,261 @@ mod tests {
         assert!(msg.contains("unknown field 'rolle'"), "got: {msg}");
     }
 
+    // --- explicit job name (quick 261020-fh7) ---
+
+    fn job_project() -> TempDir {
+        let tmp = TempDir::new();
+        write_context(&tmp, "name: dev\n", "name: us-east-1\n");
+        tmp
+    }
+
+    fn write_job(tmp: &TempDir, rel_dir: &str, file: &str, body: &str) -> PathBuf {
+        let dir = tmp.0.join(rel_dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(file);
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn job_name_explicit_becomes_manifest_key() {
+        let tmp = job_project();
+        write_job(
+            &tmp,
+            "envs/dev/sales",
+            "orders.yaml",
+            "type: glue\nname: orders\n",
+        );
+
+        let jobs = discover_jobs(&tmp.0, &tmp.0).unwrap();
+
+        assert!(jobs.contains_key("orders"), "got: {:?}", jobs.keys());
+        assert!(
+            !jobs.contains_key("dev-sales-orders"),
+            "got: {:?}",
+            jobs.keys()
+        );
+        assert!(jobs["orders"].config.get("name").is_none());
+    }
+
+    #[test]
+    fn job_name_absent_uses_generated_key() {
+        let tmp = job_project();
+        write_job(&tmp, "envs/dev/sales", "orders.yaml", "type: glue\n");
+
+        let jobs = discover_jobs(&tmp.0, &tmp.0).unwrap();
+
+        assert!(
+            jobs.contains_key("dev-sales-orders"),
+            "got: {:?}",
+            jobs.keys()
+        );
+        assert_eq!(jobs.len(), 1);
+    }
+
+    #[test]
+    fn job_name_empty_is_rejected() {
+        for body in [
+            "type: glue\nname: \"\"\n",
+            "type: glue\nname: \"   \"\n",
+            "type: glue\nname:\n",
+        ] {
+            let tmp = job_project();
+            let path = write_job(&tmp, "envs/dev/sales", "orders.yaml", body);
+
+            let err = discover_jobs(&tmp.0, &tmp.0).unwrap_err();
+
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("name must not be empty"),
+                "body {body:?}, got: {msg}"
+            );
+            assert!(msg.contains(&path.display().to_string()), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn job_name_non_string_is_rejected() {
+        let tmp = job_project();
+        let path = write_job(
+            &tmp,
+            "envs/dev/sales",
+            "orders.yaml",
+            "type: glue\nname: 42\n",
+        );
+
+        let err = discover_jobs(&tmp.0, &tmp.0).unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("name must be a string"), "got: {msg}");
+        assert!(msg.contains(&path.display().to_string()), "got: {msg}");
+    }
+
+    #[test]
+    fn job_name_invalid_chars_are_rejected() {
+        for name in ["a/b", "../x", "a b", "a\\\\b"] {
+            let tmp = job_project();
+            let body = format!("type: glue\nname: \"{name}\"\n");
+            let path = write_job(&tmp, "envs/dev/sales", "orders.yaml", &body);
+
+            let err = discover_jobs(&tmp.0, &tmp.0).unwrap_err();
+
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("only ASCII letters, digits, '.', '_' and '-' are allowed"),
+                "name {name:?}, got: {msg}"
+            );
+            assert!(msg.contains(&path.display().to_string()), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn job_name_dot_and_reserved_forms_are_rejected() {
+        for name in ["..", ".", "orders..v2", "_dag_orders", "orders.lock"] {
+            let tmp = job_project();
+            let body = format!("type: glue\nname: \"{name}\"\n");
+            let path = write_job(&tmp, "envs/dev/sales", "orders.yaml", &body);
+
+            let err = discover_jobs(&tmp.0, &tmp.0).unwrap_err();
+
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("invalid job name"),
+                "name {name:?}, got: {msg}"
+            );
+            assert!(msg.contains(&path.display().to_string()), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn job_name_duplicate_explicit_names_are_rejected() {
+        let tmp = job_project();
+        let first = write_job(&tmp, "envs/dev/a", "x.yaml", "type: glue\nname: orders\n");
+        let second = write_job(&tmp, "envs/dev/b", "y.yaml", "type: glue\nname: orders\n");
+
+        let err = discover_jobs(&tmp.0, &tmp.0).unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("duplicate job name 'orders'"), "got: {msg}");
+        assert!(msg.contains(&first.display().to_string()), "got: {msg}");
+        assert!(msg.contains(&second.display().to_string()), "got: {msg}");
+    }
+
+    #[test]
+    fn job_name_explicit_colliding_with_generated_is_rejected() {
+        let tmp = job_project();
+        let generated = write_job(&tmp, "envs/dev/sales", "orders.yaml", "type: glue\n");
+        let explicit = write_job(
+            &tmp,
+            "envs/dev/sales",
+            "other.yaml",
+            "type: glue\nname: dev-sales-orders\n",
+        );
+
+        let err = discover_jobs(&tmp.0, &tmp.0).unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("duplicate job name 'dev-sales-orders'"),
+            "got: {msg}"
+        );
+        assert!(msg.contains(&generated.display().to_string()), "got: {msg}");
+        assert!(msg.contains(&explicit.display().to_string()), "got: {msg}");
+    }
+
+    #[test]
+    fn job_name_matching_generated_value_keeps_config_byte_identical() {
+        let body =
+            "glue:\n  script_bucket: my-bucket\nrole: arn:aws:iam::123456789012:role/GlueJob\n";
+        let with_name = job_project();
+        write_job(
+            &with_name,
+            "envs/dev/sales",
+            "orders.yaml",
+            &format!("name: dev-sales-orders\ntype: glue\n{body}"),
+        );
+        let without_name = job_project();
+        write_job(
+            &without_name,
+            "envs/dev/sales",
+            "orders.yaml",
+            &format!("type: glue\n{body}"),
+        );
+
+        let named = discover_jobs(&with_name.0, &with_name.0).unwrap();
+        let plain = discover_jobs(&without_name.0, &without_name.0).unwrap();
+
+        let named_json = serde_json::to_string(&named["dev-sales-orders"].config).unwrap();
+        let plain_json = serde_json::to_string(&plain["dev-sales-orders"].config).unwrap();
+        assert_eq!(named_json, plain_json);
+    }
+
+    #[test]
+    fn job_name_interpolates_context_variables() {
+        let tmp = job_project();
+        write_job(
+            &tmp,
+            "envs/dev/sales",
+            "orders.yaml",
+            "type: glue\nname: ${account.name}-orders\n",
+        );
+
+        let jobs = discover_jobs(&tmp.0, &tmp.0).unwrap();
+
+        assert!(jobs.contains_key("dev-orders"), "got: {:?}", jobs.keys());
+    }
+
+    #[tokio::test]
+    async fn job_name_explicit_scopes_target_and_list_targets() {
+        let tmp = TempDir::new();
+        fs::create_dir_all(tmp.0.join(".yard/state")).unwrap();
+        fs::write(
+            tmp.0.join("yard.yaml"),
+            "project: smoke-test\nstate:\n  type: local\n  path: .yard/state\n",
+        )
+        .unwrap();
+        write_context(&tmp, "name: dev\n", "name: us-east-1\n");
+        write_job(
+            &tmp,
+            "envs/dev/sales",
+            "orders.yaml",
+            "type: glue\nname: orders\n",
+        );
+        write_job(&tmp, "envs/dev/sales", "customers.yaml", "type: glue\n");
+
+        let resolved = resolve_project(&tmp.0).await.unwrap();
+        let scoped = crate::orchestrate::plan(
+            &resolved.manifest,
+            &resolved.current_state,
+            &tmp.0,
+            Some("orders".to_string()),
+        )
+        .await
+        .unwrap();
+        let generated_target = crate::orchestrate::plan(
+            &resolved.manifest,
+            &resolved.current_state,
+            &tmp.0,
+            Some("dev-sales-orders".to_string()),
+        )
+        .await;
+        let rows = crate::list_targets::list_targets(&resolved.manifest, &tmp.0).unwrap();
+
+        let mut keys: Vec<&String> = resolved.manifest.jobs.keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["dev-sales-customers", "orders"]);
+        assert_eq!(scoped.job_diffs.len(), 1);
+        assert_eq!(scoped.job_diffs[0].name, "orders");
+        assert_eq!(
+            scoped.job_diffs[0].diff_type,
+            yard_structs::DiffType::Create
+        );
+        let msg = format!("{:#}", generated_target.unwrap_err());
+        assert!(msg.contains("not found"), "got: {msg}");
+        let targets: Vec<&str> = rows.iter().map(|r| r.target.as_str()).collect();
+        assert_eq!(targets, ["dev-sales-customers", "orders"]);
+    }
+
     // --- discover_environments (Phase 40) ---
 
     /// Helper: create a minimal yard project fixture with env/region structure.
@@ -2010,6 +2359,38 @@ mod tests {
 
         let envs = discover_environments(&tmp.0).unwrap();
         assert_eq!(envs[0].account_id.as_deref(), Some("123456789012"));
+    }
+
+    #[test]
+    fn discover_environments_reports_explicit_job_name() {
+        let tmp = TempDir::new();
+        make_yard_project(&tmp.0);
+        let env_dir = tmp.0.join("production");
+        let region_dir = env_dir.join("us-east-1");
+        fs::create_dir_all(&region_dir).unwrap();
+        fs::write(env_dir.join("account.yaml"), "{}").unwrap();
+        fs::write(region_dir.join("region.yaml"), "{}").unwrap();
+        fs::write(
+            region_dir.join("orders_job.yaml"),
+            "type: glue\nname: orders\n",
+        )
+        .unwrap();
+        fs::write(
+            region_dir.join("users.yaml"),
+            "type: glue\nname: \"bad/name\"\n",
+        )
+        .unwrap();
+        fs::write(region_dir.join("plain.yaml"), "type: glue\n").unwrap();
+
+        let envs = discover_environments(&tmp.0).unwrap();
+
+        let mut names: Vec<&str> = envs[0].regions[0]
+            .jobs
+            .iter()
+            .map(|j| j.name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["orders", "plain", "users"]);
     }
 
     #[test]
